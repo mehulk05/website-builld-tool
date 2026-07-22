@@ -1,0 +1,10 @@
+{
+  "name": "g99-website-build-tool",
+  "version": "0.1.0",
+  "description": "Growth99 website-build pipeline prototype: onboarding -> Stitch generate -> preview/export -> SEO audit",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "license": "UNLICENSED"
+}

@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Growth99 · Beta Site Builder</title>
+<style>
+  :root{
+    --bg:#f4f5f8; --panel:#ffffff; --ink:#1c1d29; --muted:#6b6f82; --line:#e6e8f0;
+    --accent:#6d4e8c; --accent-2:#8a6bb0; --good:#1f9d6b; --warn:#c9772b; --bad:#c0392b;
+    --radius:16px; --shadow:0 1px 2px rgba(20,20,40,.04),0 8px 24px rgba(20,20,40,.06);
+    --sans:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#14151c; --panel:#1c1e28; --ink:#ecedf3; --muted:#9a9fb5; --line:#2b2e3c; --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.35); }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
+  a{color:var(--accent)}
+  .wrap{max-width:1080px;margin:0 auto;padding:28px 24px 80px}
+
+  /* header */
+  .top{display:flex;align-items:center;gap:14px;margin-bottom:26px}
+  .logo{width:40px;height:40px;border-radius:11px;background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#fff;display:grid;place-items:center;font-weight:800;font-size:19px}
+  .top h1{font-size:17px;margin:0;font-weight:700;letter-spacing:.2px}
+  .top .sub{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.14em}
+  .biz{margin-left:auto;font-size:13px;color:var(--muted);background:var(--panel);border:1px solid var(--line);padding:8px 14px;border-radius:999px;box-shadow:var(--shadow)}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:22px 24px;margin-bottom:20px}
+  .card h2{font-size:15px;margin:0 0 4px;font-weight:700}
+  .card .desc{font-size:13px;color:var(--muted);margin:0 0 18px}
+
+  /* form panel */
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px 20px}
+  @media (max-width:720px){.grid{grid-template-columns:1fr}}
+  .field label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin-bottom:5px;font-weight:600}
+  .field input,.field textarea{width:100%;background:transparent;border:1px solid var(--line);border-radius:10px;padding:9px 11px;color:var(--ink);font:inherit;font-size:14px}
+  .field textarea{resize:vertical;min-height:60px}
+  .field input:focus,.field textarea:focus{outline:none;border-color:var(--accent)}
+  .rowbtns{display:flex;gap:10px;align-items:center;margin-top:18px;flex-wrap:wrap}
+
+  .btn{border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:10px 16px;border-radius:10px;font:inherit;font-weight:600;cursor:pointer;transition:.15s}
+  .btn:hover{border-color:var(--accent)}
+  .btn.primary{background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#fff;border:none;padding:12px 22px}
+  .btn.primary:hover{filter:brightness(1.06)}
+  .btn:disabled{opacity:.5;cursor:not-allowed}
+  .btn.sm{padding:7px 12px;font-size:13px}
+
+  .hint{font-size:13px;color:var(--muted);margin:8px 0 0}
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:7px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:11px 18px;border-radius:10px;font-size:14px;box-shadow:var(--shadow);opacity:0;pointer-events:none;transition:.25s;z-index:50}
+  .toast.show{opacity:1}
+
+  /* pipeline steps */
+  .steps{display:flex;flex-direction:column;gap:0}
+  .step{display:flex;gap:16px;padding:18px 0;border-bottom:1px solid var(--line)}
+  .step:last-child{border-bottom:none}
+  .step .idx{flex:none;width:30px;height:30px;border-radius:50%;border:1px solid var(--line);display:grid;place-items:center;font-weight:700;font-size:13px;color:var(--muted);background:var(--panel)}
+  .step.run .idx{border-color:var(--accent);color:var(--accent)}
+  .step.done .idx{background:var(--good);border-color:var(--good);color:#fff}
+  .step.err .idx{background:var(--bad);border-color:var(--bad);color:#fff}
+  .step .body{flex:1;min-width:0}
+  .step .body h3{margin:0;font-size:14px;font-weight:700}
+  .step .body .st{font-size:12.5px;color:var(--muted);margin-top:2px}
+  .step .out{margin-top:12px;display:none}
+  .step.run .out,.step.done .out,.step.err .out{display:block}
+
+  /* gauges + compare */
+  .gauges{display:flex;gap:34px;align-items:center;flex-wrap:wrap}
+  .gauge{position:relative;width:120px;height:120px;flex:none}
+  .gauge svg{transform:rotate(-90deg)}
+  .gauge .n{position:absolute;inset:0;display:grid;place-items:center;font-size:30px;font-weight:800}
+  .gauge .lbl{text-align:center;font-size:12px;color:var(--muted);margin-top:6px}
+  .delta{font-size:34px;font-weight:800}
+  .delta.up{color:var(--good)} .delta.down{color:var(--bad)}
+  .cats{margin-top:14px;display:flex;flex-direction:column;gap:8px;max-width:520px}
+  .cat{display:flex;align-items:center;gap:10px;font-size:13px}
+  .cat .cname{width:74px;color:var(--muted);text-transform:capitalize}
+  .cat .bar{flex:1;height:8px;background:var(--line);border-radius:99px;overflow:hidden}
+  .cat .bar i{display:block;height:100%;background:var(--accent)}
+  .cat .cv{width:58px;text-align:right;font-variant-numeric:tabular-nums}
+  ul.recs{margin:10px 0 0;padding-left:18px;font-size:13px;color:var(--muted)}
+  ul.recs li{margin:3px 0}
+  .previews{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-top:6px}
+  .previews a{display:block;border:1px solid var(--line);border-radius:10px;padding:12px;text-decoration:none;color:var(--ink);font-size:13px;font-weight:600;text-align:center}
+  .previews a:hover{border-color:var(--accent)}
+  .prlink{display:inline-flex;align-items:center;gap:8px;background:rgba(109,78,140,.08);border:1px solid var(--accent);color:var(--accent);padding:9px 14px;border-radius:10px;text-decoration:none;font-weight:700;font-size:13px}
+  .promptbox{width:100%;min-height:120px;border:1px solid var(--line);border-radius:10px;padding:11px;font:inherit;font-size:13px;color:var(--ink);background:transparent;resize:vertical}
+  .urlrow{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .urlrow input{flex:1;min-width:240px;border:1px solid var(--line);border-radius:10px;padding:10px 12px;font:inherit;background:transparent;color:var(--ink)}
+  .muted{color:var(--muted)}
+  .hide{display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="logo">g</div>
+    <div>
+      <div class="sub">Growth99</div>
+      <h1>Beta Site Builder</h1>
+    </div>
+    <div class="biz" id="bizChip">Loading…</div>
+  </div>
+
+  <!-- Form response -->
+  <div class="card">
+    <h2>Onboarding response</h2>
+    <p class="desc">Review the client's answers. Edit anything that needs fixing, then build the beta site.</p>
+    <div class="grid" id="formGrid"></div>
+    <div class="rowbtns">
+      <button class="btn sm" id="saveBtn" onclick="saveForm()">Save changes</button>
+      <span class="hint" id="saveHint" style="margin:0"></span>
+      <button class="btn primary" id="buildBtn" onclick="buildBetaSite()" style="margin-left:auto">🚀 Build beta site</button>
+    </div>
+  </div>
+
+  <!-- Pipeline -->
+  <div class="card" id="pipeCard">
+    <h2>Build pipeline</h2>
+    <p class="desc">Steps 1–4 run automatically. After the PR is opened, paste the live URL to run the before/after comparison.</p>
+    <div class="steps" id="steps"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="/dashboard.js"></script>
+</body>
+</html>

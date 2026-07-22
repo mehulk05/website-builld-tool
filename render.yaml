@@ -1,0 +1,21 @@
+# Render blueprint — deploy as a persistent web service (free plan).
+# Set the secret env vars in the Render dashboard (marked sync: false here).
+services:
+  - type: web
+    name: g99-website-build-tool
+    runtime: node
+    plan: free
+    buildCommand: bash render-build.sh
+    startCommand: node server.js
+    healthCheckPath: /api/auth-check
+    envVars:
+      - key: STITCH_API_KEY
+        sync: false          # set in dashboard
+      - key: GEMINI_KEYS
+        sync: false          # comma-separated list, set in dashboard
+      - key: GH_TOKEN
+        sync: false          # fine-grained PAT: Contents RW + Pull requests RW on the WP repo
+      - key: ADMIN_PASSWORD
+        sync: false          # protects /api/* — REQUIRED on a public URL
+      - key: WP_REPO
+        value: Growth99Infra/prodteam.gogroth.com

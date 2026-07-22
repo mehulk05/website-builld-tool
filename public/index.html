@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Growth99 · Website Build Tool</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header>
+  <div class="wrap hd">
+    <span class="g">g</span>
+    <span><b>Growth99</b><small>Website Build Tool</small></span>
+    <div class="spacer"></div>
+    <span class="client-pill" id="clientPill">loading…</span>
+  </div>
+</header>
+
+<div class="wrap">
+  <nav class="stepper" id="stepper">
+    <button class="step on" data-step="1"><div class="srow"><span class="num">1</span><span class="nm">Onboarding</span></div><span class="sb">Form answers</span></button>
+    <button class="step" data-step="2"><div class="srow"><span class="num">2</span><span class="nm">CRO Audit</span></div><span class="sb">Audit current site</span></button>
+    <button class="step" data-step="3"><div class="srow"><span class="num">3</span><span class="nm">Prompt &amp; Generate</span></div><span class="sb">Multi-page Stitch</span></button>
+    <button class="step" data-step="4"><div class="srow"><span class="num">4</span><span class="nm">Preview &amp; Export</span></div><span class="sb">Generated pages</span></button>
+    <button class="step" data-step="5"><div class="srow"><span class="num">5</span><span class="nm">QA &amp; Refine</span></div><span class="sb">Stitch UX feedback</span></button>
+    <button class="step" data-step="6"><div class="srow"><span class="num">6</span><span class="nm">CRO Compare</span></div><span class="sb">Before vs after</span></button>
+  </nav>
+
+  <!-- STEP 1 -->
+  <section class="panel on" data-panel="1">
+    <div class="sec-h"><span class="eyebrow">Step 1 — Website Onboarding Form</span>
+      <h2>Submitted questions &amp; answers</h2>
+      <p>The client's website-onboarding submission. AI pre-filled what it could scrape; fields tagged NEW were added by the website clone.</p></div>
+    <div class="ans-grid" id="answers"></div>
+    <div class="btnrow" style="margin-top:18px"><button class="btn" onclick="go(2)">Continue → audit existing site</button></div>
+  </section>
+
+  <!-- STEP 2 : CRO AUDIT -->
+  <section class="panel" data-panel="2">
+    <div class="sec-h"><span class="eyebrow">Step 2 — CRO audit (existing site)</span>
+      <h2>Conversion audit of the client's current website</h2>
+      <p>An agency-style CRO audit across four disciplines — Vision &amp; UI, UX &amp; Usability, CRO &amp; Sales, Content &amp; Copy. Its findings are baked into the Stitch prompt so the new site fixes them, and we re-run it on the beta site at the end for a before/after.</p></div>
+    <div class="card pad" style="margin-bottom:16px">
+      <div class="row" style="align-items:flex-end">
+        <div class="field" style="margin:0"><label>Existing website URL</label><input type="text" id="existingUrl"></div>
+        <div style="flex:0"><button class="btn" id="baseBtn" onclick="runCroExisting()">Run CRO audit</button></div>
+      </div>
+      <p class="hint" id="baseHint">Prefilled with a real medspa site (the dummy client is fictional). Change it to any URL.</p>
+    </div>
+    <div id="baseEmpty" class="card empty">Run the CRO audit to see the current site's conversion gaps.</div>
+    <div id="baseBox" style="display:none">
+      <div class="grid g2" style="margin-bottom:16px">
+        <div class="card pad" style="display:flex;gap:18px;align-items:center">
+          <div class="gauge" id="baseGauge"><div class="n"><b id="baseScoreN">0</b><small>/ 100</small></div></div>
+          <div><div class="eyebrow">Existing CRO score</div><div id="baseScoreLabel" style="font-weight:650;margin-top:4px"></div><div class="hint" id="baseScoreUrl" style="margin-top:6px"></div></div>
+        </div>
+        <div class="card pad" id="baseCatBox"></div>
+      </div>
+      <div id="baseCro"></div>
+      <div class="btnrow" style="margin-top:18px"><button class="btn" onclick="go(3)">Continue → build prompt with these fixes</button></div>
+    </div>
+  </section>
+
+  <!-- STEP 3 : PROMPT & GENERATE -->
+  <section class="panel" data-panel="3">
+    <div class="sec-h"><span class="eyebrow">Step 3 — Prompt, theme &amp; data</span>
+      <h2>Generate the multi-page site in one submission</h2>
+      <p>The prompt carries the brand, the reference site, and the SEO fixes from Step 2. One click generates all pages (Home, Services, About, Contact), reusing one Stitch project. Each page is a real ~2-min call.</p></div>
+    <div class="grid g2c">
+      <div class="card pad">
+        <div class="row">
+          <div class="field"><label>Vibe / theme</label>
+            <select id="vibe"><option>Luxurious &amp; Warm</option><option>Clean &amp; Minimalist</option><option>Bold &amp; Modern</option><option>Clinical &amp; Precise</option></select></div>
+          <div class="field"><label>Device</label>
+            <select id="device"><option>DESKTOP</option><option>MOBILE</option><option>TABLET</option></select></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Primary color</label><div class="color-in"><input type="color" id="c1v" value="#e8dcc4"><input type="text" id="c1" value="#E8DCC4"></div></div>
+          <div class="field"><label>Secondary color</label><div class="color-in"><input type="color" id="c2v" value="#2c2c2c"><input type="text" id="c2" value="#2C2C2C"></div></div>
+        </div>
+        <div class="field"><label>Reference / existing website</label>
+          <div class="row" style="gap:8px"><input type="text" id="ref" value="ruma.com">
+          <button class="btn ghost sm" id="scanBtn" style="flex:0;white-space:nowrap" onclick="scanSite()">🔍 Scan design</button></div>
+          <div class="hint" id="scanHint" style="margin-top:6px"></div>
+          <div id="scanResult" style="display:none;margin-top:8px"></div></div>
+        <div class="field"><label>Hero headline</label><input type="text" id="headline"></div>
+        <div class="field"><label>Featured treatments</label><input type="text" id="featured"></div>
+        <div class="field" style="margin:0"><label>Pages to generate</label>
+          <div id="pageChecks" style="display:flex;gap:14px;flex-wrap:wrap;font-size:13px"></div></div>
+      </div>
+      <div class="card pad">
+        <div class="field" style="margin-bottom:8px"><label>Prompt preface (brand + SEO fixes) — applied to every page</label>
+          <textarea id="prompt" style="min-height:300px"></textarea></div>
+        <div class="btnrow"><button class="btn sm" id="composeBtn" onclick="composeBrand()">✨ AI-compose prompt (Gemini)</button><button class="btn ghost sm" onclick="buildPrompt()">↻ Rebuild from template</button><span class="hint" id="composeHint" style="margin:0"></span></div>
+        <div class="btnrow" style="margin-top:12px">
+          <button class="btn" id="genBtnBoth" onclick="generateSite('both')">⚔ Generate with BOTH — compare</button>
+          <button class="btn ghost" id="genBtn" onclick="generateSite('stitch')">Stitch only (~2 min/page)</button>
+          <button class="btn ghost" id="genBtnGemini" onclick="generateSite('gemini')">⚡ Gemini only (~1 min/page)</button>
+          <span class="hint" id="genHint" style="margin:0"></span>
+        </div>
+        <div class="plist" id="progress"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- STEP 4 : PREVIEW -->
+  <section class="panel" data-panel="4">
+    <div class="sec-h"><span class="eyebrow">Step 4 — Generated pages</span>
+      <h2>Live preview &amp; export</h2>
+      <p>Every generated page, served live. Switch pages, export the HTML, or open the live URL in a new tab.</p></div>
+    <div id="previewEmpty" class="card empty">No pages generated yet — go to Step 3.</div>
+    <div id="previewBox" style="display:none">
+      <div class="ptabs" id="ptabs"></div>
+      <div class="btnrow" style="margin-bottom:14px">
+        <span id="asmRow" class="btnrow" style="gap:10px"></span>
+        <button class="btn" onclick="go(5)">QA &amp; Refine →</button>
+      </div>
+      <div id="siteLinks" class="card pad" style="display:none;margin-bottom:14px">
+        <span class="eyebrow">Beta site (one navigable bundle)</span>
+        <div class="btnrow" style="margin-top:10px">
+          <a class="btn" id="siteOpen" href="/site/" target="_blank">↗ Open beta site</a>
+          <a class="btn ghost" id="siteZip" href="/export-site">⬇ Download site (zip)</a>
+          <span class="hint" id="siteFiles" style="margin:0"></span>
+        </div>
+      </div>
+      <div class="card pad" style="margin-bottom:14px">
+        <span class="eyebrow">Client deliverables (shareable review pages)</span>
+        <div class="btnrow" style="margin-top:10px">
+          <button class="btn" onclick="genDeliverable('brand-guide', this)">🎨 Generate Brand Guide</button>
+          <button class="btn" onclick="genDeliverable('seo-report', this)">📈 Generate SEO Report</button>
+          <button class="btn ghost" onclick="exportWp(this)">🧩 Export WordPress theme</button>
+          <button class="btn" onclick="pushWp(this)">⬆ Push to GitHub (open PR)</button>
+          <span id="delivLinks" class="btnrow" style="gap:10px"></span>
+        </div>
+      </div>
+      <div class="btnrow" id="refineRow" style="margin-bottom:12px"></div>
+      <div id="pvGrid" class="grid g2"></div>
+      <div id="refineOut"></div>
+      <p class="hint">When both engines are generated, each page shows Stitch (left) vs Gemini (right). Pages load Tailwind + fonts from a CDN — if a frame looks unstyled, click “↗ Open”.</p>
+    </div>
+  </section>
+
+  <!-- STEP 5 : QA & REFINE -->
+  <section class="panel" data-panel="5">
+    <div class="sec-h"><span class="eyebrow">Step 5 — QA &amp; Refine (Stitch UX feedback)</span>
+      <h2>Audit a generated page, then refine it with Stitch</h2>
+      <p>Runs a UX/conversion audit across <b>every page</b> of the generated site, gathers the feedback, then lets you choose whether to refine the whole site with Stitch to address it.</p></div>
+    <div class="card pad" style="margin-bottom:16px">
+      <div class="btnrow">
+        <button class="btn" id="qaBtn" onclick="runQaSite()">Run QA on the whole website</button>
+        <span class="hint" id="qaHint" style="margin:0">Audits all Stitch pages (uses Stitch's edit_screens for the refine step).</span>
+      </div>
+    </div>
+    <div id="qaEmpty" class="card empty">No Stitch pages yet — generate a site with Stitch in Step 3 first.</div>
+    <div id="qaOut"></div>
+  </section>
+
+  <!-- STEP 6 : CRO BEFORE/AFTER -->
+  <section class="panel" data-panel="6">
+    <div class="sec-h"><span class="eyebrow">Step 6 — CRO before / after</span>
+      <h2>Beta site vs existing site (conversion)</h2>
+      <p>Runs the same CRO audit on the generated beta site and compares it to the Step 2 existing-site audit — overall CRO score, per-discipline, and which conversion issues got fixed.</p></div>
+    <div class="card pad" style="margin-bottom:16px">
+      <div class="btnrow">
+        <button class="btn" id="cmpBtn" onclick="runCroCompare()">Run CRO audit on beta &amp; compare</button>
+        <span class="hint" id="cmpHint" style="margin:0"></span>
+      </div>
+    </div>
+    <div id="cmpEmpty" class="card empty">Run the Step 2 CRO audit and generate the beta site first, then compare.</div>
+    <div id="cmpBox" style="display:none">
+      <div class="card pad" style="margin-bottom:16px">
+        <div class="twogauge" style="display:flex;align-items:center;gap:28px;justify-content:center">
+          <div class="gwrap" style="text-align:center"><div class="gauge" id="gExist"><div class="n"><b id="gExistN">0</b><small>/100</small></div></div><div class="lb">Existing site</div></div>
+          <div class="arrow" style="font-size:24px;color:var(--ink-3)">→</div>
+          <div class="gwrap" style="text-align:center"><div class="gauge" id="gNew"><div class="n"><b id="gNewN">0</b><small>/100</small></div></div><div class="lb">Beta site</div></div>
+          <div class="gwrap" style="text-align:center"><div class="delta" id="deltaBig" style="font-size:30px;font-weight:750"></div><div class="lb">CRO change</div></div>
+        </div>
+      </div>
+      <div class="grid g2">
+        <div class="card pad"><span class="eyebrow">Discipline comparison</span>
+          <div class="cmp" id="cmpCats" style="margin-top:14px"></div></div>
+        <div class="card"><div class="pad" style="padding-bottom:6px"><span class="eyebrow">Conversion issues fixed vs still open</span></div><div class="resolved" id="resolved"></div></div>
+      </div>
+      <div style="margin-top:22px"><div class="ey" style="font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent-ink);font-weight:700;margin-bottom:10px">Beta site — full CRO report</div><div id="cmpDetailNew"></div></div>
+      <div style="margin-top:22px"><div class="ey" style="font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);font-weight:700;margin-bottom:10px">Existing site — full CRO report</div><div id="cmpDetailOld"></div></div>
+    </div>
+  </section>
+</div>
+<div class="toast" id="toast"></div>
+<script src="/app.js"></script>
+</body>
+</html>

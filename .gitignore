@@ -1,0 +1,8 @@
+.env
+generated/
+bin/
+*.log
+node_modules/
+# local debug scripts (contain hardcoded API keys)
+test-full.js
+test-invalid.js
