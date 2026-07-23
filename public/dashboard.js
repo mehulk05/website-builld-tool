@@ -398,5 +398,77 @@ function renderComparison() {
   out(7, `<div class="gauges">${gauge(croBefore.overall, "Before")}<div class="delta ${d >= 0 ? "up" : "down"}">${d >= 0 ? "+" : ""}${d}</div>${gauge(croAfter.overall, "After")}</div><div class="cats">${cats}</div>`);
 }
 
+// ---------- monitor mode: render a server-side webhook job onto this UI ----------
+// /dashboard?job=<draftId> — read-only view of a run driven by the job runner.
+const MONITOR_ID = new URLSearchParams(location.search).get("job");
+const RANK = { pending: 0, done: 1, running: 2, error: 3 };
+const CLS = { pending: "", done: "done", running: "run", error: "err" };
+function worst(...steps) {
+  return steps.reduce((w, s) => (RANK[s.status] > RANK[w.status] ? s : w));
+}
+function detailOf(...steps) {
+  // prefer the most-advanced step's detail so combined rows read naturally
+  const active = [...steps].reverse().find((s) => s.status !== "pending");
+  return active ? active.detail : steps[0].detail;
+}
+let monRendered = { form: false, before: false, site: false, pr: false, after: false, compare: false, final: false };
+function monitorJob(id) {
+  const desc = document.querySelector("#pipeCard .desc");
+  $("buildBtn").disabled = true; $("saveBtn").disabled = true;
+  const tick = async () => {
+    let d;
+    try { d = await (await fetch("/api/jobs")).json(); } catch (e) { return; }
+    const j = (d.jobs || []).find((x) => x.draftId === id);
+    if (!j) { desc.innerHTML = `Webhook job <b>${esc(id)}</b> not found — it may have been lost on a server restart. <a href="/jobs">← all jobs</a>`; return; }
+    desc.innerHTML = `Monitoring webhook job <b>${esc(id)}</b> — ${esc(j.businessName)} · <b>${esc(j.status.toUpperCase())}</b> · <a href="/jobs">← all jobs</a>`;
+
+    // one-time: overlay the job's answers onto the form
+    if (!monRendered.form && j.payload && j.payload.answers) {
+      for (const [k, , , scope] of FIELDS) {
+        const el = $("f_" + k); if (!el) continue;
+        const v = scope === "top" ? j.payload.existingWebsite : j.payload.answers[k];
+        if (v != null && !el.disabled) el.value = val(v);
+      }
+      $("bizChip").textContent = j.businessName + (j.payload.answers.location ? " · " + j.payload.answers.location : "");
+      monRendered.form = true;
+    }
+
+    const s = j.steps; // server steps s0..s7 → dashboard steps d1..d7
+    setStep(1, CLS[s[0].status], s[0].detail || s[0].label);
+    if (!monRendered.before && j.before) { out(1, `<div class="gauges">${gauge(j.before.overall, "Existing site")}<div>${catsHtml(j.before)}</div></div>${recsHtml(j.before)}`); monRendered.before = true; }
+    setStep(2, CLS[s[1].status], s[1].detail || s[1].label);
+    const d3 = worst(s[2], s[3]);
+    setStep(3, CLS[d3.status], detailOf(s[2], s[3]) || d3.label);
+    if (!monRendered.site && j.siteUrl) {
+      out(3, `<div class="previews">${PAGES.map((p) => `<a href="/preview/${p.key}" target="_blank">${esc(p.title)} ↗</a>`).join("")}</div><div style="margin-top:12px"><a class="prlink" href="${esc(j.siteUrl)}" target="_blank">↗ Preview assembled site</a></div>`);
+      monRendered.site = true;
+    }
+    const d4 = worst(s[4], s[5]);
+    setStep(4, CLS[d4.status], detailOf(s[4], s[5]) || d4.label);
+    if (!monRendered.pr && j.prUrl) { out(4, `<a class="prlink" href="${esc(j.prUrl)}" target="_blank">↗ View pull request</a>`); monRendered.pr = true; }
+    setStep(5, CLS[s[6].status], s[6].detail || s[6].label);
+    setStep(6, CLS[s[7].status], s[7].detail || s[7].label);
+    if (!monRendered.after && j.after) { out(6, `<div class="gauges">${gauge(j.after.overall, "New site")}<div>${catsHtml(j.after)}</div></div>${recsHtml(j.after)}`); monRendered.after = true; }
+    if (!monRendered.compare && j.after) {
+      croBefore = j.before; croAfter = j.after;
+      renderComparison();
+      if (j.reportUrl) $("out7").insertAdjacentHTML("beforeend", `<div style="margin-top:12px"><a class="prlink" href="${esc(j.reportUrl)}" target="_blank">↗ Before/after report</a></div>`);
+      monRendered.compare = true;
+    }
+
+    if ((j.status === "done" || j.status === "error") && !monRendered.final) {
+      monRendered.final = true;
+      $("buildBtn").disabled = false; $("saveBtn").disabled = false;
+      clearInterval(monTimer);
+      if (j.status === "error" && j.error) toast("Job failed: " + j.error);
+    }
+  };
+  const monTimer = setInterval(tick, 3000);
+  tick();
+}
+
 renderSteps();
-ensureAuth().then((ok) => { if (ok) loadForm(); else toast("Unauthorized — reload and enter the admin password."); });
+ensureAuth().then((ok) => {
+  if (!ok) { toast("Unauthorized — reload and enter the admin password."); return; }
+  loadForm().then(() => { if (MONITOR_ID) monitorJob(MONITOR_ID); });
+});

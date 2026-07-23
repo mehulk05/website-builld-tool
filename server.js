@@ -1444,6 +1444,315 @@ function json(res, code, obj) { send(res, code, "application/json", JSON.stringi
 function readBody(req) { return new Promise(r => { let d = ""; req.on("data", c => d += c); req.on("end", () => r(d)); }); }
 const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".png": "image/png" };
 
+// ============================================================ JOB RUNNER
+// Server-side pipeline: a webhook (or manual enqueue) runs the whole 7-step
+// flow with no browser. The runner drives the tool's OWN http routes — the
+// same calls dashboard.js makes — so there is exactly one implementation of
+// each step. Plain http.request (not fetch) so multi-minute steps aren't
+// killed by undici's header timeouts.
+function localApi(pathName, body, timeoutMs = 30 * 60 * 1000) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(body || {});
+    const r = http.request({
+      host: "127.0.0.1", port: PORT, path: pathName, method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data), "x-admin-key": process.env.ADMIN_PASSWORD || "" },
+    }, (rs) => {
+      let s = "";
+      rs.on("data", (c) => s += c);
+      rs.on("end", () => {
+        let d;
+        try { d = JSON.parse(s); } catch (e) { return reject(new Error(`${pathName} → ${rs.statusCode}: ${s.slice(0, 160)}`)); }
+        if (rs.statusCode >= 400) return reject(new Error(d.error || `${pathName} failed (${rs.statusCode})`));
+        resolve(d);
+      });
+    });
+    r.setTimeout(timeoutMs, () => r.destroy(new Error(pathName + " timed out")));
+    r.on("error", reject);
+    r.end(data);
+  });
+}
+
+const JOB_STEPS = [
+  "CRO audit — existing site", "Compose build prompt", "Generate pages (Stitch)",
+  "Assemble site", "WordPress theme + PR", "CI checks → auto-merge",
+  "Theme activation watch", "CRO after-audit + comparison",
+];
+const JOBS = new Map();     // draftId -> job record
+const JOB_QUEUE = [];       // draftIds waiting (single concurrency — Stitch/Gemini quotas)
+let JOB_RUNNING = false;
+const LIVE_URL = process.env.WP_LIVE_URL || "https://prodteam.gogroth.com/";
+
+function newJob(payload) {
+  return {
+    draftId: String(payload.draftId), businessId: payload.businessId || null,
+    businessName: payload.businessName || (payload.answers || {}).business_name || "Client",
+    status: "queued", currentStep: 0,
+    steps: JOB_STEPS.map((label) => ({ label, status: "pending", detail: "" })),
+    payload, prUrl: null, branch: null, siteUrl: null,
+    before: null, after: null, delta: null, reportUrl: null, error: null,
+    createdAt: new Date().toISOString(), startedAt: null, finishedAt: null,
+  };
+}
+function jobStep(job, i, status, detail) {
+  job.currentStep = i;
+  job.steps[i].status = status;
+  if (detail != null) job.steps[i].detail = String(detail).slice(0, 240);
+}
+
+// G99 onboarding question_key -> tool onboarding.json field. Identity keys pass
+// through; unknown keys are kept as-is (harmless) and logged once per job.
+const G99_KEY_ALIASES = {
+  team_members: "team_roster", patient_value: "ideal_patient",
+  practice_name: "business_name", business_location: "location",
+  phone: "phone_for_website", website: "existingWebsite", existing_website: "existingWebsite",
+  services: "services_offered", featured_treatments: "revenue_services",
+  testimonials: "featured_review", financing: "financing_offered",
+};
+function mapG99Answers(list) {
+  const answers = {}; let existingWebsite = null; const unknown = [];
+  const KNOWN = new Set(["business_name", "location", "phone_for_website", "business_description",
+    "why_patients_choose", "ideal_patient", "services_offered", "revenue_services", "featured_review",
+    "financing_offered", "booking_platform", "primary_cta", "team_roster", "brand_aesthetic",
+    "hero_headline", "hero_subheadline", "seo_keywords", "logo_file", "site_love_1_url", "site_love_1_reason",
+    "tone_clinical_warm", "tone_lux_approachable", "tone_bold_understated", "tone_playful_serious",
+    "competitors", "why_now", "testimonials_status", "provider_credentials_status"]);
+  for (const a of (list || [])) {
+    if (!a || !a.key) continue;
+    const key = G99_KEY_ALIASES[a.key] || a.key;
+    let v = a.value;
+    if (typeof v === "string" && /^\s*[\[{]/.test(v)) { try { v = JSON.parse(v); } catch (e) { /* keep string */ } }
+    if (key === "existingWebsite") { existingWebsite = v; continue; }
+    if (!KNOWN.has(key)) unknown.push(a.key);
+    answers[key] = v;
+  }
+  if (unknown.length) console.warn("webhook: unmapped question keys (kept as-is):", unknown.join(", "));
+  return { answers, existingWebsite };
+}
+
+// Server-side copy of the dashboard's per-page prompt sections.
+function jobPageSections(key, A) {
+  const val2 = (v) => Array.isArray(v) ? v.map((x) => (x && typeof x === "object") ? [x.name, x.title].filter(Boolean).join(" — ") + (x.bio ? ": " + x.bio : "") : String(x)).join(Array.isArray(v) && v.some((x) => x && typeof x === "object") ? "; " : ", ") : (v == null ? "" : String(v));
+  const featured = val2(A.revenue_services), providers = val2(A.team_roster), services = val2(A.services_offered);
+  return ({
+    home: [`Sections (each a DISTINCT layout — do not repeat patterns):`,
+      `1. HERO — full-viewport cinematic image under a dark gradient; oversized serif headline "${A.hero_headline || ""}"; subheadline "${A.hero_subheadline || ""}"; two CTAs ("${A.primary_cta || "Book now"}" + "Explore treatments"); a floating glass trust-bar.`,
+      `2. INTRO — asymmetric split with an editorial pull-quote: "${A.why_patients_choose || ""}".`,
+      `3. SIGNATURE TREATMENTS — staggered editorial grid for ${featured}.`,
+      `4. SERVICE CATEGORIES — full-bleed dark band listing ${services}.`,
+      `5. STATS / TRUST band. 6. FEATURE with curved image masks.`,
+      `7. PROVIDERS — offset portraits with credentials: ${providers}.`,
+      `8. TESTIMONIAL — oversized pull-quote: "${A.featured_review || ""}".`,
+      `9. MEMBERSHIP & FINANCING: ${val2(A.financing_offered)}. 10. CLOSING CTA "${A.primary_cta || "Book now"}".`,
+      `11. FOOTER: ${A.business_name || ""}, ${A.location || ""}, phone ${A.phone_for_website || ""}.`].join("\n"),
+    services: [`Sections:`, `1. Same transparent nav as home.`, `2. Editorial hero "Our Treatments".`,
+      `3. One section per category — ${services} — with cards + "${A.primary_cta || "Book now"}" CTAs.`,
+      `4. Signature spotlight: ${featured}. 5. Financing: ${val2(A.financing_offered)}. 6. CTA. 7. Footer.`].join("\n"),
+    about: [`Sections:`, `1. Same nav.`, `2. Practice story: "${A.why_patients_choose || ""}".`,
+      `3. Meet the team — portrait cards: ${providers}. 4. Values with curved masks.`,
+      `5. Testimonial: ${A.featured_review || ""}. 6. CTA. 7. Footer.`].join("\n"),
+    contact: [`Sections:`, `1. Same nav.`, `2. Split layout: consultation form beside imagery.`,
+      `3. ${A.booking_platform || "Online"} booking panel. 4. Location: ${A.location || ""}, phone ${A.phone_for_website || ""}.`,
+      `5. CTA band. 6. Footer.`].join("\n"),
+  })[key];
+}
+
+function enqueueJob(payload) {
+  const id = String(payload.draftId);
+  const existing = JOBS.get(id);
+  if (existing && (existing.status === "queued" || existing.status === "running")) {
+    return { job: existing, dedupe: true };
+  }
+  const job = newJob(payload);
+  JOBS.set(id, job);
+  JOB_QUEUE.push(id);
+  processJobQueue();
+  return { job, dedupe: false };
+}
+async function processJobQueue() {
+  if (JOB_RUNNING) return;
+  const id = JOB_QUEUE.shift();
+  if (!id) return;
+  JOB_RUNNING = true;
+  try { await runJob(JOBS.get(id)); }
+  catch (e) { console.error("job runner crashed:", e); }
+  finally { JOB_RUNNING = false; processJobQueue(); }
+}
+
+async function runJob(job) {
+  job.status = "running";
+  job.startedAt = new Date().toISOString();
+  const P = job.payload;
+  try {
+    // Apply this job's answers to onboarding.json (safe: single concurrency).
+    const file = path.join(DIR, "onboarding.json");
+    const onb = JSON.parse(fs.readFileSync(file, "utf8"));
+    onb.answers = { ...onb.answers, ...(P.answers || {}) };
+    if (P.existingWebsite) onb.existingWebsite = P.existingWebsite;
+    if (P.businessId) onb.businessId = P.businessId;
+    if (P.draftId) onb.draftId = P.draftId;
+    fs.writeFileSync(file, JSON.stringify(onb, null, 2));
+    const A = onb.answers;
+
+    // 1 — CRO of the existing site (skippable: no URL = no before-audit).
+    if (onb.existingWebsite) {
+      jobStep(job, 0, "running", "Auditing " + onb.existingWebsite);
+      try {
+        job.before = await localApi("/api/cro-audit", { url: onb.existingWebsite });
+        jobStep(job, 0, "done", `Existing site: ${job.before.overall}/100`);
+      } catch (e) { jobStep(job, 0, "error", "audit failed (continuing): " + e.message); }
+    } else {
+      jobStep(job, 0, "done", "No existing website — skipped");
+    }
+
+    // 2 — compose the brand + build brief
+    jobStep(job, 1, "running", "Scanning site + composing brand system…");
+    const composed = await localApi("/api/compose-brand", {});
+    const theme = { displayName: A.business_name, primary: composed.primary, secondary: composed.secondary, accent: composed.accent, headingFont: composed.headingFont, bodyFont: composed.bodyFont };
+    job.composed = { primary: composed.primary, secondary: composed.secondary, accent: composed.accent, headingFont: composed.headingFont, bodyFont: composed.bodyFont, brief: composed.brief || "" };
+    jobStep(job, 1, "done", `Palette ${composed.primary}/${composed.accent} · ${composed.headingFont}`);
+
+    // 3 — generate all pages with Stitch
+    jobStep(job, 2, "running", "Generating 4 pages…");
+    const pages = ["home", "services", "about", "contact"].map((k) => ({
+      key: k, prompt: `${composed.brief}\n\n${jobPageSections(k, A)}\n\nReturn one complete, responsive, production-quality HTML page with the SEO requirements applied.`,
+    }));
+    const gen = await localApi("/api/generate-site", { engine: "", deviceType: "DESKTOP", theme, pages }, 45 * 60 * 1000);
+    const ok = (gen.pages || []).filter((x) => x && !x.error);
+    // Snapshot final per-page result onto the job so completed cards still show it.
+    job.pages = {};
+    for (const pr of (gen.pages || [])) {
+      const k = pr.pageKey || pr.page;
+      if (k) job.pages[k] = { status: pr.error ? "error" : "done", bytes: pr.htmlBytes || 0, error: pr.error || "" };
+    }
+    if (!ok.length) throw new Error("Stitch generated 0 pages: " + (((gen.pages || [])[0] || {}).error || "no output"));
+    jobStep(job, 2, "done", `${ok.length}/4 pages generated`);
+
+    // 4 — assemble into one coherent site
+    jobStep(job, 3, "running", "Binding site with AI chrome…");
+    const bound = await localApi("/api/bind-site", { engine: "", theme });
+    job.siteUrl = bound.siteUrl || "/site/";
+    jobStep(job, 3, "done", `Assembled (${bound.chromeSource || "AI chrome"})`);
+
+    // 5 — WordPress theme + PR
+    jobStep(job, 4, "running", "Building theme, pushing, opening PR…");
+    const push = await localApi("/api/push-wordpress", { theme, skipRebind: true }, 15 * 60 * 1000);
+    job.prUrl = push.prUrl; job.branch = push.branch;
+    const slug = ((push.themePath || "").match(/g99-([a-z0-9-]+)\//) || [])[1] || "";
+    if (!job.prUrl) throw new Error("push succeeded but no PR URL returned");
+    jobStep(job, 4, "done", job.prUrl);
+
+    // 6 — CI watch → auto-fix → auto-merge
+    jobStep(job, 5, "running", "Watching CI build checks…");
+    let fixes = 0, merged = false;
+    for (let i = 0; i < 90 && !merged; i++) {
+      let st;
+      try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); }
+      catch (e) { await sleep(10000); continue; }
+      const summary = (st.checks || []).map((c) => `${c.name}:${c.status}`).join(" ");
+      jobStep(job, 5, "running", summary || "CI starting…");
+      if (st.allPass) {
+        await localApi("/api/pr-merge", { prUrl: job.prUrl });
+        merged = true;
+        jobStep(job, 5, "done", `Merged${fixes ? ` after ${fixes} auto-fix(es)` : ""}`);
+        break;
+      }
+      if (st.anyFail) {
+        if (fixes >= 3) throw new Error("CI still failing after 3 auto-fix attempts — see " + job.prUrl);
+        fixes++;
+        jobStep(job, 5, "running", `Build failed — Gemini auto-fix ${fixes}/3…`);
+        const fix = await localApi("/api/pr-autofix", { prUrl: job.prUrl }, 5 * 60 * 1000);
+        if (!fix.fixed || !fix.fixed.length) throw new Error("auto-fix could not resolve CI failure: " + (fix.message || ""));
+        await sleep(20000);
+        continue;
+      }
+      await sleep(10000);
+    }
+    if (!merged) throw new Error("CI watch timed out (~15 min) — " + job.prUrl);
+
+    // 7 — wait for the mu-plugin to activate the theme on the live site
+    jobStep(job, 6, "running", "Waiting for deploy + activation on " + LIVE_URL);
+    let active = false;
+    for (let i = 0; i < 40 && !active; i++) {
+      try { active = (await localApi("/api/theme-live", { url: LIVE_URL, slug })).active; } catch (e) { /* keep polling */ }
+      if (!active) { jobStep(job, 6, "running", `Not active yet (check ${i + 1}/40)…`); await sleep(15000); }
+    }
+    if (!active) throw new Error("theme not detected on live within ~10 min — deploy may be slow; re-run after-audit manually");
+    jobStep(job, 6, "done", "Theme active on " + LIVE_URL);
+
+    // 8 — after-audit + comparison + report
+    jobStep(job, 7, "running", "Auditing the new live site…");
+    job.after = await localApi("/api/cro-audit-url", { url: LIVE_URL });
+    job.delta = job.before ? job.after.overall - job.before.overall : null;
+    job.reportUrl = writeComparisonReport(job);
+    await postPrComment(job);
+    jobStep(job, 7, "done", job.before ? `${job.before.overall} → ${job.after.overall} (${job.delta >= 0 ? "+" : ""}${job.delta})` : `New site: ${job.after.overall}/100`);
+
+    job.status = "done";
+  } catch (e) {
+    job.error = e.message;
+    job.status = "error";
+    if (job.steps[job.currentStep] && job.steps[job.currentStep].status === "running") jobStep(job, job.currentStep, "error", e.message);
+    console.error(`job ${job.draftId} failed at step ${job.currentStep + 1}:`, e.message);
+  } finally {
+    job.finishedAt = new Date().toISOString();
+  }
+}
+
+// Self-contained before/after comparison report → generated/reports/<draftId>.html (+.json)
+function writeComparisonReport(job) {
+  const dir = path.join(GEN, "reports");
+  fs.mkdirSync(dir, { recursive: true });
+  const cats = ["vision", "ux", "cro", "content"];
+  const esc2 = (s) => String(s == null ? "" : s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  const row = (k) => {
+    const b = job.before && job.before[k] ? job.before[k].score : "—";
+    const a = job.after && job.after[k] ? job.after[k].score : "—";
+    const d = (typeof b === "number" && typeof a === "number") ? a - b : null;
+    return `<tr><td style="text-transform:capitalize;padding:8px 14px">${k}</td><td style="text-align:center">${b}</td><td style="text-align:center">${a}</td><td style="text-align:center;font-weight:700;color:${d == null ? "#666" : d >= 0 ? "#1f9d6b" : "#c0392b"}">${d == null ? "—" : (d >= 0 ? "+" : "") + d}</td></tr>`;
+  };
+  const recs = ((job.before && job.before.summary && job.before.summary.topRecommendations) || []).slice(0, 6);
+  const html = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CRO Before/After — ${esc2(job.businessName)}</title></head>
+<body style="margin:0;font-family:Inter,-apple-system,Segoe UI,sans-serif;background:#f4f5f8;color:#1c1d29">
+<div style="max-width:760px;margin:0 auto;padding:40px 24px">
+  <h1 style="font-size:22px">CRO Comparison — ${esc2(job.businessName)}</h1>
+  <p style="color:#6b6f82;font-size:14px">Draft ${esc2(job.draftId)} · generated ${esc2(job.finishedAt || new Date().toISOString())}${job.prUrl ? ` · <a href="${esc2(job.prUrl)}">pull request</a>` : ""}</p>
+  <div style="display:flex;gap:28px;align-items:center;background:#fff;border:1px solid #e6e8f0;border-radius:14px;padding:22px;margin:18px 0">
+    <div style="text-align:center"><div style="font-size:44px;font-weight:800">${job.before ? job.before.overall : "—"}</div><div style="color:#6b6f82;font-size:13px">Before</div></div>
+    <div style="font-size:34px;font-weight:800;color:${(job.delta || 0) >= 0 ? "#1f9d6b" : "#c0392b"}">${job.delta == null ? "→" : (job.delta >= 0 ? "+" : "") + job.delta}</div>
+    <div style="text-align:center"><div style="font-size:44px;font-weight:800">${job.after ? job.after.overall : "—"}</div><div style="color:#6b6f82;font-size:13px">After</div></div>
+  </div>
+  <table style="width:100%;background:#fff;border:1px solid #e6e8f0;border-radius:14px;border-collapse:separate;border-spacing:0;font-size:14px">
+    <tr style="color:#6b6f82"><th style="text-align:left;padding:10px 14px">Discipline</th><th>Before</th><th>After</th><th>Δ</th></tr>
+    ${cats.map(row).join("")}
+  </table>
+  ${recs.length ? `<h2 style="font-size:15px;margin-top:26px">What the audit said to fix (before)</h2><ul style="color:#444;font-size:14px">${recs.map((r) => `<li>${esc2(r)}</li>`).join("")}</ul>` : ""}
+</div></body></html>`;
+  fs.writeFileSync(path.join(dir, job.draftId + ".html"), html);
+  fs.writeFileSync(path.join(dir, job.draftId + ".json"), JSON.stringify({ draftId: job.draftId, businessName: job.businessName, before: job.before, after: job.after, delta: job.delta, prUrl: job.prUrl, finishedAt: job.finishedAt }, null, 2));
+  return "/reports/" + job.draftId + ".html";
+}
+
+// Durable record: comment the comparison summary on the (merged) PR.
+async function postPrComment(job) {
+  const prNum = ((job.prUrl || "").match(/\/pull\/(\d+)/) || [])[1];
+  if (!prNum) return;
+  const cats = ["vision", "ux", "cro", "content"];
+  const line = (k) => `| ${k} | ${job.before && job.before[k] ? job.before[k].score : "—"} | ${job.after && job.after[k] ? job.after[k].score : "—"} |`;
+  const body = [
+    `## 🤖 Beta-site CRO comparison — ${job.businessName}`,
+    ``,
+    `**Overall: ${job.before ? job.before.overall : "—"} → ${job.after ? job.after.overall : "—"}${job.delta != null ? ` (${job.delta >= 0 ? "+" : ""}${job.delta})` : ""}**`,
+    ``, `| Discipline | Before | After |`, `|---|---|---|`,
+    ...cats.map(line),
+    ``, `Draft ${job.draftId} · pipeline ran automatically from the onboarding webhook.`,
+  ].join("\n");
+  const tmpFile = path.join(os.tmpdir(), `prc-${Date.now()}.md`);
+  fs.writeFileSync(tmpFile, body);
+  const r = await sh(`gh pr comment ${prNum} --repo ${WP_REPO} --body-file "${tmpFile}"`);
+  fs.rmSync(tmpFile, { force: true });
+  if (r.code) console.warn("PR comment failed:", (r.stderr || "").slice(-200));
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const u = new URL(req.url, `http://localhost:${PORT}`);
@@ -1460,8 +1769,8 @@ const server = http.createServer(async (req, res) => {
       if (ADMIN && !supplied && req.headers["x-login"] === "1") return json(res, 401, { error: "unauthorized" });
       return json(res, 200, { ok: true, gated: !!ADMIN });
     }
-    if (ADMIN && p.startsWith("/api/") && (req.headers["x-admin-key"] || "") !== ADMIN) {
-      return json(res, 401, { error: "unauthorized" });
+    if (ADMIN && p.startsWith("/api/") && !p.startsWith("/api/webhook/") && (req.headers["x-admin-key"] || "") !== ADMIN) {
+      return json(res, 401, { error: "unauthorized" }); // /api/webhook/* carries its own secret check
     }
 
     if (p === "/" || p === "/index.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "index.html")));
@@ -1484,6 +1793,38 @@ const server = http.createServer(async (req, res) => {
 
     // Live per-page generation progress for the dashboard (poll ~2s during step 3).
     if (p === "/api/generate-progress") return json(res, 200, GEN_PROGRESS);
+
+    // G99 platform → tool: onboarding wizard Part 2 submitted. Fire-and-forget:
+    // validates the shared secret, maps answers, queues the pipeline, replies 202.
+    if (p === "/api/webhook/onboarding-submitted" && req.method === "POST") {
+      const secret = process.env.WEBHOOK_SECRET || "";
+      if (!secret || (req.headers["x-webhook-secret"] || "") !== secret) return json(res, 401, { error: "bad webhook secret" });
+      const body = JSON.parse(await readBody(req) || "{}");
+      if (!body.draftId) return json(res, 400, { error: "draftId required" });
+      const mapped = mapG99Answers(body.answers);
+      const { job, dedupe } = enqueueJob({
+        draftId: body.draftId, businessId: body.businessId, businessName: body.businessName,
+        answers: mapped.answers, existingWebsite: body.existingWebsite || mapped.existingWebsite,
+      });
+      res.writeHead(202, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ accepted: true, dedupe, draftId: job.draftId, status: job.status, monitor: "/jobs" }));
+    }
+
+    // Jobs monitor data (newest first).
+    if (p === "/api/jobs") {
+      const list = [...JOBS.values()].sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+      return json(res, 200, { running: JOB_RUNNING, queued: JOB_QUEUE.length, jobs: list });
+    }
+
+    if (p === "/jobs" || p === "/jobs.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "jobs.html")));
+    if (p === "/jobs.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "jobs.js")));
+
+    // Comparison reports written by the job runner.
+    if (p.startsWith("/reports/")) {
+      const f = path.join(GEN, "reports", p.slice(9).replace(/[^a-zA-Z0-9._-]/g, ""));
+      if (fs.existsSync(f)) return send(res, 200, f.endsWith(".json") ? "application/json" : "text/html", fs.readFileSync(f));
+      return send(res, 404, "text/plain", "report not found");
+    }
 
     if (p === "/api/generate" && req.method === "POST") {
       const { prompt, deviceType, page } = JSON.parse(await readBody(req) || "{}");

@@ -17,5 +17,7 @@ services:
         sync: false          # fine-grained PAT: Contents RW + Pull requests RW on the WP repo
       - key: ADMIN_PASSWORD
         sync: false          # protects /api/* — REQUIRED on a public URL
+      - key: WEBHOOK_SECRET
+        sync: false          # shared secret for /api/webhook/onboarding-submitted
       - key: WP_REPO
         value: Growth99Infra/prodteam.gogroth.com
