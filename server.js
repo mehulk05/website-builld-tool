@@ -1509,7 +1509,7 @@ const G99_KEY_ALIASES = {
   testimonials: "featured_review", financing: "financing_offered",
 };
 function mapG99Answers(list) {
-  const answers = {}; let existingWebsite = null; const unknown = [];
+  const answers = {}; let existingWebsite = null; let referenceWebsite = null; const unknown = [];
   const KNOWN = new Set(["business_name", "location", "phone_for_website", "business_description",
     "why_patients_choose", "ideal_patient", "services_offered", "revenue_services", "featured_review",
     "financing_offered", "booking_platform", "primary_cta", "team_roster", "brand_aesthetic",
@@ -1524,9 +1524,11 @@ function mapG99Answers(list) {
     if (key === "existingWebsite") { existingWebsite = v; continue; }
     if (!KNOWN.has(key)) unknown.push(a.key);
     answers[key] = v;
+    // site_love_1_url = the site the client loves → the design REFERENCE to emulate.
+    if (key === "site_love_1_url" && v) referenceWebsite = v;
   }
   if (unknown.length) console.warn("webhook: unmapped question keys (kept as-is):", unknown.join(", "));
-  return { answers, existingWebsite };
+  return { answers, existingWebsite, referenceWebsite };
 }
 
 // Server-side copy of the dashboard's per-page prompt sections.
@@ -1583,11 +1585,19 @@ async function runJob(job) {
   job.startedAt = new Date().toISOString();
   const P = job.payload;
   try {
+    // Fresh start: clear the previous client's cached scan/CRO so this job never
+    // reuses another business's design analysis or before-audit.
+    for (const c of [".site-analysis.json", ".cro-existing.json", ".cro-beta.json"]) {
+      try { fs.rmSync(path.join(GEN, c), { force: true }); } catch (e) { /* ignore */ }
+    }
     // Apply this job's answers to onboarding.json (safe: single concurrency).
     const file = path.join(DIR, "onboarding.json");
     const onb = JSON.parse(fs.readFileSync(file, "utf8"));
     onb.answers = { ...onb.answers, ...(P.answers || {}) };
     if (P.existingWebsite) onb.existingWebsite = P.existingWebsite;
+    // referenceWebsite = the design-inspiration site (site_love_1_url). Explicitly
+    // clear it when the client gave none, so we don't inherit the sample's ruma.com.
+    onb.referenceWebsite = P.referenceWebsite || "";
     if (P.businessId) onb.businessId = P.businessId;
     if (P.draftId) onb.draftId = P.draftId;
     fs.writeFileSync(file, JSON.stringify(onb, null, 2));
@@ -1805,6 +1815,7 @@ const server = http.createServer(async (req, res) => {
       const { job, dedupe } = enqueueJob({
         draftId: body.draftId, businessId: body.businessId, businessName: body.businessName,
         answers: mapped.answers, existingWebsite: body.existingWebsite || mapped.existingWebsite,
+        referenceWebsite: body.referenceWebsite || mapped.referenceWebsite,
       });
       res.writeHead(202, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ accepted: true, dedupe, draftId: job.draftId, status: job.status, monitor: "/jobs" }));
@@ -1892,7 +1903,12 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req) || "{}");
       const onb = JSON.parse(fs.readFileSync(path.join(DIR, "onboarding.json"), "utf8"));
       const a = onb.answers;
-      const siteUrl = onb.existingWebsite || a.existingWebsite || "";
+      // Design language comes from the REFERENCE site the client loves
+      // (site_love_1_url); the existing site is only the CRO/what-to-fix source.
+      const refUrl = onb.referenceWebsite || a.site_love_1_url || "";
+      const existUrl = onb.existingWebsite || a.existingWebsite || "";
+      const siteUrl = refUrl || existUrl;
+      const isRef = !!refUrl;
 
       // 1) Existing-site brand theme — reuse passed analysis, else cache, else scan.
       let analysis = body.analysis || null;
@@ -1926,7 +1942,7 @@ const server = http.createServer(async (req, res) => {
       ].filter(Boolean).join("\n");
 
       const themeBlock = analysis ? [
-        `EXISTING SITE BRAND THEME (extracted from ${siteUrl}) — keep the brand's DNA but elevate it:`,
+        `${isRef ? "REFERENCE / INSPIRATION SITE the client loves" : "EXISTING SITE"} BRAND THEME (extracted from ${siteUrl}) — ${isRef ? "the new site must feel like the same design family (emulate this):" : "keep the brand's DNA but elevate it:"}`,
         `- Colors: primary ${analysis.primaryColor}, secondary ${analysis.secondaryColor}, accent ${analysis.accentColor}, background ${analysis.backgroundColor}.`,
         `- Vibe: ${analysis.vibe}. Headings: ${analysis.headingFontStyle}. Body: ${analysis.bodyFontStyle}.`,
         `- Layout style: ${analysis.layoutStyle}. Imagery style: ${analysis.imageryStyle}.`,

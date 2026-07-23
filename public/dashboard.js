@@ -411,7 +411,7 @@ function detailOf(...steps) {
   const active = [...steps].reverse().find((s) => s.status !== "pending");
   return active ? active.detail : steps[0].detail;
 }
-let monRendered = { form: false, before: false, site: false, pr: false, after: false, compare: false, final: false };
+let monRendered = { form: false, before: false, compose: false, pageInit: false, pageFinal: false, site: false, pr: false, after: false, compare: false, final: false };
 function monitorJob(id) {
   const desc = document.querySelector("#pipeCard .desc");
   $("buildBtn").disabled = true; $("saveBtn").disabled = true;
@@ -436,11 +436,29 @@ function monitorJob(id) {
     const s = j.steps; // server steps s0..s7 → dashboard steps d1..d7
     setStep(1, CLS[s[0].status], s[0].detail || s[0].label);
     if (!monRendered.before && j.before) { out(1, `<div class="gauges">${gauge(j.before.overall, "Existing site")}<div>${catsHtml(j.before)}</div></div>${recsHtml(j.before)}`); monRendered.before = true; }
+    // Step 2 — brand strip + the composed build prompt (read-only), like the live run.
     setStep(2, CLS[s[1].status], s[1].detail || s[1].label);
+    if (!monRendered.compose && j.composed) {
+      out(2, `${brandStrip(j.composed)}<textarea class="promptbox" readonly style="margin-top:8px">${esc(j.composed.brief || "")}</textarea><div class="hint">Auto-composed from CRO + onboarding + reference site. This exact brief drove generation.</div>`);
+      monRendered.compose = true;
+    }
+    // Step 3 — per-page rows: live while generating, snapshot once done.
     const d3 = worst(s[2], s[3]);
     setStep(3, CLS[d3.status], detailOf(s[2], s[3]) || d3.label);
+    if (!monRendered.pageInit && s[2].status !== "pending") { out(3, progressRows()); monRendered.pageInit = true; }
+    if (monRendered.pageInit && s[2].status === "running") { updateProgressRows(); }        // live poll of /api/generate-progress
+    if (!monRendered.pageFinal && s[2].status === "done") {
+      // freeze final per-page state from the job's own snapshot (survives later jobs)
+      for (const p of PAGES) {
+        const el = $("pps_" + p.key); if (!el) continue;
+        const st = (j.pages || {})[p.key];
+        if (st) { el.textContent = st.status === "error" ? `! ${st.error || "failed"}` : `✓ ${((st.bytes || 0) / 1024).toFixed(1)} KB`; el.style.color = st.status === "error" ? "var(--bad)" : "var(--good)"; }
+      }
+      monRendered.pageFinal = true;
+    }
+    // assembled-site preview (append after the per-page rows, don't overwrite them)
     if (!monRendered.site && j.siteUrl) {
-      out(3, `<div class="previews">${PAGES.map((p) => `<a href="/preview/${p.key}" target="_blank">${esc(p.title)} ↗</a>`).join("")}</div><div style="margin-top:12px"><a class="prlink" href="${esc(j.siteUrl)}" target="_blank">↗ Preview assembled site</a></div>`);
+      $("out3").insertAdjacentHTML("beforeend", `<div class="previews" style="margin-top:12px">${PAGES.map((p) => `<a href="/preview/${p.key}" target="_blank">${esc(p.title)} ↗</a>`).join("")}</div><div style="margin-top:8px"><a class="prlink" href="${esc(j.siteUrl)}" target="_blank">↗ Preview assembled site</a></div>`);
       monRendered.site = true;
     }
     const d4 = worst(s[4], s[5]);
