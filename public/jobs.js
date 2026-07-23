@@ -67,7 +67,29 @@ function perPageRows(j, live) {
   return `<div style="margin:6px 0 4px 28px">${rows}</div>`;
 }
 
+function editCard(j) {
+  // Edit jobs have their OWN shape (no onboarding form / build steps) — render
+  // their detail inline here so clicking never lands on the build dashboard.
+  const badge = `<span class="badge ${j.status}">${j.status.toUpperCase()}</span>`;
+  const steps = j.steps.map((s) =>
+    `<div class="jstep ${s.status}"><span class="ic">${ICON[s.status] || "·"}</span><span class="lb">${esc(s.label)}</span><span class="dt" style="${s.status === "error" ? "color:var(--bad)" : ""}">${esc(s.detail)}</span></div>`).join("");
+  const files = (j.editPlan || []).map((f) => `<div style="font-size:12.5px;font-family:ui-monospace,monospace"><b style="color:var(--accent)">${esc(f.op)}</b> ${esc(f.path)}</div>`).join("");
+  const links = [
+    j.prUrl ? `<a href="${esc(j.prUrl)}" target="_blank" onclick="event.stopPropagation()">↗ Pull request / diff</a>` : "",
+  ].filter(Boolean).join("");
+  const when = (j.startedAt || j.createdAt || "").replace("T", " ").slice(0, 19);
+  return `<div class="card" style="cursor:pointer" onclick="location.href='/job?id=${encodeURIComponent(j.draftId)}'">
+    <div class="jhead"><h2>✏️ ${esc(j.businessName)}</h2><span class="meta">edit · ${esc(when)}</span>${badge}</div>
+    <div style="margin:8px 0 4px;font-size:13.5px"><b>Request:</b> <span class="muted">${esc((j.payload && j.payload.prompt) || "")}</span></div>
+    ${j.editSummary ? `<div style="font-size:13px;color:var(--muted);margin-bottom:6px"><b>Plan:</b> ${esc(j.editSummary)}</div>` : ""}
+    ${files ? `<div style="margin:6px 0 10px">${files}</div>` : ""}
+    <div class="steps">${steps}</div>
+    ${links ? `<div class="links">${links}</div>` : ""}
+    ${j.error ? `<div class="links" style="color:var(--bad)">${esc(j.error)}</div>` : ""}
+  </div>`;
+}
 function jobCard(j) {
+  if (j.type === "edit") return editCard(j);
   const badge = `<span class="badge ${j.status}">${j.status.toUpperCase()}</span>`;
   const scores = (j.before || j.after)
     ? `<div class="scores">${j.before ? j.before.overall : "—"} <span class="d" style="color:${(j.delta || 0) >= 0 ? "var(--good)" : "var(--bad)"}">${j.delta == null ? "→" : (j.delta >= 0 ? "+" : "") + j.delta}</span> ${j.after ? j.after.overall : "—"}</div>` : "";
@@ -85,7 +107,7 @@ function jobCard(j) {
     j.reportUrl ? `<a href="${esc(j.reportUrl)}" target="_blank" ${stop}>↗ Before/after report</a>` : "",
   ].filter(Boolean).join("");
   const when = (j.startedAt || j.createdAt || "").replace("T", " ").slice(0, 19);
-  return `<div class="card" style="cursor:pointer" onclick="location.href='/dashboard?job=${encodeURIComponent(j.draftId)}'">
+  return `<div class="card" style="cursor:pointer" onclick="location.href='/job?id=${encodeURIComponent(j.draftId)}'">
     <div class="jhead"><h2>${esc(j.businessName)}</h2><span class="meta">draft ${esc(j.draftId)} · ${esc(when)}</span>${badge}${scores}</div>
     <div class="steps">${steps}</div>
     ${links ? `<div class="links">${links}</div>` : ""}
@@ -93,20 +115,58 @@ function jobCard(j) {
   </div>`;
 }
 
+// ---- summary + filters ----
+const FILTER = { status: "all", type: "all", q: "" };
+const tile = (v, k, color) => `<div class="stat-tile"><div class="v" ${color ? `style="color:${color}"` : ""}>${v}</div><div class="k">${k}</div></div>`;
+function renderSummary(jobs) {
+  const done = jobs.filter((j) => j.status === "done");
+  const err = jobs.filter((j) => j.status === "error").length;
+  const running = jobs.filter((j) => j.status === "running").length;
+  const finished = done.length + err;
+  const successRate = finished ? Math.round((done.length / finished) * 100) : null;
+  const lifts = done.filter((j) => j.type !== "edit" && j.delta != null).map((j) => j.delta);
+  const avgLift = lifts.length ? Math.round(lifts.reduce((a, b) => a + b, 0) / lifts.length) : null;
+  document.getElementById("summary").innerHTML =
+    tile(jobs.length, "Total jobs") +
+    tile(running, "Running", running ? "var(--accent)" : "") +
+    tile(done.length, "Completed", "var(--good)") +
+    tile(err, "Errors", err ? "var(--bad)" : "") +
+    tile(successRate == null ? "—" : successRate + "%", "Success rate") +
+    tile(avgLift == null ? "—" : (avgLift >= 0 ? "+" : "") + avgLift, "Avg CRO lift", avgLift == null ? "" : avgLift >= 0 ? "var(--good)" : "var(--bad)");
+}
+function renderFilterControls() {
+  const grp = (id, key, opts) => document.getElementById(id).innerHTML = opts.map((o) =>
+    `<button class="chipbtn ${FILTER[key] === o[0] ? "on" : ""}" data-key="${key}" data-val="${o[0]}">${o[1]}</button>`).join("");
+  grp("fStatus", "status", [["all", "All"], ["running", "Running"], ["done", "Done"], ["error", "Errors"]]);
+  grp("fType", "type", [["all", "Any type"], ["build", "Build"], ["edit", "Edit"]]);
+  [...document.querySelectorAll(".chipbtn")].forEach((b) => b.onclick = () => { FILTER[b.dataset.key] = b.dataset.val; renderFilterControls(); refresh(); });
+  const box = document.getElementById("fSearch");
+  if (box && !box._wired) { box._wired = true; box.value = FILTER.q; box.oninput = () => { FILTER.q = box.value.toLowerCase(); refresh(); }; }
+}
+function applyFilter(jobs) {
+  return jobs.filter((j) =>
+    (FILTER.status === "all" || j.status === FILTER.status) &&
+    (FILTER.type === "all" || (j.type || "build") === FILTER.type) &&
+    (!FILTER.q || (j.businessName || "").toLowerCase().includes(FILTER.q)));
+}
+
 async function refresh() {
   try {
-    // per-page progress (global; one job runs at a time) for the running job's generate step
     try { GEN_PROG = await (await fetch("/api/generate-progress")).json(); } catch (e) { /* keep last */ }
     const d = await (await fetch("/api/jobs")).json();
     document.getElementById("stat").textContent = `${d.jobs.length} job(s) · ${d.running ? "1 running" : "idle"}${d.queued ? ` · ${d.queued} queued` : ""}`;
+    renderSummary(d.jobs);
+    renderFilterControls();
+    const shown = applyFilter(d.jobs);
     document.getElementById("list").innerHTML = d.jobs.length
-      ? d.jobs.map(jobCard).join("")
+      ? (shown.length ? shown.map(jobCard).join("") : '<div class="empty">No jobs match the current filters.</div>')
       : '<div class="empty">Waiting for jobs — submit an onboarding form (or POST the webhook) and runs appear here live.</div>';
   } catch (e) { /* transient poll error — keep last render */ }
 }
 
 ensureAuth().then((ok) => {
   if (!ok) { document.getElementById("stat").textContent = "Unauthorized"; return; }
+  renderFilterControls();
   refresh();
   setInterval(refresh, 3000);
 });

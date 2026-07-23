@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Growth99 · Job detail</title>
+<link rel="stylesheet" href="/theme.css">
+<style>
+  :root{
+    --bg:#f4f5f8; --panel:#fff; --ink:#1c1d29; --muted:#6b6f82; --line:#e6e8f0;
+    --accent:#6d4e8c; --accent-2:#8a6bb0; --good:#1f9d6b; --warn:#c9772b; --bad:#c0392b;
+    --radius:14px; --shadow:0 1px 2px rgba(20,20,40,.04),0 8px 24px rgba(20,20,40,.06);
+  }
+  @media (prefers-color-scheme: dark){ :root{ --bg:#14151c; --panel:#1c1e28; --ink:#ecedf3; --muted:#9a9fb5; --line:#2b2e3c; --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.35);} }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:15px;line-height:1.55}
+  a{color:var(--accent)}
+  .wrap{max-width:900px;margin:0 auto;padding:26px 24px 90px}
+  .back{font-size:13px;color:var(--muted);text-decoration:none}
+  .head{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:12px 0 6px}
+  .head h1{font-size:20px;margin:0}
+  .badge{font-size:12px;font-weight:700;padding:3px 12px;border-radius:999px;border:1px solid var(--line)}
+  .badge.running{color:var(--accent);border-color:var(--accent)} .badge.done{color:var(--good);border-color:var(--good)}
+  .badge.error,.badge.cancelled{color:var(--bad);border-color:var(--bad)} .badge.queued{color:var(--muted)}
+  .meta{font-size:12.5px;color:var(--muted)}
+  .actions{margin-left:auto;display:flex;gap:8px}
+  .btn{border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 14px;border-radius:9px;font:inherit;font-weight:600;cursor:pointer;font-size:13px}
+  .btn:hover{border-color:var(--accent)} .btn.primary{background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#fff;border:none}
+  .btn.danger{color:var(--bad);border-color:var(--bad)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:18px 20px;margin-bottom:16px}
+  .card h2{font-size:14px;margin:0 0 10px;font-weight:700}
+  .cost{font-size:12.5px;color:var(--muted)}
+  .jstep{display:flex;gap:10px;align-items:baseline;font-size:13.5px;padding:3px 0}
+  .jstep .ic{width:18px;text-align:center} .jstep .lb{width:200px;flex:none} .jstep .dt{color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .jstep.running .ic{color:var(--accent)} .jstep.done .ic{color:var(--good)} .jstep.error .ic{color:var(--bad)}
+  .files div{font-family:ui-monospace,monospace;font-size:12.5px;padding:2px 0}
+  .files b{color:var(--accent)}
+  pre.diff{background:#0d1117;color:#c9d1d9;font-size:12px;line-height:1.5;border-radius:10px;padding:14px;overflow:auto;max-height:520px;white-space:pre}
+  pre.diff .a{color:#3fb950}.pre.diff .d{color:#f85149}
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:11px 18px;border-radius:10px;font-size:14px;opacity:0;pointer-events:none;transition:.25s;z-index:50}.toast.show{opacity:1}
+  .prlink{display:inline-flex;gap:8px;background:rgba(109,78,140,.08);border:1px solid var(--accent);color:var(--accent);padding:8px 13px;border-radius:9px;text-decoration:none;font-weight:700;font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back" href="/jobs">← All jobs</a>
+  <div id="detail"><p class="meta" style="margin-top:20px"><span class="spin"></span> Loading…</p></div>
+</div>
+<div class="toast" id="toast"></div>
+<script src="/nav.js"></script>
+<script src="/job.js"></script>
+</body>
+</html>

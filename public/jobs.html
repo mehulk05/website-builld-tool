@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Growth99 · Pipeline Jobs</title>
+<link rel="stylesheet" href="/theme.css">
 <style>
   :root{
     --bg:#f4f5f8; --panel:#ffffff; --ink:#1c1d29; --muted:#6b6f82; --line:#e6e8f0;
@@ -46,6 +47,16 @@
   .empty{color:var(--muted);text-align:center;padding:60px 0}
   .spin{display:inline-block;width:12px;height:12px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-1px}
   @keyframes sp{to{transform:rotate(360deg)}}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;margin-bottom:16px}
+  .stat-tile{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;box-shadow:var(--shadow)}
+  .stat-tile .v{font-size:26px;font-weight:800;line-height:1}
+  .stat-tile .k{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-top:5px}
+  .filters{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px}
+  .fgroup{display:flex;gap:6px}
+  .chipbtn{font-size:12.5px;border:1px solid var(--line);background:var(--panel);color:var(--muted);border-radius:999px;padding:6px 13px;cursor:pointer;font-weight:600}
+  .chipbtn.on{background:linear-gradient(135deg,var(--accent),var(--accent-2,#8a6bb0));color:#fff;border-color:transparent}
+  .fsearch{margin-left:auto;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:10px;padding:8px 12px;font:inherit;font-size:13px;min-width:180px}
+  .fsearch:focus{outline:none;border-color:var(--accent)}
 </style>
 </head>
 <body>
@@ -58,8 +69,18 @@
     </div>
     <div class="stat" id="stat">Loading…</div>
   </div>
+
+  <div class="stats" id="summary"></div>
+
+  <div class="filters" id="filters">
+    <div class="fgroup" id="fStatus"></div>
+    <div class="fgroup" id="fType"></div>
+    <input id="fSearch" class="fsearch" placeholder="Search business…">
+  </div>
+
   <div id="list"><div class="empty">Waiting for jobs — submit an onboarding form (or POST the webhook) and runs appear here live.</div></div>
 </div>
+<script src="/nav.js"></script>
 <script src="/jobs.js"></script>
 </body>
 </html>

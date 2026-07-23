@@ -6,3 +6,6 @@ node_modules/
 # local debug scripts (contain hardcoded API keys)
 test-full.js
 test-invalid.js
+jobs.json
+registry.json
+reaudit.json

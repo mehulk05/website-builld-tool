@@ -216,6 +216,17 @@ async function updateProgressRows() {
 function progressRowsFinal(okKeys) {
   return `<div class="previews">${PAGES.filter((p) => okKeys.has(p.key)).map((p) => `<a href="/preview/${p.key}" target="_blank">${esc(p.title)} ↗</a>`).join("")}</div>`;
 }
+// Live scaled thumbnails of the generated pages — shows the actual website, not
+// just status. Non-interactive; opens full preview on click. (Serves the current
+// generated/ bundle, so accurate for the most-recent build.)
+function thumbStrip(keys) {
+  const thumb = (k) => `<a href="/preview/${k}" target="_blank" title="${esc(k)}" style="display:inline-block;margin:0 8px 8px 0;text-decoration:none;vertical-align:top">
+    <div style="width:180px;height:120px;overflow:hidden;border:1px solid var(--line);border-radius:9px;background:#fff;position:relative">
+      <iframe src="/preview/${k}" scrolling="no" tabindex="-1" style="width:900px;height:600px;border:0;transform:scale(.2);transform-origin:top left;pointer-events:none"></iframe>
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin-top:4px;text-align:center;text-transform:capitalize">${esc(k)}</div></a>`;
+  return `<div style="margin-top:12px;display:flex;flex-wrap:wrap">${keys.map(thumb).join("")}</div>`;
+}
 
 // ---------- step 4 CI watcher: poll build checks every 10s, auto-fix via Gemini ----------
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -336,7 +347,7 @@ async function buildBetaSite() {
     setStep(3, "run", `Generated ${okPages.length}/${PAGES.length} — assembling site with Gemini…`);
     const bound = await api("/api/bind-site", { engine: "", theme });
     setStep(3, "done", `Generated ${okPages.length} of ${PAGES.length} pages · site assembled (${bound.chromeSource || "AI chrome"}).`);
-    out(3, `${progressRowsFinal(okKeys)}<div style="margin-top:12px"><a class="prlink" href="${esc(bound.siteUrl || "/site/")}" target="_blank">↗ Preview assembled site</a></div>${okPages.length < PAGES.length ? `<div class="hint">⚠ ${PAGES.length - okPages.length} page(s) failed in Stitch — retry Build for a full set.</div>` : ""}`);
+    out(3, `${thumbStrip([...okKeys])}${progressRowsFinal(okKeys)}<div style="margin-top:12px"><a class="prlink" href="${esc(bound.siteUrl || "/site/")}" target="_blank">↗ Preview assembled site</a></div>${okPages.length < PAGES.length ? `<div class="hint">⚠ ${PAGES.length - okPages.length} page(s) failed in Stitch — retry Build for a full set.</div>` : ""}`);
 
     // Step 4 — WP theme + PR (site already bound above; skipRebind avoids doing it twice)
     setStep(4, "run", "Building WordPress theme, pushing, opening PR…");
@@ -387,15 +398,31 @@ async function runAfter() {
     renderComparison();
   } catch (e) { setStep(6, "err", "Error: " + e.message); toast("After-audit failed: " + e.message); }
 }
+function shot(url) {
+  if (!url) return "";
+  return "https://api.microlink.io/?url=" + encodeURIComponent(url) + "&screenshot=true&embed=screenshot.url&meta=false";
+}
 function renderComparison() {
   if (!croBefore || !croAfter) return;
   const d = croAfter.overall - croBefore.overall;
+  const verdict = d >= 20 ? "a major improvement" : d >= 8 ? "a significant improvement" : d > 0 ? "an improvement" : d === 0 ? "no change" : "a regression";
   setStep(7, "done", d >= 0 ? `Conversion score up ${d} points.` : `Score down ${Math.abs(d)} points.`);
   const cats = ["vision", "ux", "cro", "content"].map((k) => {
     const b = croBefore[k] && croBefore[k].score || 0, a = croAfter[k] && croAfter[k].score || 0, dd = a - b;
     return `<div class="cat"><span class="cname">${k}</span><span class="bar"><i style="width:${a}%"></i></span><span class="cv">${b}→${a} <b style="color:${dd >= 0 ? "var(--good)" : "var(--bad)"}">${dd >= 0 ? "+" : ""}${dd}</b></span></div>`;
   }).join("");
-  out(7, `<div class="gauges">${gauge(croBefore.overall, "Before")}<div class="delta ${d >= 0 ? "up" : "down"}">${d >= 0 ? "+" : ""}${d}</div>${gauge(croAfter.overall, "After")}</div><div class="cats">${cats}</div>`);
+  const bImg = shot(croBefore.label), aImg = shot(croAfter.label);
+  const shots = (bImg || aImg) ? `<div class="ba-shots">
+      <figure><img src="${bImg}" alt="before" loading="lazy"><figcaption>Before</figcaption></figure>
+      <figure><img src="${aImg}" alt="after" loading="lazy"><figcaption>After</figcaption></figure>
+    </div>` : "";
+  out(7, `<div class="ba-hero">
+      <div class="ba-score"><div class="ba-num" style="color:${croBefore.overall >= 75 ? "var(--good)" : croBefore.overall >= 50 ? "var(--warn)" : "var(--bad)"}">${croBefore.overall}</div><div class="ba-lbl">Before</div></div>
+      <div class="ba-mid"><div class="ba-delta ${d >= 0 ? "up" : "down"}">${d >= 0 ? "▲ +" : "▼ "}${d}</div><div class="ba-verdict">${verdict}</div></div>
+      <div class="ba-score"><div class="ba-num" style="color:${croAfter.overall >= 75 ? "var(--good)" : croAfter.overall >= 50 ? "var(--warn)" : "var(--bad)"}">${croAfter.overall}</div><div class="ba-lbl">After</div></div>
+    </div>
+    ${shots}
+    <div class="cats">${cats}</div>`);
 }
 
 // ---------- monitor mode: render a server-side webhook job onto this UI ----------
@@ -458,7 +485,7 @@ function monitorJob(id) {
     }
     // assembled-site preview (append after the per-page rows, don't overwrite them)
     if (!monRendered.site && j.siteUrl) {
-      $("out3").insertAdjacentHTML("beforeend", `<div class="previews" style="margin-top:12px">${PAGES.map((p) => `<a href="/preview/${p.key}" target="_blank">${esc(p.title)} ↗</a>`).join("")}</div><div style="margin-top:8px"><a class="prlink" href="${esc(j.siteUrl)}" target="_blank">↗ Preview assembled site</a></div>`);
+      $("out3").insertAdjacentHTML("beforeend", `${thumbStrip(PAGES.map((p) => p.key))}<div style="margin-top:8px"><a class="prlink" href="${esc(j.siteUrl)}" target="_blank">↗ Preview assembled site</a></div>`);
       monRendered.site = true;
     }
     const d4 = worst(s[4], s[5]);

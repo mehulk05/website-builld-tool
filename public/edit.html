@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Growth99 · Edit a Site</title>
+<link rel="stylesheet" href="/theme.css">
+<style>
+  :root{
+    --bg:#f4f5f8; --panel:#fff; --ink:#1c1d29; --muted:#6b6f82; --line:#e6e8f0;
+    --accent:#6d4e8c; --accent2:#8a6bb0; --good:#1f9d6b; --radius:14px;
+    --sans:"Inter",-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  @media (prefers-color-scheme: dark){ :root{ --bg:#14151c; --panel:#1c1e28; --ink:#ecedf3; --muted:#9a9fb5; --line:#2b2e3c; } }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.55}
+  a{color:var(--accent)}
+  .wrap{max-width:900px;margin:0 auto;padding:28px 24px 90px}
+  .top{display:flex;align-items:center;gap:14px;margin-bottom:22px}
+  .logo{width:40px;height:40px;border-radius:11px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;display:grid;place-items:center;font-weight:800;font-size:19px}
+  .top h1{font-size:17px;margin:0;font-weight:700}.top .sub{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.14em}
+  .top .nav{margin-left:auto;font-size:13px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:20px 22px;margin-bottom:18px;box-shadow:0 1px 2px rgba(20,20,40,.04),0 8px 24px rgba(20,20,40,.06)}
+  h2{font-size:15px;margin:0 0 4px;font-weight:700}.desc{font-size:13px;color:var(--muted);margin:0 0 14px}
+  .sites{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  @media(max-width:640px){.sites{grid-template-columns:1fr}}
+  .site{border:1px solid var(--line);border-radius:11px;padding:12px 14px;cursor:pointer;transition:.12s}
+  .site:hover{border-color:var(--accent2)}
+  .site.sel{border-color:var(--accent);box-shadow:0 0 0 2px rgba(109,78,140,.18)}
+  .site .nm{font-weight:700;font-size:14px}
+  .site .meta{font-size:11.5px;color:var(--muted);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .presets{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
+  .preset{font-size:12.5px;border:1px solid var(--line);background:transparent;color:var(--ink);border-radius:999px;padding:6px 13px;cursor:pointer}
+  .preset:hover{border-color:var(--accent)}
+  textarea{width:100%;min-height:120px;border:1px solid var(--line);border-radius:10px;padding:12px;font:inherit;font-size:14px;color:var(--ink);background:transparent;resize:vertical}
+  textarea:focus{outline:none;border-color:var(--accent)}
+  .row{display:flex;gap:10px;align-items:center;margin-top:12px;flex-wrap:wrap}
+  .btn{border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:10px 16px;border-radius:10px;font:inherit;font-weight:600;cursor:pointer}
+  .btn:hover{border-color:var(--accent)}.btn:disabled{opacity:.5;cursor:not-allowed}
+  .btn.primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border:none;margin-left:auto}
+  .hint{font-size:13px;color:var(--muted)}
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:6px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:11px 18px;border-radius:10px;font-size:14px;opacity:0;pointer-events:none;transition:.25s;z-index:50}
+  .toast.show{opacity:1}
+  .disabledCard{opacity:.5;pointer-events:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="logo">g</div>
+    <div><div class="sub">Growth99</div><h1>Edit a live site</h1></div>
+    <div class="nav"><a href="/jobs">Jobs →</a></div>
+  </div>
+
+  <div class="card">
+    <h2>1 · Pick the site</h2>
+    <p class="desc">Sites are read live from the WordPress repo. <a href="#" id="refresh">Refresh list</a></p>
+    <div class="sites" id="sites"><p class="hint"><span class="spin"></span>Loading sites…</p></div>
+  </div>
+
+  <div class="card disabledCard" id="historyCard">
+    <h2>Change history</h2>
+    <p class="desc">Every PR raised for this site — build &amp; edits. Click to view the diff on GitHub.</p>
+    <div id="history"><p class="hint">Select a site to load its history.</p></div>
+  </div>
+
+  <div class="card disabledCard" id="editCard">
+    <h2>2 · Describe the change</h2>
+    <p class="desc">Pick a template, type freely, or turn a rough idea into a precise instruction with AI.</p>
+    <div class="presets" id="presets"></div>
+    <textarea id="prompt" placeholder="e.g. Add a Terms of Service page with standard sections, linked in the main navigation."></textarea>
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);margin-top:12px;cursor:pointer">
+      <input type="checkbox" id="approvalToggle"> Require human approval before merge (this site)
+    </label>
+    <div class="row">
+      <button class="btn" id="suggestBtn">✨ Improve with AI</button>
+      <span class="hint" id="suggestHint"></span>
+      <button class="btn primary" id="applyBtn">Apply change →</button>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<script src="/nav.js"></script>
+<script src="/edit.js"></script>
+</body>
+</html>

@@ -42,6 +42,10 @@ if (!GEMINI_KEYS.length) console.warn("⚠ GEMINI_KEYS not set — all AI featur
 let GEMINI_KEY = GEMINI_KEYS[0];                 // kept for legacy call sites
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-lite-latest";
 let gkIdx = 0;
+// Cost/usage meter: the running job sets COST_SINK to its cost object; each
+// Gemini/Stitch call bumps a counter (single-concurrency, so no cross-talk).
+let COST_SINK = null;
+function bumpUsage(kind) { if (COST_SINK) COST_SINK[kind] = (COST_SINK[kind] || 0) + 1; }
 // Rotating Gemini caller: cycles across all keys, skipping 429/503 (load-balance
 // + free-tier quota multiplied by key count). parts = Gemini content parts array.
 async function geminiCall(parts, opts = {}) {
@@ -62,6 +66,7 @@ async function geminiCall(parts, opts = {}) {
       gkIdx = (gkIdx + i + 1) % GEMINI_KEYS.length;
       const txt = ((d.candidates || [])[0]?.content?.parts || []).map(p => p.text || "").join("");
       if (!txt) throw new Error("empty response" + (d.candidates?.[0]?.finishReason ? ` (${d.candidates[0].finishReason})` : ""));
+      bumpUsage("gemini");
       return txt;
     } catch (e) { lastErr = e; }
     finally { clearTimeout(timer); }
@@ -115,6 +120,7 @@ function parsePayload(raw) {
   return last ? JSON.parse(last) : null;
 }
 async function callTool(name, args) {
+  bumpUsage("stitch");
   const r = await rpc("tools/call", { name, arguments: args });
   if (r && r.isError) throw new Error(`tool ${name}: ${(r.content || []).map(c => c.text).join("")}`);
   return r;
@@ -1482,21 +1488,159 @@ const JOB_QUEUE = [];       // draftIds waiting (single concurrency — Stitch/G
 let JOB_RUNNING = false;
 const LIVE_URL = process.env.WP_LIVE_URL || "https://prodteam.gogroth.com/";
 
+// Persist jobs so /jobs survives a process restart/crash (best-effort; on
+// Render's ephemeral disk it survives in-deploy restarts, not a fresh deploy).
+const JOBS_FILE = path.join(DIR, "jobs.json");
+let saveTimer = null;
+function saveJobs() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try { fs.writeFileSync(JOBS_FILE, JSON.stringify([...JOBS.values()].slice(-60), null, 0)); } catch (e) { /* non-fatal */ }
+  }, 400); // debounce — jobStep fires often
+}
+function loadJobs() {
+  try {
+    for (const j of JSON.parse(fs.readFileSync(JOBS_FILE, "utf8"))) {
+      if (j.status === "running" || j.status === "queued") { j.status = "error"; j.error = "interrupted by a server restart"; }
+      JOBS.set(j.draftId, j);
+    }
+  } catch (e) { /* none yet */ }
+}
+loadJobs();
+
+// ---------------------------------------------------------------- Site registry
+// No DB: the repo is the source of truth. syncSiteRegistry() derives the list of
+// editable sites from the theme dirs on main + each slug's latest merged PR, and
+// caches it to registry.json. Build/edit jobs call it at the end for freshness.
+const REGISTRY_FILE = path.join(DIR, "registry.json");
+function readRegistry() {
+  try { return JSON.parse(fs.readFileSync(REGISTRY_FILE, "utf8")); } catch (e) { return { sites: [], syncedAt: null }; }
+}
+function prettyName(slug) {
+  return slug.replace(/^g99-/, "").split("-").filter(Boolean).map(w => w[0].toUpperCase() + w.slice(1)).join(" ");
+}
+// Which theme is live: WordPress enqueues the active theme's assets, so the
+// homepage HTML contains /themes/g99-<slug>/. One fetch → the active slug.
+async function detectActiveTheme(url) {
+  try {
+    const r = await fetch(url, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36", "Cache-Control": "no-cache" } });
+    if (!r.ok) return null;
+    const m = (await r.text()).match(/\/themes\/(g99-[a-z0-9-]+)\//i);
+    return m ? m[1] : null;
+  } catch (e) { return null; }
+}
+async function syncSiteRegistry() {
+  const themes = await sh(`gh api "repos/${WP_REPO}/contents/web/app/themes?ref=main" --jq ".[]|select(.type==\\"dir\\")|.name"`);
+  const slugs = (themes.stdout || "").split("\n").map(s => s.trim()).filter(s => s.startsWith("g99-"));
+  const prsRaw = await sh(`gh pr list --repo ${WP_REPO} --state merged --limit 80 --json number,title,headRefName,mergedAt,url`);
+  let prs = []; try { prs = JSON.parse(prsRaw.stdout || "[]"); } catch (e) { prs = []; }
+  const byId = {}; (readRegistry().sites || []).forEach(s => { byId[s.siteId] = s; });
+  const sites = slugs.map(slug => {
+    const bare = slug.replace(/^g99-/, "");
+    // boundary match so "mehul-aesthetic" doesn't also grab "mehul-aesthetic1"'s branch
+    const re = new RegExp("(^|[/-])" + bare.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "(-|$)");
+    const last = prs.filter(pr => re.test(pr.headRefName || ""))
+      .sort((a, b) => (b.mergedAt || "").localeCompare(a.mergedAt || ""))[0];
+    const prev = byId[slug] || {};
+    return {
+      siteId: slug,
+      businessName: prev.businessName || prettyName(slug),
+      themeSlug: slug,
+      themePath: `web/app/themes/${slug}`,
+      githubRepo: WP_REPO,
+      liveUrl: prev.liveUrl || LIVE_URL,
+      requireApproval: prev.requireApproval || false,
+      lastPrUrl: (last && last.url) || prev.lastPrUrl || null,
+      lastChange: (last && last.title) || prev.lastChange || null,
+      updatedAt: (last && last.mergedAt) || prev.updatedAt || null,
+    };
+  });
+  // Flag which theme is currently active on each live site (one fetch per URL).
+  const activeByUrl = {};
+  for (const s of sites) {
+    if (!(s.liveUrl in activeByUrl)) activeByUrl[s.liveUrl] = await detectActiveTheme(s.liveUrl);
+    s.active = activeByUrl[s.liveUrl] === s.themeSlug;
+  }
+  const reg = { sites, syncedAt: new Date().toISOString() };
+  fs.writeFileSync(REGISTRY_FILE, JSON.stringify(reg, null, 2));
+  return reg;
+}
+
+// Scheduled re-audit: re-score the live active site, store the trend, alert on
+// regression. Runs on demand (/api/reaudit) and on a timer (REAUDIT_HOURS>0).
+const REAUDIT_FILE = path.join(DIR, "reaudit.json");
+function readReaudit() { try { return JSON.parse(fs.readFileSync(REAUDIT_FILE, "utf8")); } catch (e) { return { entries: [] }; } }
+async function reauditActiveSite() {
+  const slug = await detectActiveTheme(LIVE_URL);
+  const rep = await croAudit({ url: LIVE_URL, label: LIVE_URL });
+  const store = readReaudit();
+  const prev = [...(store.entries || [])].reverse().find(e => e.slug === slug);
+  const entry = { slug: slug || "unknown", overall: rep.overall, at: new Date().toISOString(), url: LIVE_URL };
+  store.entries = (store.entries || []).concat(entry).slice(-100);
+  fs.writeFileSync(REAUDIT_FILE, JSON.stringify(store, null, 2));
+  const regression = !!(prev && entry.overall < prev.overall - 5);
+  if (regression) notify(`⚠️ CRO regression on *${slug}*: ${prev.overall} → ${entry.overall} (${LIVE_URL})`);
+  return { entry, prev: prev || null, regression };
+}
+
 function newJob(payload) {
   return {
+    type: "build",
     draftId: String(payload.draftId), businessId: payload.businessId || null,
     businessName: payload.businessName || (payload.answers || {}).business_name || "Client",
     status: "queued", currentStep: 0,
     steps: JOB_STEPS.map((label) => ({ label, status: "pending", detail: "" })),
     payload, prUrl: null, branch: null, siteUrl: null,
     before: null, after: null, delta: null, reportUrl: null, error: null,
+    cost: { gemini: 0, stitch: 0 }, cancelRequested: false, awaitingApproval: false,
+    createdAt: new Date().toISOString(), startedAt: null, finishedAt: null,
+  };
+}
+
+const EDIT_STEPS = ["Pull latest code", "Plan the edit (AI)", "Apply changes (AI)", "Push + open PR", "CI checks → auto-merge", "Sync registry"];
+function newEditJob(payload) {
+  return {
+    type: "edit",
+    draftId: String(payload.jobId), businessId: null,
+    businessName: payload.businessName || payload.siteId || "Site",
+    status: "queued", currentStep: 0,
+    steps: EDIT_STEPS.map((label) => ({ label, status: "pending", detail: "" })),
+    payload, prUrl: null, branch: null, siteUrl: null,
+    editPlan: null, editSummary: null, error: null,
+    cost: { gemini: 0, stitch: 0 }, cancelRequested: false, awaitingApproval: false,
     createdAt: new Date().toISOString(), startedAt: null, finishedAt: null,
   };
 }
 function jobStep(job, i, status, detail) {
+  // Cancellation lands at step boundaries: refuse to start a new step if asked to cancel.
+  if (status === "running" && job.cancelRequested) throw Object.assign(new Error("cancelled by user"), { cancelled: true });
   job.currentStep = i;
   job.steps[i].status = status;
   if (detail != null) job.steps[i].detail = String(detail).slice(0, 240);
+  saveJobs();
+}
+// Slack (or any incoming-webhook) notification — fail-soft, off when unset.
+function notify(text) {
+  const url = process.env.SLACK_WEBHOOK_URL || "";
+  if (!url) return;
+  fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) }).catch(() => {});
+}
+function siteRequiresApproval(siteId) {
+  return !!(readRegistry().sites || []).find(s => s.siteId === siteId && s.requireApproval);
+}
+// Per-site approval gate: with green CI, if the site requires approval, pause
+// (up to 60 min) until /api/job-approve flips job.approved — then merge.
+async function awaitApprovalIfNeeded(job, siteId, stepIdx) {
+  if (job.approved || !siteRequiresApproval(siteId)) return;
+  job.awaitingApproval = true;
+  jobStep(job, stepIdx, "running", "Build is green — waiting for approval to merge…");
+  notify(`⏳ *${job.businessName}* build passed — needs approval to go live: ${job.prUrl || ""}`);
+  for (let i = 0; i < 240 && !job.approved; i++) {
+    if (job.cancelRequested) { job.awaitingApproval = false; throw Object.assign(new Error("cancelled by user"), { cancelled: true }); }
+    await sleep(15000); saveJobs();
+  }
+  job.awaitingApproval = false;
+  if (!job.approved) throw new Error("approval timed out (60 min) — not merged; PR left open: " + job.prUrl);
 }
 
 // G99 onboarding question_key -> tool onboarding.json field. Identity keys pass
@@ -1566,7 +1710,7 @@ function enqueueJob(payload) {
   }
   const job = newJob(payload);
   JOBS.set(id, job);
-  JOB_QUEUE.push(id);
+  JOB_QUEUE.push(id); saveJobs();
   processJobQueue();
   return { job, dedupe: false };
 }
@@ -1575,14 +1719,22 @@ async function processJobQueue() {
   const id = JOB_QUEUE.shift();
   if (!id) return;
   JOB_RUNNING = true;
-  try { await runJob(JOBS.get(id)); }
+  const job = JOBS.get(id);
+  try { await (job && job.type === "edit" ? runEditJob(job) : runJob(job)); }
   catch (e) { console.error("job runner crashed:", e); }
   finally { JOB_RUNNING = false; processJobQueue(); }
+}
+function enqueueEditJob(payload) {
+  const job = newEditJob(payload);
+  JOBS.set(job.draftId, job);
+  JOB_QUEUE.push(job.draftId); saveJobs();
+  processJobQueue();
+  return job;
 }
 
 async function runJob(job) {
   job.status = "running";
-  job.startedAt = new Date().toISOString();
+  job.startedAt = new Date().toISOString(); COST_SINK = job.cost;
   const P = job.payload;
   try {
     // Fresh start: clear the previous client's cached scan/CRO so this job never
@@ -1661,6 +1813,7 @@ async function runJob(job) {
       const summary = (st.checks || []).map((c) => `${c.name}:${c.status}`).join(" ");
       jobStep(job, 5, "running", summary || "CI starting…");
       if (st.allPass) {
+        await awaitApprovalIfNeeded(job, "g99-" + slug, 5);
         await localApi("/api/pr-merge", { prUrl: job.prUrl });
         merged = true;
         jobStep(job, 5, "done", `Merged${fixes ? ` after ${fixes} auto-fix(es)` : ""}`);
@@ -1671,6 +1824,7 @@ async function runJob(job) {
         fixes++;
         jobStep(job, 5, "running", `Build failed — Gemini auto-fix ${fixes}/3…`);
         const fix = await localApi("/api/pr-autofix", { prUrl: job.prUrl }, 5 * 60 * 1000);
+        if (fix.billing) throw new Error(fix.message);
         if (!fix.fixed || !fix.fixed.length) throw new Error("auto-fix could not resolve CI failure: " + (fix.message || ""));
         await sleep(20000);
         continue;
@@ -1697,14 +1851,19 @@ async function runJob(job) {
     await postPrComment(job);
     jobStep(job, 7, "done", job.before ? `${job.before.overall} → ${job.after.overall} (${job.delta >= 0 ? "+" : ""}${job.delta})` : `New site: ${job.after.overall}/100`);
 
+    try { await syncSiteRegistry(); } catch (e) { /* non-fatal: keep registry current so the new site is editable */ }
     job.status = "done";
+    notify(`✅ Beta site *${job.businessName}*: CRO ${job.before ? job.before.overall + "→" + job.after.overall : job.after && job.after.overall} · ${job.prUrl || ""}`);
   } catch (e) {
-    job.error = e.message;
-    job.status = "error";
-    if (job.steps[job.currentStep] && job.steps[job.currentStep].status === "running") jobStep(job, job.currentStep, "error", e.message);
-    console.error(`job ${job.draftId} failed at step ${job.currentStep + 1}:`, e.message);
+    if (e && e.cancelled) { job.status = "cancelled"; }
+    else {
+      job.error = e.message; job.status = "error";
+      if (job.steps[job.currentStep] && job.steps[job.currentStep].status === "running") { job.steps[job.currentStep].status = "error"; job.steps[job.currentStep].detail = String(e.message).slice(0, 240); }
+      console.error(`job ${job.draftId} failed at step ${job.currentStep + 1}:`, e.message);
+      notify(`❌ Beta site *${job.businessName}* failed: ${e.message}`);
+    }
   } finally {
-    job.finishedAt = new Date().toISOString();
+    job.finishedAt = new Date().toISOString(); saveJobs(); COST_SINK = null;
   }
 }
 
@@ -1763,6 +1922,162 @@ async function postPrComment(job) {
   if (r.code) console.warn("PR comment failed:", (r.stderr || "").slice(-200));
 }
 
+// ============================================================ EDIT ENGINE
+// Modify an already-deployed theme with AI (plan-then-apply), then reuse the
+// PR → CI → auto-merge rails. Edits are bounded to the site's theme dir + its
+// mu-plugin — never any other repo code.
+const THEME_CONVENTIONS = `This is a classic WordPress (Roots Bedrock) theme at web/app/themes/<slug>/. Conventions you MUST follow:
+- style.css (theme metadata header) and index.php (fallback template) are REQUIRED — never delete them.
+- header.php / footer.php = shared chrome (get_header/get_footer). front-page.php = the HOME page.
+- page-<name>.php = a page template; it MUST start with a line "<?php /* Template Name: <Name> */ ?>" then get_header(); a <main>…</main>; get_footer();.
+- The must-use plugin web/app/mu-plugins/g99-activate-<slug>.php auto-activates the theme and provisions Pages + the Primary menu on 'init'. It contains a $pages array of ['title'=>, 'slug'=>, 'template'=>] entries. To ADD a page you MUST (1) create page-<slug>.php with a Template Name header, AND (2) add its ['title'=>'<Title>','slug'=>'<slug>','template'=>'page-<slug>.php'] entry to that $pages array — otherwise the Page + nav item are never created.
+- Styling uses Tailwind + Google Fonts from CDN in the page <head>. Preserve the existing palette/fonts unless the change is explicitly about them.
+- All PHP must pass Laravel Pint (PER preset): blank line after <?php in pure-PHP files; a named function's opening brace on its own line; one statement per line.`;
+
+function stripFence(t) { return String(t || "").replace(/^```(?:json|php|html)?\s*\n?/i, "").replace(/\n?```\s*$/i, "").trim(); }
+
+async function editPlan(manifest, prompt) {
+  const p = [
+    `You are editing an existing WordPress theme. Decide the MINIMAL set of files to create/modify/delete to satisfy the change request. Touch only files under the theme dir or its mu-plugin.`,
+    THEME_CONVENTIONS,
+    `\nFILES PRESENT (path — bytes):\n${manifest.map(f => `- ${f.path} (${f.bytes})`).join("\n")}`,
+    `\nCHANGE REQUEST:\n${prompt}`,
+    `\nReturn ONLY minified JSON: {"summary":"one line of what you'll change","files":[{"path":"web/app/…","op":"create|modify|delete","instruction":"precise instruction for THIS file"}]}`,
+  ].join("\n");
+  const raw = await geminiCall([{ text: p }], { temperature: 0.2, maxOutputTokens: 3000, timeoutMs: 60000 });
+  return JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
+}
+async function editFileContent(op, path_, instruction, currentContent, planContext) {
+  const p = [
+    `You are ${op === "create" ? "creating" : "rewriting"} the file ${path_} in a WordPress theme. Output the COMPLETE final file content — no markdown fences, no commentary.`,
+    THEME_CONVENTIONS,
+    planContext ? `\nThis change spans multiple files — use these EXACT paths/filenames when one references another (e.g. a mu-plugin 'template' must match the created page-*.php filename here):\n${planContext}` : "",
+    op === "modify" ? `\nCURRENT CONTENT:\n-----\n${currentContent}\n-----` : "",
+    `\nDO THIS:\n${instruction}`,
+    op === "modify" ? `\nReturn the full modified file. Keep everything not related to the change byte-for-byte.` : `\nReturn the full new file.`,
+  ].join("\n");
+  return stripFence(await geminiCall([{ text: p }], { temperature: 0.2, maxOutputTokens: 16000, timeoutMs: 90000 }));
+}
+
+async function runEditJob(job) {
+  job.status = "running";
+  job.startedAt = new Date().toISOString(); COST_SINK = job.cost;
+  const P = job.payload;                 // {siteId, themeSlug, themePath, muPath, githubRepo, businessName, prompt}
+  const repo = P.githubRepo || WP_REPO;
+  const tmp = path.join(os.tmpdir(), "g99edit-" + Date.now());
+  const run = async (cmd, cwd) => sh(cmd, cwd);
+  const runRetry = async (cmd, cwd, n = 3) => { let r; for (let i = 1; i <= n; i++) { r = await run(cmd, cwd); if (!r.code) return r; await sleep(3000 * i); } return r; };
+  try {
+    // 1 — pull latest
+    jobStep(job, 0, "running", "Cloning " + repo);
+    let r = await runRetry(`gh repo clone ${repo} "${tmp}" -- --depth 1`);
+    const cloneUrl = process.env.GH_TOKEN ? `https://x-access-token:${process.env.GH_TOKEN}@github.com/${repo}.git` : `https://github.com/${repo}.git`;
+    if (r.code) r = await runRetry(`git clone --depth 1 "${cloneUrl}" "${tmp}"`);
+    if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
+    if (process.env.GH_TOKEN) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
+    const themeAbs = path.join(tmp, P.themePath);
+    if (!fs.existsSync(themeAbs)) throw new Error("theme not found in repo: " + P.themePath);
+    jobStep(job, 0, "done", "Latest code pulled");
+
+    // 2 — plan
+    jobStep(job, 1, "running", "Planning the edit…");
+    const manifest = [];
+    for (const f of fs.readdirSync(themeAbs)) manifest.push({ path: `${P.themePath}/${f}`, bytes: fs.statSync(path.join(themeAbs, f)).size });
+    if (P.muPath && fs.existsSync(path.join(tmp, P.muPath))) manifest.push({ path: P.muPath, bytes: fs.statSync(path.join(tmp, P.muPath)).size });
+    const plan = await editPlan(manifest, P.prompt);
+    const allowed = (rel) => rel === P.muPath || rel.startsWith(P.themePath + "/");
+    plan.files = (plan.files || []).filter(f => f && f.path && allowed(f.path)).slice(0, 8);
+    if (!plan.files.length) throw new Error("planner produced no in-scope file changes");
+    job.editPlan = plan.files.map(f => ({ path: f.path, op: f.op }));
+    job.editSummary = plan.summary || "";
+    jobStep(job, 1, "done", plan.summary || `${plan.files.length} file(s)`);
+
+    // 3 — apply
+    jobStep(job, 2, "running", "Applying changes…");
+    const planContext = plan.files.map(f => `${f.op} ${f.path}`).join("\n");
+    for (const f of plan.files) {
+      const abs = path.join(tmp, f.path);
+      if (f.op === "delete") { fs.rmSync(abs, { force: true }); continue; }
+      const cur = f.op === "modify" && fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : "";
+      const content = await editFileContent(f.op, f.path, f.instruction || plan.summary, cur, planContext);
+      if (!content || (abs.endsWith(".php") && !content.includes("<?php") && cur.includes("<?php"))) throw new Error("AI returned empty/invalid content for " + f.path);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, content);
+    }
+    // guardrail: theme must still have its required files
+    for (const req of ["index.php", "style.css"]) {
+      if (!fs.existsSync(path.join(themeAbs, req))) throw new Error(`edit would remove required ${req} — aborted`);
+    }
+    jobStep(job, 2, "done", `${plan.files.length} file(s) written`);
+
+    // 4 — push + PR
+    jobStep(job, 3, "running", "Pushing + opening PR…");
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
+    const branch = `g99/edit-${P.themeSlug.replace(/^g99-/, "")}-${stamp}`;
+    await run(`git checkout -b "${branch}"`, tmp);
+    await run(`git add -A "${P.themePath}" ${P.muPath ? `"${P.muPath}"` : ""}`, tmp);
+    r = await run(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "Edit ${P.businessName}: ${(plan.summary || "AI change").slice(0, 60)}"`, tmp);
+    if (r.code) throw new Error("commit failed (no changes?): " + (r.stderr || r.stdout).slice(-160));
+    r = await runRetry(`git push -u origin "${branch}"`, tmp);
+    if (r.code) throw new Error("push failed: " + r.stderr.slice(-200));
+    const prBody = `Automated edit for **${P.businessName}**.\\n\\n**Request:** ${P.prompt.replace(/"/g, "'").slice(0, 300)}\\n\\n**Plan:** ${(plan.summary || "").replace(/"/g, "'")}\\n\\nFiles: ${plan.files.map(f => `${f.op} ${f.path}`).join(", ")}`;
+    r = await runRetry(`gh pr create --repo ${repo} --base main --head "${branch}" --title "Edit ${P.businessName}: ${(plan.summary || "AI change").replace(/"/g, "'").slice(0, 60)}" --body "${prBody}"`, tmp);
+    job.prUrl = (r.stdout.match(/https:\/\/github\.com\/\S+/) || [""])[0];
+    job.branch = branch;
+    fs.rmSync(tmp, { recursive: true, force: true });
+    if (!job.prUrl) throw new Error("PR create failed: " + r.stderr.slice(-200));
+    jobStep(job, 3, "done", job.prUrl);
+
+    // 5 — CI watch → auto-fix → merge on green
+    jobStep(job, 4, "running", "Watching CI build checks…");
+    let fixes = 0, merged = false;
+    for (let i = 0; i < 90 && !merged; i++) {
+      let st; try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); } catch (e) { await sleep(10000); continue; }
+      jobStep(job, 4, "running", (st.checks || []).map(c => `${c.name}:${c.status}`).join(" ") || "CI starting…");
+      if (st.allPass) { await awaitApprovalIfNeeded(job, P.themeSlug, 4); await localApi("/api/pr-merge", { prUrl: job.prUrl }); merged = true; jobStep(job, 4, "done", `Merged${fixes ? ` after ${fixes} fix(es)` : ""}`); break; }
+      if (st.anyFail) {
+        if (fixes >= 3) throw new Error("CI still failing after 3 auto-fix attempts — " + job.prUrl);
+        fixes++; jobStep(job, 4, "running", `Build failed — Gemini auto-fix ${fixes}/3…`);
+        const fix = await localApi("/api/pr-autofix", { prUrl: job.prUrl }, 5 * 60 * 1000);
+        if (fix.billing) throw new Error(fix.message);
+        if (!fix.fixed || !fix.fixed.length) throw new Error("auto-fix could not resolve CI: " + (fix.message || ""));
+        await sleep(20000); continue;
+      }
+      await sleep(10000);
+    }
+    if (!merged) throw new Error("CI watch timed out — " + job.prUrl);
+
+    // 6 — refresh registry so lastChange reflects this edit
+    jobStep(job, 5, "running", "Updating site registry…");
+    try { await syncSiteRegistry(); } catch (e) { /* non-fatal */ }
+    jobStep(job, 5, "done", "Done — change is live on merge/deploy");
+    await postEditPrComment(job);
+    job.status = "done";
+    notify(`✏️ Edit merged for *${job.businessName}*: ${job.editSummary || ""} · ${job.prUrl || ""}`);
+  } catch (e) {
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
+    if (e && e.cancelled) { job.status = "cancelled"; }
+    else {
+      job.error = e.message; job.status = "error";
+      if (job.steps[job.currentStep] && job.steps[job.currentStep].status === "running") { job.steps[job.currentStep].status = "error"; job.steps[job.currentStep].detail = String(e.message).slice(0, 240); }
+      console.error(`edit job ${job.draftId} failed:`, e.message);
+      notify(`❌ Edit failed for *${job.businessName}*: ${e.message}`);
+    }
+  } finally {
+    job.finishedAt = new Date().toISOString(); saveJobs(); COST_SINK = null;
+  }
+}
+async function postEditPrComment(job) {
+  const prNum = ((job.prUrl || "").match(/\/pull\/(\d+)/) || [])[1];
+  if (!prNum) return;
+  const body = [`## 🤖 Automated edit — ${job.businessName}`, "", `**Change:** ${job.editSummary || ""}`, "", `Files: ${(job.editPlan || []).map(f => `\`${f.op} ${f.path}\``).join(", ")}`, "", `Requested via the edit tool.`].join("\n");
+  const tmpFile = path.join(os.tmpdir(), `epc-${Date.now()}.md`);
+  fs.writeFileSync(tmpFile, body);
+  const r = await sh(`gh pr comment ${prNum} --repo ${job.payload.githubRepo || WP_REPO} --body-file "${tmpFile}"`);
+  fs.rmSync(tmpFile, { force: true });
+  if (r.code) console.warn("edit PR comment failed:", (r.stderr || "").slice(-160));
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const u = new URL(req.url, `http://localhost:${PORT}`);
@@ -1788,6 +2103,10 @@ const server = http.createServer(async (req, res) => {
     if (p === "/styles.css") return send(res, 200, "text/css", fs.readFileSync(path.join(DIR, "public", "styles.css")));
     if (p === "/dashboard" || p === "/dashboard.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "dashboard.html")));
     if (p === "/dashboard.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "dashboard.js")));
+    if (p === "/nav.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "nav.js")));
+    if (p === "/theme.css") return send(res, 200, "text/css", fs.readFileSync(path.join(DIR, "public", "theme.css")));
+    if (p === "/job" || p === "/job.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "job.html")));
+    if (p === "/job.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "job.js")));
 
     if (p === "/api/onboarding" && req.method === "POST") {
       const body = JSON.parse(await readBody(req) || "{}");
@@ -1826,6 +2145,117 @@ const server = http.createServer(async (req, res) => {
       const list = [...JOBS.values()].sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
       return json(res, 200, { running: JOB_RUNNING, queued: JOB_QUEUE.length, jobs: list });
     }
+    if (p === "/api/job" ) {
+      const j = JOBS.get(u.searchParams.get("id"));
+      return j ? json(res, 200, j) : json(res, 404, { error: "job not found" });
+    }
+
+    // Cancel a job (queued → dropped; running → stops at the next step boundary).
+    if (p === "/api/job-cancel" && req.method === "POST") {
+      const { id } = JSON.parse(await readBody(req) || "{}");
+      const j = JOBS.get(id); if (!j) return json(res, 404, { error: "job not found" });
+      if (j.status === "queued") { const k = JOB_QUEUE.indexOf(id); if (k >= 0) JOB_QUEUE.splice(k, 1); j.status = "cancelled"; }
+      else if (j.status === "running") { j.cancelRequested = true; }
+      saveJobs();
+      return json(res, 200, { ok: true, status: j.status });
+    }
+    // Retry a finished job — re-enqueue the same payload as a fresh job.
+    if (p === "/api/job-retry" && req.method === "POST") {
+      const { id } = JSON.parse(await readBody(req) || "{}");
+      const j = JOBS.get(id); if (!j) return json(res, 404, { error: "job not found" });
+      const nj = j.type === "edit"
+        ? enqueueEditJob({ ...j.payload, jobId: "edit-" + Date.now() })
+        : enqueueJob(j.payload).job;
+      return json(res, 202, { ok: true, jobId: nj.draftId });
+    }
+    // Approve a job that's paused awaiting human sign-off (per-site approval).
+    if (p === "/api/job-approve" && req.method === "POST") {
+      const { id } = JSON.parse(await readBody(req) || "{}");
+      const j = JOBS.get(id); if (!j) return json(res, 404, { error: "job not found" });
+      j.approved = true; saveJobs();
+      return json(res, 200, { ok: true });
+    }
+    // Toggle per-site require-approval (persisted in the registry).
+    if (p === "/api/site-approval" && req.method === "POST") {
+      const { siteId, requireApproval } = JSON.parse(await readBody(req) || "{}");
+      const reg = readRegistry(); const s = (reg.sites || []).find(x => x.siteId === siteId);
+      if (!s) return json(res, 404, { error: "unknown site" });
+      s.requireApproval = !!requireApproval;
+      fs.writeFileSync(REGISTRY_FILE, JSON.stringify(reg, null, 2));
+      return json(res, 200, { ok: true, siteId, requireApproval: s.requireApproval });
+    }
+    // Rendered PR diff (for the job detail page).
+    if (p === "/api/pr-diff") {
+      const prUrl = u.searchParams.get("prUrl") || "";
+      const prNum = (prUrl.match(/\/pull\/(\d+)/) || [])[1];
+      if (!prNum) return json(res, 400, { error: "prUrl required" });
+      const r = await sh(`gh pr diff ${prNum} --repo ${WP_REPO}`);
+      return json(res, 200, { diff: (r.stdout || r.stderr || "").slice(0, 200000) });
+    }
+    // Re-audit the currently-active live site now (also runs on a schedule).
+    if (p === "/api/reaudit" && req.method === "POST") {
+      try { return json(res, 200, await reauditActiveSite()); }
+      catch (e) { return json(res, 500, { error: e.message }); }
+    }
+    if (p === "/api/reaudit-history") return json(res, 200, readReaudit());
+
+    // Editable sites. ?refresh=1 re-derives from the repo (source of truth); else cached.
+    if (p === "/api/sites") {
+      if (u.searchParams.get("refresh") === "1") {
+        try { return json(res, 200, await syncSiteRegistry()); }
+        catch (e) { return json(res, 500, { error: "registry sync failed: " + e.message }); }
+      }
+      return json(res, 200, readRegistry());
+    }
+
+    // Change history for a site: every PR (build + edit) whose branch targets its slug.
+    if (p === "/api/site-history") {
+      const siteId = u.searchParams.get("siteId");
+      const site = (readRegistry().sites || []).find(s => s.siteId === siteId);
+      if (!site) return json(res, 404, { error: "unknown site" });
+      const bare = site.themeSlug.replace(/^g99-/, "");
+      const raw = await sh(`gh pr list --repo ${site.githubRepo} --state all --limit 80 --json number,title,url,state,mergedAt,createdAt,headRefName`);
+      let prs = []; try { prs = JSON.parse(raw.stdout || "[]"); } catch (e) { prs = []; }
+      const re = new RegExp("(^|[/-])" + bare.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "(-|$)");
+      const history = prs.filter(pr => re.test(pr.headRefName || ""))
+        .map(pr => ({ number: pr.number, title: pr.title, url: pr.url, state: pr.state, type: (pr.headRefName || "").includes("/edit-") ? "edit" : "build", date: pr.mergedAt || pr.createdAt }))
+        .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+      return json(res, 200, { siteId, history });
+    }
+
+    // Expand a rough idea into a precise, unambiguous edit instruction (Gemini).
+    if (p === "/api/edit-suggest" && req.method === "POST") {
+      const { siteId, idea } = JSON.parse(await readBody(req) || "{}");
+      const site = (readRegistry().sites || []).find(s => s.siteId === siteId) || {};
+      const prompt = [
+        `You help an operator phrase a website change request for an AI that edits a WordPress theme for "${site.businessName || "a medspa"}".`,
+        `Rewrite the rough idea below into ONE precise, unambiguous instruction: what to add/change, where, and any concrete copy/labels. Keep it to 2-4 sentences. If it's a new page, say the page title and that it should be linked in the nav.`,
+        `\nRough idea: ${idea || ""}`,
+        `\nReturn ONLY the improved instruction text.`,
+      ].join("\n");
+      try { return json(res, 200, { prompt: (await geminiCall([{ text: prompt }], { temperature: 0.4, maxOutputTokens: 500 })).trim() }); }
+      catch (e) { return json(res, 502, { error: "suggest failed: " + e.message }); }
+    }
+
+    // Start an edit job for a registered site.
+    if (p === "/api/edit-run" && req.method === "POST") {
+      const { siteId, prompt } = JSON.parse(await readBody(req) || "{}");
+      if (!prompt || !prompt.trim()) return json(res, 400, { error: "prompt required" });
+      const site = (readRegistry().sites || []).find(s => s.siteId === siteId);
+      if (!site) return json(res, 404, { error: "unknown siteId — refresh the site list" });
+      const bare = site.themeSlug.replace(/^g99-/, "");
+      const job = enqueueEditJob({
+        jobId: "edit-" + Date.now(),
+        siteId, businessName: site.businessName, githubRepo: site.githubRepo,
+        themeSlug: site.themeSlug, themePath: site.themePath,
+        muPath: `web/app/mu-plugins/g99-activate-${bare}.php`,
+        prompt: prompt.trim(),
+      });
+      return json(res, 202, { jobId: job.draftId, status: job.status, monitor: "/jobs" });
+    }
+
+    if (p === "/edit" || p === "/edit.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "edit.html")));
+    if (p === "/edit.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "edit.js")));
 
     if (p === "/jobs" || p === "/jobs.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "jobs.html")));
     if (p === "/jobs.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "jobs.js")));
@@ -2333,6 +2763,12 @@ const server = http.createServer(async (req, res) => {
       const failing = checks.find(c => /^build/i.test((c[0] || "").trim()) && (c[1] || "").trim() === "fail");
       if (!failing) return json(res, 200, { fixed: [], message: "no failing build check found" });
       const runId = ((failing[3] || "").match(/\/runs\/(\d+)/) || [])[1];
+      // Detect the "Actions can't run" case (org billing / spending limit / disabled)
+      // — Gemini can't fix that; surface it clearly instead of hunting a file.
+      const runSummary = runId ? (await sh(`gh run view ${runId} --repo ${WP_REPO}`)).stdout : "";
+      if (/recent account payments|spending limit|not started because|Actions.*disabled|billing/i.test(runSummary)) {
+        return json(res, 200, { fixed: [], billing: true, message: "GitHub Actions is not running for this repo (billing / spending-limit). CI can't pass until org billing is fixed." });
+      }
       const log = runId ? (await sh(`gh run view ${runId} --repo ${WP_REPO} --log-failed`)).stdout.slice(-8000) : "";
       // offending files: Pint prints "⨯ path/to/file.php" (often truncated with …) — also accept any .php path in the log
       const raw = [...new Set([...log.matchAll(/[⨯x]\s+(\S+?\.php)|((?:web|config)\/[\w\/.-]+?\.php)/g)].map(m => (m[1] || m[2])).filter(Boolean))];
@@ -2432,5 +2868,11 @@ const server = http.createServer(async (req, res) => {
 });
 if (require.main === module) {
   server.listen(PORT, () => console.log(`G99 Website Build Tool → http://localhost:${PORT}`));
+  // Scheduled re-audit (off unless REAUDIT_HOURS > 0, to avoid burning quota).
+  const reauditHours = parseFloat(process.env.REAUDIT_HOURS || "0");
+  if (reauditHours > 0) {
+    setInterval(() => { reauditActiveSite().catch((e) => console.warn("re-audit failed:", e.message)); }, reauditHours * 3600 * 1000);
+    console.log(`re-audit scheduled every ${reauditHours}h`);
+  }
 }
 module.exports = { seoEnhance, audit, sharpenStitchImages, injectCanonicalNav, qcStitchImages, fixImages };

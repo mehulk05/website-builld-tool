@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Growth99 Beta Site Builder — Workflow & Architecture</title>
+<style>
+  :root{
+    --bg:#f5f6fa; --panel:#fff; --ink:#1c1d29; --muted:#6b6f82; --line:#e3e6ef;
+    --accent:#6d4e8c; --accent2:#8a6bb0; --g99:#2f6f4f; --stitch:#b8742b; --gem:#2f5bd0; --gh:#24292f; --wp:#1f6feb;
+    --good:#1f9d6b; --warn:#c9772b; --radius:14px; --sans:"Segoe UI",-apple-system,Roboto,Helvetica,Arial,sans-serif;
+    --mono:"SF Mono",ui-monospace,Consolas,"Courier New",monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.6}
+  .wrap{max-width:1040px;margin:0 auto;padding:36px 24px 90px}
+  h1{font-size:26px;margin:0 0 4px} h2{font-size:19px;margin:38px 0 12px;padding-bottom:6px;border-bottom:2px solid var(--line)}
+  h3{font-size:15px;margin:18px 0 6px}
+  .sub{color:var(--muted);margin:0 0 6px}
+  code{font-family:var(--mono);font-size:.88em;background:#eceef5;padding:1px 6px;border-radius:5px}
+  a{color:var(--accent)}
+  .top{display:flex;align-items:center;gap:14px;margin-bottom:8px}
+  .logo{width:46px;height:46px;border-radius:12px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;display:grid;place-items:center;font-weight:800;font-size:22px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px 20px;box-shadow:0 1px 2px rgba(20,20,40,.04),0 6px 20px rgba(20,20,40,.05)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:760px){.grid2{grid-template-columns:1fr}}
+  table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;font-size:14px}
+  th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{background:#eceef5;color:var(--muted);font-weight:600;text-transform:uppercase;font-size:11px;letter-spacing:.06em}
+  tr:last-child td{border-bottom:none}
+  .pill{display:inline-block;font-size:11px;font-weight:700;padding:2px 9px;border-radius:999px;color:#fff}
+  .chips span{display:inline-block;font-size:12px;background:#eceef5;border:1px solid var(--line);border-radius:999px;padding:2px 10px;margin:2px 3px}
+  .diagram{overflow-x:auto;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px}
+  .steps{counter-reset:s;display:flex;flex-direction:column;gap:10px;margin-top:8px}
+  .step{position:relative;background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:12px;padding:12px 16px 12px 54px}
+  .step::before{counter-increment:s;content:counter(s);position:absolute;left:14px;top:12px;width:26px;height:26px;border-radius:50%;background:var(--accent);color:#fff;font-weight:700;display:grid;place-items:center;font-size:13px}
+  .step b{font-size:14.5px}
+  .step .who{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;padding:1px 8px;border-radius:6px;color:#fff;margin-left:6px}
+  .step p{margin:4px 0 0;font-size:13.5px;color:#3a3d4c}
+  .note{background:#fff8ec;border:1px solid #f0d9a8;border-radius:10px;padding:10px 14px;font-size:13.5px;margin:8px 0}
+  .kv{font-size:14px} .kv b{display:inline-block;min-width:120px;color:var(--muted)}
+  ul{margin:6px 0 6px 0;padding-left:20px} li{margin:3px 0;font-size:14px}
+  .muted{color:var(--muted)} .mono{font-family:var(--mono);font-size:12.5px}
+  footer{margin-top:40px;color:var(--muted);font-size:12px;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="top">
+    <div class="logo">g</div>
+    <div>
+      <h1>Growth99 Beta Site Builder</h1>
+      <p class="sub">Onboarding form → fully-automated, conversion-optimized beta website → WordPress PR → live. Workflow, architecture &amp; operating assumptions.</p>
+    </div>
+  </div>
+
+  <!-- ====================== WHERE IT LIVES ====================== -->
+  <h2>Where it's deployed</h2>
+  <div class="grid2">
+    <div class="card">
+      <h3 style="margin-top:0">🛠️ The tool (this app)</h3>
+      <p class="kv"><b>Runtime</b> Pure Node.js, <em>zero npm deps</em> — one <code>server.js</code></p>
+      <p class="kv"><b>Host</b> Render (free web service)</p>
+      <p class="kv"><b>URL</b> <a href="https://g99-website-build-tool.onrender.com">g99-website-build-tool.onrender.com</a></p>
+      <p class="kv"><b>Repo</b> <code>github.com/mehulk05/website-builld-tool</code></p>
+      <p class="kv"><b>Deploy</b> <code>render.yaml</code> blueprint; <code>render-build.sh</code> fetches the <code>gh</code> CLI binary at build</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">🏥 The G99 platform (trigger source)</h3>
+      <p class="kv"><b>Service</b> <code>g99-product-service</code> (web 8181 + public-api 8182)</p>
+      <p class="kv"><b>Where</b> Currently <em>local</em> (dev/prod wiring deferred)</p>
+      <p class="kv"><b>Trigger</b> <code>WebsiteBuildNotifierService</code> fires on <b>Part-2 submit</b></p>
+      <p class="kv"><b>Direction</b> Outbound webhook → the Render tool (no gateway change needed)</p>
+    </div>
+  </div>
+
+  <!-- ====================== ASSUMPTIONS / ACCOUNTS ====================== -->
+  <h2>Operating assumptions &amp; accounts</h2>
+  <table>
+    <tr><th>Thing</th><th>Value / assumption</th><th>Notes</th></tr>
+    <tr>
+      <td><span class="pill" style="background:var(--gem)">Gemini</span></td>
+      <td>Multiple API keys, rotated (<code>GEMINI_KEYS</code>).<br>Model <code>gemini-flash-lite-latest</code>.</td>
+      <td>Powers CRO audits, prompt composition, site-assembly chrome, image QC, and the CI auto-fix. Key rotation dodges free-tier 429/503.</td>
+    </tr>
+    <tr>
+      <td><span class="pill" style="background:var(--stitch)">Stitch</span></td>
+      <td>Google Stitch MCP, key <code>STITCH_API_KEY</code> (<code>AQ.</code>-prefixed).<br>Model pinned <code>GEMINI_3_FLASH</code>.</td>
+      <td>Generates the 4 pages. Flaky API — retried; <code>deviceType</code> must be UPPERCASE; default model is deprecated so we pin one.</td>
+    </tr>
+    <tr>
+      <td><span class="pill" style="background:var(--gh)">GitHub</span></td>
+      <td>Target repo <code>Growth99Infra/prodteam.gogroth.com</code>.<br>Auth via classic PAT (<code>GH_TOKEN</code>, <code>repo</code> scope).</td>
+      <td>Tool clones the repo, pushes a theme branch, opens a PR, watches CI, auto-merges. Fine-grained PAT was blocked by the org → classic token.</td>
+    </tr>
+    <tr>
+      <td><span class="pill" style="background:var(--wp)">WordPress</span></td>
+      <td>Roots <b>Bedrock</b> repo above; live site <a href="https://prodteam.gogroth.com/">prodteam.gogroth.com</a> (<code>WP_LIVE_URL</code>).</td>
+      <td>Host = FlyWP; <b>merge to <code>main</code> → live</b>. Theme is a classic PHP theme + a must-use plugin that auto-activates &amp; provisions pages.</td>
+    </tr>
+    <tr>
+      <td><span class="pill" style="background:var(--g99)">Client data</span></td>
+      <td>Real answers arrive <b>in the webhook</b>. A sample <code>onboarding.json</code> (dummy “Mehul Aesthetic”, ref site <code>ruma.com</code>) is the fallback / local test fixture.</td>
+      <td>The existing website drives the CRO “before”; <code>site_love_1_url</code> is the design <b>reference</b> the new site emulates.</td>
+    </tr>
+    <tr>
+      <td><span class="pill" style="background:var(--accent)">Auth</span></td>
+      <td><code>ADMIN_PASSWORD</code> gates all <code>/api/*</code>; <code>WEBHOOK_SECRET</code> guards the webhook.</td>
+      <td>Set on Render. The webhook carries <code>X-Webhook-Secret</code>; the UI prompts for the admin password once.</td>
+    </tr>
+  </table>
+  <div class="note">🔒 <b>Secrets never live in the repo.</b> All keys are Render environment variables (locally a git-ignored <code>.env</code>). The keys that were once hardcoded should be rotated.</div>
+
+  <!-- ====================== ARCHITECTURE DIAGRAM ====================== -->
+  <h2>System architecture</h2>
+  <div class="diagram">
+    <svg viewBox="0 0 980 430" width="100%" font-family="Segoe UI, sans-serif" font-size="12.5">
+      <defs>
+        <marker id="arw" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#6b6f82"/></marker>
+      </defs>
+      <!-- G99 platform -->
+      <rect x="20" y="150" width="185" height="120" rx="12" fill="#eaf3ee" stroke="#2f6f4f"/>
+      <text x="112" y="175" text-anchor="middle" font-weight="700" fill="#2f6f4f">G99 Platform</text>
+      <text x="112" y="196" text-anchor="middle" fill="#3a3d4c">product-service</text>
+      <text x="112" y="214" text-anchor="middle" fill="#6b6f82">client submits</text>
+      <text x="112" y="230" text-anchor="middle" fill="#6b6f82">onboarding wizard</text>
+      <text x="112" y="252" text-anchor="middle" font-weight="700" fill="#2f6f4f">Part-2 submit ✓</text>
+
+      <!-- webhook arrow -->
+      <line x1="205" y1="210" x2="330" y2="210" stroke="#6b6f82" stroke-width="2" marker-end="url(#arw)"/>
+      <text x="267" y="200" text-anchor="middle" fill="#6b6f82">webhook</text>
+      <text x="267" y="228" text-anchor="middle" fill="#6b6f82" font-size="11">HTTPS + secret</text>
+
+      <!-- Render tool -->
+      <rect x="335" y="70" width="300" height="290" rx="12" fill="#f2edf7" stroke="#6d4e8c"/>
+      <text x="485" y="94" text-anchor="middle" font-weight="700" fill="#6d4e8c">Render — Beta Site Builder</text>
+      <text x="485" y="112" text-anchor="middle" font-size="11" fill="#6b6f82">Node job runner (single concurrency)</text>
+      <g fill="#fff" stroke="#c9b8dd">
+        <rect x="352" y="126" width="266" height="26" rx="6"/>
+        <rect x="352" y="158" width="266" height="26" rx="6"/>
+        <rect x="352" y="190" width="266" height="26" rx="6"/>
+        <rect x="352" y="222" width="266" height="26" rx="6"/>
+        <rect x="352" y="254" width="266" height="26" rx="6"/>
+        <rect x="352" y="286" width="266" height="26" rx="6"/>
+        <rect x="352" y="318" width="266" height="26" rx="6"/>
+      </g>
+      <g fill="#3a3d4c" font-size="12">
+        <text x="362" y="143">1 · CRO audit (existing site)</text>
+        <text x="362" y="175">2 · Compose build prompt</text>
+        <text x="362" y="207">3 · Generate 4 pages</text>
+        <text x="362" y="239">4 · Assemble site</text>
+        <text x="362" y="271">5 · WP theme + open PR</text>
+        <text x="362" y="303">6 · CI watch → auto-merge</text>
+        <text x="362" y="335">7–8 · activation + after-audit</text>
+      </g>
+
+      <!-- external services on the right -->
+      <rect x="700" y="60" width="255" height="46" rx="10" fill="#eaf0fb" stroke="#2f5bd0"/>
+      <text x="827" y="80" text-anchor="middle" font-weight="700" fill="#2f5bd0">Gemini</text>
+      <text x="827" y="96" text-anchor="middle" font-size="11" fill="#6b6f82">CRO · prompt · assemble · QC · autofix</text>
+
+      <rect x="700" y="122" width="255" height="46" rx="10" fill="#fbf1e6" stroke="#b8742b"/>
+      <text x="827" y="142" text-anchor="middle" font-weight="700" fill="#b8742b">Stitch (MCP)</text>
+      <text x="827" y="158" text-anchor="middle" font-size="11" fill="#6b6f82">page generation</text>
+
+      <rect x="700" y="184" width="255" height="60" rx="10" fill="#eef0f2" stroke="#24292f"/>
+      <text x="827" y="206" text-anchor="middle" font-weight="700" fill="#24292f">GitHub — prodteam.gogroth.com</text>
+      <text x="827" y="224" text-anchor="middle" font-size="11" fill="#6b6f82">clone · push branch · PR · CI · squash-merge</text>
+
+      <rect x="700" y="260" width="255" height="60" rx="10" fill="#e9f1fe" stroke="#1f6feb"/>
+      <text x="827" y="282" text-anchor="middle" font-weight="700" fill="#1f6feb">WordPress live (FlyWP)</text>
+      <text x="827" y="300" text-anchor="middle" font-size="11" fill="#6b6f82">main → deploy → mu-plugin activates</text>
+
+      <!-- arrows tool -> services -->
+      <line x1="635" y1="150" x2="700" y2="83"  stroke="#6b6f82" stroke-width="1.6" marker-end="url(#arw)"/>
+      <line x1="635" y1="175" x2="700" y2="145" stroke="#6b6f82" stroke-width="1.6" marker-end="url(#arw)"/>
+      <line x1="635" y1="260" x2="700" y2="214" stroke="#6b6f82" stroke-width="1.6" marker-end="url(#arw)"/>
+      <line x1="700" y1="300" x2="640" y2="330" stroke="#6b6f82" stroke-width="1.6" marker-end="url(#arw)"/>
+      <text x="662" y="352" fill="#6b6f82" font-size="10">activation poll</text>
+
+      <!-- operator monitor -->
+      <rect x="335" y="378" width="300" height="34" rx="8" fill="#fff" stroke="#6d4e8c" stroke-dasharray="4 3"/>
+      <text x="485" y="399" text-anchor="middle" fill="#6d4e8c">Operator watches: /jobs · /dashboard?job=id</text>
+      <line x1="485" y1="360" x2="485" y2="378" stroke="#6b6f82" stroke-width="1.4" marker-end="url(#arw)"/>
+    </svg>
+  </div>
+
+  <!-- ====================== END-TO-END FLOW ====================== -->
+  <h2>End-to-end flow</h2>
+  <p class="sub">One trigger, then eight automated steps. No human clicks between submit and a merged, live site.</p>
+  <div class="steps">
+    <div class="step"><b>Trigger — client completes the wizard</b><span class="who" style="background:var(--g99)">G99</span>
+      <p>On <b>Part-2 submit</b>, <code>OnboardingWizardService</code>’s after-commit hook calls <code>WebsiteBuildNotifierService</code>, which POSTs a JSON webhook (business + answers) to the tool with <code>X-Webhook-Secret</code>. Fail-soft: a webhook error never breaks the client’s submit. One retry after 90s covers Render cold-start.</p></div>
+    <div class="step"><b>Intake — webhook → queued job</b><span class="who" style="background:var(--accent)">TOOL</span>
+      <p><code>POST /api/webhook/onboarding-submitted</code> validates the secret, maps G99 <code>question_key</code>s to the tool schema (incl. <code>site_love_1_url</code> → design reference), returns <b>202</b>, and queues a job (deduped by <code>draftId</code>, one at a time).</p></div>
+    <div class="step"><b>CRO audit — existing site</b><span class="who" style="background:var(--gem)">GEMINI</span>
+      <p>Scores the client’s current site (vision / UX / CRO / content) — the “before” benchmark and the list of what to fix.</p></div>
+    <div class="step"><b>Compose the build prompt</b><span class="who" style="background:var(--gem)">GEMINI</span>
+      <p>Scans the <b>reference site</b> the client loves (e.g. ruma.com) for its design language, folds in the CRO findings + full onboarding + imagery direction, and writes a detailed brand system + build brief.</p></div>
+    <div class="step"><b>Generate 4 pages</b><span class="who" style="background:var(--stitch)">STITCH</span>
+      <p>One project + design system → Home / Treatments / Team / Contact generated in parallel. Post-processing fixes broken images, swaps text-in-image, injects SEO + a consistent nav.</p></div>
+    <div class="step"><b>Assemble the site</b><span class="who" style="background:var(--gem)">GEMINI</span>
+      <p>Binds the pages into one coherent bundle with shared AI chrome (nav/footer), rewires links → a previewable <code>/site/</code>.</p></div>
+    <div class="step"><b>WordPress theme + open PR</b><span class="who" style="background:var(--gh)">GITHUB</span>
+      <p>Builds a <b>classic PHP theme</b> (index.php + style.css + page templates) plus a <b>must-use plugin</b> that auto-activates the theme and provisions Pages + menu on deploy. Clones prodteam, writes to <code>web/app/themes/g99-&lt;slug&gt;/</code>, pushes a unique branch, opens a PR.</p></div>
+    <div class="step"><b>CI watch → auto-fix → auto-merge</b><span class="who" style="background:var(--gh)">GITHUB</span>
+      <p>Polls the PR’s <b>build</b> checks every 10s (integration test ignored). On a Pint failure it feeds the CI log to Gemini, commits the corrected file, and re-checks (max 3). When green → <b>squash-merge + delete branch</b>.</p></div>
+    <div class="step"><b>Activation watch</b><span class="who" style="background:var(--wp)">WORDPRESS</span>
+      <p>main → FlyWP deploy. Polls the live site until <code>/themes/g99-&lt;slug&gt;/</code> appears in the HTML — the signal the mu-plugin has activated the theme.</p></div>
+    <div class="step"><b>After-audit + comparison</b><span class="who" style="background:var(--gem)">GEMINI</span>
+      <p>Re-runs the CRO audit on the live site, computes the before→after delta, writes a self-contained report (<code>/reports/&lt;id&gt;.html</code>) and posts the score table as a PR comment (the durable copy — Render’s disk is ephemeral).</p></div>
+  </div>
+
+  <!-- ====================== MONITORING ====================== -->
+  <h2>How you watch it</h2>
+  <div class="grid2">
+    <div class="card"><h3 style="margin-top:0">/jobs</h3><p class="muted" style="font-size:14px">Live list of every run — business, status, per-step detail, PR / site / report links, before→after scores.</p></div>
+    <div class="card"><h3 style="margin-top:0">/dashboard?job=&lt;id&gt;</h3><p class="muted" style="font-size:14px">Full detail: the editable answers, CRO gauge, the composed build prompt, the brand palette, and each page’s live progress (queued → generating → done).</p></div>
+  </div>
+
+  <!-- ====================== KEY PIECES ====================== -->
+  <h2>Key files &amp; endpoints</h2>
+  <div class="grid2">
+    <div class="card">
+      <h3 style="margin-top:0">Tool</h3>
+      <ul>
+        <li><code>server.js</code> — everything: routes, job runner, Stitch/Gemini/gh integration</li>
+        <li><code>public/dashboard.html·js</code> — build UI + job monitor</li>
+        <li><code>public/jobs.html·js</code> — jobs list</li>
+        <li><code>onboarding.json</code> — sample/fallback client</li>
+        <li><code>render.yaml</code>, <code>render-build.sh</code> — deploy</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Endpoints (self-driving)</h3>
+      <ul class="mono" style="list-style:none;padding-left:0">
+        <li>POST /api/webhook/onboarding-submitted</li>
+        <li>POST /api/cro-audit · /api/cro-audit-url</li>
+        <li>POST /api/compose-brand</li>
+        <li>POST /api/generate-site · /api/bind-site</li>
+        <li>POST /api/push-wordpress · /api/pr-status</li>
+        <li>POST /api/pr-autofix · /api/pr-merge</li>
+        <li>POST /api/theme-live · GET /api/jobs</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ====================== GOTCHAS ====================== -->
+  <h2>Known constraints &amp; gotchas</h2>
+  <ul>
+    <li><b>Render free tier sleeps after ~15 min idle.</b> A background job makes only outbound calls, so keep <code>/jobs</code> open (its poll keeps the instance awake) or use a paid tier for unattended runs.</li>
+    <li><b>Ephemeral disk.</b> Generated files and <code>/reports/*</code> are wiped on restart/deploy — the PR comment is the durable record.</li>
+    <li><b>Stitch is flaky</b> and returns a generic “invalid argument” for many issues; every call is retried, <code>deviceType</code> is forced UPPERCASE, and the model is pinned (default is deprecated).</li>
+    <li><b>WordPress pages live in the DB, not Git</b> — hence the mu-plugin that provisions Pages/menu on <code>init</code> (a programmatic theme switch does not fire <code>after_switch_theme</code>).</li>
+    <li><b>Merge to <code>main</code> = production.</b> Webhook-triggered runs auto-merge; only the <b>build</b> checks gate it (integration test is intentionally ignored).</li>
+    <li><b>Repo is currently public</b> — no secrets in it, but consider making it private.</li>
+  </ul>
+
+  <footer>Growth99 Beta Site Builder · internal workflow documentation · generated with Claude Code</footer>
+</div>
+</body>
+</html>
