@@ -19,7 +19,26 @@ async function ensureAuth() {
 }
 
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-const ICON = { pending: "·", running: '<span class="spin"></span>', done: "✓", error: "✗" };
+const ICON = { pending: "", running: '<span class="spin"></span>', done: "✓", error: "✗" };
+const SVG_EDIT = `<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>`;
+const SVG_BUILD = `<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>`;
+const typeChip = (t) => `<span class="tchip ${t}">${t === "edit" ? SVG_EDIT : SVG_BUILD}</span>`;
+
+// one step marker + label/detail, with optional sub-content nested under the step
+function stepRow(s, extra) {
+  return `<div class="jstep ${s.status}">
+    <span class="ic">${ICON[s.status] || ""}</span>
+    <div class="jb"><span class="lb">${esc(s.label)}</span>
+      <span class="dt" style="${s.status === "error" ? "color:var(--bad)" : ""}">${esc(s.detail)}</span>
+      ${extra ? `<div class="sub-detail">${extra}</div>` : ""}</div>
+  </div>`;
+}
+// bordered box listing changed files (edit jobs)
+function fileBox(plan) {
+  if (!plan || !plan.length) return "";
+  const rows = plan.map((f) => `<div class="frow"><span class="fop ${esc((f.op || "edit").toLowerCase())}">${esc(f.op || "edit")}</span><span class="fpath">${esc(f.path)}</span></div>`).join("");
+  return `<div class="filebox"><div class="fhead">${plan.length} file${plan.length > 1 ? "s" : ""} changed</div>${rows}</div>`;
+}
 const PG_ICON = { queued: "·", generating: '<span class="spin"></span>', "post-processing": "◌", done: "✓", error: "✗" };
 const PAGE_LABELS = [["home", "Home"], ["services", "Services"], ["about", "About"], ["contact", "Contact"]];
 let GEN_PROG = { phase: "idle", pages: {} };  // populated from /api/generate-progress each refresh
@@ -40,10 +59,10 @@ function brandSwatches(j) {
   const fonts = [c.headingFont, c.bodyFont].filter(Boolean).join(" + ");
   const brief = (c.brief || "").trim();
   const briefBlock = brief
-    ? `<details style="margin:4px 0 4px 28px"><summary style="cursor:pointer;font-size:12.5px;color:var(--accent)">View build prompt (${brief.length} chars)</summary>
+    ? `<details style="margin:6px 0 4px"><summary style="cursor:pointer;font-size:12.5px;color:var(--accent)">View build prompt (${brief.length} chars)</summary>
        <div style="white-space:pre-wrap;font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:6px;max-height:260px;overflow:auto">${esc(brief)}</div></details>`
     : "";
-  return `<div style="display:flex;align-items:center;flex-wrap:wrap;gap:4px;margin:8px 0 4px 28px">
+  return `<div style="display:flex;align-items:center;flex-wrap:wrap;gap:4px">
     ${sw(c.primary, "Primary")}${sw(c.secondary, "Secondary")}${sw(c.accent, "Accent")}
     ${fonts ? `<span style="font-size:12px;color:var(--muted)">${esc(fonts)}</span>` : ""}</div>${briefBlock}`;
 }
@@ -64,25 +83,23 @@ function perPageRows(j, live) {
     const col = status === "done" ? "var(--good)" : status === "error" ? "var(--bad)" : "var(--muted)";
     return `<div style="font-size:12.5px;color:${col}"><span style="display:inline-block;width:80px">${esc(l)}</span>${t}</div>`;
   }).join("");
-  return `<div style="margin:6px 0 4px 28px">${rows}</div>`;
+  return `<div>${rows}</div>`;
 }
 
 function editCard(j) {
   // Edit jobs have their OWN shape (no onboarding form / build steps) — render
   // their detail inline here so clicking never lands on the build dashboard.
   const badge = `<span class="badge ${j.status}">${j.status.toUpperCase()}</span>`;
-  const steps = j.steps.map((s) =>
-    `<div class="jstep ${s.status}"><span class="ic">${ICON[s.status] || "·"}</span><span class="lb">${esc(s.label)}</span><span class="dt" style="${s.status === "error" ? "color:var(--bad)" : ""}">${esc(s.detail)}</span></div>`).join("");
-  const files = (j.editPlan || []).map((f) => `<div style="font-size:12.5px;font-family:ui-monospace,monospace"><b style="color:var(--accent)">${esc(f.op)}</b> ${esc(f.path)}</div>`).join("");
+  const steps = j.steps.map((s) => stepRow(s)).join("");
   const links = [
     j.prUrl ? `<a href="${esc(j.prUrl)}" target="_blank" onclick="event.stopPropagation()">↗ Pull request / diff</a>` : "",
   ].filter(Boolean).join("");
   const when = (j.startedAt || j.createdAt || "").replace("T", " ").slice(0, 19);
   return `<div class="card" style="cursor:pointer" onclick="location.href='/job?id=${encodeURIComponent(j.draftId)}'">
-    <div class="jhead"><h2>✏️ ${esc(j.businessName)}</h2><span class="meta">edit · ${esc(when)}</span>${badge}</div>
-    <div style="margin:8px 0 4px;font-size:13.5px"><b>Request:</b> <span class="muted">${esc((j.payload && j.payload.prompt) || "")}</span></div>
-    ${j.editSummary ? `<div style="font-size:13px;color:var(--muted);margin-bottom:6px"><b>Plan:</b> ${esc(j.editSummary)}</div>` : ""}
-    ${files ? `<div style="margin:6px 0 10px">${files}</div>` : ""}
+    <div class="jhead">${typeChip("edit")}<h2>${esc(j.businessName)}</h2><span class="meta">edit · ${esc(when)}</span>${badge}</div>
+    <div class="prompt-line"><b>Request:</b> <span class="muted">${esc((j.payload && j.payload.prompt) || "")}</span></div>
+    ${j.editSummary ? `<div class="plan-line"><b>Plan:</b> ${esc(j.editSummary)}</div>` : ""}
+    ${fileBox(j.editPlan)}
     <div class="steps">${steps}</div>
     ${links ? `<div class="links">${links}</div>` : ""}
     ${j.error ? `<div class="links" style="color:var(--bad)">${esc(j.error)}</div>` : ""}
@@ -94,11 +111,10 @@ function jobCard(j) {
   const scores = (j.before || j.after)
     ? `<div class="scores">${j.before ? j.before.overall : "—"} <span class="d" style="color:${(j.delta || 0) >= 0 ? "var(--good)" : "var(--bad)"}">${j.delta == null ? "→" : (j.delta >= 0 ? "+" : "") + j.delta}</span> ${j.after ? j.after.overall : "—"}</div>` : "";
   const steps = j.steps.map((s, i) => {
-    const row = `<div class="jstep ${s.status}"><span class="ic">${ICON[s.status] || "·"}</span><span class="lb">${esc(s.label)}</span><span class="dt" style="${s.status === "error" ? "color:var(--bad)" : ""}">${esc(s.detail)}</span></div>`;
     let extra = "";
     if (i === 1 && (s.status === "done" || s.status === "running")) extra = brandSwatches(j);           // compose → palette + fonts + prompt
     if (i === 2 && s.status !== "pending") extra = perPageRows(j, s.status === "running" && j.status === "running"); // generate → per-page (live while running, snapshot after)
-    return row + extra;
+    return stepRow(s, extra);
   }).join("");
   const stop = 'onclick="event.stopPropagation()"';
   const links = [
@@ -108,7 +124,7 @@ function jobCard(j) {
   ].filter(Boolean).join("");
   const when = (j.startedAt || j.createdAt || "").replace("T", " ").slice(0, 19);
   return `<div class="card" style="cursor:pointer" onclick="location.href='/job?id=${encodeURIComponent(j.draftId)}'">
-    <div class="jhead"><h2>${esc(j.businessName)}</h2><span class="meta">draft ${esc(j.draftId)} · ${esc(when)}</span>${badge}${scores}</div>
+    <div class="jhead">${typeChip("build")}<h2>${esc(j.businessName)}</h2><span class="meta">draft ${esc(j.draftId)} · ${esc(when)}</span>${badge}${scores}</div>
     <div class="steps">${steps}</div>
     ${links ? `<div class="links">${links}</div>` : ""}
     ${j.error ? `<div class="links" style="color:var(--bad)">${esc(j.error)}</div>` : ""}

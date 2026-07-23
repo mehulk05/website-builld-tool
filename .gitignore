@@ -9,3 +9,4 @@ test-invalid.js
 jobs.json
 registry.json
 reaudit.json
+server.out

@@ -1519,6 +1519,20 @@ function readRegistry() {
 function prettyName(slug) {
   return slug.replace(/^g99-/, "").split("-").filter(Boolean).map(w => w[0].toUpperCase() + w.slice(1)).join(" ");
 }
+// Collapse a PR's statusCheckRollup (mix of CheckRun + StatusContext) into one
+// CI verdict: failing > pending > passing > none (no checks configured/ran).
+function ciRollup(rollup) {
+  if (!Array.isArray(rollup) || !rollup.length) return "none";
+  let pending = false, failing = false, passing = false;
+  for (const c of rollup) {
+    const st = (c.status || "").toUpperCase();          // CheckRun: QUEUED/IN_PROGRESS/COMPLETED
+    const v = (c.conclusion || c.state || "").toUpperCase(); // conclusion (CheckRun) or state (StatusContext)
+    if (["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"].includes(v)) failing = true;
+    else if (["SUCCESS", "NEUTRAL", "SKIPPED"].includes(v)) passing = true;
+    else if (["PENDING", "EXPECTED", "IN_PROGRESS", "QUEUED", "WAITING", "REQUESTED"].includes(v) || st === "IN_PROGRESS" || st === "QUEUED") pending = true;
+  }
+  return failing ? "failing" : pending ? "pending" : passing ? "passing" : "none";
+}
 // Which theme is live: WordPress enqueues the active theme's assets, so the
 // homepage HTML contains /themes/g99-<slug>/. One fetch → the active slug.
 async function detectActiveTheme(url) {
@@ -2214,11 +2228,11 @@ const server = http.createServer(async (req, res) => {
       const site = (readRegistry().sites || []).find(s => s.siteId === siteId);
       if (!site) return json(res, 404, { error: "unknown site" });
       const bare = site.themeSlug.replace(/^g99-/, "");
-      const raw = await sh(`gh pr list --repo ${site.githubRepo} --state all --limit 80 --json number,title,url,state,mergedAt,createdAt,headRefName`);
+      const raw = await sh(`gh pr list --repo ${site.githubRepo} --state all --limit 80 --json number,title,url,state,mergedAt,createdAt,headRefName,statusCheckRollup`);
       let prs = []; try { prs = JSON.parse(raw.stdout || "[]"); } catch (e) { prs = []; }
       const re = new RegExp("(^|[/-])" + bare.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "(-|$)");
       const history = prs.filter(pr => re.test(pr.headRefName || ""))
-        .map(pr => ({ number: pr.number, title: pr.title, url: pr.url, state: pr.state, type: (pr.headRefName || "").includes("/edit-") ? "edit" : "build", date: pr.mergedAt || pr.createdAt }))
+        .map(pr => ({ number: pr.number, title: pr.title, url: pr.url, state: pr.state, type: (pr.headRefName || "").includes("/edit-") ? "edit" : "build", date: pr.mergedAt || pr.createdAt, build: ciRollup(pr.statusCheckRollup) }))
         .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
       return json(res, 200, { siteId, history });
     }

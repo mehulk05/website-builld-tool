@@ -48,5 +48,12 @@ Prior plan preserved in `onboarding-v1-plan.md` (v1 pipeline — delivered; only
 | P2-6 | Scheduled re-audits | server.js interval + /api/reaudit | ✅ done | periodic CRO on active site(s), store + alert on regression via notify |
 | P2-7 | Design-system pass | public/theme.css (shared), linked on all pages | ✅ done | Inter font, refined tokens/shadows/spacing, consistent buttons/cards |
 
+## UI revamp (2026-07-23) — Vercel/Linear-inspired
+| # | Task | Files | Status | Notes |
+|---|------|-------|--------|-------|
+| UI-1 | Centralize design tokens | public/theme.css + strip per-page :root | ✅ done | theme.css is now the single source of tokens (light+dark); removed the 4 pages' own :root blocks → one change restyles everything |
+| UI-2 | Vercel-clean palette/type | theme.css | ✅ done | refined neutrals, crisp 1px borders, minimal shadow, tighter radius (10px), restrained violet accent, Inter, focus rings, quiet scrollbar |
+| UI-3 | Declutter headers | theme.css (.top logo/sub hidden) | ✅ done | left rail carries the brand; pages lead with just their title. Verified /jobs + /edit render clean, no console errors |
+
 ## Archive
 (see onboarding-v1-plan.md for the delivered v1 pipeline; older plans archived there)
