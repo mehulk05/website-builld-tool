@@ -2686,9 +2686,16 @@ const server = http.createServer(async (req, res) => {
         const muRel = "web/app/mu-plugins";
         const muFile = `g99-activate-${slug}.php`;
         fs.mkdirSync(path.join(tmp, muRel), { recursive: true });
+        // Prune prior builds' activators — otherwise every one of them fires on
+        // 'init' against a fresh DB (they all race to switch_theme() before
+        // their own g99_autoactivated_* option exists yet), and whichever file
+        // sorts last alphabetically wins instead of the theme this PR ships.
+        for (const f of fs.readdirSync(path.join(tmp, muRel))) {
+          if (/^g99-activate-.*\.php$/.test(f) && f !== muFile) fs.unlinkSync(path.join(tmp, muRel, f));
+        }
         fs.writeFileSync(path.join(tmp, muRel, muFile), wpActivatorPlugin(slug, a.business_name, built.buildId));
         await run(`git checkout -b "${branch}"`, tmp);
-        await run(`git add -A "${rel}" "${muRel}/${muFile}"`, tmp);
+        await run(`git add -A "${rel}" "${muRel}"`, tmp);
         r = await run(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "Add ${a.business_name} beta theme + auto-activator (Growth99 generated)"`, tmp);
         if (r.code) throw new Error("commit failed: " + (r.stderr || r.stdout).slice(-200));
         r = await run(`git push -u origin "${branch}"`, tmp);
