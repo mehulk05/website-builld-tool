@@ -1,165 +1,520 @@
-// Growth99 — Edit a live site. Pick a site, describe a change, ship it as a PR.
+// Growth99 Website Studio — Edit a site.
+// Two panes: a chat thread on the left where every message you send starts a
+// real edit run against that website's own repo, and the site's live homepage
+// on the right. Assistant bubbles are bound to a jobId and stream that run's
+// actual steps, plan and pull request — nothing here is simulated.
 "use strict";
 
-const _fetch = window.fetch.bind(window);
-window.fetch = (url, opts = {}) => {
-  if (String(url).startsWith("/api/")) opts.headers = { ...(opts.headers || {}), "x-admin-key": localStorage.getItem("g99AdminKey") || "" };
-  return _fetch(url, opts);
-};
-async function ensureAuth() {
-  for (let i = 0; i < 3; i++) {
-    const r = await fetch("/api/auth-check", { headers: { "x-login": "1" } });
-    if (r.status !== 401) return true;
-    const k = prompt("This tool is password-protected. Enter the admin password:");
-    if (k == null) return false;
-    localStorage.setItem("g99AdminKey", k.trim());
-  }
-  return false;
-}
+const { esc, avatarColor, initials, host, relTime, toast, getJSON, postJSON, ensureAuth, svg,
+        jobState, jobProgress } = window.G99;
 
 const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-let toastT;
-function toast(m) { const t = $("toast"); t.textContent = m; t.classList.add("show"); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove("show"), 3600); }
+const qs = new URLSearchParams(location.search);
 
-// stable pleasant avatar color from the slug
-function avatarColor(s) { let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0)) % 360; return `hsl(${h} 52% 48%)`; }
-const initials = (name) => (name || "?").replace(/[^A-Za-z0-9 ]/g, "").split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0].toUpperCase()).join("") || "?";
-const ICONS = {
-  check: `<svg fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"/></svg>`,
-  ext: `<svg style="width:13px;height:13px" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>`,
-  page: `<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>`,
-  text: `<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h10"/></svg>`,
-  color: `<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7 21a4 4 0 01-4-4V5a2 2 0 012-2h4a2 2 0 012 2v12a4 4 0 01-4 4zm0 0h12a2 2 0 002-2v-4a2 2 0 00-2-2h-2.343M11 7.343l1.657-1.657a2 2 0 012.828 0l2.829 2.829a2 2 0 010 2.828l-8.486 8.485"/></svg>`,
-  section: `<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 5a1 1 0 011-1h14a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 15a1 1 0 011-1h14a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1v-4z"/></svg>`,
-  footer: `<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 10h18M3 6h18M3 14h18M3 18h18"/></svg>`,
-  mobile: `<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 18h.01M8 21h8a1 1 0 001-1V4a1 1 0 00-1-1H8a1 1 0 00-1 1v16a1 1 0 001 1z"/></svg>`,
-};
-// CI status glyphs for the PR history (check / x / clock / dash)
-const CI_ICON = {
-  passing: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"/></svg>`,
-  failing: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path stroke-linecap="round" stroke-linejoin="round" d="M6 6l12 12M18 6L6 18"/></svg>`,
-  pending: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 7v5l3 2M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>`,
-  none: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path stroke-linecap="round" stroke-linejoin="round" d="M5 12h14"/></svg>`,
-};
+let SITES = [];
+let SITE = null;
+let TARGET = null;          // { themeSlug, resolveError }
+let THREAD = [];            // [{ role:"user"|"ai", text, jobId?, job? }]
+let SENDING = false;
+let MODE = "desktop";
+// Chat panel collapsed → the live preview gets the full width. Remembered
+// across sites and reloads; below 900px the tabs own this instead.
+let COLLAPSED = localStorage.getItem("g99chatCollapsed") === "1";
+let poll;
+
+const threadKey = () => "g99thread:" + (SITE ? SITE.siteId : "none");
 
 const PRESETS = [
-  ["Add a page", ICONS.page, "Add a new __ page. Give it a clear title, on-brand copy with a few sections, and link it in the main navigation."],
-  ["Change hero headline", ICONS.text, "Change the homepage hero headline to \"__\" and adjust the sub-headline to match."],
-  ["Update colors", ICONS.color, "Update the brand colors to __ (primary) and __ (accent) across the whole theme, keeping contrast accessible."],
-  ["Add a section", ICONS.section, "Add a new __ section to the home page (e.g. testimonials / FAQ / financing), styled like the existing sections."],
-  ["Edit contact / footer", ICONS.footer, "Update the footer / contact details: __."],
-  ["Fix mobile layout", ICONS.mobile, "Improve the mobile layout of the __ — fix spacing, overflow, and tap targets."],
+  ["Change hero text", "M4 6h16M4 12h10M4 18h7", "Update the homepage hero headline and sub-headline to feel more premium and benefit-led."],
+  ["Add a page", "M12 4v16m8-8H4", "Add a Terms of Service page with standard sections, and link it in the footer navigation."],
+  ["Update colors", "M7 21a4 4 0 01-4-4V5a2 2 0 012-2h14a2 2 0 012 2v12a4 4 0 01-4 4H7z", "Refresh the brand color palette to a warmer, more luxurious tone across the whole site, keeping contrast accessible."],
+  ["Add a section", "M4 5a1 1 0 011-1h14a1 1 0 011 1v4H4V5zm0 6h16v8a1 1 0 01-1 1H5a1 1 0 01-1-1v-8z", "Add a testimonials section with three patient reviews to the homepage, below the services."],
+  ["Fix an SEO issue", "M21 21l-4.3-4.3M17 11a6 6 0 11-12 0 6 6 0 0112 0z", "Remove any noindex tag and fix the meta title and description so search engines can index the site."],
+  ["Update contact info", "M3 5a2 2 0 012-2h3l2 5-2 1a11 11 0 005 5l1-2 5 2v3a2 2 0 01-2 2A16 16 0 013 5z", "Update the clinic phone number, address and opening hours in the footer and on the contact page."],
 ];
 
-let SEL = null;
+// ------------------------------------------------------------------ picker
+function showPicker() {
+  const old = document.querySelector(".picker");
+  if (old) old.remove();
+  const el = document.createElement("div");
+  el.className = "picker";
+  // This screen runs without the app shell, so the picker is the only chrome
+  // there is. It must always offer a way out — close when a site is already
+  // loaded behind it, links back into the app when there isn't.
+  el.innerHTML = `
+    <div class="box2" role="dialog" aria-modal="true" aria-labelledby="pkt">
+      <div class="hd" style="display:flex;align-items:flex-start;gap:12px">
+        <div style="flex:1;min-width:0">
+          <h2 id="pkt">Which site are you editing?</h2>
+          <p>Every website registered in NocoDB, each mapped to its own repository.</p>
+        </div>
+        <button class="btn sm" id="pkx" aria-label="Close">${svg("close", 15, 2.2)}</button>
+      </div>
+      <div class="list">${SITES.length ? SITES.map((s) => {
+        const c = avatarColor(s.businessName);
+        const on = SITE && SITE.siteId === s.siteId;
+        return `<a class="it" href="/edit?site=${encodeURIComponent(s.siteId)}">
+          <span class="ava md" style="background:${c}">${esc(initials(s.businessName))}</span>
+          <div style="flex:1;min-width:0"><div class="nm trunc">${esc(s.businessName)}</div><div class="dm trunc">${esc(host(s.liveUrl) || "no domain set")}</div></div>
+          ${on ? `<span class="pill">Current</span>` : ""}
+        </a>`;
+      }).join("") : `<p class="empty">No websites found in NocoDB. Check the table and that NOCODB_TOKEN is set.</p>`}</div>
+      <div style="display:flex;gap:14px;align-items:center;padding:12px 20px;border-top:1px solid var(--line);background:var(--surface-2)">
+        <a class="linkbtn" href="/sites">${svg("back", 13, 2.2)}All sites</a>
+        <a class="linkbtn" href="/">Overview</a>
+      </div>
+    </div>`;
+  const close = () => { if (SITE) { el.remove(); document.removeEventListener("keydown", onKey, true); } };
+  const onKey = (e) => { if (e.key === "Escape") close(); };
+  el.onclick = (e) => { if (e.target === el) close(); };
+  el.querySelector("#pkx").onclick = () => {
+    // With no site loaded there is nothing behind the modal — go somewhere real.
+    if (SITE) close(); else location.href = "/sites";
+  };
+  document.addEventListener("keydown", onKey, true);
+  document.body.appendChild(el);
+}
 
-function renderSites(sites) {
-  if (!sites.length) { $("sites").innerHTML = '<p class="empty">No sites found yet. Build one first, or click Refresh.</p>'; return; }
-  $("sites").innerHTML = sites.map((s) =>
-    `<button class="site" data-id="${esc(s.siteId)}">
-       <span class="ava" style="background:${avatarColor(s.themeSlug)}">${esc(initials(s.businessName))}</span>
-       <span class="site-main">
-         <span class="site-nm">${esc(s.businessName)}${s.active ? '<span class="live"><span class="dot"></span>LIVE</span>' : ""}</span>
-         <span class="site-slug">${esc(s.themeSlug)}</span>
-         <span class="site-last">${esc((s.lastChange || "—").slice(0, 46))}</span>
-       </span>
-       <span class="check">${ICONS.check}</span>
-     </button>`).join("");
-  [...document.querySelectorAll(".site")].forEach((el) => el.onclick = () => {
-    document.querySelectorAll(".site").forEach((x) => x.classList.remove("sel"));
-    el.classList.add("sel");
-    SEL = sites.find((s) => s.siteId === el.dataset.id);
-    $("editCard").classList.remove("dim");
-    $("historyCard").classList.remove("dim");
-    if ($("approvalToggle")) $("approvalToggle").checked = !!SEL.requireApproval;
-    loadHistory(SEL.siteId);
+// ------------------------------------------------------- version history
+// Read straight from GitHub: every commit that touched this site's theme. The
+// newest one is what's live; any older one can be restored as a new commit.
+function closeVersions() {
+  document.querySelectorAll(".vscrim, .vpanel").forEach((el) => el.remove());
+  document.removeEventListener("keydown", onVersionKey, true);
+  const b = $("history"); if (b) b.setAttribute("aria-expanded", "false");
+}
+function onVersionKey(e) { if (e.key === "Escape") closeVersions(); }
+
+async function showVersions() {
+  closeVersions();
+  const scrim = document.createElement("div");
+  scrim.className = "vscrim";
+  const panel = document.createElement("aside");
+  panel.className = "vpanel";
+  panel.setAttribute("role", "dialog");
+  panel.setAttribute("aria-modal", "true");
+  panel.setAttribute("aria-labelledby", "vpt");
+  const body = (inner) => `
+    <div class="vh2">
+      <div style="flex:1;min-width:0">
+        <h2 id="vpt">Version history</h2>
+        <p>Every change to this site's theme, read live from GitHub. Restoring puts the theme back as it was — later theme changes are discarded.</p>
+      </div>
+      <button class="btn sm" id="vpx" aria-label="Close version history">${svg("close", 15, 2.2)}</button>
+    </div>
+    <div class="vlist">${inner}</div>`;
+  panel.innerHTML = body(`<p class="empty"><span class="spin"></span>Reading history from GitHub…</p>`);
+  scrim.onclick = closeVersions;
+  document.addEventListener("keydown", onVersionKey, true);
+  document.body.append(scrim, panel);
+  panel.querySelector("#vpx").onclick = closeVersions;
+  const b = $("history"); if (b) b.setAttribute("aria-expanded", "true");
+
+  let d;
+  try { d = await getJSON("/api/site-versions?siteId=" + encodeURIComponent(SITE.siteId)); }
+  catch (e) { panel.innerHTML = body(`<p class="empty">Could not read history: ${esc(e.message)}</p>`); panel.querySelector("#vpx").onclick = closeVersions; return; }
+
+  const vs = d.versions || [];
+  panel.innerHTML = body(
+    d.resolveError ? `<p class="empty">No theme resolved for this site, so there's no history to show.<br>${esc(d.resolveError.slice(0, 160))}</p>`
+    : !vs.length ? `<p class="empty">No commits have touched this theme yet.</p>`
+    : vs.map((v, i) => `<div class="ver">
+        <span class="tchip">${svg(v.current ? "globe" : "clock", 15)}</span>
+        <div class="vt">
+          <div class="t">${esc(v.title)}</div>
+          <div class="m"><span class="sha">${esc(v.short)}</span> · ${esc(relTime(v.date) || (v.date || "").slice(0, 10))}${v.author ? " · " + esc(v.author) : ""}${v.prUrl ? ` · <a href="${esc(v.prUrl)}" target="_blank" rel="noopener">#${v.prNumber}</a>` : ""}</div>
+        </div>
+        ${v.current
+          ? `<span class="pill good">Live now</span>`
+          : `<button class="btn sm" data-restore="${i}">Restore</button>`}
+      </div>`).join("")
+  );
+  panel.querySelector("#vpx").onclick = closeVersions;
+  panel.querySelectorAll("[data-restore]").forEach((btn) => {
+    btn.onclick = () => restoreVersion(vs[+btn.dataset.restore]);
   });
 }
 
-document.addEventListener("change", (e) => {
-  if (e.target && e.target.id === "approvalToggle" && SEL) {
-    fetch("/api/site-approval", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ siteId: SEL.siteId, requireApproval: e.target.checked }) })
-      .then((r) => r.json()).then((d) => { if (!d.error) { SEL.requireApproval = d.requireApproval; toast(d.requireApproval ? "Approval required before merge" : "Auto-merge on green build"); } })
-      .catch(() => toast("Could not update approval setting"));
+async function restoreVersion(v) {
+  if (!v) return;
+  // A restore merges into a client's live repo — same weight as shipping an
+  // edit, so it gets the same explicit confirmation.
+  const ok = await window.G99.confirm({
+    title: "Restore this version?",
+    body: SITE.requireApproval
+      ? "Studio will roll the theme back to this version and open a pull request, then pause for your approval before merging."
+      : "Studio will roll the theme back to this version, open a pull request and merge it once the build passes. Theme changes made after this version are discarded.",
+    details: {
+      Site: SITE.businessName,
+      Repository: SITE.githubRepo || "not set",
+      Version: `${v.short} · ${v.title.length > 60 ? v.title.slice(0, 60) + "…" : v.title}`,
+      Dated: (v.date || "").slice(0, 10),
+    },
+    confirmLabel: "Restore this version",
+    tone: "warn",
+  });
+  if (!ok) return;
+  closeVersions();
+
+  const ai = { role: "ai", text: `Restoring ${SITE.businessName} to ${v.short} — ${v.title}.`, jobId: null, job: null };
+  THREAD.push(ai);
+  renderThread(); save();
+  try {
+    const d = await postJSON("/api/site-restore", { siteId: SITE.siteId, sha: v.sha, label: v.title });
+    ai.jobId = d.jobId;
+    save(); renderThread(); startPolling();
+  } catch (e) {
+    ai.text = "That restore didn't start: " + e.message;
+    renderThread(); save();
   }
-});
+}
 
-async function loadHistory(siteId) {
-  $("history").innerHTML = '<p class="empty"><span class="spin"></span>Loading history…</p>';
+// ------------------------------------------------------------------ render
+// Plain-English phase per pipeline step, positionally matched to the server's
+// step lists. The Activity screen keeps the technical labels; chat says what's
+// happening in words an operator can read at a glance.
+const PHASES = {
+  edit: ["Pulling the latest code", "Planning the change", "Writing the change", "Opening a pull request", "Waiting for the build to pass", "Finishing up"],
+  restore: ["Pulling the latest code", "Rolling the theme back", "Opening a pull request", "Waiting for the build to pass", "Finishing up"],
+};
+function phaseText(job) {
+  const steps = job.steps || [];
+  let i = steps.findIndex((s) => s.status === "running");
+  if (i < 0) i = Math.max(0, steps.filter((s) => s.status === "done").length - 1);
+  return (PHASES[job.type] || [])[i] || (steps[i] && steps[i].label) || "Getting started";
+}
+
+// One status line per run — Started → Working → Completed, plus whatever action
+// is actually the operator's (approve, open the PR). Every step, file and log
+// line stays on the Activity screen behind "Details".
+function runBox(job, missing) {
+  // A thread survives in localStorage after the server has cleared its jobs.
+  // Say so plainly instead of spinning forever on a run that no longer exists.
+  if (missing) {
+    return `<div class="run">
+      <div class="rl" style="color:var(--muted)">${svg("warn", 13)}<span class="grow">Run details no longer available</span></div>
+      <div class="sum">This run was cleared from the server — check the site's history for what shipped.</div>
+      <div class="acts"><a class="linkbtn" href="/site?id=${encodeURIComponent(SITE.siteId)}">Site history →</a></div>
+    </div>`;
+  }
+  if (!job) {
+    return `<div class="run"><div class="rl"><span class="spin"></span><span class="grow">Started</span></div>
+      <div class="sum">Getting started</div></div>`;
+  }
+  const done = job.status === "done";
+  const failed = job.status === "error" || job.status === "cancelled";
+  const waiting = job.awaitingApproval && !job.approved;
+  const head = failed ? (job.status === "cancelled" ? "Cancelled" : "Couldn't finish this change")
+    : done ? "Completed — live on the site"
+    : waiting ? "Waiting for your approval"
+    : job.status === "queued" ? "Started" : "Working on it";
+  const color = failed ? "var(--bad-ink)" : done ? "var(--good-ink)" : waiting ? "var(--warn-ink)" : "var(--ink)";
+  const icon = done ? svg("check", 13, 2.6) : failed || waiting ? svg("warn", 13) : `<span class="spin"></span>`;
+  const running = !done && !failed && !waiting;
+
+  return `<div class="run">
+    <div class="rl" style="color:${color}">${icon}<span class="grow">${esc(head)}</span>
+      ${done ? `<span class="pill good">Done</span>` : ""}</div>
+    ${running ? `<div class="sum">${esc(phaseText(job))}</div>` : ""}
+    ${job.editSummary && (done || failed) ? `<div class="sum">${esc(job.editSummary)}</div>` : ""}
+    ${job.error ? `<div class="sum" style="color:var(--bad-ink)">${esc(job.error.slice(0, 160))}</div>` : ""}
+    <div class="acts">
+      ${waiting ? `<button class="btn warn sm" data-approve="${esc(job.draftId)}">Approve &amp; merge</button>` : ""}
+      ${job.prUrl ? `<a class="linkbtn" href="${esc(job.prUrl)}" target="_blank" rel="noopener">Pull request${svg("ext", 13)}</a>` : ""}
+      <a class="linkbtn end" href="/job?id=${encodeURIComponent(job.draftId)}">Details →</a>
+    </div>
+  </div>`;
+}
+
+function renderThread() {
+  const el = $("thread");
+  if (!el) return;
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  el.innerHTML = THREAD.map((m) => {
+    if (m.role === "user") {
+      return `<div class="msg user"><div class="col"><div class="bubble">${esc(m.text)}</div></div></div>`;
+    }
+    return `<div class="msg"><div class="col">
+      <div class="say">${esc(m.text)}</div>
+      ${m.jobId ? runBox(m.job, m.missing) : ""}
+    </div></div>`;
+  }).join("");
+  el.querySelectorAll("[data-approve]").forEach((b) => {
+    b.onclick = async () => {
+      b.disabled = true;
+      try { await postJSON("/api/job-approve", { id: b.dataset.approve }); toast("Approved — merging…"); refreshJobs(); }
+      catch (e) { toast("Could not approve: " + e.message); b.disabled = false; }
+    };
+  });
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+
+function render() {
+  const color = avatarColor(SITE.businessName);
+  const domain = host(SITE.liveUrl);
+
+  $("shell").innerHTML = `
+    <div class="topbar">
+      <a class="back" href="/site?id=${encodeURIComponent(SITE.siteId)}" title="Back to site">${svg("back", 14, 2.2)}</a>
+      <span class="ava md" style="background:${color}">${esc(initials(SITE.businessName))}</span>
+      <div style="min-width:0">
+        <div style="display:flex;align-items:center;gap:8px"><h1 class="nm">${esc(SITE.businessName)}</h1><span class="pill">Editing</span></div>
+        <div class="dm">${esc(domain || "no domain set")}</div>
+      </div>
+      <div class="right">
+        <label class="switch"><input type="checkbox" id="appr"${SITE.requireApproval ? " checked" : ""}><span class="track"></span>Approve before ship</label>
+        <button class="btn" id="history" aria-expanded="false" title="Version history">${svg("clock", 15)}History</button>
+        <button class="btn" id="togglePane" aria-pressed="${COLLAPSED ? "true" : "false"}" aria-controls="panes" title="${COLLAPSED ? "Show the chat panel" : "Hide the chat panel"}">${svg("panel", 15)}<span id="togglePaneLabel">${COLLAPSED ? "Show chat" : "Hide chat"}</span></button>
+        <button class="btn" id="switchSite">Switch site</button>
+        <a class="btn primary" href="/jobs">${svg("activity", 15)}All runs</a>
+      </div>
+    </div>
+
+    <div class="seg mobtabs" id="mobtabs" role="group" aria-label="Switch panel">
+      <button data-v="chat" class="on" aria-pressed="true" style="flex:1">Chat</button>
+      <button data-v="preview" aria-pressed="false" style="flex:1">Live preview</button>
+    </div>
+
+    <div class="panes show-chat${COLLAPSED ? " nochat" : ""}" id="panes">
+      <div class="pane chatpane">
+        <div class="thread" id="thread"></div>
+        <div class="composer">
+          <div class="chips" id="chips">${PRESETS.map((p, i) =>
+            `<button class="chip" data-p="${i}"><svg style="width:12px;height:12px" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="${p[1]}"/></svg>${esc(p[0])}</button>`).join("")}</div>
+          <div class="box">
+            <textarea id="input" rows="1" placeholder="Describe a change — e.g. make the hero headline bolder"></textarea>
+            <button class="iconbtn ghost" id="improve" title="Sharpen this instruction with AI">${svg("spark", 16)}</button>
+            <button class="iconbtn" id="send" title="Ship this change">${svg("arrow", 16, 2.2)}</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="pane prev">
+        <div class="pv-bar">
+          <div class="lights"><i style="background:#f2b8b5"></i><i style="background:#fadf98"></i><i style="background:#b9e2c0"></i></div>
+          <div class="url">${svg("globe", 12)}<span>${esc(domain || "no domain set")}</span></div>
+          <button class="btn sm" id="reload">${svg("refresh", 13)}Reload</button>
+          <div class="seg" style="margin-left:auto;flex:none">
+            <button data-m="desktop" class="${MODE === "desktop" ? "on" : ""}" title="Desktop" style="padding:5px 9px">${svg("desktop", 15)}</button>
+            <button data-m="mobile" class="${MODE === "mobile" ? "on" : ""}" title="Mobile" style="padding:5px 9px">${svg("mobile", 15)}</button>
+          </div>
+        </div>
+        ${SITE.liveUrl
+          ? `<div class="pv-stage ${MODE}" id="stage"><iframe id="pv" src="${esc(SITE.liveUrl)}" title="Live site preview" sandbox="allow-scripts allow-same-origin allow-forms"></iframe></div>`
+          : `<div class="pv-empty"><div><div style="font-weight:700;margin-bottom:6px">No domain set</div><div style="font-size:13px;color:var(--muted);max-width:320px">Add this website's Domain in NocoDB and the live preview appears here.</div></div></div>`}
+      </div>
+    </div>`;
+
+  wire();
+  renderThread();
+}
+
+function wire() {
+  const input = $("input");
+  input.oninput = () => { input.style.height = "auto"; input.style.height = Math.min(120, input.scrollHeight) + "px"; };
+  input.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } };
+  $("send").onclick = send;
+  $("improve").onclick = improve;
+  $("chips").onclick = (e) => {
+    const b = e.target.closest("[data-p]");
+    if (!b) return;
+    input.value = PRESETS[+b.dataset.p][2];
+    input.focus(); input.dispatchEvent(new Event("input"));
+  };
+  $("switchSite").onclick = () => showPicker();
+  $("appr").onchange = async (e) => {
+    try {
+      const d = await postJSON("/api/site-approval", { siteId: SITE.siteId, requireApproval: e.target.checked });
+      SITE.requireApproval = d.requireApproval;
+      toast(d.requireApproval ? "Changes will pause for your approval before merge" : "Changes auto-merge once the build is green");
+    } catch (err) { e.target.checked = !e.target.checked; toast("Could not update: " + err.message); }
+  };
+  $("history").onclick = showVersions;
+  $("togglePane").onclick = () => {
+    COLLAPSED = !COLLAPSED;
+    localStorage.setItem("g99chatCollapsed", COLLAPSED ? "1" : "0");
+    $("panes").classList.toggle("nochat", COLLAPSED);
+    $("togglePane").setAttribute("aria-pressed", String(COLLAPSED));
+    $("togglePane").title = COLLAPSED ? "Show the chat panel" : "Hide the chat panel";
+    $("togglePaneLabel").textContent = COLLAPSED ? "Show chat" : "Hide chat";
+  };
+  $("mobtabs").onclick = (e) => {
+    const b = e.target.closest("[data-v]");
+    if (!b) return;
+    // Toggle rather than reassign — .nochat must survive a tab switch.
+    const panes = $("panes");
+    panes.classList.toggle("show-chat", b.dataset.v === "chat");
+    panes.classList.toggle("show-preview", b.dataset.v === "preview");
+    [...$("mobtabs").children].forEach((x) => {
+      const on = x === b;
+      x.classList.toggle("on", on);
+      x.setAttribute("aria-pressed", String(on));
+    });
+  };
+  const rl = $("reload"); if (rl) rl.onclick = reloadPreview;
+  document.querySelectorAll("[data-m]").forEach((b) => {
+    b.onclick = () => {
+      MODE = b.dataset.m;
+      document.querySelectorAll("[data-m]").forEach((x) => x.classList.toggle("on", x === b));
+      const st = $("stage"); if (st) st.className = "pv-stage " + MODE;
+    };
+  });
+}
+
+function reloadPreview() {
+  const f = $("pv");
+  if (!f) return;
+  // Cache-bust so a just-deployed change actually shows up.
+  const u = new URL(SITE.liveUrl);
+  u.searchParams.set("_g99", Date.now());
+  f.src = u.toString();
+}
+
+// ------------------------------------------------------------------ actions
+async function improve() {
+  const idea = $("input").value.trim();
+  if (!idea) { toast("Type a rough idea first."); return; }
+  const b = $("improve"); b.disabled = true;
   try {
-    const d = await (await fetch("/api/site-history?siteId=" + encodeURIComponent(siteId))).json();
-    const h = d.history || [];
-    if (!h.length) { $("history").innerHTML = '<p class="empty">No pull requests found for this site yet.</p>'; return; }
-    $("history").innerHTML = h.map((p) => {
-      const day = (p.date || "").slice(0, 10);
-      const st = (p.state || "").toLowerCase();
-      const label = st === "merged" ? "Merged" : st === "closed" ? "Closed" : "Open";
-      const cls = st === "merged" ? "merged" : st === "closed" ? "closed" : "open";
-      const b = p.build || "none";
-      const bLabel = { passing: "CI passed", failing: "CI failed", pending: "CI running", none: "no CI" }[b];
-      return `<a class="hrow" href="${esc(p.url)}" target="_blank">
-        <span class="htype ${p.type}">${esc(p.type)}</span>
-        <span class="hnum">#${p.number}</span>
-        <span class="htitle">${esc(p.title)}</span>
-        <span class="hbuild ${b}">${CI_ICON[b]}${bLabel}</span>
-        <span class="hstate ${cls}">${label}</span>
-        <span class="hdate">${esc(day)}</span>
-        <span class="hext">${ICONS.ext}</span>
-      </a>`;
-    }).join("");
-  } catch (e) { $("history").innerHTML = '<p class="empty">Could not load history: ' + esc(e.message) + "</p>"; }
+    const d = await postJSON("/api/edit-suggest", { siteId: SITE.siteId, idea });
+    $("input").value = d.prompt || idea;
+    $("input").dispatchEvent(new Event("input"));
+    toast("Sharpened — review it, then send.");
+  } catch (e) { toast("Could not improve: " + e.message); }
+  finally { b.disabled = false; }
 }
 
-async function loadSites(refresh) {
-  $("sites").innerHTML = '<p class="empty"><span class="spin"></span>Loading sites…</p>';
+async function send() {
+  if (SENDING) return;
+  const text = $("input").value.trim();
+  if (!text) return;
+  if (!SITE.githubRepo) { toast("This website has no repository set in NocoDB."); return; }
+  if (TARGET && TARGET.resolveError) { toast("No editable theme resolved — see the site page."); return; }
+
+  // Sending opens a real pull request against a client repo — never on a
+  // stray Enter. Confirm names the repo, the theme and the merge policy.
+  const ok = await window.G99.confirm({
+    title: "Ship this change?",
+    body: SITE.requireApproval
+      ? "Studio will write the change and open a pull request, then pause for your approval before merging."
+      : "Studio will write the change, open a pull request and merge it automatically once the build passes.",
+    details: {
+      Site: SITE.businessName,
+      Repository: SITE.githubRepo,
+      Theme: (TARGET && TARGET.themeSlug) || "resolving…",
+      Change: text.length > 120 ? text.slice(0, 120) + "…" : text,
+    },
+    confirmLabel: SITE.requireApproval ? "Open pull request" : "Ship it",
+  });
+  if (!ok) return;
+
+  SENDING = true;
+  $("send").disabled = true;
+  $("input").value = ""; $("input").style.height = "auto";
+
+  THREAD.push({ role: "user", text });
+  const mode = SITE.requireApproval ? "I'll pause before merging so you can approve it." : "It merges automatically once the build passes.";
+  const ai = { role: "ai", text: `On it — applying that to ${SITE.businessName}. ${mode}`, jobId: null, job: null };
+  THREAD.push(ai);
+  renderThread(); save();
+
   try {
-    const d = await (await fetch("/api/sites" + (refresh ? "?refresh=1" : ""))).json();
-    renderSites(d.sites || []);
-  } catch (e) { $("sites").innerHTML = '<p class="empty">Could not load: ' + esc(e.message) + "</p>"; }
+    const d = await postJSON("/api/edit-run", { siteId: SITE.siteId, prompt: text });
+    ai.jobId = d.jobId;
+    save(); renderThread(); startPolling();
+  } catch (e) {
+    ai.text = "That didn't start: " + e.message;
+    renderThread(); save();
+  } finally {
+    SENDING = false;
+    $("send").disabled = false;
+  }
 }
 
-function renderPresets() {
-  $("presets").innerHTML = PRESETS.map((p, i) => `<button class="preset" data-i="${i}">${p[1]}${esc(p[0])}</button>`).join("");
-  [...document.querySelectorAll(".preset")].forEach((el) => el.onclick = () => { $("prompt").value = PRESETS[el.dataset.i][2]; $("prompt").focus(); });
+// ------------------------------------------------------------------ polling
+async function refreshJobs() {
+  const ids = THREAD.filter((m) => m.jobId).map((m) => m.jobId);
+  if (!ids.length) return false;
+  let live = false, justFinished = false;
+  const jobs = await Promise.all(ids.map((id) => getJSON("/api/job?id=" + encodeURIComponent(id)).catch(() => null)));
+  THREAD.filter((m) => m.jobId).forEach((m, i) => {
+    const j = jobs[i];
+    if (!j) { if (!m.job) m.missing = true; return; }   // never resolved → it's gone
+    m.missing = false;
+    const was = m.job && m.job.status;
+    m.job = j;
+    if (was && was !== "done" && j.status === "done") justFinished = true;
+    if (j.status === "running" || j.status === "queued") live = true;
+  });
+  renderThread();
+  if (justFinished) { toast("Change is live — reloading the preview."); setTimeout(reloadPreview, 1500); }
+  return live;
 }
 
-async function suggest() {
-  if (!SEL) { toast("Pick a site first"); return; }
-  const idea = $("prompt").value.trim();
-  if (!idea) { toast("Type a rough idea first"); return; }
-  $("suggestBtn").disabled = true; $("suggestHint").innerHTML = '<span class="spin"></span>Improving…';
+function startPolling() {
+  clearInterval(poll);
+  const tick = async () => { const live = await refreshJobs(); if (!live) clearInterval(poll); };
+  tick();
+  poll = setInterval(tick, 3000);
+}
+
+// ------------------------------------------------------------------ storage
+function save() {
   try {
-    const d = await (await fetch("/api/edit-suggest", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ siteId: SEL.siteId, idea }) })).json();
-    if (d.prompt) { $("prompt").value = d.prompt; $("suggestHint").textContent = "Refined ✓"; }
-    else throw new Error(d.error || "no suggestion");
-  } catch (e) { $("suggestHint").textContent = ""; toast("Suggest failed: " + e.message); }
-  finally { $("suggestBtn").disabled = false; }
+    localStorage.setItem(threadKey(), JSON.stringify(THREAD.map((m) => ({ role: m.role, text: m.text, jobId: m.jobId || null }))));
+  } catch (e) { /* quota — the thread is a convenience, jobs are the source of truth */ }
+}
+function restore() {
+  try { THREAD = JSON.parse(localStorage.getItem(threadKey()) || "[]"); } catch (e) { THREAD = []; }
+  if (!THREAD.length) {
+    THREAD = [{ role: "ai", text: `I'm looking at ${SITE.businessName}. Tell me what you'd like to change and I'll ship it to ${SITE.githubRepo || "its repo"} as a pull request. The live site is on the right.` }];
+  }
 }
 
-const APPLY_LABEL = $("applyBtn").innerHTML;
-async function apply() {
-  if (!SEL) { toast("Pick a site first"); return; }
-  const prompt = $("prompt").value.trim();
-  if (!prompt) { toast("Describe the change first"); return; }
-  const mode = SEL.requireApproval ? "open a PR and wait for your approval to merge" : "open a PR and auto-merge once the build passes";
-  if (!confirm(`Apply this change to "${SEL.businessName}"?\n\nIt will ${mode}.`)) return;
-  $("applyBtn").disabled = true; $("applyBtn").innerHTML = '<span class="spin"></span>Starting…';
+// ------------------------------------------------------------------ boot
+async function load() {
   try {
-    const r = await fetch("/api/edit-run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ siteId: SEL.siteId, prompt }) });
-    const d = await r.json();
-    if (!r.ok) throw new Error(d.error || "failed");
-    toast("Edit job started — opening the jobs monitor…");
-    setTimeout(() => location.href = "/jobs", 900);
-  } catch (e) { toast("Error: " + e.message); $("applyBtn").disabled = false; $("applyBtn").innerHTML = APPLY_LABEL; }
-}
+    const d = await getJSON("/api/sites");
+    SITES = (d.sites || []).sort((a, b) => (a.businessName || "").localeCompare(b.businessName || ""));
+  } catch (e) {
+    $("shell").innerHTML = `<p class="empty">Could not load websites: ${esc(e.message)}</p>`;
+    return;
+  }
+  const want = qs.get("site");
+  SITE = SITES.find((s) => s.siteId === want) || null;
+  if (!SITE) {
+    $("shell").innerHTML = `
+      <div style="margin:auto;text-align:center;max-width:420px">
+        <h1 style="font-size:20px;margin:0 0 8px">Edit a site</h1>
+        <p class="empty" style="padding:0 0 16px">Pick a website to edit.</p>
+        <div style="display:flex;gap:9px;justify-content:center">
+          <a class="btn" href="/sites">All sites</a>
+          <a class="btn" href="/">Overview</a>
+        </div>
+      </div>`;
+    showPicker();
+    return;
+  }
 
-$("refresh").onclick = (e) => { e.preventDefault(); loadSites(true); };
-$("suggestBtn").onclick = suggest;
-$("applyBtn").onclick = apply;
+  document.title = "Growth99 · Editing " + SITE.businessName;
+  restore();
+  render();
+  startPolling();
+
+  // Confirm which theme an edit would target; surface the error inline if none.
+  getJSON("/api/site-history?siteId=" + encodeURIComponent(SITE.siteId))
+    .then((t) => {
+      TARGET = t;
+      if (t.resolveError) {
+        THREAD.push({ role: "ai", text: "Heads up — I couldn't work out which theme to edit for this site: " + t.resolveError });
+        renderThread();
+      }
+    })
+    .catch(() => {});
+}
 
 ensureAuth().then((ok) => {
-  if (!ok) { toast("Unauthorized — reload and enter the admin password."); return; }
-  renderPresets();
-  loadSites(true);
+  if (!ok) { $("shell").innerHTML = '<p class="empty">Unauthorized — reload and enter the admin password.</p>'; return; }
+  load();
 });

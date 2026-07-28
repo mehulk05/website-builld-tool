@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Growth99 · Sites</title>
+<link rel="stylesheet" href="/theme.css?v=10">
+<style>
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 30px 34px 90px; display: flex; flex-direction: column; gap: 20px; animation: g99fadeup .32s ease both; }
+
+  .bar-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 16px; }
+  .sc {
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+    box-shadow: var(--shadow-sm); overflow: hidden; cursor: pointer;
+    display: flex; flex-direction: column; text-decoration: none; color: inherit;
+    transition: border-color .14s, box-shadow .14s, transform .12s;
+  }
+  .sc:hover { border-color: var(--ink-3); box-shadow: var(--shadow); transform: translateY(-1px); }
+  .sc .thumb { height: 118px; position: relative; display: grid; place-items: center; border-bottom: 1px solid var(--line); }
+  .sc .thumb .wm { font-weight: 800; font-size: 34px; letter-spacing: -.03em; opacity: .32; }
+  /* Tag and status share the top edge — the tag truncates so a long repo slug
+     can never run under the status pill. */
+  .sc .thumb .tag {
+    position: absolute; top: 11px; left: 11px; font-family: var(--mono); font-size: 10px;
+    /* Sits on the tinted thumbnail, so the chip needs a near-opaque fill for
+       the label to clear 4.5:1. */
+    color: var(--ink-3); background: color-mix(in srgb, var(--surface) 92%, transparent);
+    border-radius: 6px; padding: 2px 7px;
+    max-width: calc(100% - 22px - 96px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .sc .thumb .st {
+    position: absolute; top: 11px; right: 11px; font-size: 10px; font-weight: 700;
+    border-radius: 99px; padding: 3px 9px; display: flex; align-items: center; gap: 5px;
+    max-width: 92px; overflow: hidden; white-space: nowrap;
+    background: color-mix(in srgb, var(--surface) 82%, transparent);
+  }
+  .sc .body { padding: 14px 16px 15px; display: flex; flex-direction: column; gap: 12px; flex: 1; }
+  .sc .hd { display: flex; align-items: center; gap: 11px; }
+  .sc .nm { font-size: 14px; font-weight: 700; }
+  .sc .dm { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .sc .cro { font-size: 17px; font-weight: 800; line-height: 1; }
+  .sc .crol { font-size: 10px; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+  .sc .ft { display: flex; align-items: center; gap: 8px; padding-top: 11px; border-top: 1px solid var(--line-2); }
+  .sc .lc { font-size: 12px; color: var(--ink-2); font-weight: 600; }
+  .sc .up { font-size: 11px; color: var(--muted); margin-top: 1px; }
+</style>
+</head>
+<body data-title="Sites">
+<main class="wrap" id="g99main">
+  <div class="page-h">
+    <div>
+      <h1>Sites</h1>
+      <p id="sub">Loading websites from NocoDB…</p>
+    </div>
+    <a class="btn primary" href="/dashboard">New site</a>
+  </div>
+
+  <div class="bar-row">
+    <div class="seg" id="filters" role="group" aria-label="Filter sites by status">
+      <button data-f="all" class="on" aria-pressed="true">All</button>
+      <button data-f="live" aria-pressed="false">Live</button>
+      <button data-f="building" aria-pressed="false">Building</button>
+      <button data-f="attention" aria-pressed="false">Attention</button>
+    </div>
+    <label for="search" class="vh">Search sites</label>
+    <div class="search" style="max-width:260px;flex:1;margin-left:auto">
+      <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-4.3-4.3M17 11a6 6 0 11-12 0 6 6 0 0112 0z"/></svg>
+      <input id="search" type="search" placeholder="Search sites…">
+    </div>
+    <button class="btn" id="refresh">Refresh</button>
+  </div>
+
+  <div class="grid" id="grid"><p class="empty"><span class="spin"></span>Loading websites…</p></div>
+</main>
+<div class="toast" id="toast"></div>
+<script src="/nav.js"></script>
+<script src="/sites.js"></script>
+</body>
+</html>

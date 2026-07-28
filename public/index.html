@@ -3,10 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Growth99 · Website Build Tool</title>
-<link rel="stylesheet" href="/styles.css">
+<title>Growth99 · Build wizard</title>
+<!-- theme.css first so the injected Studio shell has its tokens; styles.css
+     then re-declares the wizard's own palette on top. -->
+<link rel="stylesheet" href="/theme.css?v=10">
+<link rel="stylesheet" href="/styles.css?v=8">
 </head>
-<body>
+<body data-title="Build wizard">
 <header>
   <div class="wrap hd">
     <span class="g">g</span>
@@ -80,7 +83,7 @@
         </div>
         <div class="field"><label>Reference / existing website</label>
           <div class="row" style="gap:8px"><input type="text" id="ref" value="ruma.com">
-          <button class="btn ghost sm" id="scanBtn" style="flex:0;white-space:nowrap" onclick="scanSite()">🔍 Scan design</button></div>
+          <button class="btn ghost sm" id="scanBtn" style="flex:0;white-space:nowrap" onclick="scanSite()">Scan design</button></div>
           <div class="hint" id="scanHint" style="margin-top:6px"></div>
           <div id="scanResult" style="display:none;margin-top:8px"></div></div>
         <div class="field"><label>Hero headline</label><input type="text" id="headline"></div>
@@ -91,13 +94,13 @@
       <div class="card pad">
         <div class="field" style="margin-bottom:8px"><label>Prompt preface (brand + SEO fixes) — applied to every page</label>
           <textarea id="prompt" style="min-height:300px"></textarea></div>
-        <div class="btnrow"><button class="btn sm" id="composeBtn" onclick="composeBrand()">✨ AI-compose prompt (Gemini)</button><button class="btn ghost sm" onclick="buildPrompt()">↻ Rebuild from template</button><span class="hint" id="composeHint" style="margin:0"></span></div>
-        <div class="btnrow" style="margin-top:12px">
-          <button class="btn" id="genBtnBoth" onclick="generateSite('both')">⚔ Generate with BOTH — compare</button>
+        <div class="btnrow"><button class="btn sm" id="composeBtn" onclick="composeBrand()">AI-compose prompt (Gemini)</button><button class="btn ghost sm" onclick="buildPrompt()">↻ Rebuild from template</button><span class="hint" id="composeHint" style="margin:0"></span></div>
+        <div class="gen-choices">
+          <button class="btn" id="genBtnBoth" onclick="generateSite('both')">Generate with BOTH — compare</button>
           <button class="btn ghost" id="genBtn" onclick="generateSite('stitch')">Stitch only (~2 min/page)</button>
-          <button class="btn ghost" id="genBtnGemini" onclick="generateSite('gemini')">⚡ Gemini only (~1 min/page)</button>
-          <span class="hint" id="genHint" style="margin:0"></span>
+          <button class="btn ghost" id="genBtnGemini" onclick="generateSite('gemini')">Gemini only (~1 min/page)</button>
         </div>
+        <span class="hint" id="genHint" style="margin-top:10px;display:block"></span>
         <div class="plist" id="progress"></div>
       </div>
     </div>
@@ -119,17 +122,17 @@
         <span class="eyebrow">Beta site (one navigable bundle)</span>
         <div class="btnrow" style="margin-top:10px">
           <a class="btn" id="siteOpen" href="/site/" target="_blank">↗ Open beta site</a>
-          <a class="btn ghost" id="siteZip" href="/export-site">⬇ Download site (zip)</a>
+          <a class="btn ghost" id="siteZip" href="/export-site">Download site (zip)</a>
           <span class="hint" id="siteFiles" style="margin:0"></span>
         </div>
       </div>
       <div class="card pad" style="margin-bottom:14px">
         <span class="eyebrow">Client deliverables (shareable review pages)</span>
         <div class="btnrow" style="margin-top:10px">
-          <button class="btn" onclick="genDeliverable('brand-guide', this)">🎨 Generate Brand Guide</button>
-          <button class="btn" onclick="genDeliverable('seo-report', this)">📈 Generate SEO Report</button>
-          <button class="btn ghost" onclick="exportWp(this)">🧩 Export WordPress theme</button>
-          <button class="btn" onclick="pushWp(this)">⬆ Push to GitHub (open PR)</button>
+          <button class="btn" onclick="genDeliverable('brand-guide', this)">Generate Brand Guide</button>
+          <button class="btn" onclick="genDeliverable('seo-report', this)">Generate SEO Report</button>
+          <button class="btn ghost" onclick="exportWp(this)">Export WordPress theme</button>
+          <button class="btn" onclick="pushWp(this)">Push to GitHub (open PR)</button>
           <span id="delivLinks" class="btnrow" style="gap:10px"></span>
         </div>
       </div>
@@ -187,6 +190,7 @@
   </section>
 </div>
 <div class="toast" id="toast"></div>
+<script src="/nav.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

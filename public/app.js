@@ -52,7 +52,7 @@ function renderCats(box, cats) {
 function renderIssues(box, issues) {
   box.innerHTML = issues.length ? issues.map(i =>
     `<div class="issue ${i.sev}"><span class="sev"></span><div><h4>${esc(i.title)}</h4><p>${esc(i.desc)}</p></div><span class="fx">${esc(i.fix)}</span></div>`).join("")
-    : '<div class="empty">No issues found 🎉</div>';
+    : '<div class="empty">No issues found</div>';
 }
 function renderFacts(box, f) {
   box.innerHTML = [["Title", f.titleLen + " ch"], ["Meta desc", f.metaLen ? f.metaLen + " ch" : "—"], ["H1 / H2", f.h1 + " / " + f.h2],
@@ -423,13 +423,13 @@ function fillPreview() {
   $("ptabs").innerHTML = tabKeys.map((k, i) => {
     const t = (PAGES.find(p => p.key === k) || {}).title || k;
     const n = genPages.filter(g => g.pageKey === k).length;
-    return `<button class="ptab ${i === curTab ? "on" : ""}" onclick="showTab(${i})">${esc(t)}${n > 1 ? " ⚡⚔" : ""}</button>`;
+    return `<button class="ptab ${i === curTab ? "on" : ""}" onclick="showTab(${i})">${esc(t)}${n > 1 ? " · both" : ""}</button>`;
   }).join("");
   showTab(curTab);
   const engines = [...new Set(genPages.map(g => g.engine))];
   $("asmRow").innerHTML = engines.map(en =>
-    `<button class="btn" onclick="bindSite('${en}')">✨ Bind site (AI chrome) — ${en === "gemini" ? "Gemini" : "Stitch"}</button>
-     <button class="btn ghost" onclick="assembleSite('${en}')">🔗 Basic assemble (${en === "gemini" ? "Gemini" : "Stitch"})</button>`).join("");
+    `<button class="btn" onclick="bindSite('${en}')">Bind site (AI chrome) — ${en === "gemini" ? "Gemini" : "Stitch"}</button>
+     <button class="btn ghost" onclick="assembleSite('${en}')">Basic assemble (${en === "gemini" ? "Gemini" : "Stitch"})</button>`).join("");
 }
 function frameHtml(g) {
   const eng = g.engine === "gemini" ? "Gemini" : "Stitch";
@@ -437,9 +437,9 @@ function frameHtml(g) {
     <div class="btnrow" style="margin-bottom:8px;justify-content:space-between">
       <span class="chip ${g.engine === "gemini" ? "good" : "acc"}">${eng} · ${(g.htmlBytes / 1024).toFixed(1)} KB · ${g.seconds}s</span>
       <span class="btnrow" style="gap:6px">
-        <a class="btn ghost sm" href="${g.exportUrl}" download="${g.page}.html">⬇ Export</a>
+        <a class="btn ghost sm" href="${g.exportUrl}" download="${g.page}.html">Export</a>
         <a class="btn ghost sm" href="${g.previewUrl}" target="_blank">↗ Open</a>
-        ${g.screenshotUrl ? `<a class="btn ghost sm" href="${g.screenshotUrl}" target="_blank">🖼 Mockup</a>` : ""}
+        ${g.screenshotUrl ? `<a class="btn ghost sm" href="${g.screenshotUrl}" target="_blank">Mockup</a>` : ""}
       </span>
     </div>
     <div class="frame">
@@ -506,7 +506,10 @@ function renderCroCompare(ex, nw) {
 
 // ---------------- nav / init ----------------
 function go(n) {
-  document.querySelectorAll(".step").forEach(s => s.classList.toggle("on", s.dataset.step == n));
+  document.querySelectorAll(".step").forEach(s => {
+    s.classList.toggle("on", s.dataset.step == n);
+    s.classList.toggle("done", s.dataset.step < n);
+  });
   document.querySelectorAll(".panel").forEach(p => p.classList.toggle("on", p.dataset.panel == n));
   window.scrollTo({ top: 0, behavior: "smooth" });
   if (n == 5) loadStitchPages();

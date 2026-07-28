@@ -3,88 +3,48 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Growth99 · Job detail</title>
-<link rel="stylesheet" href="/theme.css?v=2">
+<title>Growth99 · Run detail</title>
+<link rel="stylesheet" href="/theme.css?v=10">
 <style>
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    background: transparent;
-    color: var(--ink);
-    font-family: var(--sans);
-    font-size: 13px;
-    line-height: 1.5;
-  }
-  a { color: var(--accent); text-decoration: none; }
-  .wrap { max-width: 880px; margin: 0 auto; padding: 30px 30px 90px; }
-  .back { font-size: 12.5px; color: var(--muted); text-decoration: none; font-weight: 600; display: inline-flex; align-items: center; gap: 4px; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 30px 34px 90px; display: flex; flex-direction: column; gap: 18px; animation: g99fadeup .32s ease both; }
+
+  .back { font-size: 12.5px; color: var(--muted); font-weight: 600; display: inline-flex; align-items: center; gap: 5px; width: fit-content; }
   .back:hover { color: var(--ink); }
-  .head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 16px 0 6px; }
-  .head h1 { font-size: 22px; margin: 0; }
-  .head .badge { margin-left: auto; }
-  .head .actions { margin-left: 0; }
 
-  .badge { font-size: 10.5px; font-weight: 700; padding: 3px 10px; border-radius: 99px; text-transform: uppercase; letter-spacing: .03em; }
-  .badge.running { color: var(--accent); background: var(--accent-soft); }
-  .badge.done { color: var(--good); background: var(--good-soft); }
-  .badge.error, .badge.cancelled { color: var(--bad); background: var(--bad-soft); }
-  .badge.queued { color: var(--muted); background: var(--line-2); }
+  .hero { display: flex; align-items: center; gap: 13px; flex-wrap: wrap; }
+  .hero h1 { margin: 0; font-size: 20px; font-weight: 800; }
+  .hero .meta { font-size: 12.5px; color: var(--muted); margin-top: 3px; }
+  .hero .acts { margin-left: auto; display: flex; gap: 9px; flex-wrap: wrap; }
 
-  .meta { font-size: 12px; color: var(--muted); }
-  .actions { margin-left: auto; display: flex; gap: 6px; }
+  .scores { display: flex; align-items: center; gap: 16px; padding: 18px 22px; flex-wrap: wrap; }
+  .scores .n { text-align: center; }
+  .scores .n b { display: block; font-weight: 800; line-height: 1; }
+  .scores .n i { display: block; font-style: normal; font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 700; margin-top: 4px; }
 
-  .btn {
-    border: 1px solid var(--line);
-    background: var(--panel);
-    color: var(--ink);
-    padding: 7px 13px;
-    border-radius: 8px;
-    font: inherit;
-    font-weight: 600;
-    font-size: 12.5px;
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
+  .req { font-size: 14px; line-height: 1.6; color: var(--ink-2); margin: 0; }
+
+  .disc-btn { display: flex; align-items: center; gap: 8px; width: 100%; background: none; border: none; padding: 0; font: inherit; cursor: pointer; color: var(--ink); }
+  .disc-btn .t { font-size: 13.5px; font-weight: 700; }
+  .disc-btn .h { margin-left: auto; font-size: 12px; color: var(--muted); font-weight: 600; }
+  .tech { margin-top: 14px; display: none; }
+  .tech.open { display: block; }
+  .tech .grid { display: flex; gap: 24px; flex-wrap: wrap; font-size: 12.5px; }
+  .tech .grid .k { color: var(--muted); font-weight: 600; }
+  .tech .grid .v { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin-top: 3px; word-break: break-all; }
+
+  .diff {
+    font-family: var(--mono); font-size: 11.5px; line-height: 1.55; white-space: pre-wrap;
+    background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; max-height: 460px; overflow: auto; margin: 0; color: var(--ink-2);
   }
-  .btn:hover { border-color: var(--ink-3); background: var(--line-2); }
-  .btn.primary { background: var(--primary); color: var(--primary-ink); border: none; }
-  .btn.primary:hover { filter: brightness(1.12); }
-  .btn.danger { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 35%, var(--line)); }
-  .btn.danger:hover { background: var(--bad-soft); }
-
-  .card {
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: 14px;
-    box-shadow: var(--shadow);
-    padding: 18px 20px;
-    margin-bottom: 14px;
-  }
-  .card h2 { font-size: 12px; margin: 0 0 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
-  .cost { font-size: 12px; color: var(--muted); }
-  .req { font-size: 14px; color: var(--ink); }
-
-  pre.diff { background: #0d1117; color: #e6edf3; font-size: 11.5px; line-height: 1.55; border-radius: 10px; padding: 14px; overflow: auto; max-height: 480px; white-space: pre; font-family: var(--mono); border: 1px solid var(--line); }
-  pre.diff .a { color: #3fb950; }
-  pre.diff .d { color: #f85149; }
-
-  .spin { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: sp .7s linear infinite; vertical-align: -1px; }
-  @keyframes sp { to { transform: rotate(360deg); } }
-
-  .toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--panel); padding: 11px 18px; border-radius: 10px; font-size: 13.5px; box-shadow: var(--shadow-lg); opacity: 0; pointer-events: none; transition: .2s ease; z-index: 50; }
-  .toast.show { opacity: 1; }
-
-  .prlink { display: inline-flex; gap: 6px; align-items: center; background: var(--accent-soft); color: var(--accent); padding: 8px 13px; border-radius: 9px; text-decoration: none; font-weight: 600; font-size: 12.5px; }
-  .prlink:hover { filter: brightness(.97); }
-  .scoreline { font-size: 34px; font-weight: 800; font-family: var(--display); letter-spacing: -.02em; }
+  .diff .a { color: var(--good); }
+  .diff .d { color: var(--bad); }
 </style>
 </head>
-<body>
-<div class="wrap">
-  <a class="back" href="/jobs">← All jobs</a>
-  <div id="detail"><p class="meta" style="margin-top:20px"><span class="spin"></span> Loading…</p></div>
-</div>
+<body data-title="Run detail">
+<main class="wrap" id="wrap">
+  <p class="empty"><span class="spin"></span>Loading run…</p>
+</main>
 <div class="toast" id="toast"></div>
 <script src="/nav.js"></script>
 <script src="/job.js"></script>
