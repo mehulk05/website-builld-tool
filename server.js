@@ -25,7 +25,7 @@ const DIR = __dirname;
 // Prefer a local ./bin (deploy build step drops the gh binary there).
 if (fs.existsSync(path.join(DIR, "bin"))) process.env.PATH = path.join(DIR, "bin") + path.delimiter + process.env.PATH;
 
-const WP_REPO = process.env.WP_REPO || "Growth99Infra/prodteam.gogroth.com";
+const WP_REPO = process.env.WP_REPO || "G99agency/prodteam.gogroth.com";
 // Run a shell command (gh reads GH_TOKEN from env; locally it uses your gh login).
 function sh(cmd, cwd) {
   return new Promise((resolve) => exec(cmd, { cwd, maxBuffer: 1e8, windowsHide: true },
@@ -1767,12 +1767,73 @@ function jobStep(job, i, status, detail) {
   job.steps[i].status = status;
   if (detail != null) job.steps[i].detail = String(detail).slice(0, 240);
   saveJobs();
+  postStatus(job);   // report each step transition to G99 (fail-soft)
 }
 // Slack (or any incoming-webhook) notification — fail-soft, off when unset.
 function notify(text) {
   const url = process.env.SLACK_WEBHOOK_URL || "";
   if (!url) return;
   fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) }).catch(() => {});
+}
+
+// ---- G99 status callback ------------------------------------------------------
+// Reports build progress back to Growth99 (product-service) so the admin dashboard has a durable
+// record of every build: whether it ran, how far it got, where it failed, and the live site URL.
+// Our own job state is in-memory + jobs.json (last 60, wiped on redeploy), so G99 is the long-term
+// source of truth. Fail-soft with a few retries — a build must never break because G99 is briefly down.
+const G99_STATUS_URL = process.env.G99_STATUS_CALLBACK_URL || "";
+const G99_STATUS_SECRET = process.env.G99_STATUS_SECRET || process.env.WEBHOOK_SECRET || "";
+const G99_RETRY_DELAYS_MS = [2000, 10000, 30000];
+
+// job.siteUrl / job.reportUrl are paths on THIS server ("/site/", "/reports/81.html"). G99 renders them
+// as links in its admin UI, so send absolute URLs — a relative path would be broken there.
+const G99_TOOL_PUBLIC_URL = (process.env.G99_TOOL_PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/$/, "");
+function absUrl(u) {
+  if (!u) return null;
+  return /^https?:\/\//i.test(u) ? u : G99_TOOL_PUBLIC_URL + (u.startsWith("/") ? u : "/" + u);
+}
+
+function jobStatusSnapshot(job) {
+  return {
+    draftId: job.draftId,
+    businessId: job.businessId,
+    status: job.status,                        // queued | running | done | error | cancelled
+    currentStep: job.currentStep,
+    totalSteps: (job.steps || []).length,
+    steps: (job.steps || []).map((s) => ({ label: s.label, status: s.status, detail: s.detail })),
+    error: job.error || null,
+    // The published WordPress site (shared host) — this is the real "live site" once the theme is live.
+    liveUrl: LIVE_URL || null,
+    siteUrl: absUrl(job.siteUrl),
+    prUrl: job.prUrl || null,
+    reportUrl: absUrl(job.reportUrl),
+    scoreBefore: job.before ? job.before.overall : null,
+    scoreAfter: job.after ? job.after.overall : null,
+    scoreDelta: job.delta != null ? job.delta : null,
+    startedAt: job.startedAt || null,
+    finishedAt: job.finishedAt || null,
+  };
+}
+
+function postStatus(job, attempt = 0) {
+  // Only real client builds are tracked in G99 (edit jobs key off an internal jobId, not a draft).
+  if (!G99_STATUS_URL || !job || job.type !== "build") return;
+  const body = JSON.stringify(jobStatusSnapshot(job));
+  fetch(G99_STATUS_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Webhook-Secret": G99_STATUS_SECRET },
+    body,
+  })
+    .then((r) => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    })
+    .catch((e) => {
+      if (attempt < G99_RETRY_DELAYS_MS.length) {
+        setTimeout(() => postStatus(job, attempt + 1), G99_RETRY_DELAYS_MS[attempt]);
+      } else {
+        console.error(`g99 status callback failed for ${job.draftId} after retries:`, e.message);
+      }
+    });
 }
 function siteRequiresApproval(siteId) {
   return !!readApprovals()[siteId];
@@ -1860,6 +1921,7 @@ function enqueueJob(payload) {
   const job = newJob(payload);
   JOBS.set(id, job);
   JOB_QUEUE.push(id); saveJobs();
+  postStatus(job);   // "queued" — G99 records that the build was accepted
   processJobQueue();
   return { job, dedupe: false };
 }
@@ -1892,6 +1954,7 @@ function enqueueRestoreJob(payload) {
 async function runJob(job) {
   job.status = "running";
   job.startedAt = new Date().toISOString(); COST_SINK = job.cost;
+  postStatus(job);   // "running"
   const P = job.payload;
   try {
     // Fresh start: clear the previous client's cached scan/CRO so this job never
@@ -2021,6 +2084,7 @@ async function runJob(job) {
     }
   } finally {
     job.finishedAt = new Date().toISOString(); saveJobs(); COST_SINK = null;
+    postStatus(job);   // terminal: done | error | cancelled (+ siteUrl/prUrl/scores)
   }
 }
 
@@ -2222,6 +2286,7 @@ async function runEditJob(job) {
     }
   } finally {
     job.finishedAt = new Date().toISOString(); saveJobs(); COST_SINK = null;
+    postStatus(job);   // terminal: done | error | cancelled (+ siteUrl/prUrl/scores)
   }
 }
 // Snapshot restore: put the theme tree back exactly as it was at one commit and
