@@ -61,9 +61,36 @@ const FIELDS = [
   ["seo_keywords", "SEO keywords", "textarea"],
 ];
 
+// True when nothing has come in from the platform yet — the screen starts empty
+// rather than pre-filled with a stand-in client someone could ship by accident.
+const hasResponse = () => !!(A && Object.keys(A).length);
+
+function renderEmptyForm() {
+  $("bizChip").textContent = "No client yet";
+  $("formGrid").innerHTML = `
+    <div style="grid-column:1/-1;text-align:center;padding:26px 10px 22px">
+      <div style="font-weight:700;font-size:14px;margin-bottom:6px">No onboarding response yet</div>
+      <p class="desc" style="margin:0 auto 16px;max-width:430px">
+        When a client submits the onboarding wizard, the platform posts it here and their answers
+        appear in this form, ready to review and build.
+      </p>
+      <button class="btn sm" id="loadSample">Load the sample response</button>
+      <p class="hint" style="margin:9px 0 0">For testing the pipeline without a real submission.</p>
+    </div>`;
+  $("buildBtn").disabled = true;
+  $("saveBtn").disabled = true;
+  $("loadSample").onclick = async () => {
+    const b = $("loadSample"); b.disabled = true; b.textContent = "Loading…";
+    try { await api("/api/onboarding-sample", {}); await loadForm(); toast("Sample response loaded."); }
+    catch (e) { b.disabled = false; b.textContent = "Load the sample response"; toast("Could not load it: " + e.message); }
+  };
+}
+
 async function loadForm() {
   try {
     const r = await fetch("/api/onboarding"); ONB = await r.json(); A = ONB.answers || {};
+    if (!hasResponse()) return renderEmptyForm();
+    $("buildBtn").disabled = false; $("saveBtn").disabled = false;
     $("bizChip").textContent = `${A.business_name || "Client"}${A.location ? " · " + A.location : ""}`;
     $("formGrid").innerHTML = FIELDS.map(([k, lbl, type, scope]) => {
       const v = scope === "top" ? (ONB[k] || "") : val(A[k]);
@@ -301,7 +328,24 @@ async function watchThemeLive(slug) {
 // ---------- orchestrator: auto steps 1→4 ----------
 let building = false;
 async function buildBetaSite() {
-  if (building) return; building = true;
+  if (building) return;
+  if (!hasResponse()) { toast("There's no onboarding response to build from yet."); return; }
+  // Multi-minute pipeline that spends Gemini + Stitch credits and opens a PR —
+  // never on a single stray click.
+  const { answers } = collectForm();
+  const ok = await window.G99.confirm({
+    title: "Build the beta site?",
+    body: "Studio audits the current site, composes the brand, generates every page, creates the WordPress theme and opens a pull request. This takes several minutes and spends AI credits.",
+    details: {
+      Business: answers.business_name || "(unnamed)",
+      "Audits": ONB.existingWebsite || answers.existingWebsite || "(none set)",
+      Pages: "Home, Services, About, Contact",
+    },
+    confirmLabel: "Build beta site",
+  });
+  if (!ok) return;
+
+  building = true;
   $("buildBtn").disabled = true; $("saveBtn").disabled = true;
   renderSteps();
   try {

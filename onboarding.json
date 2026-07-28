@@ -1,20 +1,16 @@
 {
-  "draftId": "81",
-  "businessId": 2283,
+  "draftId": "test-952",
+  "businessId": 90210,
   "template": "WEBSITE",
-  "referenceWebsite": "https://ruma.com",
-  "existingWebsite": "https://nuvoaestheticsclinic.com",
+  "referenceWebsite": "https://ro.co",
+  "existingWebsite": "https://elra.com",
   "answers": {
-    "business_name": "NUVO Aesthetics Clinic (clone)",
-    "location": "437 W State St, Sycamore, IL 60178",
-    "phone_for_website": "+13203387829",
-    "business_description": "NUVO Aesthetics Clinic is a premier medical spa in Sycamore, IL, offering regenerative treatments for facial aesthetics and overall well-being. Their goal is to help patients feel amazing and look great as they confidently pursue their goals.",
-    "why_patients_choose": "Patients choose NUVO Aesthetics Clinic for its combination of medical precision and personalized care, ensuring natural-looking enhancements that boost confidence.",
-    "ideal_patient": {
-      "firstVisit": 350,
-      "visitsPerYear": 3,
-      "annual": 1050
-    },
+    "business_name": "Elra Aesthetic",
+    "location": "Old Town, Scottsdale, AZ",
+    "phone_for_website": "(480) 555-0134",
+    "business_description": "Physician-led medical aesthetics and wellness spa offering injectables, advanced skin health, body contouring, laser and IV wellness in a calm, luxurious setting.",
+    "why_patients_choose": "We focus on subtle, natural-looking results that enhance each patient's unique features — medical rigor with an unhurried, warm experience.",
+    "ideal_patient": "Women and men 30–60 seeking premium, natural anti-aging and skin-health treatments; values expertise and discretion.",
     "services_offered": [
       "Cosmetic Injectables",
       "Medical Weight Loss",
@@ -59,7 +55,7 @@
         "role": "Registered Nurse and Certified Aesthetic Injector"
       }
     ],
-    "site_love_1_url": "https://ruma.com",
+    "site_love_1_url": "https://ro.co",
     "site_love_1_reason": "Clean editorial layout, warm luxurious aesthetic, calm spacing.",
     "tone_clinical_warm": "70",
     "tone_lux_approachable": "60",

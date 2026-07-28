@@ -1,0 +1,63 @@
+{
+  "draftId": "test-952",
+  "businessId": 90210,
+  "template": "WEBSITE",
+  "referenceWebsite": "https://ro.co",
+  "existingWebsite": "https://elra.com",
+  "answers": {
+    "business_name": "Elra Aesthetic",
+    "location": "Old Town, Scottsdale, AZ",
+    "phone_for_website": "(480) 555-0134",
+    "business_description": "Physician-led medical aesthetics and wellness spa offering injectables, advanced skin health, body contouring, laser and IV wellness in a calm, luxurious setting.",
+    "why_patients_choose": "We focus on subtle, natural-looking results that enhance each patient's unique features — medical rigor with an unhurried, warm experience.",
+    "ideal_patient": "Women and men 30–60 seeking premium, natural anti-aging and skin-health treatments; values expertise and discretion.",
+    "services_offered": [
+      "Injectables",
+      "Skin Health",
+      "Body Contouring",
+      "Laser Treatments",
+      "Wellness & IV Therapy"
+    ],
+    "revenue_services": [
+      "Tox",
+      "Lip Filler",
+      "SkinPen Microneedling",
+      "Morpheus8"
+    ],
+    "featured_review": "\"The most natural results I've ever had. The team is warm, professional, and truly listens.\" — Google, 5★",
+    "financing_offered": [
+      "Cherry Financing",
+      "Monthly VIP Membership"
+    ],
+    "booking_platform": "Boulevard",
+    "primary_cta": "Book a consultation",
+    "logo_file": "https://elanaesthetics.com/assets/elan-logo.png",
+    "team_roster": [
+      {
+        "name": "Dr. Amara Vance",
+        "title": "MD, Medical Director",
+        "bio": "Board-certified physician specializing in facial aesthetics with 12 years in practice."
+      },
+      {
+        "name": "Nadia Cole",
+        "title": "NP-C, Aesthetic Injector",
+        "bio": "Master injector focused on natural lip and jawline enhancement."
+      }
+    ],
+    "site_love_1_url": "https://ro.co",
+    "site_love_1_reason": "Clean editorial layout, warm luxurious aesthetic, calm spacing.",
+    "tone_clinical_warm": 72,
+    "tone_lux_approachable": 35,
+    "tone_bold_understated": 68,
+    "tone_playful_serious": 70,
+    "brand_aesthetic": "Luxurious",
+    "hero_headline": "Artistry in aesthetics, guided by medicine",
+    "hero_subheadline": "Physician-led aesthetics & wellness in Old Town Scottsdale.",
+    "seo_keywords": [
+      "botox scottsdale",
+      "lip filler scottsdale",
+      "morpheus8 arizona",
+      "medspa scottsdale"
+    ]
+  }
+}

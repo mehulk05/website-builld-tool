@@ -3,143 +3,158 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Growth99 · Edit a Site</title>
-<link rel="stylesheet" href="/theme.css?v=2">
+<title>Growth99 · Edit a site</title>
+<link rel="stylesheet" href="/theme.css?v=10">
 <style>
-  *{box-sizing:border-box}
-  body{margin:0;background:transparent;color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.55}
-  a{color:var(--accent)}
-  .wrap{max-width:1000px;margin:0 auto;padding:38px 30px 100px}
+  body { height: 100vh; overflow: hidden; }
+  .shell { height: 100vh; display: flex; flex-direction: column; gap: 12px; padding: 14px; animation: g99fadeup .32s ease both; }
 
-  /* page header */
-  .phead{margin-bottom:26px}
-  .phead h1{font-size:26px;margin:0 0 6px}
-  .phead p{margin:0;color:var(--muted);font-size:14px;max-width:640px}
+  /* ---- top bar ----
+     Deliberately NOT called .bar: theme.css owns .bar as the 6px progress bar
+     (height + overflow:hidden), which silently collapsed this header. */
+  .topbar { display: flex; align-items: center; gap: 13px; flex-wrap: wrap; flex: none; }
+  .topbar .back { color: var(--muted); display: inline-flex; }
+  .topbar .back:hover { color: var(--ink); }
+  .topbar .nm { font-size: 15px; font-weight: 800; letter-spacing: -.01em; margin: 0; }
+  .topbar .dm { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 1px; }
+  .topbar .right { margin-left: auto; display: flex; align-items: center; gap: 11px; flex-wrap: wrap; }
 
-  /* card + section header */
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:20px 22px;margin-bottom:18px}
-  .card.dim{opacity:.55;pointer-events:none}
-  .shead{display:flex;align-items:center;gap:10px;margin-bottom:16px}
-  .shead .ico{width:30px;height:30px;border-radius:8px;background:var(--line-2);border:1px solid var(--line);color:var(--ink);display:grid;place-items:center;flex:none}
-  .shead .ico svg{width:16px;height:16px}
-  .shead h2{font-size:15px;margin:0;font-weight:650}
-  .shead .sub{font-size:12.5px;color:var(--muted);margin:1px 0 0}
-  .shead .right{margin-left:auto}
-  .linkbtn{background:none;border:none;color:var(--accent);font:inherit;font-size:13px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:5px}
-  .linkbtn svg{width:14px;height:14px}
+  .panes { display: grid; grid-template-columns: 400px 1fr; gap: 14px; flex: 1; min-height: 0; }
+  /* Chat panel collapsed — the preview takes the whole width. */
+  .panes.nochat { grid-template-columns: 1fr; }
+  .panes.nochat .chatpane { display: none; }
+  .mobtabs { display: none; }
+  /* One column on small screens — the two panes become tabs rather than the
+     preview simply vanishing. */
+  @media (max-width: 900px) {
+    .panes, .panes.nochat { grid-template-columns: 1fr; }
+    .mobtabs { display: flex; flex: none; }
+    .panes.show-chat .prev { display: none; }
+    /* the tabs own the panel switch here, so they also override .nochat */
+    .panes.show-chat .chatpane { display: flex; }
+    .panes.show-preview .chatpane { display: none; }
+    #togglePane { display: none; }
+  }
 
-  /* site grid */
-  .sites{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-  @media(max-width:680px){.sites{grid-template-columns:1fr}}
-  .site{display:flex;gap:12px;align-items:flex-start;text-align:left;width:100%;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:13px 14px;cursor:pointer;font:inherit;color:var(--ink);position:relative}
-  .site:hover{border-color:var(--ink-3);box-shadow:var(--shadow)}
-  .site.sel{border-color:var(--ink);box-shadow:0 0 0 3px color-mix(in srgb,var(--ink) 12%,transparent)}
-  .site .ava{width:36px;height:36px;border-radius:9px;flex:none;display:grid;place-items:center;color:#fff;font-weight:700;font-size:15px;font-family:var(--display)}
-  .site-main{min-width:0;flex:1}
-  .site-nm{font-weight:600;font-size:13.5px;display:flex;align-items:center;gap:8px;padding-right:56px}
-  .site-slug{display:inline-block;max-width:100%;font-size:11px;font-weight:600;color:var(--ink-3);background:var(--line-2);border:1px solid var(--line);border-radius:6px;padding:2px 8px;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:top}
-  .site-last{font-size:11.5px;color:var(--ink-3);margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .live{position:absolute;top:13px;right:13px;display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:700;letter-spacing:.04em;color:var(--good);background:var(--good-soft);border-radius:999px;padding:3px 9px}
-  .live .dot{width:6px;height:6px;border-radius:50%;background:var(--good);margin:0}
-  .site .check{position:absolute;bottom:12px;right:12px;width:18px;height:18px;color:var(--ink);opacity:0;transition:.12s}
-  .site.sel .check{opacity:1}
+  .pane {
+    display: flex; flex-direction: column; min-width: 0;
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 16px; box-shadow: var(--shadow-sm); overflow: hidden;
+  }
 
-  /* presets */
-  .presets{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
-  .preset{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;border:1px solid var(--line);background:var(--panel);color:var(--ink-2);border-radius:8px;padding:7px 12px;cursor:pointer;font-weight:500}
-  .preset:hover{border-color:var(--ink-3);color:var(--ink);background:var(--line-2)}
-  .preset svg{width:13px;height:13px;color:var(--muted)}
+  /* ---- chat ----
+     Deliberately minimal: assistant turns are plain text, and a run collapses to
+     one status line. The blow-by-blow of a run lives on the Activity screen. */
+  .thread { flex: 1; overflow: auto; padding: 18px 16px; display: flex; flex-direction: column; gap: 15px; }
+  .msg { display: flex; }
+  .msg .col { width: 100%; min-width: 0; display: flex; flex-direction: column; gap: 9px; }
+  .msg.user { justify-content: flex-end; }
+  .msg.user .col { width: auto; max-width: 85%; align-items: flex-end; }
+  .say { font-size: 13.5px; line-height: 1.55; color: var(--ink); }
+  .bubble {
+    border-radius: 14px; padding: 10px 14px; font-size: 13.5px; line-height: 1.5;
+    background: var(--surface-2); border: 1px solid var(--line); color: var(--ink);
+  }
 
-  textarea{width:100%;min-height:132px;border:1px solid var(--line);border-radius:12px;padding:14px 16px;font:inherit;font-size:14px;color:var(--ink);background:var(--panel);resize:vertical;box-shadow:inset 0 1px 2px rgba(16,16,28,.03)}
-  textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
-  textarea::placeholder{color:var(--muted)}
+  .run { width: 100%; background: var(--surface-2); border: 1px solid var(--line); border-radius: 12px; padding: 11px 13px; display: flex; flex-direction: column; gap: 7px; }
+  .run .rl { display: flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 700; }
+  .run .rl .grow { flex: 1; min-width: 0; }
+  .run .sum { font-size: 12.5px; line-height: 1.45; color: var(--ink-2); }
+  .run .acts { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-top: 2px; }
+  .run .acts .end { margin-left: auto; }
+  /* The chat pane is deliberately monochrome, like the reference: only
+     success / warning / failure carry colour. */
+  .chatpane .spin { border-top-color: var(--ink); margin: 0; }
+  .chatpane .linkbtn { color: var(--ink-2); }
+  .chatpane .linkbtn:hover { color: var(--ink); }
 
-  /* toggle switch */
-  .switch{display:inline-flex;align-items:center;gap:10px;font-size:13px;color:var(--ink-2);cursor:pointer;user-select:none}
-  .switch input{position:absolute;opacity:0;width:0;height:0}
-  .track{width:38px;height:22px;border-radius:999px;background:var(--line);position:relative;transition:.16s;flex:none}
-  .track::after{content:"";position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.2);transition:.16s}
-  .switch input:checked+.track{background:var(--ink)}
-  .switch input:checked+.track::after{transform:translateX(16px)}
+  .composer { border-top: 1px solid var(--line); padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; flex: none; }
+  .chips { display: flex; gap: 7px; overflow-x: auto; padding-bottom: 2px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px; font-size: 12px; white-space: nowrap;
+    border: 1px solid var(--line); background: var(--surface); color: var(--ink-2);
+    border-radius: 99px; padding: 6px 11px; cursor: pointer; font-weight: 600; flex: none;
+    transition: border-color .14s, color .14s, background .14s;
+  }
+  .chip:hover { border-color: var(--ink-3); color: var(--ink); background: var(--line-2); }
+  .chip svg { color: var(--muted); }
+  .chip:hover svg { color: var(--ink); }
 
-  .row{display:flex;gap:10px;align-items:center;margin-top:16px;flex-wrap:wrap}
-  .btn{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:9px 15px;border-radius:9px;font:inherit;font-weight:600;font-size:13px;cursor:pointer}
-  .btn svg{width:14px;height:14px}
-  .btn:hover{border-color:var(--ink-3);background:var(--line-2)}
-  .btn:disabled{opacity:.5;cursor:not-allowed}
-  .btn.primary{background:var(--primary);color:var(--primary-ink);border:none;margin-left:auto}
-  .btn.primary:hover{filter:brightness(1.1)}
-  .hint{font-size:12.5px;color:var(--muted)}
-  .spin{display:inline-block;width:13px;height:13px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:6px}
-  @keyframes sp{to{transform:rotate(360deg)}}
+  .box {
+    display: flex; align-items: flex-end; gap: 8px; border: 1px solid var(--line);
+    border-radius: 13px; padding: 8px 8px 8px 13px; background: var(--surface-2);
+    transition: border-color .14s, box-shadow .14s, background .14s;
+  }
+  .box:focus-within { border-color: var(--ink-3); background: var(--surface); box-shadow: 0 0 0 3px var(--line-2); }
+  .box textarea {
+    flex: 1; border: none; outline: none; background: none; font: inherit; font-size: 13.5px;
+    line-height: 1.5; color: var(--ink); resize: none; max-height: 120px; padding: 5px 0;
+    box-shadow: none; border-radius: 0;
+  }
+  .box textarea:focus { box-shadow: none; }
+  .iconbtn {
+    flex: none; width: 34px; height: 34px; border-radius: 9px; border: none;
+    background: var(--ink-btn); color: #fff; display: grid; place-items: center;
+    cursor: pointer; padding: 0; transition: filter .14s;
+  }
+  .iconbtn:hover { filter: brightness(1.18); }
+  .iconbtn:disabled { opacity: .45; cursor: not-allowed; }
+  .iconbtn.ghost { background: var(--surface); border: 1px solid var(--line); color: var(--ink-2); }
+  .iconbtn.ghost:hover { border-color: var(--ink-3); color: var(--ink); filter: none; }
 
-  /* PR history — clean pill rows */
-  #history{display:flex;flex-direction:column;gap:2px}
-  .hrow{display:grid;grid-template-columns:54px 40px 1fr auto auto 84px 16px;gap:12px;align-items:center;padding:11px 12px;border-radius:10px;text-decoration:none;color:var(--ink)}
-  .hrow:hover{background:var(--line-2)}
-  .hrow:hover .hext{opacity:1}
-  .htype{font-size:9.5px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;border-radius:6px;padding:4px 0;text-align:center}
-  .htype.build{background:var(--line-2);color:var(--ink-3)} .htype.edit{background:var(--accent-soft);color:var(--accent)}
-  .hnum{font-family:var(--mono);font-size:12px;color:var(--muted);text-align:right}
-  .htitle{font-size:13px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .hbuild{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:700;border-radius:999px;padding:3px 10px 3px 8px;letter-spacing:.01em;white-space:nowrap}
-  .hbuild svg{width:13px;height:13px}
-  .hbuild.passing{background:var(--good-soft);color:var(--good)}
-  .hbuild.failing{background:var(--bad-soft);color:var(--bad)}
-  .hbuild.pending{background:#fdf3e3;color:var(--warn)}
-  .hbuild.none{background:var(--line-2);color:var(--muted)}
-  .hstate{font-size:11px;font-weight:700;border-radius:999px;padding:3px 11px;text-align:center;letter-spacing:.01em}
-  .hstate.open{background:var(--good-soft);color:var(--good)}
-  .hstate.merged{background:var(--accent-soft);color:var(--accent)}
-  .hstate.closed{background:var(--line-2);color:var(--muted)}
-  .hdate{font-family:var(--mono);font-size:11.5px;color:var(--muted);text-align:right}
-  .hext{color:var(--muted);opacity:0;transition:.12s;display:flex}
-  .empty{color:var(--muted);text-align:center;padding:28px 0;font-size:13px}
+  /* ---- preview ---- */
+  .pv-bar { display: flex; align-items: center; gap: 11px; padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--surface-2); flex: none; }
+  .pv-bar .lights { display: flex; gap: 6px; flex: none; }
+  .pv-bar .lights i { width: 10px; height: 10px; border-radius: 50%; display: block; }
+  .pv-bar .url {
+    flex: 1; min-width: 0; display: flex; align-items: center; gap: 7px; max-width: 340px;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 5px 11px;
+  }
+  .pv-bar .url span { font-family: var(--mono); font-size: 11px; color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pv-stage { flex: 1; overflow: auto; background: #ecece8; display: flex; justify-content: center; padding: 0; }
+  .pv-stage.mobile { padding: 22px; }
+  .pv-stage iframe { width: 100%; height: 100%; border: 0; background: #fff; transition: width .28s ease; }
+  .pv-stage.mobile iframe { width: 390px; max-width: 100%; border-radius: 18px; align-self: flex-start; height: calc(100% - 44px); box-shadow: 0 1px 3px rgba(0, 0, 0, .06); }
+  .pv-empty { flex: 1; display: grid; place-items: center; background: var(--surface-2); text-align: center; padding: 40px; }
 
-  .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--panel);padding:11px 18px;border-radius:10px;font-size:13.5px;box-shadow:var(--shadow-lg);opacity:0;pointer-events:none;transition:.25s;z-index:80}
-  .toast.show{opacity:1}
+  /* ---- version history slide-over ---- */
+  .vscrim { position: fixed; inset: 0; z-index: 240; background: rgba(18, 18, 26, .32); backdrop-filter: blur(3px); }
+  .vpanel {
+    position: fixed; top: 0; right: 0; bottom: 0; width: min(430px, 94vw); z-index: 241;
+    display: flex; flex-direction: column; background: var(--surface);
+    border-left: 1px solid var(--line); box-shadow: var(--shadow-lg); animation: g99slidein .2s ease both;
+  }
+  @keyframes g99slidein { from { transform: translateX(26px); opacity: 0; } to { transform: none; opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .vpanel { animation: none; } }
+  .vpanel .vh2 { display: flex; align-items: flex-start; gap: 10px; padding: 16px 18px 14px; border-bottom: 1px solid var(--line); }
+  .vpanel .vh2 h2 { margin: 0 0 3px; font-size: 15px; }
+  .vpanel .vh2 p { margin: 0; font-size: 12px; color: var(--muted); line-height: 1.45; }
+  .vpanel .vlist { flex: 1; overflow: auto; padding: 8px; }
+  .ver { display: flex; align-items: flex-start; gap: 11px; padding: 11px 12px; border-radius: 10px; }
+  .ver + .ver { border-top: 1px solid var(--line-2); }
+  .ver:hover { background: var(--line-2); }
+  .ver .vt { flex: 1; min-width: 0; }
+  .ver .vt .t { font-size: 13px; font-weight: 700; color: var(--ink); line-height: 1.4; }
+  .ver .vt .m { font-size: 11px; color: var(--muted); margin-top: 3px; }
+  .ver .vt .m .sha { font-family: var(--mono); }
+  .ver .vt .m a { color: var(--ink-2); text-decoration: underline; }
+
+  /* ---- site picker overlay ---- */
+  .picker { position: fixed; inset: 0; z-index: 250; background: rgba(18, 18, 26, .32); backdrop-filter: blur(3px); display: grid; place-items: center; padding: 24px; }
+  .picker .box2 { width: min(640px, 94vw); max-height: 80vh; display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow-lg); overflow: hidden; animation: g99pop .18s ease both; }
+  .picker .hd { padding: 18px 20px 14px; border-bottom: 1px solid var(--line); }
+  .picker .hd h2 { margin: 0 0 4px; font-size: 16px; }
+  .picker .hd p { margin: 0; font-size: 12.5px; color: var(--muted); }
+  .picker .list { overflow: auto; padding: 8px; }
+  .picker .it { display: flex; align-items: center; gap: 11px; padding: 11px 12px; border-radius: 10px; cursor: pointer; text-decoration: none; color: inherit; }
+  .picker .it:hover { background: var(--line-2); }
+  .picker .it .nm { font-size: 13.5px; font-weight: 700; }
+  .picker .it .dm { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 1px; }
 </style>
 </head>
-<body>
-<div class="wrap">
-  <div class="phead">
-    <h1>Edit a live site</h1>
-    <p>Pick a deployed site, describe the change in plain English, and ship it — the tool pulls the code, applies the edit with AI, opens a PR, and merges when the build is green.</p>
-  </div>
-
-  <div class="card">
-    <div class="shead">
-      <span class="ico"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6a2 2 0 012-2h12a2 2 0 012 2v12a2 2 0 01-2 2H6a2 2 0 01-2-2V6z"/><path stroke-linecap="round" stroke-linejoin="round" d="M4 9h16"/></svg></span>
-      <div><h2>Choose a site</h2><div class="sub">Read live from the WordPress repository</div></div>
-      <div class="right"><button class="linkbtn" id="refresh"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>Refresh</button></div>
-    </div>
-    <div class="sites" id="sites"><p class="empty"><span class="spin"></span>Loading sites…</p></div>
-  </div>
-
-  <div class="card dim" id="historyCard">
-    <div class="shead">
-      <span class="ico"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg></span>
-      <div><h2>Change history</h2><div class="sub">Every build &amp; edit PR — click to view the diff on GitHub</div></div>
-    </div>
-    <div id="history"><p class="empty">Select a site to load its history.</p></div>
-  </div>
-
-  <div class="card dim" id="editCard">
-    <div class="shead">
-      <span class="ico"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg></span>
-      <div><h2>Describe the change</h2><div class="sub">Use a template, type freely, or refine a rough idea with AI</div></div>
-    </div>
-    <div class="presets" id="presets"></div>
-    <textarea id="prompt" placeholder="e.g. Add a Terms of Service page with standard sections, linked in the main navigation."></textarea>
-    <div class="row">
-      <label class="switch"><input type="checkbox" id="approvalToggle"><span class="track"></span>Require approval before merge</label>
-    </div>
-    <div class="row">
-      <button class="btn" id="suggestBtn"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z"/></svg>Improve with AI</button>
-      <span class="hint" id="suggestHint"></span>
-      <button class="btn primary" id="applyBtn">Apply change<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 7l5 5m0 0l-5 5m5-5H6"/></svg></button>
-    </div>
-  </div>
+<body data-shell="none" data-title="Edit a site">
+<div class="shell" id="shell">
+  <p class="empty"><span class="spin"></span>Loading…</p>
 </div>
 <div class="toast" id="toast"></div>
 <script src="/nav.js"></script>

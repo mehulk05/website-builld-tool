@@ -37,7 +37,13 @@ const PORT = process.env.PORT || 8793;
 const API_KEY = process.env.STITCH_API_KEY || "";
 const MCP_URL = "https://stitch.googleapis.com/mcp";
 const GEMINI_KEYS = (process.env.GEMINI_KEYS || "").split(",").map(s => s.trim()).filter(Boolean);
+// NocoDB is the source of truth for real websites (name / domain / repo). The
+// table id is derived from the shared board URL; only the token is a secret.
+const NOCODB_BASE = (process.env.NOCODB_BASE || "https://app.nocodb.com").replace(/\/$/, "");
+const NOCODB_TOKEN = process.env.NOCODB_TOKEN || "";
+const NOCODB_TABLE = process.env.NOCODB_TABLE || "mp8nfno2six11yi";
 if (!API_KEY) console.warn("⚠ STITCH_API_KEY not set — Stitch generation will fail. Add it to .env or the platform env vars.");
+if (!NOCODB_TOKEN) console.warn("⚠ NOCODB_TOKEN not set — the All Sites / Edit Sites website list will be empty until it's added to .env.");
 if (!GEMINI_KEYS.length) console.warn("⚠ GEMINI_KEYS not set — all AI features (CRO, prompt, bind, QC) will fail.");
 let GEMINI_KEY = GEMINI_KEYS[0];                 // kept for legacy call sites
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-lite-latest";
@@ -1539,7 +1545,9 @@ async function detectActiveTheme(url) {
   try {
     const r = await fetch(url, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36", "Cache-Control": "no-cache" } });
     if (!r.ok) return null;
-    const m = (await r.text()).match(/\/themes\/(g99-[a-z0-9-]+)\//i);
+    // Active theme's assets are enqueued as /themes/<slug>/… . Accept any slug
+    // (real client sites aren't all g99-*, e.g. "ecka"), first match wins.
+    const m = (await r.text()).match(/\/themes\/([a-z0-9][a-z0-9._-]*)\//i);
     return m ? m[1] : null;
   } catch (e) { return null; }
 }
@@ -1580,6 +1588,92 @@ async function syncSiteRegistry() {
   return reg;
 }
 
+// ---------------------------------------------------------------- NocoDB sites
+// Real websites (name / domain / repo) live in a NocoDB table — one row per
+// client site, each mapped to its OWN GitHub repo. This replaces the old
+// "every theme folder in WP_REPO is a site" model, which conflated themes with
+// websites. A short in-memory cache keeps the board responsive.
+let NOCO_CACHE = { sites: [], at: 0 };
+// case/space-insensitive field read with a few tolerated aliases
+function nocoField(row, names) {
+  const keys = Object.keys(row || {});
+  for (const n of names) {
+    const k = keys.find(k => k.toLowerCase().trim() === n.toLowerCase().trim());
+    if (k && row[k] != null && String(row[k]).trim()) return String(row[k]).trim();
+  }
+  return "";
+}
+// "https://github.com/Owner/Repo(.git)" (or git@…) -> "Owner/Repo". Repo names
+// can contain dots (e.g. prodteam.gogroth.com), so split rather than a greedy RE.
+function parseRepoSlug(url) {
+  const s = String(url || "").trim().replace(/\.git$/i, "").replace(/\/+$/, "");
+  const m = s.match(/github\.com[/:](.+)$/i);
+  if (!m) return "";
+  const parts = m[1].split("/").filter(Boolean);
+  return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : "";
+}
+function mapNocoRow(row) {
+  const businessName = nocoField(row, ["Website name", "Website Name", "Name", "Business", "Business Name"]);
+  const liveUrl = nocoField(row, ["Domain", "Website URL", "URL", "Site URL", "Live URL"]);
+  const repoUrl = nocoField(row, ["Repo File Path", "Repository URL", "Repo", "Repository", "GitHub", "Github Repo"]);
+  const githubRepo = parseRepoSlug(repoUrl);
+  const rowId = row.Id != null ? row.Id : (row.id != null ? row.id : null);
+  const siteId = rowId != null ? `noco-${rowId}` : (githubRepo || businessName);
+  return { siteId, rowId, businessName, liveUrl, repoUrl, githubRepo };
+}
+async function fetchNocoWebsites() {
+  if (!NOCODB_TOKEN) throw new Error("NOCODB_TOKEN not set — add it to .env");
+  const url = `${NOCODB_BASE}/api/v2/tables/${NOCODB_TABLE}/records?limit=200`;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 15000);
+  let r;
+  try { r = await fetch(url, { signal: ctl.signal, headers: { "xc-token": NOCODB_TOKEN, "accept": "application/json" } }); }
+  finally { clearTimeout(timer); }
+  if (!r.ok) throw new Error(`NocoDB ${r.status}: ${(await r.text()).slice(0, 160)}`);
+  const d = await r.json();
+  return (d.list || []).map(mapNocoRow).filter(w => w.businessName && w.githubRepo);
+}
+async function getWebsites(refresh) {
+  if (!refresh && NOCO_CACHE.sites.length && Date.now() - NOCO_CACHE.at < 60000) return NOCO_CACHE.sites;
+  const sites = await fetchNocoWebsites();
+  NOCO_CACHE = { sites, at: Date.now() };
+  return sites;
+}
+async function findWebsite(siteId) {
+  return (await getWebsites(false)).find(s => s.siteId === String(siteId))
+      || (await getWebsites(true)).find(s => s.siteId === String(siteId));   // cache miss → force refresh once
+}
+// Real theme dirs in a repo (no clone — one contents API call). Excludes the
+// .gitkeep placeholder and any dotfiles; accepts any theme name, not just g99-*.
+async function listRepoThemes(repo) {
+  const r = await sh(`gh api "repos/${repo}/contents/web/app/themes?ref=main" --jq ".[]|select(.type==\\"dir\\")|.name"`);
+  return (r.stdout || "").split("\n").map(s => s.trim()).filter(s => s && !s.startsWith("."));
+}
+// Which theme in the website's repo an edit should target: prefer the theme the
+// live domain is actually serving (and that exists in the repo); else the sole
+// theme in the repo; else a clear error. A g99-* theme also carries its
+// auto-activator mu-plugin; hand-onboarded themes (e.g. "ecka") do not.
+async function resolveEditTarget(website) {
+  const liveSlug = website.liveUrl ? await detectActiveTheme(website.liveUrl) : null;
+  const themes = await listRepoThemes(website.githubRepo).catch(() => []);
+  let slug = null;
+  if (liveSlug && themes.includes(liveSlug)) slug = liveSlug;       // best: live theme, confirmed in repo
+  else if (themes.length === 1) slug = themes[0];                   // only one theme → unambiguous
+  else if (liveSlug && !themes.length) slug = liveSlug;             // repo listing failed → trust the live slug
+  if (!slug) {
+    throw new Error(`Couldn't determine which theme to edit for ${website.businessName}. The live domain (${website.liveUrl || "none set"}) ${liveSlug ? `serves "${liveSlug}", which isn't in the repo` : "didn't reveal an active theme"}, and the repo has ${themes.length} theme(s)${themes.length ? ` (${themes.join(", ")})` : ""}. Set the correct Domain in NocoDB, or ensure the repo has exactly one theme.`);
+  }
+  const bare = slug.replace(/^g99-/, "");
+  const muPath = slug.startsWith("g99-") ? `web/app/mu-plugins/g99-activate-${bare}.php` : "";
+  return { themeSlug: slug, themePath: `web/app/themes/${slug}`, muPath, themes };
+}
+
+// Per-site "require approval before merge" is stored locally (siteId -> bool),
+// independent of NocoDB, so operators can gate merges per website.
+const APPROVALS_FILE = path.join(DIR, "approvals.json");
+function readApprovals() { try { return JSON.parse(fs.readFileSync(APPROVALS_FILE, "utf8")); } catch (e) { return {}; } }
+function writeApprovals(m) { fs.writeFileSync(APPROVALS_FILE, JSON.stringify(m, null, 2)); }
+
 // Scheduled re-audit: re-score the live active site, store the trend, alert on
 // regression. Runs on demand (/api/reaudit) and on a timer (REAUDIT_HOURS>0).
 const REAUDIT_FILE = path.join(DIR, "reaudit.json");
@@ -1595,6 +1689,33 @@ async function reauditActiveSite() {
   const regression = !!(prev && entry.overall < prev.overall - 5);
   if (regression) notify(`⚠️ CRO regression on *${slug}*: ${prev.overall} → ${entry.overall} (${LIVE_URL})`);
   return { entry, prev: prev || null, regression };
+}
+
+// Per-website CRO audits, keyed by NocoDB siteId. Each run carries the previous
+// overall forward as `before`, so Studio can show a real before → now delta on
+// the site page, the sites grid and the overview without re-deriving it.
+const SITE_AUDITS_FILE = path.join(DIR, "site-audits.json");
+function readSiteAudits() { try { return JSON.parse(fs.readFileSync(SITE_AUDITS_FILE, "utf8")); } catch (e) { return {}; } }
+function writeSiteAudits(m) { fs.writeFileSync(SITE_AUDITS_FILE, JSON.stringify(m, null, 2)); }
+async function auditWebsite(site) {
+  if (!site.liveUrl) throw new Error("This website has no Domain set in NocoDB — nothing to audit.");
+  const rep = await croAudit({ url: site.liveUrl, label: site.businessName || site.liveUrl });
+  const num = (v) => (typeof v === "number" && isFinite(v) ? Math.round(v) : null);
+  const store = readSiteAudits();
+  const prev = store[site.siteId];
+  const entry = {
+    siteId: site.siteId, url: site.liveUrl, overall: rep.overall,
+    before: prev ? prev.overall : null,
+    cats: {
+      vision: num(rep.vision && rep.vision.score), ux: num(rep.ux && rep.ux.score),
+      cro: num(rep.cro && rep.cro.score), content: num(rep.content && rep.content.score),
+    },
+    summary: rep.summary || {},
+    at: new Date().toISOString(),
+  };
+  store[site.siteId] = entry;
+  writeSiteAudits(store);
+  return entry;
 }
 
 function newJob(payload) {
@@ -1619,6 +1740,20 @@ function newEditJob(payload) {
     businessName: payload.businessName || payload.siteId || "Site",
     status: "queued", currentStep: 0,
     steps: EDIT_STEPS.map((label) => ({ label, status: "pending", detail: "" })),
+    payload, prUrl: null, branch: null, siteUrl: null,
+    editPlan: null, editSummary: null, error: null,
+    cost: { gemini: 0, stitch: 0 }, cancelRequested: false, awaitingApproval: false,
+    createdAt: new Date().toISOString(), startedAt: null, finishedAt: null,
+  };
+}
+const RESTORE_STEPS = ["Pull latest code", "Roll the theme back", "Push + open PR", "CI checks → auto-merge", "Sync registry"];
+function newRestoreJob(payload) {
+  return {
+    type: "restore",
+    draftId: String(payload.jobId), businessId: null,
+    businessName: payload.businessName || payload.siteId || "Site",
+    status: "queued", currentStep: 0,
+    steps: RESTORE_STEPS.map((label) => ({ label, status: "pending", detail: "" })),
     payload, prUrl: null, branch: null, siteUrl: null,
     editPlan: null, editSummary: null, error: null,
     cost: { gemini: 0, stitch: 0 }, cancelRequested: false, awaitingApproval: false,
@@ -1701,7 +1836,7 @@ function postStatus(job, attempt = 0) {
     });
 }
 function siteRequiresApproval(siteId) {
-  return !!(readRegistry().sites || []).find(s => s.siteId === siteId && s.requireApproval);
+  return !!readApprovals()[siteId];
 }
 // Per-site approval gate: with green CI, if the site requires approval, pause
 // (up to 60 min) until /api/job-approve flips job.approved — then merge.
@@ -1796,12 +1931,20 @@ async function processJobQueue() {
   if (!id) return;
   JOB_RUNNING = true;
   const job = JOBS.get(id);
-  try { await (job && job.type === "edit" ? runEditJob(job) : runJob(job)); }
+  const RUNNER = { edit: runEditJob, restore: runRestoreJob };
+  try { await ((job && RUNNER[job.type] ? RUNNER[job.type] : runJob)(job)); }
   catch (e) { console.error("job runner crashed:", e); }
   finally { JOB_RUNNING = false; processJobQueue(); }
 }
 function enqueueEditJob(payload) {
   const job = newEditJob(payload);
+  JOBS.set(job.draftId, job);
+  JOB_QUEUE.push(job.draftId); saveJobs();
+  processJobQueue();
+  return job;
+}
+function enqueueRestoreJob(payload) {
+  const job = newRestoreJob(payload);
   JOBS.set(job.draftId, job);
   JOB_QUEUE.push(job.draftId); saveJobs();
   processJobQueue();
@@ -2112,7 +2255,7 @@ async function runEditJob(job) {
     for (let i = 0; i < 90 && !merged; i++) {
       let st; try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); } catch (e) { await sleep(10000); continue; }
       jobStep(job, 4, "running", (st.checks || []).map(c => `${c.name}:${c.status}`).join(" ") || "CI starting…");
-      if (st.allPass) { await awaitApprovalIfNeeded(job, P.themeSlug, 4); await localApi("/api/pr-merge", { prUrl: job.prUrl }); merged = true; jobStep(job, 4, "done", `Merged${fixes ? ` after ${fixes} fix(es)` : ""}`); break; }
+      if (st.allPass) { await awaitApprovalIfNeeded(job, P.siteId, 4); await localApi("/api/pr-merge", { prUrl: job.prUrl }); merged = true; jobStep(job, 4, "done", `Merged${fixes ? ` after ${fixes} fix(es)` : ""}`); break; }
       if (st.anyFail) {
         if (fixes >= 3) throw new Error("CI still failing after 3 auto-fix attempts — " + job.prUrl);
         fixes++; jobStep(job, 4, "running", `Build failed — Gemini auto-fix ${fixes}/3…`);
@@ -2146,6 +2289,110 @@ async function runEditJob(job) {
     postStatus(job);   // terminal: done | error | cancelled (+ siteUrl/prUrl/scores)
   }
 }
+// Snapshot restore: put the theme tree back exactly as it was at one commit and
+// ship it through the same PR → CI → approval → merge path as an edit. No AI, no
+// force-push, no history rewrite — the restore is just another commit forward.
+async function runRestoreJob(job) {
+  job.status = "running";
+  job.startedAt = new Date().toISOString(); COST_SINK = job.cost;
+  const P = job.payload;                 // {siteId, themeSlug, themePath, muPath, githubRepo, businessName, sha, versionLabel}
+  const repo = P.githubRepo || WP_REPO;
+  const tmp = path.join(os.tmpdir(), "g99restore-" + Date.now());
+  const run = async (cmd, cwd) => sh(cmd, cwd);
+  const runRetry = async (cmd, cwd, n = 3) => { let r; for (let i = 1; i <= n; i++) { r = await run(cmd, cwd); if (!r.code) return r; await sleep(3000 * i); } return r; };
+  try {
+    // 1 — full clone: unlike an edit, this needs the history the sha lives in.
+    jobStep(job, 0, "running", "Cloning " + repo);
+    let r = await runRetry(`gh repo clone ${repo} "${tmp}"`);
+    const cloneUrl = process.env.GH_TOKEN ? `https://x-access-token:${process.env.GH_TOKEN}@github.com/${repo}.git` : `https://github.com/${repo}.git`;
+    if (r.code) r = await runRetry(`git clone "${cloneUrl}" "${tmp}"`);
+    if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
+    if (process.env.GH_TOKEN) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
+    r = await run(`git rev-parse --verify --quiet ${P.sha}`, tmp);
+    if (r.code || !r.stdout.trim()) throw new Error(`commit ${P.sha.slice(0, 7)} isn't in ${repo}`);
+    const full = r.stdout.trim();
+    // The theme must exist at that commit, or "restore" would just delete it.
+    r = await run(`git ls-tree ${full} -- "${P.themePath}"`, tmp);
+    if (!r.stdout.trim()) throw new Error(`${P.themePath} didn't exist at ${P.sha.slice(0, 7)} — nothing to restore to`);
+    jobStep(job, 0, "done", "Latest code pulled");
+
+    // 2 — swap the theme tree for the one at that commit. Removing first is what
+    // makes this a snapshot: files added after the version go away too.
+    jobStep(job, 1, "running", "Restoring " + P.themeSlug + " to " + P.sha.slice(0, 7));
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
+    const branch = `g99/restore-${P.themeSlug.replace(/^g99-/, "")}-${stamp}`;
+    await run(`git checkout -b "${branch}"`, tmp);
+    await run(`git rm -r -q --ignore-unmatch -- "${P.themePath}"`, tmp);
+    r = await run(`git checkout ${full} -- "${P.themePath}"`, tmp);
+    if (r.code) throw new Error("restore failed: " + (r.stderr || r.stdout).slice(-200));
+    // The activator plugin only comes along if it existed then; deleting a
+    // plugin the live site now depends on would take the theme offline.
+    if (P.muPath) {
+      const had = await run(`git ls-tree ${full} -- "${P.muPath}"`, tmp);
+      if (had.stdout.trim()) await run(`git checkout ${full} -- "${P.muPath}"`, tmp);
+    }
+    // Guardrail: a restore may only ever touch this website's own files.
+    // --cached against HEAD lists one clean path per line (no status columns or
+    // rename arrows to parse) and everything above is already staged.
+    const status = await run(`git diff --cached --name-only HEAD`, tmp);
+    const touched = status.stdout.split("\n").map(l => l.trim().replace(/^"|"$/g, "")).filter(Boolean);
+    const stray = touched.filter(f => f !== P.muPath && !f.startsWith(P.themePath + "/"));
+    if (stray.length) throw new Error("restore would touch files outside the theme — aborted: " + stray.slice(0, 3).join(", "));
+    if (!touched.length) throw new Error("that version is already what's live — nothing to restore");
+    for (const req of ["index.php", "style.css"]) {
+      if (!fs.existsSync(path.join(tmp, P.themePath, req))) throw new Error(`restored theme is missing ${req} — aborted`);
+    }
+    job.editSummary = `Restored ${P.themeSlug} to ${P.sha.slice(0, 7)}${P.versionLabel ? ` — ${P.versionLabel}` : ""}`;
+    job.editPlan = touched.slice(0, 8).map(f => ({ path: f, op: "restore" }));
+    jobStep(job, 1, "done", `${touched.length} file(s) rolled back`);
+
+    // 3 — push + PR
+    jobStep(job, 2, "running", "Pushing + opening PR…");
+    await run(`git add -A "${P.themePath}" ${P.muPath ? `"${P.muPath}"` : ""}`, tmp);
+    r = await run(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "Restore ${P.businessName} to ${P.sha.slice(0, 7)}"`, tmp);
+    if (r.code) throw new Error("commit failed: " + (r.stderr || r.stdout).slice(-160));
+    r = await runRetry(`git push -u origin "${branch}"`, tmp);
+    if (r.code) throw new Error("push failed: " + r.stderr.slice(-200));
+    const prBody = `Snapshot restore for **${P.businessName}**.\\n\\nPuts \`${P.themePath}\` back exactly as it was at \`${P.sha.slice(0, 7)}\`${P.versionLabel ? ` (${P.versionLabel.replace(/"/g, "'")})` : ""}, discarding theme changes made after it.\\n\\nFiles: ${touched.length}`;
+    r = await runRetry(`gh pr create --repo ${repo} --base main --head "${branch}" --title "Restore ${P.businessName} to ${P.sha.slice(0, 7)}" --body "${prBody}"`, tmp);
+    job.prUrl = (r.stdout.match(/https:\/\/github\.com\/\S+/) || [""])[0];
+    job.branch = branch;
+    fs.rmSync(tmp, { recursive: true, force: true });
+    if (!job.prUrl) throw new Error("PR create failed: " + r.stderr.slice(-200));
+    jobStep(job, 2, "done", job.prUrl);
+
+    // 4 — CI watch → merge on green (same policy as an edit; no auto-fix, since
+    // a failing build on a known-good tree means something outside it changed).
+    jobStep(job, 3, "running", "Watching CI build checks…");
+    let merged = false;
+    for (let i = 0; i < 90 && !merged; i++) {
+      let st; try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); } catch (e) { await sleep(10000); continue; }
+      jobStep(job, 3, "running", (st.checks || []).map(c => `${c.name}:${c.status}`).join(" ") || "CI starting…");
+      if (st.allPass) { await awaitApprovalIfNeeded(job, P.siteId, 3); await localApi("/api/pr-merge", { prUrl: job.prUrl }); merged = true; jobStep(job, 3, "done", "Merged"); break; }
+      if (st.anyFail) throw new Error("CI failed on the restore — review it by hand: " + job.prUrl);
+      await sleep(10000);
+    }
+    if (!merged) throw new Error("CI watch timed out — " + job.prUrl);
+
+    // 5 — registry
+    jobStep(job, 4, "running", "Updating site registry…");
+    try { await syncSiteRegistry(); } catch (e) { /* non-fatal */ }
+    jobStep(job, 4, "done", "Done — the restored version is live on merge/deploy");
+    job.status = "done";
+    notify(`⏪ Restore merged for *${job.businessName}*: ${job.editSummary} · ${job.prUrl || ""}`);
+  } catch (e) {
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
+    if (e && e.cancelled) { job.status = "cancelled"; }
+    else {
+      job.error = e.message; job.status = "error";
+      if (job.steps[job.currentStep] && job.steps[job.currentStep].status === "running") { job.steps[job.currentStep].status = "error"; job.steps[job.currentStep].detail = String(e.message).slice(0, 240); }
+      console.error(`restore job ${job.draftId} failed:`, e.message);
+      notify(`❌ Restore failed for *${job.businessName}*: ${e.message}`);
+    }
+  } finally {
+    job.finishedAt = new Date().toISOString(); saveJobs(); COST_SINK = null;
+  }
+}
 async function postEditPrComment(job) {
   const prNum = ((job.prUrl || "").match(/\/pull\/(\d+)/) || [])[1];
   if (!prNum) return;
@@ -2177,7 +2424,14 @@ const server = http.createServer(async (req, res) => {
       return json(res, 401, { error: "unauthorized" }); // /api/webhook/* carries its own secret check
     }
 
-    if (p === "/" || p === "/index.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "index.html")));
+    // "/" is the Studio overview; the original 6-step build wizard lives on at /wizard.
+    if (p === "/" || p === "/overview" || p === "/overview.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "overview.html")));
+    if (p === "/overview.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "overview.js")));
+    if (p === "/wizard" || p === "/index.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "index.html")));
+    // Studio's site-detail screen. Gated on ?id= so bare /site still falls
+    // through to the assembled-bundle handler further down.
+    if (p === "/site.html" || (p === "/site" && u.searchParams.get("id"))) return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "site.html")));
+    if (p === "/site.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "site.js")));
     if (p === "/app.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "app.js")));
     if (p === "/styles.css") return send(res, 200, "text/css", fs.readFileSync(path.join(DIR, "public", "styles.css")));
     if (p === "/dashboard" || p === "/dashboard.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "dashboard.html")));
@@ -2199,6 +2453,17 @@ const server = http.createServer(async (req, res) => {
     }
     if (p === "/api/onboarding") return send(res, 200, "application/json", fs.readFileSync(path.join(DIR, "onboarding.json")));
 
+    // Load the bundled sample response into the builder. Opt-in only: the build
+    // screen starts empty, so nobody ships a demo client by accident.
+    if (p === "/api/onboarding-sample" && req.method === "POST") {
+      const sample = path.join(DIR, "onboarding.sample.json");
+      if (!fs.existsSync(sample)) return json(res, 404, { error: "no sample response bundled" });
+      const cur = JSON.parse(fs.readFileSync(sample, "utf8"));
+      cur.receivedAt = new Date().toISOString();
+      fs.writeFileSync(path.join(DIR, "onboarding.json"), JSON.stringify(cur, null, 2));
+      return json(res, 200, cur);
+    }
+
     // Live per-page generation progress for the dashboard (poll ~2s during step 3).
     if (p === "/api/generate-progress") return json(res, 200, GEN_PROGRESS);
 
@@ -2210,6 +2475,17 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req) || "{}");
       if (!body.draftId) return json(res, 400, { error: "draftId required" });
       const mapped = mapG99Answers(body.answers);
+      // Persist it as the current onboarding response, so "Build a site" shows
+      // the client who actually submitted rather than whatever was there before.
+      try {
+        fs.writeFileSync(path.join(DIR, "onboarding.json"), JSON.stringify({
+          draftId: body.draftId, businessId: body.businessId || null, template: body.template || "WEBSITE",
+          receivedAt: new Date().toISOString(),
+          referenceWebsite: body.referenceWebsite || mapped.referenceWebsite || "",
+          existingWebsite: body.existingWebsite || mapped.existingWebsite || "",
+          answers: mapped.answers,
+        }, null, 2));
+      } catch (e) { console.warn("could not persist onboarding.json:", e.message); }
       const { job, dedupe } = enqueueJob({
         draftId: body.draftId, businessId: body.businessId, businessName: body.businessName,
         answers: mapped.answers, existingWebsite: body.existingWebsite || mapped.existingWebsite,
@@ -2242,8 +2518,8 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/job-retry" && req.method === "POST") {
       const { id } = JSON.parse(await readBody(req) || "{}");
       const j = JOBS.get(id); if (!j) return json(res, 404, { error: "job not found" });
-      const nj = j.type === "edit"
-        ? enqueueEditJob({ ...j.payload, jobId: "edit-" + Date.now() })
+      const nj = j.type === "edit" ? enqueueEditJob({ ...j.payload, jobId: "edit-" + Date.now() })
+        : j.type === "restore" ? enqueueRestoreJob({ ...j.payload, jobId: "restore-" + Date.now() })
         : enqueueJob(j.payload).job;
       return json(res, 202, { ok: true, jobId: nj.draftId });
     }
@@ -2257,11 +2533,11 @@ const server = http.createServer(async (req, res) => {
     // Toggle per-site require-approval (persisted in the registry).
     if (p === "/api/site-approval" && req.method === "POST") {
       const { siteId, requireApproval } = JSON.parse(await readBody(req) || "{}");
-      const reg = readRegistry(); const s = (reg.sites || []).find(x => x.siteId === siteId);
-      if (!s) return json(res, 404, { error: "unknown site" });
-      s.requireApproval = !!requireApproval;
-      fs.writeFileSync(REGISTRY_FILE, JSON.stringify(reg, null, 2));
-      return json(res, 200, { ok: true, siteId, requireApproval: s.requireApproval });
+      if (!siteId) return json(res, 400, { error: "siteId required" });
+      const m = readApprovals();
+      if (requireApproval) m[siteId] = true; else delete m[siteId];
+      writeApprovals(m);
+      return json(res, 200, { ok: true, siteId, requireApproval: !!requireApproval });
     }
     // Rendered PR diff (for the job detail page).
     if (p === "/api/pr-diff") {
@@ -2278,34 +2554,104 @@ const server = http.createServer(async (req, res) => {
     }
     if (p === "/api/reaudit-history") return json(res, 200, readReaudit());
 
-    // Editable sites. ?refresh=1 re-derives from the repo (source of truth); else cached.
-    if (p === "/api/sites") {
-      if (u.searchParams.get("refresh") === "1") {
-        try { return json(res, 200, await syncSiteRegistry()); }
-        catch (e) { return json(res, 500, { error: "registry sync failed: " + e.message }); }
-      }
-      return json(res, 200, readRegistry());
+    // Cached CRO audits for every website — one read that powers the overview
+    // KPIs and the sites grid without auditing anything.
+    if (p === "/api/site-audits") return json(res, 200, { audits: readSiteAudits() });
+
+    // GET: this website's cached audit (or {}). POST: run a fresh one now.
+    if (p === "/api/site-audit") {
+      const siteId = req.method === "POST"
+        ? (JSON.parse(await readBody(req) || "{}").siteId || "")
+        : (u.searchParams.get("siteId") || "");
+      if (!siteId) return json(res, 400, { error: "siteId required" });
+      if (req.method !== "POST") return json(res, 200, readSiteAudits()[siteId] || {});
+      const site = await findWebsite(siteId);
+      if (!site) return json(res, 404, { error: "unknown site — refresh the list" });
+      try { return json(res, 200, await auditWebsite(site)); }
+      catch (e) { return json(res, 502, { error: e.message }); }
     }
 
-    // Change history for a site: every PR (build + edit) whose branch targets its slug.
+    // Real websites from NocoDB (name / domain / repo). ?refresh=1 bypasses the
+    // 60s cache. Approval flags are merged in from the local store.
+    if (p === "/api/sites") {
+      try {
+        const sites = await getWebsites(u.searchParams.get("refresh") === "1");
+        const appr = readApprovals();
+        return json(res, 200, { sites: sites.map(s => ({ ...s, requireApproval: !!appr[s.siteId] })), syncedAt: new Date(NOCO_CACHE.at).toISOString() });
+      } catch (e) { return json(res, 502, { error: "NocoDB fetch failed: " + e.message }); }
+    }
+
+    // Change history for a website: resolve its repo + active theme, then list
+    // every PR (build + edit) whose branch targets that theme slug.
     if (p === "/api/site-history") {
       const siteId = u.searchParams.get("siteId");
-      const site = (readRegistry().sites || []).find(s => s.siteId === siteId);
-      if (!site) return json(res, 404, { error: "unknown site" });
-      const bare = site.themeSlug.replace(/^g99-/, "");
+      const site = await findWebsite(siteId);
+      if (!site) return json(res, 404, { error: "unknown site — refresh the list" });
+      let target; try { target = await resolveEditTarget(site); } catch (e) { return json(res, 200, { siteId, repo: site.githubRepo, themeSlug: null, resolveError: e.message, history: [] }); }
+      const bare = target.themeSlug.replace(/^g99-/, "");
       const raw = await sh(`gh pr list --repo ${site.githubRepo} --state all --limit 80 --json number,title,url,state,mergedAt,createdAt,headRefName,statusCheckRollup`);
       let prs = []; try { prs = JSON.parse(raw.stdout || "[]"); } catch (e) { prs = []; }
       const re = new RegExp("(^|[/-])" + bare.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "(-|$)");
       const history = prs.filter(pr => re.test(pr.headRefName || ""))
-        .map(pr => ({ number: pr.number, title: pr.title, url: pr.url, state: pr.state, type: (pr.headRefName || "").includes("/edit-") ? "edit" : "build", date: pr.mergedAt || pr.createdAt, build: ciRollup(pr.statusCheckRollup) }))
+        .map(pr => ({ number: pr.number, title: pr.title, url: pr.url, state: pr.state, type: (pr.headRefName || "").includes("/edit-") ? "edit" : (pr.headRefName || "").includes("/restore-") ? "restore" : "build", date: pr.mergedAt || pr.createdAt, build: ciRollup(pr.statusCheckRollup) }))
         .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
-      return json(res, 200, { siteId, history });
+      return json(res, 200, { siteId, repo: site.githubRepo, themeSlug: target.themeSlug, history });
+    }
+
+    // Version history straight from GitHub: every commit on the default branch
+    // that touched this website's theme, newest first. The newest one is what's
+    // live, so it's flagged rather than offered as something to restore.
+    if (p === "/api/site-versions") {
+      const site = await findWebsite(u.searchParams.get("siteId"));
+      if (!site) return json(res, 404, { error: "unknown site — refresh the list" });
+      let target; try { target = await resolveEditTarget(site); } catch (e) { return json(res, 200, { siteId: site.siteId, repo: site.githubRepo, resolveError: e.message, versions: [] }); }
+      const r = await sh(`gh api "repos/${site.githubRepo}/commits?path=${encodeURIComponent(target.themePath)}&per_page=30"`);
+      let raw = []; try { raw = JSON.parse(r.stdout || "[]"); } catch (e) { raw = []; }
+      if (!Array.isArray(raw)) return json(res, 502, { error: "GitHub returned no commit list for " + target.themePath });
+      const versions = raw.map((c, i) => {
+        const msg = String((c.commit && c.commit.message) || "");
+        const lines = msg.split("\n").map(s => s.trim()).filter(Boolean);
+        const merge = /^Merge pull request #(\d+)/.exec(lines[0] || "");
+        // A merge commit's first line is plumbing and its last line is the PR
+        // title; a squash-merge puts the title first with a trailing "(#12)".
+        let title = (merge ? lines[lines.length - 1] : lines[0]) || "(no message)";
+        const squash = /\(#(\d+)\)\s*$/.exec(title);
+        if (squash) title = title.slice(0, squash.index).trim();
+        const pr = merge ? merge[1] : squash ? squash[1] : null;
+        return {
+          sha: c.sha, short: String(c.sha || "").slice(0, 7), title,
+          date: (c.commit && c.commit.committer && c.commit.committer.date) || null,
+          author: (c.author && c.author.login) || (c.commit && c.commit.author && c.commit.author.name) || "",
+          prNumber: pr ? Number(pr) : null,
+          prUrl: pr ? `https://github.com/${site.githubRepo}/pull/${pr}` : null,
+          current: i === 0,
+        };
+      });
+      return json(res, 200, { siteId: site.siteId, repo: site.githubRepo, themeSlug: target.themeSlug, themePath: target.themePath, versions });
+    }
+
+    // Put the theme back exactly as it was at one commit. This is a forward
+    // commit through the same PR + CI + approval path as an edit — nothing is
+    // force-pushed, and a restore can itself be restored.
+    if (p === "/api/site-restore" && req.method === "POST") {
+      const { siteId, sha, label } = JSON.parse(await readBody(req) || "{}");
+      if (!/^[0-9a-f]{7,40}$/i.test(String(sha || ""))) return json(res, 400, { error: "a full commit sha is required" });
+      const site = await findWebsite(siteId);
+      if (!site) return json(res, 404, { error: "unknown siteId — refresh the site list" });
+      let target; try { target = await resolveEditTarget(site); } catch (e) { return json(res, 409, { error: e.message }); }
+      const job = enqueueRestoreJob({
+        jobId: "restore-" + Date.now(),
+        siteId, businessName: site.businessName, githubRepo: site.githubRepo,
+        themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
+        sha: String(sha), versionLabel: String(label || "").slice(0, 120),
+      });
+      return json(res, 202, { jobId: job.draftId, status: job.status, monitor: "/jobs" });
     }
 
     // Expand a rough idea into a precise, unambiguous edit instruction (Gemini).
     if (p === "/api/edit-suggest" && req.method === "POST") {
       const { siteId, idea } = JSON.parse(await readBody(req) || "{}");
-      const site = (readRegistry().sites || []).find(s => s.siteId === siteId) || {};
+      const site = (await findWebsite(siteId)) || {};
       const prompt = [
         `You help an operator phrase a website change request for an AI that edits a WordPress theme for "${site.businessName || "a medspa"}".`,
         `Rewrite the rough idea below into ONE precise, unambiguous instruction: what to add/change, where, and any concrete copy/labels. Keep it to 2-4 sentences. If it's a new page, say the page title and that it should be linked in the nav.`,
@@ -2316,18 +2662,18 @@ const server = http.createServer(async (req, res) => {
       catch (e) { return json(res, 502, { error: "suggest failed: " + e.message }); }
     }
 
-    // Start an edit job for a registered site.
+    // Start an edit job for a NocoDB website. Resolve its repo + active theme
+    // server-side so the edit only ever touches the selected website's repo.
     if (p === "/api/edit-run" && req.method === "POST") {
       const { siteId, prompt } = JSON.parse(await readBody(req) || "{}");
       if (!prompt || !prompt.trim()) return json(res, 400, { error: "prompt required" });
-      const site = (readRegistry().sites || []).find(s => s.siteId === siteId);
+      const site = await findWebsite(siteId);
       if (!site) return json(res, 404, { error: "unknown siteId — refresh the site list" });
-      const bare = site.themeSlug.replace(/^g99-/, "");
+      let target; try { target = await resolveEditTarget(site); } catch (e) { return json(res, 409, { error: e.message }); }
       const job = enqueueEditJob({
         jobId: "edit-" + Date.now(),
         siteId, businessName: site.businessName, githubRepo: site.githubRepo,
-        themeSlug: site.themeSlug, themePath: site.themePath,
-        muPath: `web/app/mu-plugins/g99-activate-${bare}.php`,
+        themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
         prompt: prompt.trim(),
       });
       return json(res, 202, { jobId: job.draftId, status: job.status, monitor: "/jobs" });
@@ -2335,6 +2681,9 @@ const server = http.createServer(async (req, res) => {
 
     if (p === "/edit" || p === "/edit.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "edit.html")));
     if (p === "/edit.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "edit.js")));
+
+    if (p === "/sites" || p === "/sites.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "sites.html")));
+    if (p === "/sites.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "sites.js")));
 
     if (p === "/jobs" || p === "/jobs.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "jobs.html")));
     if (p === "/jobs.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "jobs.js")));

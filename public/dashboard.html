@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Growth99 · Beta Site Builder</title>
-<link rel="stylesheet" href="/theme.css?v=1.1">
+<title>Growth99 · Build a site</title>
+<link rel="stylesheet" href="/theme.css?v=10">
 <style>
   * { box-sizing: border-box; }
   body {
@@ -12,7 +12,7 @@
     background: var(--bg);
     color: var(--ink);
     font-family: var(--sans);
-    font-size: 13px;
+    font-size: 14px;
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
   }
@@ -43,9 +43,11 @@
   .biz {
     margin-left: auto;
     font-size: 12px;
-    color: var(--accent-ink);
+    /* --accent-ink is white (for text ON the accent fill). On accent-soft it
+       renders 1.07:1 — use the accent itself, which clears 4.5:1. */
+    color: var(--accent);
     background: var(--accent-soft);
-    border: 1px solid rgba(37,99,235,0.15);
+    border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent);
     padding: 4px 10px;
     border-radius: 99px;
     font-weight: 600;
@@ -175,13 +177,14 @@
   .ba-shots figcaption { font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); text-align: center; margin-top: 4px; }
 </style>
 </head>
-<body>
-<div class="wrap">
+<body data-title="Build a site">
+<main class="wrap" id="g99main">
   <div class="top">
     <div class="logo">g</div>
     <div>
       <div class="sub">Growth99</div>
-      <h1>Beta Site Builder</h1>
+      <h1>Build a new site</h1>
+      <p class="desc" style="margin:6px 0 0">Studio audits the reference site, designs the brand, generates every page and deploys — you get a before/after conversion score at the end. Need to drive the steps by hand? <a href="/wizard">Open the step-by-step wizard</a>.</p>
     </div>
     <div class="biz" id="bizChip">Loading…</div>
   </div>
@@ -194,7 +197,7 @@
     <div class="rowbtns">
       <button class="btn sm" id="saveBtn" onclick="saveForm()">Save changes</button>
       <span class="hint" id="saveHint" style="margin:0"></span>
-      <button class="btn primary" id="buildBtn" onclick="buildBetaSite()" style="margin-left:auto">🚀 Build beta site</button>
+      <button class="btn primary" id="buildBtn" onclick="buildBetaSite()" style="margin-left:auto">Build beta site</button>
     </div>
   </div>
 
@@ -204,7 +207,7 @@
     <p class="desc">Steps 1–4 run automatically. After the PR is opened, paste the live URL to run the before/after comparison.</p>
     <div class="steps" id="steps"></div>
   </div>
-</div>
+</main>
 
 <div class="toast" id="toast"></div>
 <script src="/nav.js"></script>

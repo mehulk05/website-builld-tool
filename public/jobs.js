@@ -1,188 +1,118 @@
-// Growth99 Pipeline Jobs — live monitor for webhook-triggered runs.
+// Growth99 Website Studio — Activity. Every build and edit run, split into
+// what's in flight and what recently landed. Polls while anything is live.
 "use strict";
 
-// auth: same admin-key handling as the dashboard
-const _fetch = window.fetch.bind(window);
-window.fetch = (url, opts = {}) => {
-  if (String(url).startsWith("/api/")) opts.headers = { ...(opts.headers || {}), "x-admin-key": localStorage.getItem("g99AdminKey") || "" };
-  return _fetch(url, opts);
-};
-async function ensureAuth() {
-  for (let i = 0; i < 3; i++) {
-    const r = await fetch("/api/auth-check", { headers: { "x-login": "1" } });
-    if (r.status !== 401) return true;
-    const k = prompt("This tool is password-protected. Enter the admin password:");
-    if (k == null) return false;
-    localStorage.setItem("g99AdminKey", k.trim());
-  }
-  return false;
+const { esc, avatarColor, initials, relTime, getJSON, ensureAuth,
+        jobState, jobProgress, jobCost, jobStepLabel, isActiveJob } = window.G99;
+
+const $ = (id) => document.getElementById(id);
+
+let JOBS = [], FILTER = "all", QUERY = "", timer;
+const PAGE = 30;
+let shownCount = PAGE;
+
+const needsYou = (j) => j.awaitingApproval && !j.approved;
+const title = (j) => j.editSummary || (j.payload && j.payload.prompt) || (j.type === "edit" ? "Website edit" : "Build " + j.businessName);
+
+function match(j) {
+  if (QUERY && !((j.businessName || "") + " " + title(j)).toLowerCase().includes(QUERY)) return false;
+  if (FILTER === "all") return true;
+  if (FILTER === "attention") return needsYou(j) || j.status === "error";
+  return j.type === FILTER;
 }
 
-const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-const ICON = { pending: "", running: '<span class="spin"></span>', done: "✓", error: "✗" };
-const SVG_EDIT = `<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>`;
-const SVG_BUILD = `<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>`;
-const typeChip = (t) => `<span class="tchip ${t}">${t === "edit" ? SVG_EDIT : SVG_BUILD}</span>`;
-
-// one step marker + label/detail, with optional sub-content nested under the step
-function stepRow(s, extra) {
-  return `<div class="jstep ${s.status}">
-    <span class="ic">${ICON[s.status] || ""}</span>
-    <div class="jb"><span class="lb">${esc(s.label)}</span>
-      <span class="dt" style="${s.status === "error" ? "color:var(--bad)" : ""}">${esc(s.detail)}</span>
-      ${extra ? `<div class="sub-detail">${extra}</div>` : ""}</div>
-  </div>`;
-}
-// bordered box listing changed files (edit jobs)
-function fileBox(plan) {
-  if (!plan || !plan.length) return "";
-  const rows = plan.map((f) => `<div class="frow"><span class="fop ${esc((f.op || "edit").toLowerCase())}">${esc(f.op || "edit")}</span><span class="fpath">${esc(f.path)}</span></div>`).join("");
-  return `<div class="filebox"><div class="fhead">${plan.length} file${plan.length > 1 ? "s" : ""} changed</div>${rows}</div>`;
-}
-const PG_ICON = { queued: "·", generating: '<span class="spin"></span>', "post-processing": "◌", done: "✓", error: "✗" };
-const PAGE_LABELS = [["home", "Home"], ["services", "Services"], ["about", "About"], ["contact", "Contact"]];
-let GEN_PROG = { phase: "idle", pages: {} };  // populated from /api/generate-progress each refresh
-
-// Brand palette + fonts strip (shown on the compose step). Uses job.composed if
-// the server provides it, else parses the hexes/font out of the step-2 detail.
-function brandSwatches(j) {
-  let c = j.composed;
-  if (!c) {
-    const d = (j.steps[1] && j.steps[1].detail) || "";
-    const hex = d.match(/#[0-9a-fA-F]{6}/g) || [];
-    if (!hex.length) return "";
-    c = { primary: hex[0], accent: hex[1] || null, headingFont: (d.split("·")[1] || "").trim() || null };
-  }
-  const sw = (h, l) => h ? `<span style="display:inline-flex;flex-direction:column;align-items:center;gap:3px;margin-right:14px">
-      <span style="width:34px;height:34px;border-radius:8px;background:${esc(h)};border:1px solid var(--line)"></span>
-      <span style="font-size:10px;color:var(--muted)">${esc(l)}</span><span style="font-size:10px;font-variant-numeric:tabular-nums">${esc(h)}</span></span>` : "";
-  const fonts = [c.headingFont, c.bodyFont].filter(Boolean).join(" + ");
-  const brief = (c.brief || "").trim();
-  const briefBlock = brief
-    ? `<details style="margin:6px 0 4px"><summary style="cursor:pointer;font-size:12.5px;color:var(--accent)">View build prompt (${brief.length} chars)</summary>
-       <div style="white-space:pre-wrap;font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:6px;max-height:260px;overflow:auto">${esc(brief)}</div></details>`
-    : "";
-  return `<div style="display:flex;align-items:center;flex-wrap:wrap;gap:4px">
-    ${sw(c.primary, "Primary")}${sw(c.secondary, "Secondary")}${sw(c.accent, "Accent")}
-    ${fonts ? `<span style="font-size:12px;color:var(--muted)">${esc(fonts)}</span>` : ""}</div>${briefBlock}`;
+function activeRow(j) {
+  const st = jobState(j);
+  const pct = jobProgress(j);
+  return `<a class="run" href="/job?id=${encodeURIComponent(j.draftId)}">
+    <div class="hd">
+      <span class="ava" style="background:${avatarColor(j.businessName)}">${esc(initials(j.businessName))}</span>
+      <div style="flex:1;min-width:0">
+        <div class="nm trunc">${esc(title(j))}</div>
+        <div class="sub trunc">${esc(j.businessName)} · ${esc(jobStepLabel(j))}</div>
+      </div>
+      ${needsYou(j) ? `<span class="btn warn sm">Review &amp; approve</span>` : ""}
+      <span class="pill ${st.cls}">${esc(st.label)}</span>
+    </div>
+    <div class="mt">
+      <div class="bar${needsYou(j) ? " still" : ""}"><i style="width:${pct}%;background:${st.bar}"></i></div>
+      <span class="eta">${pct}%</span>
+      <span class="cost">${esc(jobCost(j))}</span>
+    </div>
+  </a>`;
 }
 
-// Per-page rows under the "Generate pages" step. While the job is running we use
-// the live global progress (queued→generating→done); once done we use the job's
-// own persisted snapshot so the breakdown survives.
-const PG_TXT = { queued: "queued", generating: "generating…", "post-processing": "fixing images / SEO…", done: "", error: "" };
-function perPageRows(j, live) {
-  const g = live ? (GEN_PROG.pages || {}) : (j.pages || {});
-  if (!Object.keys(g).length) return "";
-  const rows = PAGE_LABELS.map(([k, l]) => {
-    const st = g[k];
-    const status = st ? st.status : "queued";
-    const t = status === "done" ? `✓ ${((st.bytes || 0) / 1024).toFixed(1)} KB`
-      : status === "error" ? `✗ ${(st && st.error) || "failed"}`
-      : `${PG_ICON[status] || "·"} ${PG_TXT[status] || status}`;
-    const col = status === "done" ? "var(--good)" : status === "error" ? "var(--bad)" : "var(--muted)";
-    return `<div style="font-size:12.5px;color:${col}"><span style="display:inline-block;width:80px">${esc(l)}</span>${t}</div>`;
-  }).join("");
-  return `<div>${rows}</div>`;
+function doneRow(j) {
+  const st = jobState(j);
+  const sub = j.type === "build" ? "Generated & deployed" : j.prUrl ? "Change shipped" : "Run ended";
+  return `<a class="run compact" href="/job?id=${encodeURIComponent(j.draftId)}">
+    <span class="ava" style="background:${avatarColor(j.businessName)}">${esc(initials(j.businessName))}</span>
+    <div style="flex:1;min-width:0;margin-left:12px">
+      <div class="nm trunc">${esc(title(j))}</div>
+      <div class="sub trunc">${esc(j.businessName)} · ${esc(sub)} · ${esc(relTime(j.finishedAt || j.createdAt))}</div>
+    </div>
+    ${j.delta != null ? `<span class="pill ${j.delta >= 0 ? "good" : "bad"}" style="margin-right:8px">CRO ${j.delta >= 0 ? "+" : ""}${j.delta}</span>` : ""}
+    <span class="pill ${st.cls}">${esc(st.label)}</span>
+  </a>`;
 }
 
-function editCard(j) {
-  // Edit jobs have their OWN shape (no onboarding form / build steps) — render
-  // their detail inline here so clicking never lands on the build dashboard.
-  const badge = `<span class="badge ${j.status}">${j.status.toUpperCase()}</span>`;
-  const steps = j.steps.map((s) => stepRow(s)).join("");
-  const links = [
-    j.prUrl ? `<a href="${esc(j.prUrl)}" target="_blank" onclick="event.stopPropagation()">↗ Pull request / diff</a>` : "",
-  ].filter(Boolean).join("");
-  const when = (j.startedAt || j.createdAt || "").replace("T", " ").slice(0, 19);
-  return `<div class="card" style="cursor:pointer" onclick="location.href='/job?id=${encodeURIComponent(j.draftId)}'">
-    <div class="jhead">${typeChip("edit")}<h2>${esc(j.businessName)}</h2><span class="meta">edit · ${esc(when)}</span>${badge}</div>
-    <div class="prompt-line"><b>Request:</b> <span class="muted">${esc((j.payload && j.payload.prompt) || "")}</span></div>
-    ${j.editSummary ? `<div class="plan-line"><b>Plan:</b> ${esc(j.editSummary)}</div>` : ""}
-    ${fileBox(j.editPlan)}
-    <div class="steps">${steps}</div>
-    ${links ? `<div class="links">${links}</div>` : ""}
-    ${j.error ? `<div class="links" style="color:var(--bad)">${esc(j.error)}</div>` : ""}
-  </div>`;
-}
-function jobCard(j) {
-  if (j.type === "edit") return editCard(j);
-  const badge = `<span class="badge ${j.status}">${j.status.toUpperCase()}</span>`;
-  const scores = (j.before || j.after)
-    ? `<div class="scores">${j.before ? j.before.overall : "—"} <span class="d" style="color:${(j.delta || 0) >= 0 ? "var(--good)" : "var(--bad)"}">${j.delta == null ? "→" : (j.delta >= 0 ? "+" : "") + j.delta}</span> ${j.after ? j.after.overall : "—"}</div>` : "";
-  const steps = j.steps.map((s, i) => {
-    let extra = "";
-    if (i === 1 && (s.status === "done" || s.status === "running")) extra = brandSwatches(j);           // compose → palette + fonts + prompt
-    if (i === 2 && s.status !== "pending") extra = perPageRows(j, s.status === "running" && j.status === "running"); // generate → per-page (live while running, snapshot after)
-    return stepRow(s, extra);
-  }).join("");
-  const stop = 'onclick="event.stopPropagation()"';
-  const links = [
-    j.prUrl ? `<a href="${esc(j.prUrl)}" target="_blank" ${stop}>↗ Pull request</a>` : "",
-    j.siteUrl ? `<a href="${esc(j.siteUrl)}" target="_blank" ${stop}>↗ Assembled site</a>` : "",
-    j.reportUrl ? `<a href="${esc(j.reportUrl)}" target="_blank" ${stop}>↗ Before/after report</a>` : "",
-  ].filter(Boolean).join("");
-  const when = (j.startedAt || j.createdAt || "").replace("T", " ").slice(0, 19);
-  return `<div class="card" style="cursor:pointer" onclick="location.href='/job?id=${encodeURIComponent(j.draftId)}'">
-    <div class="jhead">${typeChip("build")}<h2>${esc(j.businessName)}</h2><span class="meta">draft ${esc(j.draftId)} · ${esc(when)}</span>${badge}${scores}</div>
-    <div class="steps">${steps}</div>
-    ${links ? `<div class="links">${links}</div>` : ""}
-    ${j.error ? `<div class="links" style="color:var(--bad)">${esc(j.error)}</div>` : ""}
-  </div>`;
+function render() {
+  const shown = JOBS.filter(match);
+  const active = shown.filter((j) => isActiveJob(j) || needsYou(j));
+  const done = shown.filter((j) => !isActiveJob(j) && !needsYou(j));
+
+  $("activeCount").textContent = `${active.length} running`;
+  $("doneCount").textContent = String(done.length);
+  $("active").innerHTML = active.length ? active.map(activeRow).join("")
+    : `<p class="empty">Nothing in flight. Start a build or an edit and it appears here live.</p>`;
+
+  const visible = done.slice(0, shownCount);
+  const hidden = done.length - visible.length;
+  $("done").innerHTML = done.length
+    ? visible.map(doneRow).join("") +
+      (hidden > 0
+        ? `<div style="padding:14px 0 4px;display:flex;align-items:center;gap:12px;border-top:1px solid var(--line-2)">
+             <span style="font-size:12.5px;color:var(--muted)">Showing ${visible.length} of ${done.length}</span>
+             <button class="btn sm" id="showMore" style="margin-left:auto">Show ${Math.min(PAGE, hidden)} more</button>
+           </div>`
+        : (done.length > PAGE ? `<div style="padding:14px 0 4px;font-size:12.5px;color:var(--muted);border-top:1px solid var(--line-2)">Showing all ${done.length}</div>` : ""))
+    : `<p class="empty">${JOBS.length ? "No completed runs match this filter." : "No runs yet."}</p>`;
+  const more = $("showMore");
+  if (more) more.onclick = () => { shownCount += PAGE; render(); };
+
+  const live = JOBS.filter(isActiveJob).length;
+  $("sub").textContent = live
+    ? `${live} run${live === 1 ? "" : "s"} in flight · ${JOBS.length} total`
+    : `${JOBS.length} run${JOBS.length === 1 ? "" : "s"} recorded · nothing running right now`;
 }
 
-// ---- summary + filters ----
-const FILTER = { status: "all", type: "all", q: "" };
-const tile = (v, k, color) => `<div class="stat-tile"><div class="v" ${color ? `style="color:${color}"` : ""}>${v}</div><div class="k">${k}</div></div>`;
-function renderSummary(jobs) {
-  const done = jobs.filter((j) => j.status === "done");
-  const err = jobs.filter((j) => j.status === "error").length;
-  const running = jobs.filter((j) => j.status === "running").length;
-  const finished = done.length + err;
-  const successRate = finished ? Math.round((done.length / finished) * 100) : null;
-  const lifts = done.filter((j) => j.type !== "edit" && j.delta != null).map((j) => j.delta);
-  const avgLift = lifts.length ? Math.round(lifts.reduce((a, b) => a + b, 0) / lifts.length) : null;
-  document.getElementById("summary").innerHTML =
-    tile(jobs.length, "Total jobs") +
-    tile(running, "Running", running ? "var(--accent)" : "") +
-    tile(done.length, "Completed", "var(--good)") +
-    tile(err, "Errors", err ? "var(--bad)" : "") +
-    tile(successRate == null ? "—" : successRate + "%", "Success rate") +
-    tile(avgLift == null ? "—" : (avgLift >= 0 ? "+" : "") + avgLift, "Avg CRO lift", avgLift == null ? "" : avgLift >= 0 ? "var(--good)" : "var(--bad)");
-}
-function renderFilterControls() {
-  const grp = (id, key, opts) => document.getElementById(id).innerHTML = opts.map((o) =>
-    `<button class="chipbtn ${FILTER[key] === o[0] ? "on" : ""}" data-key="${key}" data-val="${o[0]}">${o[1]}</button>`).join("");
-  grp("fStatus", "status", [["all", "All"], ["running", "Running"], ["done", "Done"], ["error", "Errors"]]);
-  grp("fType", "type", [["all", "Any type"], ["build", "Build"], ["edit", "Edit"]]);
-  [...document.querySelectorAll(".chipbtn")].forEach((b) => b.onclick = () => { FILTER[b.dataset.key] = b.dataset.val; renderFilterControls(); refresh(); });
-  const box = document.getElementById("fSearch");
-  if (box && !box._wired) { box._wired = true; box.value = FILTER.q; box.oninput = () => { FILTER.q = box.value.toLowerCase(); refresh(); }; }
-}
-function applyFilter(jobs) {
-  return jobs.filter((j) =>
-    (FILTER.status === "all" || j.status === FILTER.status) &&
-    (FILTER.type === "all" || (j.type || "build") === FILTER.type) &&
-    (!FILTER.q || (j.businessName || "").toLowerCase().includes(FILTER.q)));
-}
-
-async function refresh() {
+async function load() {
   try {
-    try { GEN_PROG = await (await fetch("/api/generate-progress")).json(); } catch (e) { /* keep last */ }
-    const d = await (await fetch("/api/jobs")).json();
-    document.getElementById("stat").textContent = `${d.jobs.length} job(s) · ${d.running ? "1 running" : "idle"}${d.queued ? ` · ${d.queued} queued` : ""}`;
-    renderSummary(d.jobs);
-    renderFilterControls();
-    const shown = applyFilter(d.jobs);
-    document.getElementById("list").innerHTML = d.jobs.length
-      ? (shown.length ? shown.map(jobCard).join("") : '<div class="empty">No jobs match the current filters.</div>')
-      : '<div class="empty">Waiting for jobs — submit an onboarding form (or POST the webhook) and runs appear here live.</div>';
-  } catch (e) { /* transient poll error — keep last render */ }
+    const d = await getJSON("/api/jobs");
+    JOBS = d.jobs || [];
+    render();
+    clearInterval(timer);
+    if (JOBS.some(isActiveJob)) timer = setInterval(load, 3000);
+  } catch (e) {
+    $("active").innerHTML = `<p class="empty">Could not load runs: ${esc(e.message)}</p>`;
+  }
 }
+
+$("filters").onclick = (e) => {
+  const b = e.target.closest("button[data-f]");
+  if (!b) return;
+  FILTER = b.dataset.f;
+  shownCount = PAGE;
+  [...$("filters").children].forEach((x) => {
+    const on = x === b;
+    x.classList.toggle("on", on);
+    x.setAttribute("aria-pressed", String(on));
+  });
+  render();
+};
+$("search").oninput = (e) => { QUERY = e.target.value.toLowerCase().trim(); shownCount = PAGE; render(); };
 
 ensureAuth().then((ok) => {
-  if (!ok) { document.getElementById("stat").textContent = "Unauthorized"; return; }
-  renderFilterControls();
-  refresh();
-  setInterval(refresh, 3000);
+  if (!ok) { $("active").innerHTML = '<p class="empty">Unauthorized — reload and enter the admin password.</p>'; return; }
+  load();
 });

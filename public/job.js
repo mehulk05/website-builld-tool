@@ -1,118 +1,196 @@
-// Growth99 — unified, type-aware job detail (build + edit) with actions + PR diff.
+// Growth99 Website Studio — run detail (build + edit). Plain-language progress
+// up top, engineer detail behind a disclosure, real actions against the runner.
 "use strict";
-const _fetch = window.fetch.bind(window);
-window.fetch = (url, opts = {}) => {
-  if (String(url).startsWith("/api/")) opts.headers = { ...(opts.headers || {}), "x-admin-key": localStorage.getItem("g99AdminKey") || "" };
-  return _fetch(url, opts);
-};
-async function ensureAuth() {
-  for (let i = 0; i < 3; i++) {
-    const r = await fetch("/api/auth-check", { headers: { "x-login": "1" } });
-    if (r.status !== 401) return true;
-    const k = prompt("Admin password:"); if (k == null) return false;
-    localStorage.setItem("g99AdminKey", k.trim());
-  }
-  return false;
-}
+
+const { esc, avatarColor, initials, croColor, relTime, toast, getJSON, postJSON,
+        ensureAuth, svg, jobState, jobCost } = window.G99;
+
 const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-let toastT; function toast(m) { const t = $("toast"); t.textContent = m; t.classList.add("show"); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove("show"), 3200); }
 const ID = new URLSearchParams(location.search).get("id");
-const ICON = { pending: "·", running: '<span class="spin"></span>', done: "✓", error: "✗" };
-const SVG_EDIT = `<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>`;
-const SVG_BUILD = `<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>`;
-let diffLoaded = false;
 
-async function act(path, okMsg) {
-  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: ID }) });
-  const d = await r.json();
-  if (!r.ok) { toast(d.error || "failed"); return; }
-  toast(okMsg);
-  if (d.jobId) setTimeout(() => location.href = "/job?id=" + encodeURIComponent(d.jobId), 700);
-  else render();
-}
-window._cancel = () => act("/api/job-cancel", "Cancelling…");
-window._retry = () => act("/api/job-retry", "Retrying — new job started…");
-window._approve = () => act("/api/job-approve", "Approved — merging…");
+let JOB = null, TECH_OPEN = false, diffLoaded = false, timer;
 
-function steps(j) {
-  return `<div class="steps">${j.steps.map((s) => `<div class="jstep ${s.status}">
-    <span class="ic">${ICON[s.status] || ""}</span>
-    <div class="jb"><span class="lb">${esc(s.label)}</span>
-      <span class="dt" style="${s.status === "error" ? "color:var(--bad)" : ""}">${esc(s.detail)}</span></div>
-  </div>`).join("")}</div>`;
+const verdict = (d) => d == null ? "" : d >= 15 ? "Significant improvement" : d >= 5 ? "Improved" : d >= 0 ? "Stable" : "Regressed";
+
+function stepper(j) {
+  const ic = { done: svg("check", 13, 3), running: `<span class="spin" style="margin:0;border-color:var(--accent);border-top-color:transparent"></span>`, error: svg("close", 13, 3), pending: "" };
+  return `<div class="steps">${(j.steps || []).map((s) => `
+    <div class="jstep ${s.status}">
+      <span class="ic">${ic[s.status] || ""}</span>
+      <div class="jb">
+        <span class="lb">${esc(s.label)}</span>
+        ${s.detail ? `<span class="dt"${s.status === "error" ? ' style="color:var(--bad)"' : ""}>${esc(s.detail)}</span>` : ""}
+      </div>
+    </div>`).join("")}</div>`;
 }
-function fileBox(plan) {
-  if (!plan || !plan.length) return "";
-  const rows = plan.map((f) => `<div class="frow"><span class="fop ${esc((f.op || "edit").toLowerCase())}">${esc(f.op || "edit")}</span><span class="fpath">${esc(f.path)}</span></div>`).join("");
-  return `<div class="filebox"><div class="fhead">${plan.length} file${plan.length > 1 ? "s" : ""} changed</div>${rows}</div>`;
+
+function scoresCard(j) {
+  if (!j.before && !j.after) return "";
+  const before = j.before ? j.before.overall : null;
+  const after = j.after ? j.after.overall : null;
+  return `<div class="card scores">
+    <div class="n"><b style="font-size:30px;color:var(--muted)">${before == null ? "—" : before}</b><i>Before</i></div>
+    ${svg("arrow", 20)}
+    <div class="n"><b style="font-size:44px;color:${croColor(after)}">${after == null ? "—" : after}</b><i>Now</i></div>
+    <div style="margin-left:auto;text-align:right">
+      ${j.delta == null ? "" : `<span class="pill ${j.delta >= 0 ? "good" : "bad"}" style="font-size:15px;padding:4px 12px">${j.delta >= 0 ? "+" : ""}${j.delta}</span>`}
+      <div style="font-size:12px;color:var(--ink-3);font-weight:600;margin-top:6px">CRO score${j.delta == null ? "" : " · " + verdict(j.delta)}</div>
+    </div>
+  </div>`;
 }
-function costLine(j) {
-  const c = j.cost || {}; const est = ((c.gemini || 0) * 0.001 + (c.stitch || 0) * 0.01);
-  return `<span class="cost">Usage: ${c.gemini || 0} Gemini · ${c.stitch || 0} Stitch calls · ~$${est.toFixed(3)} est.</span>`;
+
+function techCard(j) {
+  const c = j.cost || {};
+  return `<div class="card pad">
+    <button class="disc-btn" id="techBtn" aria-expanded="${TECH_OPEN}" aria-controls="tech">
+      ${svg("code", 16)}<span class="t">Technical details</span><span class="h">for engineers</span>
+    </button>
+    <div class="tech${TECH_OPEN ? " open" : ""}" id="tech">
+      <div class="grid">
+        <div><span class="k">Repository</span><div class="v">${esc((j.payload && j.payload.githubRepo) || "—")}</div></div>
+        <div><span class="k">Theme</span><div class="v">${esc((j.payload && j.payload.themeSlug) || "—")}</div></div>
+        <div><span class="k">Branch</span><div class="v">${esc(j.branch || "—")}</div></div>
+        <div><span class="k">Usage</span><div class="v">${c.gemini || 0} Gemini · ${c.stitch || 0} Stitch · ${esc(jobCost(j))}</div></div>
+      </div>
+      ${j.prUrl ? `<a href="${esc(j.prUrl)}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:6px;margin-top:14px;font-size:12.5px;font-weight:700">Open pull request on GitHub${svg("ext", 13)}</a>` : ""}
+      ${j.prUrl ? `<pre class="diff" id="diffBox" style="margin-top:14px"><span class="spin"></span>loading diff…</pre>` : ""}
+    </div>
+  </div>`;
 }
-function actionButtons(j) {
+
+function actions(j) {
   const b = [];
-  if (j.awaitingApproval) b.push(`<button class="btn primary" onclick="_approve()">✓ Approve &amp; merge</button>`);
-  if (j.status === "running" || j.status === "queued") b.push(`<button class="btn danger" onclick="_cancel()">Cancel</button>`);
-  if (["done", "error", "cancelled"].includes(j.status)) b.push(`<button class="btn" onclick="_retry()">↻ Retry</button>`);
+  if (j.awaitingApproval && !j.approved) b.push(`<button class="btn primary" data-act="approve">${svg("check", 15, 2.2)}Approve &amp; ship</button>`);
+  if (j.status === "running" || j.status === "queued") b.push(`<button class="btn danger" data-act="cancel">Cancel</button>`);
+  if (["done", "error", "cancelled"].includes(j.status)) b.push(`<button class="btn" data-act="retry">${svg("refresh", 15)}Run again</button>`);
   return b.join("");
 }
-async function loadDiff(j) {
-  if (diffLoaded || !j.prUrl) return; diffLoaded = true;
+
+function render() {
+  const j = JOB;
+  const st = jobState(j);
+  const isEdit = j.type === "edit";
+  const site = (j.payload && j.payload.siteId) || null;
+  const c = j.cost || {};
+
+  $("wrap").innerHTML = `
+    <a class="back" href="${site ? "/site?id=" + encodeURIComponent(site) : "/jobs"}">${svg("back", 14, 2.2)}${site ? "Back to site" : "All activity"}</a>
+
+    <div class="hero">
+      <span class="ava lg" style="width:42px;height:42px;border-radius:11px;font-size:15px;background:${avatarColor(j.businessName)}">${esc(initials(j.businessName))}</span>
+      <div style="min-width:0;flex:1">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <h1>${esc(j.editSummary || (isEdit ? "Website edit" : "Build " + j.businessName))}</h1>
+          <span class="pill ${st.cls}">${esc(st.label)}</span>
+        </div>
+        <div class="meta">${isEdit ? "Edit" : "Build"} · ${esc(j.businessName)} · started ${esc(relTime(j.startedAt || j.createdAt))} · ${c.gemini || 0} AI planning · ${c.stitch || 0} generation calls · ${esc(jobCost(j))} est.</div>
+      </div>
+      <div class="acts">${actions(j)}</div>
+    </div>
+
+    ${j.awaitingApproval && !j.approved ? `<div class="banner">${svg("warn", 18)}<div style="flex:1"><div class="bt">Paused for your approval</div><div class="bd">The change is written and the pull request is open — it merges only once you approve.</div></div></div>` : ""}
+    ${j.status === "error" ? `<div class="banner bad">${svg("warn", 18)}<div style="flex:1"><div class="bt">This run failed</div><div class="bd">${esc((j.error || "").slice(0, 240))}</div></div></div>` : ""}
+
+    ${scoresCard(j)}
+
+    ${isEdit && j.payload && j.payload.prompt ? `<div class="card pad"><div class="card-h"><h2>The request</h2></div><p class="req">${esc(j.payload.prompt)}</p></div>` : ""}
+
+    <div class="card pad">
+      <div class="card-h"><h2>Progress</h2>${j.prUrl ? `<a class="right linkbtn" href="${esc(j.prUrl)}" target="_blank" rel="noopener">Pull request${svg("ext", 13)}</a>` : ""}</div>
+      <div style="padding-top:10px">${stepper(j)}</div>
+      ${j.editPlan && j.editPlan.length ? `<div class="filebox"><div class="fhead">${j.editPlan.length} file${j.editPlan.length > 1 ? "s" : ""} changed</div>${j.editPlan.map((f) => `<div class="frow"><span class="fop ${esc((f.op || "edit").toLowerCase())}">${esc(f.op || "edit")}</span><span class="fpath">${esc(f.path)}</span></div>`).join("")}</div>` : ""}
+      ${(j.siteUrl || j.reportUrl) ? `<div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:14px">
+        ${j.siteUrl ? `<a class="linkbtn" href="${esc(j.siteUrl)}" target="_blank" rel="noopener">Assembled site${svg("ext", 13)}</a>` : ""}
+        ${j.reportUrl ? `<a class="linkbtn" href="${esc(j.reportUrl)}" target="_blank" rel="noopener">Comparison report${svg("ext", 13)}</a>` : ""}
+      </div>` : ""}
+    </div>
+
+    ${techCard(j)}`;
+
+  $("techBtn").onclick = () => {
+    TECH_OPEN = !TECH_OPEN;
+    $("tech").classList.toggle("open", TECH_OPEN);
+    $("techBtn").setAttribute("aria-expanded", String(TECH_OPEN));
+    if (TECH_OPEN) loadDiff();
+  };
+  document.querySelectorAll("[data-act]").forEach((b) => { b.onclick = () => act(b.dataset.act, b); });
+  if (TECH_OPEN) loadDiff();
+}
+
+async function act(kind, btn) {
+  // Edit jobs carry the target repo on their payload; build jobs don't, so the
+  // row is omitted rather than filled with a placeholder.
+  const repo = (JOB.payload && JOB.payload.githubRepo) || null;
+  const withRepo = (d) => (repo ? { ...d, Repository: repo } : d);
+  const ASK = {
+    approve: {
+      title: "Approve and merge?",
+      body: "This merges the pull request and ships the change to the live site. It can only be undone with another change.",
+      details: withRepo({ Site: JOB.businessName, ...(JOB.prUrl ? { "Pull request": JOB.prUrl } : {}) }),
+      confirmLabel: "Approve & ship",
+    },
+    cancel: {
+      title: "Cancel this run?",
+      body: "The run stops at the next step boundary. Work already pushed stays on its branch — nothing is rolled back.",
+      details: { Site: JOB.businessName, Run: JOB.draftId },
+      confirmLabel: "Cancel run", tone: "danger",
+    },
+    retry: {
+      title: "Run this again?",
+      body: JOB.type === "build"
+        ? "Starts a fresh build: audit, brand, page generation, theme and deploy. Takes several minutes and spends AI credits."
+        : "Starts a fresh edit run with the same request, opening a new pull request.",
+      details: withRepo({ Site: JOB.businessName }),
+      confirmLabel: "Run again",
+    },
+  }[kind];
+
+  if (!(await window.G99.confirm(ASK))) return;
+
+  const cfg = {
+    approve: ["/api/job-approve", "Approved — merging…"],
+    cancel: ["/api/job-cancel", "Cancelling…"],
+    retry: ["/api/job-retry", "Retrying — new run started…"],
+  }[kind];
+  btn.disabled = true;
   try {
-    const d = await (await fetch("/api/pr-diff?prUrl=" + encodeURIComponent(j.prUrl))).json();
-    const html = esc(d.diff || "(empty diff)").split("\n").map((l) =>
+    const d = await postJSON(cfg[0], { id: ID });
+    toast(cfg[1]);
+    if (d.jobId) setTimeout(() => { location.href = "/job?id=" + encodeURIComponent(d.jobId); }, 700);
+    else load();
+  } catch (e) { toast("Failed: " + e.message); btn.disabled = false; }
+}
+
+async function loadDiff() {
+  if (diffLoaded || !JOB || !JOB.prUrl || !$("diffBox")) return;
+  diffLoaded = true;
+  try {
+    const d = await getJSON("/api/pr-diff?prUrl=" + encodeURIComponent(JOB.prUrl));
+    $("diffBox").innerHTML = esc(d.diff || "(empty diff)").split("\n").map((l) =>
       l.startsWith("+") && !l.startsWith("+++") ? `<span class="a">${l}</span>` :
       l.startsWith("-") && !l.startsWith("---") ? `<span class="d">${l}</span>` : l).join("\n");
-    if ($("diffBox")) $("diffBox").innerHTML = html;
-  } catch (e) { if ($("diffBox")) $("diffBox").textContent = "Could not load diff: " + e.message; }
-}
-
-function render(j) {
-  // j passed on poll; else fetch
-}
-async function poll() {
-  let j; try { j = await (await fetch("/api/job?id=" + encodeURIComponent(ID))).json(); } catch (e) { return; }
-  if (j.error && j.error === "job not found") { $("detail").innerHTML = `<p class="meta">Job <b>${esc(ID)}</b> not found (it may have been cleared). <a href="/jobs">← all jobs</a></p>`; clearInterval(timer); return; }
-  const badge = `<span class="badge ${j.status}">${esc(j.status.toUpperCase())}</span>`;
-  const when = (j.startedAt || j.createdAt || "").replace("T", " ").slice(0, 19);
-  let body = "";
-  if (j.type === "edit") {
-    body = `
-      <div class="card"><h2>Request</h2><div class="req">${esc((j.payload && j.payload.prompt) || "")}</div>
-        ${j.editSummary ? `<div class="meta" style="margin-top:10px"><b>Plan:</b> ${esc(j.editSummary)}</div>` : ""}
-        ${fileBox(j.editPlan)}</div>
-      <div class="card"><h2>Progress</h2>${steps(j)}
-        ${j.prUrl ? `<div style="margin-top:14px"><a class="prlink" href="${esc(j.prUrl)}" target="_blank">↗ Pull request</a></div>` : ""}
-        ${j.error ? `<div class="meta" style="color:var(--bad);margin-top:10px">${esc(j.error)}</div>` : ""}</div>
-      ${j.prUrl ? `<div class="card"><h2>Diff</h2><pre class="diff" id="diffBox"><span class="spin"></span> loading…</pre></div>` : ""}`;
-  } else {
-    const scores = (j.before || j.after)
-      ? `<div class="card"><h2>CRO before → after</h2><div class="scoreline">${j.before ? j.before.overall : "—"} <span style="color:${(j.delta || 0) >= 0 ? "var(--good)" : "var(--bad)"}">${j.delta == null ? "→" : (j.delta >= 0 ? "+" : "") + j.delta}</span> ${j.after ? j.after.overall : "—"}</div></div>` : "";
-    body = `${scores}
-      <div class="card"><h2>Progress</h2>${steps(j)}
-        <div style="margin-top:12px;display:flex;gap:12px;flex-wrap:wrap">
-          ${j.prUrl ? `<a class="prlink" href="${esc(j.prUrl)}" target="_blank">↗ Pull request</a>` : ""}
-          ${j.siteUrl ? `<a class="prlink" href="${esc(j.siteUrl)}" target="_blank">↗ Assembled site</a>` : ""}
-          ${j.reportUrl ? `<a class="prlink" href="${esc(j.reportUrl)}" target="_blank">↗ Report</a>` : ""}
-          <a class="prlink" href="/dashboard?job=${encodeURIComponent(j.draftId)}">↗ Live build view</a>
-        </div>
-        ${j.error ? `<div class="meta" style="color:var(--bad);margin-top:8px">${esc(j.error)}</div>` : ""}</div>`;
+  } catch (e) {
+    diffLoaded = false;
+    if ($("diffBox")) $("diffBox").textContent = "Could not load diff: " + e.message;
   }
-  $("detail").innerHTML = `
-    <div class="head"><span class="tchip ${j.type === "edit" ? "edit" : "build"}">${j.type === "edit" ? SVG_EDIT : SVG_BUILD}</span><h1>${esc(j.businessName)}</h1><span class="meta">${esc(j.type)} · ${esc(when)}</span>${badge}
-      <div class="actions">${actionButtons(j)}</div></div>
-    <div style="margin-bottom:14px">${costLine(j)}</div>
-    ${body}`;
-  if (j.type === "edit") loadDiff(j);
-  if (["done", "error", "cancelled"].includes(j.status)) clearInterval(timer);
 }
 
-let timer;
+async function load() {
+  try {
+    JOB = await getJSON("/api/job?id=" + encodeURIComponent(ID));
+  } catch (e) {
+    $("wrap").innerHTML = `<p class="empty">Run <b>${esc(ID)}</b> not found — it may have been cleared. <a href="/jobs">← all activity</a></p>`;
+    clearInterval(timer);
+    return;
+  }
+  document.title = "Growth99 · " + JOB.businessName;
+  render();
+  if (["done", "error", "cancelled"].includes(JOB.status)) clearInterval(timer);
+}
+
 ensureAuth().then((ok) => {
-  if (!ok) { $("detail").innerHTML = '<p class="meta">Unauthorized.</p>'; return; }
-  if (!ID) { $("detail").innerHTML = '<p class="meta">No job id. <a href="/jobs">← all jobs</a></p>'; return; }
-  poll();
-  timer = setInterval(poll, 3000);
+  if (!ok) { $("wrap").innerHTML = '<p class="empty">Unauthorized — reload and enter the admin password.</p>'; return; }
+  if (!ID) { $("wrap").innerHTML = '<p class="empty">No run id. <a href="/jobs">← all activity</a></p>'; return; }
+  load();
+  timer = setInterval(load, 3000);
 });

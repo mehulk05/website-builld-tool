@@ -12,4 +12,5 @@ test-invalid.js
 jobs.json
 registry.json
 reaudit.json
+site-audits.json
 server.out
