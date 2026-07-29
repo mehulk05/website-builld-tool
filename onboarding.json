@@ -1,8 +1,8 @@
 {
-  "draftId": "e2e-1785313981",
+  "draftId": "e2e2-1785317593",
   "businessId": 2274,
   "template": "WEBSITE",
-  "receivedAt": "2026-07-29T08:33:02.144Z",
+  "receivedAt": "2026-07-29T09:33:13.318Z",
   "referenceWebsite": "https://ruma.com",
   "existingWebsite": "https://nuvoaestheticsclinic.com",
   "answers": {
@@ -42,6 +42,8 @@
     "tone_clinical_warm": "85",
     "tone_lux_approachable": "13",
     "tone_bold_understated": "90",
-    "tone_playful_serious": "85"
+    "tone_playful_serious": "85",
+    "hero_headline": "Refined, natural results",
+    "hero_subheadline": "Physician-led aesthetics & wellness in Sycamore, IL"
   }
 }

@@ -1965,6 +1965,10 @@ function newJob(payload) {
   return {
     type: "build",
     draftId: String(payload.draftId), businessId: payload.businessId || null,
+    // Per-client build target, sent by G99 from the HubSpot deal (beta_site_repo / beta_site_url).
+    // Absent => fall back to this deployment's own defaults, so existing clients are unaffected.
+    repo: payload.betaSiteRepo || payload.githubRepo || WP_REPO,
+    liveUrl: payload.betaSiteUrl || LIVE_URL,
     businessName: payload.businessName || (payload.answers || {}).business_name || "Client",
     status: "queued", currentStep: 0,
     steps: JOB_STEPS.map((label) => ({ label, status: "pending", detail: "" })),
@@ -2046,7 +2050,7 @@ function jobStatusSnapshot(job) {
     steps: (job.steps || []).map((s) => ({ label: s.label, status: s.status, detail: s.detail })),
     error: job.error || null,
     // The published WordPress site (shared host) — this is the real "live site" once the theme is live.
-    liveUrl: LIVE_URL || null,
+    liveUrl: job.liveUrl || LIVE_URL || null,
     siteUrl: absUrl(job.siteUrl),
     prUrl: job.prUrl || null,
     reportUrl: absUrl(job.reportUrl),
@@ -2293,7 +2297,7 @@ async function runJob(job) {
 
     // 5 — WordPress theme + PR
     jobStep(job, 4, "running", "Building theme, pushing, opening PR…");
-    const push = await localApi("/api/push-wordpress", { theme, skipRebind: true }, 15 * 60 * 1000);
+    const push = await localApi("/api/push-wordpress", { theme, skipRebind: true, githubRepo: job.repo }, 15 * 60 * 1000);
     job.prUrl = push.prUrl; job.branch = push.branch;
     const slug = ((push.themePath || "").match(/g99-([a-z0-9-]+)\//) || [])[1] || "";
     if (!job.prUrl) throw new Error("push succeeded but no PR URL returned");
@@ -2330,18 +2334,18 @@ async function runJob(job) {
     if (!merged) throw new Error("CI watch timed out (~15 min) — " + job.prUrl);
 
     // 7 — wait for the mu-plugin to activate the theme on the live site
-    jobStep(job, 6, "running", "Waiting for deploy + activation on " + LIVE_URL);
+    jobStep(job, 6, "running", "Waiting for deploy + activation on " + job.liveUrl);
     let active = false;
     for (let i = 0; i < 40 && !active; i++) {
-      try { active = (await localApi("/api/theme-live", { url: LIVE_URL, slug })).active; } catch (e) { /* keep polling */ }
+      try { active = (await localApi("/api/theme-live", { url: job.liveUrl, slug })).active; } catch (e) { /* keep polling */ }
       if (!active) { jobStep(job, 6, "running", `Not active yet (check ${i + 1}/40)…`); await sleep(15000); }
     }
     if (!active) throw new Error("theme not detected on live within ~10 min — deploy may be slow; re-run after-audit manually");
-    jobStep(job, 6, "done", "Theme active on " + LIVE_URL);
+    jobStep(job, 6, "done", "Theme active on " + job.liveUrl);
 
     // 8 — after-audit + comparison + report
     jobStep(job, 7, "running", "Auditing the new live site…");
-    job.after = await localApi("/api/cro-audit-url", { url: LIVE_URL });
+    job.after = await localApi("/api/cro-audit-url", { url: job.liveUrl });
     job.delta = job.before ? job.after.overall - job.before.overall : null;
     job.reportUrl = writeComparisonReport(job);
     await postPrComment(job);
@@ -2356,7 +2360,7 @@ async function runJob(job) {
       if (slug) {
         const ej = enqueueEnrichJob({
           jobId: "enrich-" + Date.now(), businessId: job.businessId, parentDraftId: job.draftId,
-          siteId: "g99-" + slug, businessName: job.businessName, githubRepo: WP_REPO,
+          siteId: "g99-" + slug, businessName: job.businessName, githubRepo: job.repo,
           themeSlug: "g99-" + slug, themePath: `web/app/themes/g99-${slug}`,
           muPath: `web/app/mu-plugins/g99-activate-${slug}.php`,
           answers: A, composed: job.composed, referenceWebsite: onb.referenceWebsite || "",
@@ -2438,7 +2442,7 @@ async function postPrComment(job) {
   ].join("\n");
   const tmpFile = path.join(os.tmpdir(), `prc-${Date.now()}.md`);
   fs.writeFileSync(tmpFile, body);
-  const r = await sh(`gh pr comment ${prNum} --repo ${WP_REPO} --body-file "${tmpFile}"`);
+  const r = await sh(`gh pr comment ${prNum} --repo ${job.repo || WP_REPO} --body-file "${tmpFile}"`);
   fs.rmSync(tmpFile, { force: true });
   if (r.code) console.warn("PR comment failed:", (r.stderr || "").slice(-200));
 }
@@ -4138,6 +4142,8 @@ const server = http.createServer(async (req, res) => {
 
     if (p === "/api/push-wordpress" && req.method === "POST") {
       const body = JSON.parse(await readBody(req) || "{}");
+      // Per-client target repo (from the job); falls back to this deployment's default.
+      const repo = body.githubRepo || WP_REPO;
       const a = JSON.parse(fs.readFileSync(path.join(DIR, "onboarding.json"), "utf8")).answers;
       const slug = (a.business_name || "client").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32);
       if (!body.skipRebind) await ensureFreshSite(body.theme); // rebind /site/ from newest generation — never ship stale (dashboard binds itself and passes skipRebind)
@@ -4157,12 +4163,12 @@ const server = http.createServer(async (req, res) => {
       try {
         // gh repo clone hits api.github.com/graphql, which flaky DNS occasionally
         // refuses; retry, then fall back to a plain git clone over github.com.
-        let r = await runRetry(`gh repo clone ${WP_REPO} "${tmp}" -- --depth 1`);
+        let r = await runRetry(`gh repo clone ${repo} "${tmp}" -- --depth 1`);
         // Fallback avoids api.github.com (flaky DNS). With GH_TOKEN (deployed),
         // embed it so the plain clone is authenticated too.
         const cloneUrl = process.env.GH_TOKEN
-          ? `https://x-access-token:${process.env.GH_TOKEN}@github.com/${WP_REPO}.git`
-          : `https://github.com/${WP_REPO}.git`;
+          ? `https://x-access-token:${process.env.GH_TOKEN}@github.com/${repo}.git`
+          : `https://github.com/${repo}.git`;
         if (r.code) r = await runRetry(`git clone --depth 1 "${cloneUrl}" "${tmp}"`);
         if (r.code) throw new Error("clone failed (network — could not reach GitHub): " + r.stderr.slice(-200));
         // Deployed (headless) git push must authenticate via the token URL too.
@@ -4200,7 +4206,7 @@ const server = http.createServer(async (req, res) => {
         }
         const title = `Add ${a.business_name} beta theme (Growth99 generated)`;
         const prBody = `AI-generated classic WordPress theme for **${a.business_name}**, added at \`${rel}/\`.\\n\\nShips a must-use plugin (\`${muRel}/${muFile}\`) that auto-activates the theme once on deploy — no manual wp-admin click. Delete that file to disable auto-activation.\\n\\nGenerated by the Growth99 Website Build Tool. Beta: styling loads Tailwind + fonts from CDN; compile to static CSS before production.`;
-        r = await runRetry(`gh pr create --repo ${WP_REPO} --base main --head "${branch}" --title "${title.replace(/"/g, "'")}" --body "${prBody}"`, tmp);
+        r = await runRetry(`gh pr create --repo ${repo} --base main --head "${branch}" --title "${title.replace(/"/g, "'")}" --body "${prBody}"`, tmp);
         const prUrl = (r.stdout.match(/https:\/\/github\.com\/\S+/) || [""])[0];
         fs.rmSync(tmp, { recursive: true, force: true });
         if (!prUrl && r.code) throw new Error("PR create failed: " + r.stderr.slice(-200));
@@ -4285,12 +4291,12 @@ const server = http.createServer(async (req, res) => {
       // offending files: Pint prints "⨯ path/to/file.php" (often truncated with …) — also accept any .php path in the log
       const raw = [...new Set([...log.matchAll(/[⨯x]\s+(\S+?\.php)|((?:web|config)\/[\w\/.-]+?\.php)/g)].map(m => (m[1] || m[2])).filter(Boolean))];
       // resolve truncated paths against the branch tree
-      const tree = (await sh(`gh api repos/${WP_REPO}/git/trees/${branch}?recursive=1 --jq ".tree[].path"`)).stdout.split("\n");
+      const tree = (await sh(`gh api repos/${repoFromPrUrl(prUrl)}/git/trees/${branch}?recursive=1 --jq ".tree[].path"`)).stdout.split("\n");
       const files = [...new Set(raw.map(f => tree.find(t => t === f) || tree.find(t => t.startsWith(f.replace(/…$/, ""))) || null).filter(Boolean))].slice(0, 3);
       if (!files.length) return json(res, 200, { fixed: [], message: "could not identify offending file from log", log: log.slice(-1500) });
       const fixed = [];
       for (const f of files) {
-        const meta = JSON.parse((await sh(`gh api "repos/${WP_REPO}/contents/${f}?ref=${branch}"`)).stdout || "{}");
+        const meta = JSON.parse((await sh(`gh api "repos/${repoFromPrUrl(prUrl)}/contents/${f}?ref=${branch}"`)).stdout || "{}");
         if (!meta.content) continue;
         const content = Buffer.from(meta.content, "base64").toString("utf8");
         const prompt = [
@@ -4304,7 +4310,7 @@ const server = http.createServer(async (req, res) => {
         if (!fixedContent.trim().startsWith("<?php") && content.trim().startsWith("<?php")) continue; // sanity: don't commit garbage
         if (fixedContent.trim() === content.trim()) continue; // nothing changed
         const b64 = Buffer.from(fixedContent, "utf8").toString("base64");
-        const put = await sh(`gh api -X PUT "repos/${WP_REPO}/contents/${f}" -f message="Auto-fix CI build failure (Gemini)" -f content="${b64}" -f sha="${meta.sha}" -f branch="${branch}"`);
+        const put = await sh(`gh api -X PUT "repos/${repoFromPrUrl(prUrl)}/contents/${f}" -f message="Auto-fix CI build failure (Gemini)" -f content="${b64}" -f sha="${meta.sha}" -f branch="${branch}"`);
         if (!put.code) fixed.push(f);
       }
       return json(res, 200, { fixed, branch, message: fixed.length ? `committed fix to ${fixed.join(", ")}` : "Gemini produced no usable fix", log: fixed.length ? undefined : log.slice(-1500) });
