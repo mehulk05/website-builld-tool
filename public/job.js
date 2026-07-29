@@ -9,19 +9,60 @@ const $ = (id) => document.getElementById(id);
 const ID = new URLSearchParams(location.search).get("id");
 
 let JOB = null, TECH_OPEN = false, diffLoaded = false, timer;
+let GENPROG = { phase: "idle", pages: {} };   // live per-page Stitch progress
 
 const verdict = (d) => d == null ? "" : d >= 15 ? "Significant improvement" : d >= 5 ? "Improved" : d >= 0 ? "Stable" : "Regressed";
 
+// ---- per-step detail ---------------------------------------------------------
+// The brand system chosen in "Compose build prompt": swatches + fonts + the full
+// generated brief behind a disclosure.
+function brandBlock(j) {
+  const c = j.composed;
+  if (!c) return "";
+  const sw = (hex, label) => hex ? `<span class="sw"><i style="background:${esc(hex)}"></i><b>${esc(label)}</b><code>${esc(hex)}</code></span>` : "";
+  const fonts = [c.headingFont, c.bodyFont].filter(Boolean).join(" + ");
+  return `<div class="sub-detail">
+    <div class="swatches">${sw(c.primary, "Primary")}${sw(c.secondary, "Secondary")}${sw(c.accent, "Accent")}</div>
+    ${fonts ? `<div class="kv">Typography · ${esc(fonts)}</div>` : ""}
+    ${c.brief ? `<details class="brief"><summary>View the full build prompt (${c.brief.length} chars)</summary><div>${esc(c.brief)}</div></details>` : ""}
+  </div>`;
+}
+// Per-page generation status. While the step is running we use the live global
+// progress (queued → generating → post-processing → done); once finished we use
+// the job's own snapshot so the breakdown survives a reload.
+const PAGE_ORDER = [["home", "Home"], ["services", "Services"], ["about", "About"], ["contact", "Contact"]];
+const PG_TXT = { queued: "queued", generating: "generating…", "post-processing": "optimising images / SEO…", done: "", error: "" };
+function pageRows(j, live) {
+  const src = live && GENPROG && GENPROG.pages && Object.keys(GENPROG.pages).length ? GENPROG.pages : (j.pages || {});
+  const keys = Object.keys(src);
+  if (!keys.length) return "";
+  const order = PAGE_ORDER.filter(([k]) => keys.includes(k)).concat(keys.filter((k) => !PAGE_ORDER.some(([p]) => p === k)).map((k) => [k, k]));
+  return `<div class="sub-detail"><div class="pages">${order.map(([k, label]) => {
+    const st = src[k] || {};
+    const status = st.status || "queued";
+    const right = status === "done" ? (st.bytes ? (st.bytes / 1024).toFixed(1) + " KB" : "done")
+      : status === "error" ? (st.error || "failed") : (PG_TXT[status] || status);
+    const dot = status === "done" ? "done" : status === "error" ? "error" : status === "queued" ? "queued" : "running";
+    return `<div class="pg ${status}"><span class="dot ${dot}"></span><span class="pgn">${esc(label)}</span><span class="pgs">${esc(right)}</span></div>`;
+  }).join("")}</div></div>`;
+}
 function stepper(j) {
   const ic = { done: svg("check", 13, 3), running: `<span class="spin" style="margin:0;border-color:var(--accent);border-top-color:transparent"></span>`, error: svg("close", 13, 3), pending: "" };
-  return `<div class="steps">${(j.steps || []).map((s) => `
+  const isBuild = j.type !== "edit" && j.type !== "enrich" && j.type !== "restore";
+  return `<div class="steps">${(j.steps || []).map((s, i) => {
+    let extra = "";
+    if (isBuild && i === 1 && s.status !== "pending") extra = brandBlock(j);
+    if (isBuild && i === 2 && s.status !== "pending") extra = pageRows(j, s.status === "running");
+    return `
     <div class="jstep ${s.status}">
       <span class="ic">${ic[s.status] || ""}</span>
       <div class="jb">
         <span class="lb">${esc(s.label)}</span>
         ${s.detail ? `<span class="dt"${s.status === "error" ? ' style="color:var(--bad)"' : ""}>${esc(s.detail)}</span>` : ""}
+        ${extra}
       </div>
-    </div>`).join("")}</div>`;
+    </div>`;
+  }).join("")}</div>`;
 }
 
 function scoresCard(j) {
@@ -66,10 +107,12 @@ function actions(j) {
   return b.join("");
 }
 
+const TYPE_LABEL = { edit: "Edit", enrich: "Enrich", restore: "Restore", build: "Build" };
 function render() {
   const j = JOB;
   const st = jobState(j);
   const isEdit = j.type === "edit";
+  const isEnrich = j.type === "enrich";
   const site = (j.payload && j.payload.siteId) || null;
   const c = j.cost || {};
 
@@ -80,10 +123,10 @@ function render() {
       <span class="ava lg" style="width:42px;height:42px;border-radius:11px;font-size:15px;background:${avatarColor(j.businessName)}">${esc(initials(j.businessName))}</span>
       <div style="min-width:0;flex:1">
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-          <h1>${esc(j.editSummary || (isEdit ? "Website edit" : "Build " + j.businessName))}</h1>
+          <h1>${esc(j.editSummary || (isEdit ? "Website edit" : isEnrich ? "Service pages + brand guide" : "Build " + j.businessName))}</h1>
           <span class="pill ${st.cls}">${esc(st.label)}</span>
         </div>
-        <div class="meta">${isEdit ? "Edit" : "Build"} · ${esc(j.businessName)} · started ${esc(relTime(j.startedAt || j.createdAt))} · ${c.gemini || 0} AI planning · ${c.stitch || 0} generation calls · ${esc(jobCost(j))} est.</div>
+        <div class="meta">${TYPE_LABEL[j.type] || "Build"} · ${esc(j.businessName)} · started ${esc(relTime(j.startedAt || j.createdAt))} · ${c.gemini || 0} AI planning · ${c.stitch || 0} generation calls · ${esc(jobCost(j))} est.</div>
       </div>
       <div class="acts">${actions(j)}</div>
     </div>
@@ -93,15 +136,24 @@ function render() {
 
     ${scoresCard(j)}
 
+    ${isEnrich && j.servicePages ? `<div class="card pad"><div class="card-h"><h2>What this adds</h2>${j.enrichPlan && j.enrichPlan.truncated ? `<span class="right" style="font-size:12px;color:var(--muted)">capped at ${j.servicePages.length} of ${j.enrichPlan.total}</span>` : ""}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 4px">
+        ${j.servicePages.map((s) => `<span class="pill" style="background:var(--accent-soft);color:var(--accent)">${esc(s.name)}</span>`).join("")}
+        <span class="pill good">Brand guide</span>
+      </div>
+      <div class="meta" style="margin-top:8px">${j.servicePages.length} individual service page(s) under a Treatments dropdown, a services hub, and a public /brand-guide page${j.enrichPlan && j.enrichPlan.refCount ? ` · reference site has ${j.enrichPlan.refCount} service pages` : ""}.</div></div>` : ""}
+
     ${isEdit && j.payload && j.payload.prompt ? `<div class="card pad"><div class="card-h"><h2>The request</h2></div><p class="req">${esc(j.payload.prompt)}</p></div>` : ""}
 
     <div class="card pad">
       <div class="card-h"><h2>Progress</h2>${j.prUrl ? `<a class="right linkbtn" href="${esc(j.prUrl)}" target="_blank" rel="noopener">Pull request${svg("ext", 13)}</a>` : ""}</div>
       <div style="padding-top:10px">${stepper(j)}</div>
       ${j.editPlan && j.editPlan.length ? `<div class="filebox"><div class="fhead">${j.editPlan.length} file${j.editPlan.length > 1 ? "s" : ""} changed</div>${j.editPlan.map((f) => `<div class="frow"><span class="fop ${esc((f.op || "edit").toLowerCase())}">${esc(f.op || "edit")}</span><span class="fpath">${esc(f.path)}</span></div>`).join("")}</div>` : ""}
-      ${(j.siteUrl || j.reportUrl) ? `<div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:14px">
+      ${(j.siteUrl || j.reportUrl || j.enrichJobId || (j.payload && j.payload.parentDraftId)) ? `<div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:14px;align-items:center">
         ${j.siteUrl ? `<a class="linkbtn" href="${esc(j.siteUrl)}" target="_blank" rel="noopener">Assembled site${svg("ext", 13)}</a>` : ""}
         ${j.reportUrl ? `<a class="linkbtn" href="${esc(j.reportUrl)}" target="_blank" rel="noopener">Comparison report${svg("ext", 13)}</a>` : ""}
+        ${j.enrichJobId ? `<a class="btn sm" href="/job?id=${encodeURIComponent(j.enrichJobId)}">${svg("spark", 14)}View service pages run</a>` : ""}
+        ${(j.payload && j.payload.parentDraftId) ? `<a class="btn sm" href="/job?id=${encodeURIComponent(j.payload.parentDraftId)}">${svg("back", 14)}Back to the build run</a>` : ""}
       </div>` : ""}
     </div>
 
@@ -190,9 +242,19 @@ async function load() {
     clearInterval(timer);
     return;
   }
+  // While pages are being generated, pull the live per-page progress too.
+  const genStep = (JOB.steps || [])[2];
+  if (JOB.type !== "edit" && JOB.type !== "enrich" && genStep && genStep.status === "running") {
+    try { GENPROG = await getJSON("/api/generate-progress"); } catch (e) { /* keep last */ }
+  }
   document.title = "Growth99 · " + JOB.businessName;
   render();
-  if (["done", "error", "cancelled"].includes(JOB.status)) clearInterval(timer);
+  // Keep polling while anything can still change. A build can be "done" while its
+  // enrichment run is still going (that step mirrors it), so don't stop on status
+  // alone — otherwise the page goes stale and needs a manual refresh.
+  const settled = ["done", "error", "cancelled"].includes(JOB.status);
+  const childRunning = (JOB.steps || []).some((s) => s.status === "running" || s.status === "pending");
+  if (settled && !childRunning) clearInterval(timer);
 }
 
 ensureAuth().then((ok) => {

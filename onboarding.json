@@ -1,92 +1,47 @@
 {
-  "draftId": "test-952",
-  "businessId": 90210,
+  "draftId": "e2e-1785313981",
+  "businessId": 2274,
   "template": "WEBSITE",
-  "referenceWebsite": "https://ro.co",
-  "existingWebsite": "https://elra.com",
+  "receivedAt": "2026-07-29T08:33:02.144Z",
+  "referenceWebsite": "https://ruma.com",
+  "existingWebsite": "https://nuvoaestheticsclinic.com",
   "answers": {
-    "business_name": "Elra Aesthetic",
-    "location": "Old Town, Scottsdale, AZ",
-    "phone_for_website": "(480) 555-0134",
-    "business_description": "Physician-led medical aesthetics and wellness spa offering injectables, advanced skin health, body contouring, laser and IV wellness in a calm, luxurious setting.",
-    "why_patients_choose": "We focus on subtle, natural-looking results that enhance each patient's unique features — medical rigor with an unhurried, warm experience.",
-    "ideal_patient": "Women and men 30–60 seeking premium, natural anti-aging and skin-health treatments; values expertise and discretion.",
+    "business_name": "NUVO Aesthetics Clinic - GIA Upsell - June 2026 (clone)",
+    "primary_contact": "Medryck Ghadieh",
+    "phone_for_website": "+13203387829",
+    "location": "437 W State St, Sycamore, IL 60178",
+    "business_description": "NUVO Aesthetics Clinic is a premier medical spa in Sycamore, IL, specializing in regenerative treatments for facial aesthetics and general well-being.",
     "services_offered": [
-      "Cosmetic Injectables",
-      "Medical Weight Loss",
-      "Bio-identical HRT",
-      "Hair Restoration",
-      "Microneedling",
-      "Chemical Peels",
-      "Dermaplaning",
-      "Laser Skin Resurfacing",
-      "Laser Hair Removal",
-      "Sculptra Injections",
-      "Ariessence Pure PDGF+ Treatment",
-      "IV Therapy"
-    ],
-    "revenue_services": [
-      "Cosmetic Injectables",
+      "Neurotoxins (Botox",
+      "Dysport)",
       "Dermal Fillers",
-      "Sculptra Injections"
+      "Sculptra Aesthetic",
+      "Medical Weight Loss",
+      "Bio-identical HRT"
     ],
-    "featured_review": "Jeannine always makes me feel super comfortable when I’m getting my Botox or filler.",
-    "financing_offered": [
-      "None"
+    "why_patients_choose": "Patients choose NUVO for its focus on regenerative medicine and natural-looking results.",
+    "revenue_services": [
+      "Dermal Fillers",
+      "Neurotoxins",
+      "Bio-identical HRT"
     ],
-    "booking_platform": "Aesthetic Record",
+    "site_love_1_url": "https://ruma.com",
     "primary_cta": "Book online",
-    "logo_file": "https://nuvoaestheticsclinic.com/storage/2023/04/cropped-Nuvo-Logo-Full-Transparent.png",
+    "booking_platform": "GlossGenius",
     "team_roster": [
       {
-        "name": "Jeannine Fair, MSN FPA APRN NP-C",
+        "name": "Jeannine Fair MSN FPA APRN NP-C",
         "role": "Owner and Medical Director"
       },
       {
-        "name": "Olivia Burton, APRN FNP-BC",
+        "name": "Olivia Burton APRN FNP-BC",
         "role": "Certified Nurse Practitioner and Aesthetic Injector"
-      },
-      {
-        "name": "Jutona Jensen",
-        "role": "Aesthetician"
-      },
-      {
-        "name": "Urska Suligoj, RN",
-        "role": "Registered Nurse and Certified Aesthetic Injector"
       }
     ],
-    "site_love_1_url": "https://ro.co",
-    "site_love_1_reason": "Clean editorial layout, warm luxurious aesthetic, calm spacing.",
-    "tone_clinical_warm": "70",
-    "tone_lux_approachable": "60",
-    "tone_bold_understated": "50",
-    "tone_playful_serious": "40",
-    "brand_aesthetic": "Luxurious",
-    "hero_headline": "Artistry in aesthetics, guided by medicine",
-    "hero_subheadline": "Physician-led aesthetics & wellness in Old Town Scottsdale.",
-    "seo_keywords": [
-      "botox scottsdale",
-      "lip filler scottsdale",
-      "morpheus8 arizona",
-      "medspa scottsdale"
-    ],
-    "primary_contact": "Medryck Ghadieh",
-    "growth_services": [
-      "Medical Weight Loss",
-      "Ariessence Pure PDGF+ Treatment"
-    ],
-    "before_after_status": "Have, with consent",
-    "team_photos_status": "Use stock for now",
-    "no_website_yet": "false",
-    "current_site_feedback": "The website content effectively highlights services but could improve in clarity and organization to better guide potential patients through their offerings.",
-    "content_strategy": "Enhance it",
-    "provider_credentials_status": "Have, not shown",
-    "testimonials_status": "Have video",
     "practice_type": "Med spa",
-    "lead_alert_email": "medryckg@gmail.com",
-    "lead_alert_sms": "+13203387829",
-    "ad_history_platforms": [],
-    "ad_geo": "437 W State St, Sycamore, IL 60178",
-    "audience_notes": "The ideal patient is an adult seeking non-surgical aesthetic enhancements to improve their appearance and self-esteem, with realistic expectations for results."
+    "tone_clinical_warm": "85",
+    "tone_lux_approachable": "13",
+    "tone_bold_understated": "90",
+    "tone_playful_serious": "85"
   }
 }
