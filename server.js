@@ -3180,11 +3180,16 @@ function navDropdownSnippet(services, composed) {
   const items = JSON.stringify(services.map((s) => ({ name: s.name, url: "/" + s.slug + "/" })));
   return `<!-- g99-treatments-dropdown -->
 <style>
-.g99-hasdrop{position:relative}
-.g99-drop{position:absolute;top:100%;left:0;min-width:230px;background:${c.primary || "#141414"};border:1px solid rgba(255,255,255,.14);border-radius:12px;padding:8px;display:none;flex-direction:column;gap:2px;z-index:99999;box-shadow:0 16px 40px rgba(0,0,0,.4)}
-.g99-hasdrop:hover .g99-drop,.g99-drop:hover{display:flex}
+/* The wrapper is injected around the Treatments link ONLY, so hovering Home /
+   Team / Contact can never open it (these themes have no <li> — every nav link
+   sits in one shared container, so hovering the container was wrong). */
+.g99-hasdrop{position:relative;display:inline-flex;align-items:center}
+.g99-drop{position:absolute;top:100%;left:0;margin-top:2px;min-width:232px;background:${c.primary || "#141414"};border:1px solid rgba(255,255,255,.14);border-radius:12px;padding:8px;display:none;flex-direction:column;gap:2px;z-index:99999;box-shadow:0 16px 40px rgba(0,0,0,.4)}
+/* a small invisible bridge so the pointer can travel from link to panel */
+.g99-drop::before{content:"";position:absolute;top:-8px;left:0;right:0;height:8px}
+.g99-hasdrop:hover > .g99-drop,.g99-hasdrop:focus-within > .g99-drop{display:flex}
 .g99-drop a{display:block;padding:9px 14px;color:#fff !important;text-decoration:none;border-radius:8px;font-size:14px;white-space:nowrap;font-weight:500}
-.g99-drop a:hover{background:rgba(255,255,255,.08);color:${c.accent || "#d4af37"} !important}
+.g99-drop a:hover,.g99-drop a:focus{background:rgba(255,255,255,.08);color:${c.accent || "#d4af37"} !important}
 </style>
 <script>
 (function () {
@@ -3193,24 +3198,36 @@ function navDropdownSnippet(services, composed) {
     var link = document.querySelector('a[href="/services/"], a[href$="/services/"]');
     if (!link || link.getAttribute('data-g99')) { return; }
     link.setAttribute('data-g99', '1');
-    var li = link.closest('li') || link.parentElement;
-    if (!li) { return; }
-    li.classList.add('g99-hasdrop');
+
+    // Wrap the Treatments link itself — never its parent, which holds every
+    // other nav link and would make them all trigger the dropdown.
+    var host = link.closest('li');
+    if (!host) {
+      host = document.createElement('span');
+      host.className = 'g99-hasdrop';
+      link.parentElement.insertBefore(host, link);
+      host.appendChild(link);
+    } else {
+      host.classList.add('g99-hasdrop');
+    }
+
     var d = document.createElement('div');
     d.className = 'g99-drop';
-    items.forEach(function (it) { var a = document.createElement('a'); a.href = it.url; a.textContent = it.name; d.appendChild(a); });
-    li.appendChild(d);
-    // Brand Guide as a top-level nav item: clone the Treatments link so it
-    // inherits the theme's own nav styling, whatever markup the AI produced.
-    if (!document.querySelector('nav a[href="/brand-guide/"], header a[href="/brand-guide/"]')) {
+    items.forEach(function (it) {
+      var a = document.createElement('a');
+      a.href = it.url; a.textContent = it.name;
+      d.appendChild(a);
+    });
+    host.appendChild(d);
+
+    // Brand Guide as its own top-level nav item: clone the Treatments link so it
+    // inherits the theme's nav styling, then place it after the wrapper.
+    if (!document.querySelector('a[href="/brand-guide/"]')) {
       var bg = link.cloneNode(true);
       bg.textContent = 'Brand Guide';
       bg.setAttribute('href', '/brand-guide/');
       bg.removeAttribute('data-g99');
-      var wrap2 = li.cloneNode(false);
-      wrap2.classList.remove('g99-hasdrop');
-      wrap2.appendChild(bg);
-      li.parentElement.insertBefore(wrap2, li.nextSibling);
+      host.parentElement.insertBefore(bg, host.nextSibling);
     }
   }
   if (document.readyState !== 'loading') { build(); } else { document.addEventListener('DOMContentLoaded', build); }
