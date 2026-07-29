@@ -2364,6 +2364,7 @@ async function runJob(job) {
           themeSlug: "g99-" + slug, themePath: `web/app/themes/g99-${slug}`,
           muPath: `web/app/mu-plugins/g99-activate-${slug}.php`,
           answers: A, composed: job.composed, referenceWebsite: onb.referenceWebsite || "",
+          existingWebsite: onb.existingWebsite || "",
         });
         job.enrichJobId = ej.draftId;   // frontend links to the run from this step
         jobStep(job, ENRICH_STEP_IDX, "running", "Queued as its own run — generating service pages…");
@@ -2804,6 +2805,114 @@ async function discoverServicePages(url) {
   return { count: pages.length, pages: pages.map((p) => ({ path: p })), localSeo };
 }
 
+// ---- existing-site reference scraping ------------------------------------------
+// The client's CURRENT website usually already has a page per service (e.g.
+// /services/neurotoxins-in-sycamore-il/). Scrape each matching page's real copy
+// and feed it to Stitch as the content reference, so generated pages carry the
+// practice's actual claims/FAQ/process instead of invented text.
+async function scrapeExistingServiceRefs(existingUrl, services) {
+  const out = {};
+  if (!existingUrl) return out;
+  let origin; try { origin = new URL(existingUrl).origin; } catch (e) { return out; }
+  const fetchText = async (u) => {
+    try { const r = await fetch(u, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 G99Bot" } }); return r.ok ? await r.text() : ""; } catch (e) { return ""; }
+  };
+  // candidate links: homepage + /services/ hub
+  const links = new Set();
+  for (const page of ["/", "/services/"]) {
+    const html = await fetchText(origin + page);
+    for (const m of html.matchAll(/href="((?:https?:\/\/[^"\/]+)?\/[a-z0-9-\/]+\/)"/gi)) {
+      const p = m[1].replace(origin, "");
+      if (p.length > 3 && !/\/(blog|feed|privacy|contact|about|cart|checkout)/.test(p)) links.add(p);
+    }
+  }
+  const linkArr = [...links];
+  for (const s of services) {
+    const tokens = s.slug.split("-").filter((t) => t.length > 3);
+    let best = null, bestScore = 0;
+    for (const p of linkArr) {
+      const score = tokens.filter((t) => p.includes(t)).length;
+      if (score > bestScore) { bestScore = score; best = p; }
+    }
+    if (!best || !bestScore) continue;
+    const html = await fetchText(origin + best);
+    if (!html) continue;
+    const title = (html.match(/<title>([^<]{0,120})/i) || [])[1] || "";
+    const h1 = ((html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i) || [])[1] || "").replace(/<[^>]+>/g, " ").trim();
+    const h2s = [...html.matchAll(/<h2[^>]*>([\s\S]*?)<\/h2>/gi)].map((m) => m[1].replace(/<[^>]+>/g, " ").trim()).filter(Boolean).slice(0, 8);
+    const body = html.replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>|<[^>]+>/gi, " ").replace(/\s+/g, " ").trim().slice(0, 1600);
+    out[s.slug] = { url: origin + best, title, h1, h2s, text: body };
+  }
+  return out;
+}
+// Learn the REFERENCE site's service-page design (section order, imagery density,
+// local-SEO heading style) so generated pages mimic what the client loves instead
+// of a fixed outline. Fail-soft → null (composer falls back to a proven structure).
+async function scrapeReferenceServiceStructure(refUrl) {
+  if (!refUrl) return null;
+  try {
+    const disc = await discoverServicePages(refUrl);
+    if (!disc.count) return null;
+    const origin = new URL(refUrl).origin;
+    const r = await fetch(origin + disc.pages[0].path, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 G99Bot" } });
+    if (!r.ok) return null;
+    const page = await r.text();
+    const h1 = ((page.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i) || [])[1] || "").replace(/<[^>]+>/g, " ").trim();
+    const h2s = [...page.matchAll(/<h[23][^>]*>([\s\S]*?)<\/h[23]>/gi)]
+      .map((m) => m[1].replace(/<[^>]+>/g, " ").trim()).filter((t) => t && t.length < 90).slice(0, 12);
+    const imgs = (page.match(/<img/gi) || []).length;
+    const sections = (page.match(/<section/gi) || []).length;
+    return { url: origin + disc.pages[0].path, h1, h2s, imgs, sections, localSeo: disc.localSeo };
+  } catch (e) { return null; }
+}
+// Gemini composes the generation brief for ONE service page: mimic the reference
+// page's structure, rewrite the existing site's real copy, obey the brand system.
+// Nothing about the section flow is hardcoded — it comes from the reference scrape.
+async function composeServicePagePrompt(svc, refStruct, existing, A, composed, city) {
+  const loc = city ? ` in ${city}` : "";
+  const p = [
+    `Write a DESIGN BRIEF (a page-generation prompt) for one service page of a medical-aesthetics website. Return ONLY the brief text — no preamble, no markdown.`,
+    `Service: "${svc.name}" at ${A.business_name || "the clinic"}${loc}. Primary CTA "${A.primary_cta || "Book a consultation"}" (booking: ${A.booking_platform || "online"}).`,
+    refStruct
+      ? `MIMIC THIS REFERENCE PAGE'S STRUCTURE (the design the client loves — ${refStruct.url}): H1 pattern "${refStruct.h1}"; section flow: ${refStruct.h2s.join(" → ")}; ~${refStruct.imgs} images across ${refStruct.sections || "several"} sections${refStruct.localSeo ? `; local-SEO style with the city woven into headings` : ""}. Adapt that exact section order and imagery density to "${svc.name}".`
+      : `Use a proven conversion structure: hero, what-it-is, benefits, candidacy, process, trust/credentials, FAQ, closing CTA.`,
+    existing ? `REAL COPY TO REWRITE, keep the facts (from the practice's current page ${existing.url}): H1 "${existing.h1}"; sections ${existing.h2s.join(" · ")}; text: ${existing.text.slice(0, 1000)}` : "",
+    `Brand system to obey exactly: primary ${composed.primary}, secondary ${composed.secondary}, accent ${composed.accent}; headings "${composed.headingFont}", body "${composed.bodyFont}".`,
+    `The brief must specify every section in order with concrete copy direction, demand rich professional medical-aesthetic photography, and stay conversion-focused. 250-400 words.`,
+  ].filter(Boolean).join("\n");
+  return stripFence(await geminiCall([{ text: p }], { temperature: 0.5, maxOutputTokens: 1400, timeoutMs: 60000 }));
+}
+// Hard technical constraint appended to every service-page prompt (composed or
+// fallback): the page's <head> is stripped for the WP template, so custom
+// tailwind.config token names would silently die.
+function stylingConstraint(composed) {
+  return `\n\nSTYLING CONSTRAINT (critical): use ONLY standard Tailwind utility classes and arbitrary-value utilities with exact hex (e.g. bg-[${composed.primary}] text-[${composed.accent}]). Do NOT define or rely on custom tailwind.config color names. Any custom CSS must live in a <style> block. Return one complete, responsive, production-quality HTML page.`;
+}
+// Fallback Stitch prompt (fixed outline) — used only when Gemini composition fails.
+// Standard/arbitrary-value Tailwind only — named custom tokens (bg-charcoal etc.)
+// die when the page's <head> is stripped into a WP template.
+function stitchServicePrompt(svc, refc, A, composed, city) {
+  const loc = city ? ` in ${city}` : "";
+  return [
+    `Design a single, conversion-optimized SERVICE page for the treatment "${svc.name}" offered by ${A.business_name || "the clinic"}${loc} (medical aesthetics / medspa).`,
+    refc ? `\nCONTENT REFERENCE — this is the practice's CURRENT page for this service; rewrite/upgrade this real copy, keep the facts:\nTitle: ${refc.title}\nH1: ${refc.h1}\nSections: ${refc.h2s.join(" · ")}\nText: ${refc.text}` : "",
+    `\nSections: 1) full-bleed HERO with image + dark scrim, H1 "${svc.name}${loc}", benefit subhead, CTA "${A.primary_cta || "Book a consultation"}". 2) What it is (outcome-framed). 3) Benefits grid. 4) Treatment areas / candidacy. 5) How it works — 3 steps. 6) Why ${A.business_name || "us"} — credentials. 7) 3-question FAQ. 8) Closing CTA band (booking: ${A.booking_platform || "online"}).`,
+    `\nBrand: primary ${composed.primary}, secondary ${composed.secondary}, accent ${composed.accent}; headings "${composed.headingFont}", body "${composed.bodyFont}". Rich professional medical-aesthetic photography, 6-10 images.`,
+  ].filter(Boolean).join("\n");   // stylingConstraint() is appended by the caller
+}
+// Make a generated page's <main> self-sufficient inside the WP template: carry its
+// font links, <style> blocks and inline tailwind config along with the body —
+// this is THE fix for service pages rendering unstyled (their classes were
+// defined in a <head> that splitPage() threw away).
+function embedPageAssets(html) {
+  const head = (html.match(/<head[^>]*>([\s\S]*?)<\/head>/i) || [, ""])[1];
+  const fonts = (head.match(/<link[^>]+fonts\.googleapis[^>]*>/gi) || []).join("\n");
+  const styles = (head.match(/<style[\s\S]*?<\/style>/gi) || []).join("\n");
+  const twcfg = (head.match(/<script(?![^>]*\bsrc=)[^>]*>[\s\S]*?tailwind\.config[\s\S]*?<\/script>/gi) || []).join("\n");
+  const main = splitPage(html).main;
+  return [fonts, twcfg, styles, main].filter(Boolean).join("\n");
+}
+
 // ---- content generation (one template → clone per service) --------------------
 function serviceSectionSpec(svc, A, composed, ref, city) {
   const loc = city ? ` in ${city}` : "";
@@ -3191,16 +3300,64 @@ async function runEnrichJob(job) {
     if (truncated) log_srv(`services truncated: ${total} → ${MAX_SERVICE_PAGES}`);
     jobStep(job, 1, "done", `${services.length} service page(s)${truncated ? ` (capped from ${total})` : ""} + brand guide${ref.count ? ` · ref has ${ref.count}` : ""}`);
 
-    // 3 — generate pages (one template → clone) + deterministic hub + brand guide
-    jobStep(job, 2, "running", services.length ? "Generating service template…" : "Building brand guide…");
+    // 3 — generate pages: STITCH per service (grounded in the existing site's
+    // matching page copy), Gemini template+clone only as the fallback. Each page's
+    // own styles are embedded into its <main> (embedPageAssets) so nothing breaks
+    // when the <head> is stripped for the WP template.
+    jobStep(job, 2, "running", services.length ? "Scraping existing site's service pages…" : "Building brand guide…");
     const serviceMains = {};
     if (services.length) {
-      const template = await generateServiceTemplate(services[0], A, composed, ref, city);
-      serviceMains[services[0].slug] = template;
-      for (let i = 1; i < services.length; i++) {
-        jobStep(job, 2, "running", `Cloning page ${i + 1}/${services.length}: ${services[i].name}`);
-        try { serviceMains[services[i].slug] = await cloneServicePage(template, services[i], A, composed, city); }
-        catch (e) { serviceMains[services[i].slug] = template; }
+      let refs = {};
+      try { refs = await scrapeExistingServiceRefs(P.existingWebsite, services); } catch (e) { /* fail-soft */ }
+      const refCount = Object.keys(refs).length;
+      // Design structure comes from the REFERENCE site's own service page (the
+      // design the client said they love), not a hardcoded outline.
+      let refStruct = null;
+      try { refStruct = await scrapeReferenceServiceStructure(P.referenceWebsite); } catch (e) { /* fail-soft */ }
+      jobStep(job, 2, "running", `Composing ${services.length} page brief(s) with Gemini${refStruct ? " (mimicking " + new URL(refStruct.url).hostname + ")" : ""}…`);
+      const briefs = {};
+      for (const s of services) {
+        try { briefs[s.slug] = await composeServicePagePrompt(s, refStruct, refs[s.slug], A, composed, city); }
+        catch (e) { briefs[s.slug] = null; }
+      }
+      const composedCount = Object.values(briefs).filter((b) => b && b.length > 120).length;
+      jobStep(job, 2, "running", `Generating ${services.length} service page(s) with Stitch (${composedCount} AI-composed briefs${refCount ? `, ${refCount} grounded in the existing site` : ""})…`);
+      let results = null;
+      try {
+        const theme = { displayName: P.businessName, primary: composed.primary, secondary: composed.secondary, accent: composed.accent, headingFont: composed.headingFont, bodyFont: composed.bodyFont };
+        const pages = services.map((s) => ({
+          key: s.slug,
+          prompt: (briefs[s.slug] && briefs[s.slug].length > 120 ? briefs[s.slug] : stitchServicePrompt(s, refs[s.slug], A, composed, city)) + stylingConstraint(composed),
+        }));
+        // buildStitchSite writes GEN/.stitch-metadata.json (used by the main site's
+        // export/rebind) — snapshot + restore so the enrich run never clobbers it.
+        const metaFile = path.join(GEN, ".stitch-metadata.json");
+        const metaBak = fs.existsSync(metaFile) ? fs.readFileSync(metaFile) : null;
+        try { results = (await buildStitchSite(pages, theme, "DESKTOP")).results; }
+        finally { if (metaBak) fs.writeFileSync(metaFile, metaBak); }
+      } catch (e) { console.warn("enrich: Stitch generation failed, falling back to Gemini:", e.message.slice(0, 160)); }
+      const okStitch = (results || []).filter((r) => r.html);
+      job.enrichPlan = { ...(job.enrichPlan || {}), engine: okStitch.length ? "stitch" : "gemini", grounded: refCount, composedBriefs: composedCount, mimicked: refStruct ? refStruct.url : null };
+      if (okStitch.length) {
+        for (const r of okStitch) serviceMains[r.key] = embedPageAssets(r.html);
+        // any page Stitch missed: Gemini-clone it from the first good one
+        const template = serviceMains[okStitch[0].key];
+        for (const s of services) {
+          if (serviceMains[s.slug]) continue;
+          jobStep(job, 2, "running", `Stitch missed ${s.name} — cloning from template…`);
+          try { serviceMains[s.slug] = await cloneServicePage(template, s, A, composed, city); }
+          catch (e) { serviceMains[s.slug] = template; }
+        }
+      } else {
+        // full fallback: previous Gemini template → clone path
+        jobStep(job, 2, "running", "Stitch unavailable — generating with Gemini…");
+        const template = await generateServiceTemplate(services[0], A, composed, ref, city);
+        serviceMains[services[0].slug] = template;
+        for (let i = 1; i < services.length; i++) {
+          jobStep(job, 2, "running", `Cloning page ${i + 1}/${services.length}: ${services[i].name}`);
+          try { serviceMains[services[i].slug] = await cloneServicePage(template, services[i], A, composed, city); }
+          catch (e) { serviceMains[services[i].slug] = template; }
+        }
       }
     }
     const brandMain = brandGuidePage(composed, A, P.businessName);
@@ -3740,6 +3897,7 @@ const server = http.createServer(async (req, res) => {
           githubRepo: WP_REPO, themeSlug, themePath: "web/app/themes/" + themeSlug,
           muPath: "web/app/mu-plugins/g99-activate-" + themeSlug.replace(/^g99-/, "") + ".php",
           answers, composed, referenceWebsite: body0.referenceWebsite || "",
+          existingWebsite: body0.existingWebsite || "",
         });
         return json(res, 202, { jobId: job.draftId, dryRun: isDry, monitor: "/jobs" });
       }
@@ -3747,15 +3905,37 @@ const server = http.createServer(async (req, res) => {
       const site = await findWebsite(siteId);
       if (!site) return json(res, 404, { error: "unknown siteId — refresh the site list" });
       let target; try { target = await resolveEditTarget(site); } catch (e) { return json(res, 409, { error: e.message }); }
-      const build = [...JOBS.values()]
+      // Source of the onboarding answers + brand: match by THEME SLUG, not by
+      // business name (the NocoDB site name rarely equals the build's client name).
+      // Priority: (1) the newest BUILD whose auto-enrich targeted this theme — its
+      // composed brand is the theme's actual design system; (2) the newest enrich
+      // run on this theme (inherited the same data); (3) legacy name match.
+      const newest = (a, b) => (b.finishedAt || b.createdAt || "").localeCompare(a.finishedAt || a.createdAt || "");
+      const all = [...JOBS.values()];
+      const buildForSlug = all
+        .filter((j) => j.type === "build" && j.composed && j.payload && j.payload.answers && j.enrichJobId &&
+          (JOBS.get(j.enrichJobId) || {}).payload && JOBS.get(j.enrichJobId).payload.themeSlug === target.themeSlug)
+        .sort(newest)[0];
+      const enrichForSlug = all
+        .filter((j) => j.type === "enrich" && j.payload && j.payload.themeSlug === target.themeSlug && j.payload.answers && j.payload.composed)
+        .sort(newest)[0];
+      const buildByName = all
         .filter((j) => j.type === "build" && j.composed && j.payload && j.payload.answers && j.businessName === site.businessName)
-        .sort((a, b) => (b.finishedAt || b.createdAt || "").localeCompare(a.finishedAt || a.createdAt || ""))[0];
-      if (!build) return json(res, 409, { error: "No onboarding data for this site in memory — enrichment auto-runs after a build; trigger it right after building." });
+        .sort(newest)[0];
+      const src = buildForSlug
+        ? { answers: buildForSlug.payload.answers, composed: buildForSlug.composed, referenceWebsite: buildForSlug.payload.referenceWebsite, existingWebsite: buildForSlug.payload.existingWebsite, businessId: buildForSlug.businessId }
+        : enrichForSlug
+          ? { answers: enrichForSlug.payload.answers, composed: enrichForSlug.payload.composed, referenceWebsite: enrichForSlug.payload.referenceWebsite, existingWebsite: enrichForSlug.payload.existingWebsite, businessId: enrichForSlug.businessId }
+          : buildByName
+            ? { answers: buildByName.payload.answers, composed: buildByName.composed, referenceWebsite: buildByName.payload.referenceWebsite, existingWebsite: buildByName.payload.existingWebsite, businessId: buildByName.businessId }
+            : null;
+      if (!src) return json(res, 409, { error: "No onboarding data for this theme in memory — enrichment auto-runs after a build; trigger it right after building." });
       const job = enqueueEnrichJob({
-        jobId: "enrich-" + Date.now(), businessId: build.businessId,
+        jobId: "enrich-" + Date.now(), businessId: src.businessId,
         siteId, businessName: site.businessName, githubRepo: site.githubRepo,
         themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
-        answers: build.payload.answers, composed: build.composed, referenceWebsite: build.payload.referenceWebsite || "",
+        answers: src.answers, composed: src.composed, referenceWebsite: src.referenceWebsite || "",
+        existingWebsite: src.existingWebsite || "",
       });
       return json(res, 202, { jobId: job.draftId, status: job.status, monitor: "/jobs" });
     }
