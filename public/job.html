@@ -64,6 +64,32 @@
   .pg.error .pgs { color: var(--bad); }
   .pg.generating .pgn, .pg.generating .pgs { color: var(--accent); }
   .pg.queued .pgn { color: var(--muted); }
+
+  /* enrich: per-service provenance rows */
+  .svc-list { display: flex; flex-direction: column; }
+  .svc { padding: 10px 0; border-bottom: 1px solid var(--line-2); }
+  .svc:last-child { border-bottom: none; }
+  .svc-hd { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .svc-nm { font-weight: 700; font-size: 13.5px; }
+  .svc-slug { font-family: var(--mono); font-size: 11.5px; color: var(--muted); background: var(--line-2); border-radius: 6px; padding: 2px 8px; }
+  .svc-src { margin-left: auto; font-size: 12px; font-weight: 600; display: inline-flex; align-items: center; gap: 4px; }
+  .svc-src.none { color: var(--muted); font-weight: 500; }
+  .svc details.brief { margin-top: 8px; margin-left: 18px; }
+
+  /* per-service generation status */
+  .svc-st { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; border-radius: 999px; padding: 3px 9px; }
+  .svc-st.queued { background: var(--line-2); color: var(--muted); }
+  .svc-st.running { background: var(--accent-soft); color: var(--accent); }
+  .svc-st.done { background: var(--good-soft); color: var(--good); }
+  .svc-st.error { background: var(--bad-soft); color: var(--bad); }
+
+  /* readable brief: real line-height, comfortable measure, roomy scroll box */
+  details.brief > div.brieftext {
+    white-space: pre-wrap; font-size: 13.5px; line-height: 1.75; color: var(--ink-2);
+    border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 10px;
+    padding: 16px 18px; margin-top: 8px; max-width: 78ch;
+    max-height: 60vh; overflow-y: auto; background: var(--surface-2);
+  }
 </style>
 </head>
 <body data-title="Run detail">

@@ -1,0 +1,628 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Growth99 — Onboarding to Live Website</title>
+<style>
+  /* ============================================================
+     Growth99 onboarding architecture
+     Palette encodes ownership: amber = CRM origin, slate = client-facing
+     platform, violet = automated AI build, green = anything live.
+     Neutrals carry a slight violet bias so they read as chosen.
+     ============================================================ */
+  :root {
+    --bg:        #fbfafd;
+    --surface:   #ffffff;
+    --surface-2: #f4f2f8;
+    --ink:       #15141c;
+    --ink-2:     #444154;
+    --ink-3:     #6b6880;
+    --muted:     #8d8aa3;
+    --line:      #e6e3ef;
+    --line-2:    #f0eef6;
+
+    --crm:       #a8541c;
+    --crm-bg:    #fdf1e7;
+    --plat:      #235f7d;
+    --plat-bg:   #e8f2f7;
+    --ai:        #5b3fd4;
+    --ai-bg:     #efebfd;
+    --live:      #157347;
+    --live-bg:   #e6f4ec;
+    --stop:      #a32b30;
+    --stop-bg:   #fdeced;
+
+    --shadow: 0 1px 2px rgba(21,20,28,.05), 0 8px 24px -12px rgba(21,20,28,.12);
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+    --r: 14px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:        #0e0d14;
+      --surface:   #16151f;
+      --surface-2: #1c1b27;
+      --ink:       #f6f5fa;
+      --ink-2:     #cdcada;
+      --ink-3:     #a09db4;
+      --muted:     #7d7a92;
+      --line:      #292737;
+      --line-2:    #201f2c;
+
+      --crm:       #e8a06a;  --crm-bg:  #2a1d13;
+      --plat:      #7cc0dd;  --plat-bg: #12232c;
+      --ai:        #a893f7;  --ai-bg:   #1e1936;
+      --live:      #5cc98d;  --live-bg: #10261c;
+      --stop:      #f0888c;  --stop-bg: #2a1417;
+      --shadow: 0 1px 2px rgba(0,0,0,.5), 0 10px 30px -14px rgba(0,0,0,.7);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg:#0e0d14; --surface:#16151f; --surface-2:#1c1b27;
+    --ink:#f6f5fa; --ink-2:#cdcada; --ink-3:#a09db4; --muted:#7d7a92;
+    --line:#292737; --line-2:#201f2c;
+    --crm:#e8a06a; --crm-bg:#2a1d13; --plat:#7cc0dd; --plat-bg:#12232c;
+    --ai:#a893f7; --ai-bg:#1e1936; --live:#5cc98d; --live-bg:#10261c;
+    --stop:#f0888c; --stop-bg:#2a1417;
+    --shadow: 0 1px 2px rgba(0,0,0,.5), 0 10px 30px -14px rgba(0,0,0,.7);
+  }
+  :root[data-theme="light"] {
+    --bg:#fbfafd; --surface:#ffffff; --surface-2:#f4f2f8;
+    --ink:#15141c; --ink-2:#444154; --ink-3:#6b6880; --muted:#8d8aa3;
+    --line:#e6e3ef; --line-2:#f0eef6;
+    --crm:#a8541c; --crm-bg:#fdf1e7; --plat:#235f7d; --plat-bg:#e8f2f7;
+    --ai:#5b3fd4; --ai-bg:#efebfd; --live:#157347; --live-bg:#e6f4ec;
+    --stop:#a32b30; --stop-bg:#fdeced;
+    --shadow: 0 1px 2px rgba(21,20,28,.05), 0 8px 24px -12px rgba(21,20,28,.12);
+  }
+
+  body { background: var(--bg); color: var(--ink); font-family: var(--sans); line-height: 1.6;
+         -webkit-font-smoothing: antialiased; letter-spacing: -.006em; }
+  .doc { max-width: 1080px; margin: 0 auto; padding: 56px 24px 96px; }
+  @media (max-width: 640px) { .doc { padding: 36px 18px 64px; } }
+
+  h1, h2, h3, h4 { text-wrap: balance; margin: 0; }
+  h1 { font-size: clamp(30px, 4.6vw, 46px); font-weight: 800; letter-spacing: -.032em; line-height: 1.1; }
+  h2 { font-size: clamp(20px, 2.6vw, 26px); font-weight: 750; letter-spacing: -.022em; }
+  h3 { font-size: 16px; font-weight: 700; letter-spacing: -.012em; }
+  h4 { font-size: 13.5px; font-weight: 700; }
+  p  { margin: 0; }
+  a  { color: inherit; }
+  code { font-family: var(--mono); font-size: .88em; background: var(--surface-2);
+         border: 1px solid var(--line); border-radius: 5px; padding: .1em .38em; }
+
+  .eyebrow { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .16em; }
+
+  /* ---------- masthead ---------- */
+  .masthead { display: flex; flex-direction: column; gap: 16px; padding-bottom: 34px;
+              border-bottom: 1px solid var(--line); }
+  .masthead .eyebrow { color: var(--ai); }
+  .masthead .thesis { font-size: clamp(16px, 2vw, 19px); color: var(--ink-2); max-width: 62ch; }
+  .facts { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 4px; }
+  .fact { display: inline-flex; align-items: baseline; gap: 7px; background: var(--surface);
+          border: 1px solid var(--line); border-radius: 999px; padding: 6px 14px; font-size: 12.5px;
+          color: var(--ink-2); box-shadow: var(--shadow); }
+  .fact b { font-size: 13px; font-weight: 800; color: var(--ink); font-variant-numeric: tabular-nums; }
+
+  /* ---------- at a glance ---------- */
+  .glance { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 34px 0 8px; }
+  @media (max-width: 860px) { .glance { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 460px) { .glance { grid-template-columns: 1fr; } }
+  .gcard { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r);
+           padding: 16px 16px 18px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 8px;
+           border-top: 3px solid var(--ph, var(--line)); }
+  .gcard .n { font-size: 11px; font-weight: 800; color: var(--ph); font-variant-numeric: tabular-nums; letter-spacing: .1em; }
+  .gcard h3 { font-size: 14.5px; }
+  .gcard p { font-size: 12.5px; color: var(--ink-3); }
+  .gcard .who { margin-top: auto; font-size: 11px; font-weight: 700; color: var(--ph);
+                background: var(--ph-bg); border-radius: 6px; padding: 4px 8px; align-self: flex-start; }
+  .p1 { --ph: var(--crm);  --ph-bg: var(--crm-bg); }
+  .p2 { --ph: var(--plat); --ph-bg: var(--plat-bg); }
+  .p3 { --ph: var(--ai);   --ph-bg: var(--ai-bg); }
+  .p4 { --ph: var(--live); --ph-bg: var(--live-bg); }
+
+  /* ---------- phase sections ---------- */
+  .phase { margin-top: 52px; }
+  .phase-hd { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 20px; }
+  .phase-hd .badge { flex: none; width: 34px; height: 34px; border-radius: 10px; display: grid;
+                     place-items: center; font-size: 14px; font-weight: 800; background: var(--ph-bg);
+                     color: var(--ph); font-variant-numeric: tabular-nums; }
+  .phase-hd .txt { display: flex; flex-direction: column; gap: 4px; }
+  .phase-hd .sub { font-size: 13.5px; color: var(--ink-3); max-width: 68ch; }
+  .owner { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .1em;
+           color: var(--ph); }
+
+  /* ---------- the gate (won / lost) ---------- */
+  .gate { display: grid; grid-template-columns: 1fr auto 1fr; gap: 16px; align-items: stretch; }
+  @media (max-width: 760px) { .gate { grid-template-columns: 1fr; } }
+  .pipeline-box { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r);
+                  padding: 18px; box-shadow: var(--shadow); }
+  .deals { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+  .deal { width: 26px; height: 32px; border-radius: 5px; background: var(--surface-2);
+          border: 1px solid var(--line); }
+  .deal.won { background: var(--crm-bg); border-color: var(--crm); }
+  .fork { display: flex; flex-direction: column; justify-content: center; gap: 10px; }
+  .fork-arm { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 700;
+              border-radius: 999px; padding: 7px 14px; white-space: nowrap; }
+  .fork-arm.go   { background: var(--live-bg); color: var(--live); }
+  .fork-arm.halt { background: var(--stop-bg); color: var(--stop); }
+  .props { display: flex; flex-direction: column; gap: 10px; }
+  .prop { display: flex; gap: 10px; align-items: flex-start; font-size: 13px; }
+  .prop .k { font-family: var(--mono); font-size: 11.5px; font-weight: 700; color: var(--crm);
+             background: var(--crm-bg); border-radius: 5px; padding: 2px 7px; flex: none; }
+  .prop .v { color: var(--ink-3); font-size: 12.5px; }
+  .human { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 800;
+           text-transform: uppercase; letter-spacing: .09em; color: var(--crm);
+           background: var(--crm-bg); border-radius: 6px; padding: 4px 9px; }
+
+  /* ---------- form parts ---------- */
+  .parts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  @media (max-width: 760px) { .parts { grid-template-columns: 1fr; } }
+  .part { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r);
+          padding: 16px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 10px; }
+  .part .pn { font-size: 11px; font-weight: 800; letter-spacing: .1em; color: var(--plat); }
+  .part ul { margin: 0; padding-left: 17px; font-size: 12.5px; color: var(--ink-3); }
+  .part li { margin: 3px 0; }
+  .fires { font-size: 11.5px; font-weight: 700; border-radius: 8px; padding: 7px 10px;
+           display: flex; align-items: center; gap: 7px; margin-top: auto; }
+  .fires.plat { background: var(--plat-bg); color: var(--plat); }
+  .fires.ai   { background: var(--ai-bg);   color: var(--ai); }
+
+  /* ---------- the step spine ---------- */
+  .track { position: relative; margin-top: 4px; }
+  .step { position: relative; display: grid; grid-template-columns: 34px 1fr; gap: 16px;
+          padding-bottom: 22px; }
+  .step:last-child { padding-bottom: 0; }
+  .step::before { content: ""; position: absolute; left: 16px; top: 34px; bottom: -2px; width: 2px;
+                  background: var(--line); }
+  .step:last-child::before { display: none; }
+  .step .num { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center;
+               font-size: 13px; font-weight: 800; background: var(--surface); color: var(--ph);
+               border: 2px solid var(--ph); z-index: 1; font-variant-numeric: tabular-nums; }
+  .step .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r);
+                padding: 15px 17px; box-shadow: var(--shadow); }
+  .step h3 { margin-bottom: 5px; }
+  .step p { font-size: 13px; color: var(--ink-3); max-width: 74ch; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 11px; }
+  .chip { font-size: 11px; font-weight: 700; border-radius: 6px; padding: 3px 9px;
+          background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--line); }
+  .chip.gemini { background: var(--ai-bg);   color: var(--ai);   border-color: transparent; }
+  .chip.stitch { background: var(--ai-bg);   color: var(--ai);   border-color: transparent; }
+  .chip.github { background: var(--surface-2); color: var(--ink); }
+  .chip.wp     { background: var(--plat-bg); color: var(--plat); border-color: transparent; }
+  .chip.hs     { background: var(--crm-bg);  color: var(--crm);  border-color: transparent; }
+  .chip.out    { background: var(--live-bg); color: var(--live); border-color: transparent; }
+  .gateline { display: flex; align-items: center; gap: 9px; font-size: 12px; font-weight: 700;
+              color: var(--stop); background: var(--stop-bg); border-radius: 8px; padding: 7px 11px;
+              margin-top: 10px; }
+
+  /* ---------- outcome ---------- */
+  .outcome { margin-top: 52px; background: var(--surface); border: 1px solid var(--line);
+             border-radius: 18px; padding: 26px; box-shadow: var(--shadow);
+             border-left: 4px solid var(--live); }
+  .urls { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px;
+          margin-top: 16px; }
+  .url { background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px;
+         padding: 11px 13px; }
+  .url .path { font-family: var(--mono); font-size: 12.5px; font-weight: 700; color: var(--live); }
+  .url .what { font-size: 11.5px; color: var(--ink-3); margin-top: 2px; }
+  .scores { display: flex; align-items: center; gap: 14px; margin-top: 18px; flex-wrap: wrap; }
+  .score { display: flex; flex-direction: column; }
+  .score b { font-size: 30px; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; }
+  .score span { font-size: 10.5px; text-transform: uppercase; letter-spacing: .1em; color: var(--muted);
+                font-weight: 700; margin-top: 4px; }
+  .score.before b { color: var(--muted); }
+  .score.after  b { color: var(--live); }
+  .delta { font-size: 13px; font-weight: 800; color: var(--live); background: var(--live-bg);
+           border-radius: 999px; padding: 4px 12px; }
+
+  /* ---------- who does what ---------- */
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 20px; }
+  @media (max-width: 760px) { .split { grid-template-columns: 1fr; } }
+  .lane { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r);
+          padding: 18px; box-shadow: var(--shadow); }
+  .lane.man { border-top: 3px solid var(--crm); }
+  .lane.auto { border-top: 3px solid var(--ai); }
+  .lane h3 { margin-bottom: 10px; }
+  .lane ol, .lane ul { margin: 0; padding-left: 18px; font-size: 13px; color: var(--ink-2); }
+  .lane li { margin: 6px 0; }
+  .lane .note { font-size: 12px; color: var(--muted); margin-top: 12px; }
+
+  /* ---------- systems legend ---------- */
+  .systems { display: grid; grid-template-columns: repeat(auto-fit, minmax(178px, 1fr)); gap: 10px;
+             margin-top: 20px; }
+  .sys { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px;
+         box-shadow: var(--shadow); border-left: 3px solid var(--ph, var(--line)); }
+  .sys .nm { font-size: 13px; font-weight: 700; }
+  .sys .role { font-size: 11.5px; color: var(--ink-3); margin-top: 3px; }
+
+  .footnote { margin-top: 44px; padding-top: 20px; border-top: 1px solid var(--line);
+              font-size: 12px; color: var(--muted); }
+  :focus-visible { outline: 2px solid var(--ai); outline-offset: 2px; border-radius: 4px; }
+  @media (prefers-reduced-motion: no-preference) {
+    .gcard, .step .card, .lane, .sys { transition: transform .16s ease, box-shadow .16s ease; }
+    .gcard:hover, .sys:hover { transform: translateY(-2px); }
+  }
+</style>
+</head>
+<body>
+
+
+<div class="doc">
+
+  <header class="masthead">
+    <span class="eyebrow">Growth99 · Onboarding automation</span>
+    <h1>From a won deal to a live website, without anyone building it by hand</h1>
+    <p class="thesis">
+      When a sales deal closes, Growth99 sends the client one onboarding form. Answering it is enough to
+      produce a complete, conversion-optimised beta website — audited, branded, built, reviewed and
+      published. This is every stage of that pipeline, in order.
+    </p>
+    <div class="facts">
+      <span class="fact"><b>2</b> moments a person acts</span>
+      <span class="fact"><b>13</b> automated steps</span>
+      <span class="fact"><b>3</b> form parts for the client</span>
+      <span class="fact"><b>~20 min</b> deal won → site live</span>
+    </div>
+  </header>
+
+  <section class="glance" aria-label="The four phases at a glance">
+    <article class="gcard p1">
+      <span class="n">PHASE 01</span>
+      <h3>The deal closes</h3>
+      <p>A won deal in HubSpot is the only thing that starts onboarding. Lost deals go no further.</p>
+      <span class="who">HubSpot</span>
+    </article>
+    <article class="gcard p2">
+      <span class="n">PHASE 02</span>
+      <h3>The client answers</h3>
+      <p>One onboarding form in three parts. Part&nbsp;1 creates the account, Part&nbsp;2 starts the build.</p>
+      <span class="who">Growth99 platform</span>
+    </article>
+    <article class="gcard p3">
+      <span class="n">PHASE 03</span>
+      <h3>The site gets built</h3>
+      <p>Audit, brand, generate, assemble, review, publish — eight steps, no human in the loop.</p>
+      <span class="who">Website Build Tool</span>
+    </article>
+    <article class="gcard p4">
+      <span class="n">PHASE 04</span>
+      <h3>Depth gets added</h3>
+      <p>A page per treatment plus a brand guide, modelled on the sites the client admires.</p>
+      <span class="who">Live website</span>
+    </article>
+  </section>
+
+  <!-- ======================= PHASE 1 ======================= -->
+  <section class="phase p1">
+    <div class="phase-hd">
+      <span class="badge">01</span>
+      <div class="txt">
+        <span class="owner">HubSpot · sales</span>
+        <h2>A deal has to be won before anything happens</h2>
+        <p class="sub">
+          Many deals sit in the pipeline at once. The pipeline watches for one event only: a deal moving to
+          <strong>Closed&nbsp;Won</strong>. Every other deal is simply left alone — nothing is generated,
+          nothing is sent, no site is created.
+        </p>
+      </div>
+    </div>
+
+    <div class="gate">
+      <div class="pipeline-box">
+        <span class="eyebrow" style="color:var(--crm)">Deal pipeline</span>
+        <p style="font-size:12.5px;color:var(--ink-3);margin-top:6px">Ten open deals, one closes won.</p>
+        <div class="deals" aria-label="Ten deals, one won">
+          <span class="deal won"></span><span class="deal"></span><span class="deal"></span>
+          <span class="deal"></span><span class="deal"></span><span class="deal"></span>
+          <span class="deal"></span><span class="deal"></span><span class="deal"></span>
+          <span class="deal"></span>
+        </div>
+      </div>
+
+      <div class="fork">
+        <span class="fork-arm go">Closed Won → onboarding begins</span>
+        <span class="fork-arm halt">Closed Lost → nothing runs</span>
+      </div>
+
+      <div class="pipeline-box">
+        <span class="human">Person acts here</span>
+        <p style="font-size:12.5px;color:var(--ink-3);margin:10px 0 12px">
+          On the won deal, the team records two properties. They travel with the client through every
+          later stage, so the build knows where to put the code and where the site will live.
+        </p>
+        <div class="props">
+          <div class="prop"><span class="k">GitHub repo</span><span class="v">Where the website's code is committed</span></div>
+          <div class="prop"><span class="k">Beta site URL</span><span class="v">The address the finished site is published to</span></div>
+          <div class="prop"><span class="k">Existing website</span><span class="v">Already on the deal — the audit and brand come from it</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= PHASE 2 ======================= -->
+  <section class="phase p2">
+    <div class="phase-hd">
+      <span class="badge">02</span>
+      <div class="txt">
+        <span class="owner">Growth99 platform · the client</span>
+        <h2>One onboarding form, answered in three parts</h2>
+        <p class="sub">
+          The form is generated for the won deal and sent to the client. It asks plain questions about the
+          business and its current website — no technical input. Each part does real work the moment it is
+          submitted.
+        </p>
+      </div>
+    </div>
+
+    <div class="parts">
+      <article class="part">
+        <span class="pn">PART 1</span>
+        <h3>The business</h3>
+        <ul>
+          <li>Practice name, location, phone</li>
+          <li>What the business does and who it serves</li>
+          <li>The current website address</li>
+        </ul>
+        <span class="fires plat">On submit → account and resources are created</span>
+      </article>
+      <article class="part">
+        <span class="pn">PART 2</span>
+        <h3>The website</h3>
+        <ul>
+          <li>Treatments and services offered</li>
+          <li>Headline, call to action, booking tool</li>
+          <li>Providers, reviews, tone of voice</li>
+          <li>A website they admire, used as the design reference</li>
+        </ul>
+        <span class="fires ai">On submit → the beta site build starts</span>
+      </article>
+      <article class="part">
+        <span class="pn">PART 3</span>
+        <h3>The finishing details</h3>
+        <ul>
+          <li>Logo, imagery and consent</li>
+          <li>Lead alerts and contact routing</li>
+          <li>Anything still outstanding</li>
+        </ul>
+        <span class="fires plat">Completes the client's record</span>
+      </article>
+    </div>
+  </section>
+
+  <!-- ======================= PHASE 3 ======================= -->
+  <section class="phase p3">
+    <div class="phase-hd">
+      <span class="badge">03</span>
+      <div class="txt">
+        <span class="owner">Website Build Tool · automated</span>
+        <h2>Eight steps turn the answers into a published website</h2>
+        <p class="sub">
+          Submitting Part&nbsp;2 notifies the Website Build Tool, which runs the whole build on its own and
+          reports each step as it goes. Nobody writes code, opens a pull request, or clicks publish.
+        </p>
+      </div>
+    </div>
+
+    <div class="track">
+      <div class="step">
+        <span class="num">1</span>
+        <div class="card">
+          <h3>Audit the website they have today</h3>
+          <p>The current site is fetched and scored — design, usability, conversion path, copy, speed and
+             SEO. This becomes the “before” benchmark the new site is measured against.</p>
+          <div class="chips"><span class="chip hs">Existing site from HubSpot</span><span class="chip out">Before score</span></div>
+        </div>
+      </div>
+
+      <div class="step">
+        <span class="num">2</span>
+        <div class="card">
+          <h3>Learn the brand, then write the build brief</h3>
+          <p>Colours, typography and visual tone are read off the existing site and combined with the form
+             answers. Gemini turns all of it into a detailed brief describing the site to be built.</p>
+          <div class="chips"><span class="chip gemini">Google Gemini</span><span class="chip">Brand colours · fonts · tone</span></div>
+        </div>
+      </div>
+
+      <div class="step">
+        <span class="num">3</span>
+        <div class="card">
+          <h3>Generate the pages</h3>
+          <p>Stitch designs the home, treatments, about and contact pages from that brief — grounded in the
+             client's real content and the reference site they admire.</p>
+          <div class="chips"><span class="chip stitch">Stitch</span><span class="chip">4 pages as HTML</span></div>
+        </div>
+      </div>
+
+      <div class="step">
+        <span class="num">4</span>
+        <div class="card">
+          <h3>Assemble one coherent website</h3>
+          <p>The separate pages are joined into a single site with shared navigation and footer, then
+             converted by Gemini into a working WordPress theme.</p>
+          <div class="chips"><span class="chip gemini">Google Gemini</span><span class="chip wp">WordPress theme</span></div>
+        </div>
+      </div>
+
+      <div class="step">
+        <span class="num">5</span>
+        <div class="card">
+          <h3>Commit the code and open a pull request</h3>
+          <p>The theme is pushed to the GitHub repository recorded on the deal, and a pull request is opened
+             so every change is reviewable and reversible.</p>
+          <div class="chips"><span class="chip github">GitHub</span><span class="chip hs">Repo from the deal property</span></div>
+        </div>
+      </div>
+
+      <div class="step">
+        <span class="num">6</span>
+        <div class="card">
+          <h3>Wait for the checks, then merge</h3>
+          <p>Automated tests run against the new code. The pull request merges only when they all pass — and
+             if a check fails, the tool attempts a fix and tries again.</p>
+          <div class="chips"><span class="chip github">Continuous integration</span><span class="chip out">Merged on green</span></div>
+          <div class="gateline">Checks failing → the build stops here, nothing goes live</div>
+        </div>
+      </div>
+
+      <div class="step">
+        <span class="num">7</span>
+        <div class="card">
+          <h3>Publish and activate the theme</h3>
+          <p>The merged code deploys to the beta address from the deal, the new theme is activated, and the
+             site's pages and navigation are created automatically.</p>
+          <div class="chips"><span class="chip wp">WordPress</span><span class="chip out">Site is live</span></div>
+        </div>
+      </div>
+
+      <div class="step">
+        <span class="num">8</span>
+        <div class="card">
+          <h3>Audit again and compare</h3>
+          <p>The live site is scored with the same measures as step 1, producing a plain before-and-after
+             report of what the rebuild actually improved.</p>
+          <div class="chips"><span class="chip out">Before → after report</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= PHASE 4 ======================= -->
+  <section class="phase p4">
+    <div class="phase-hd">
+      <span class="badge">04</span>
+      <div class="txt">
+        <span class="owner">Automated · runs on its own after launch</span>
+        <h2>Then it adds a page for every treatment</h2>
+        <p class="sub">
+          Once the beta site is live, a second job starts by itself. It gives each treatment its own proper
+          page — the depth a real practice website needs — and publishes a brand guide alongside them.
+        </p>
+      </div>
+    </div>
+
+    <div class="track">
+      <div class="step">
+        <span class="num">1</span>
+        <div class="card">
+          <h3>Study how the admired site presents a treatment</h3>
+          <p>The reference website from the form is scanned to learn how its treatment pages are
+             structured — section order, imagery, and how location is worked into headings.</p>
+          <div class="chips"><span class="chip">Reference site structure</span></div>
+        </div>
+      </div>
+      <div class="step">
+        <span class="num">2</span>
+        <div class="card">
+          <h3>Take the treatments from the form, revenue first</h3>
+          <p>The services the client listed become the page list — highest-value treatments first, up to
+             ten pages. Their existing pages supply the real facts to rewrite.</p>
+          <div class="chips"><span class="chip">Up to 10 treatments</span><span class="chip hs">Copy grounded in their site</span></div>
+        </div>
+      </div>
+      <div class="step">
+        <span class="num">3</span>
+        <div class="card">
+          <h3>Write a brief per treatment, then design each page</h3>
+          <p>Gemini writes a bespoke brief for every treatment, and Stitch designs the page from it — so all
+             the pages share one look while each reads as its own.</p>
+          <div class="chips"><span class="chip gemini">Google Gemini</span><span class="chip stitch">Stitch</span></div>
+        </div>
+      </div>
+      <div class="step">
+        <span class="num">4</span>
+        <div class="card">
+          <h3>Publish them the same reviewable way</h3>
+          <p>All the new pages ship in a single pull request, pass the same checks, merge, and appear in the
+             site's Treatments menu — together with a public brand guide.</p>
+          <div class="chips"><span class="chip github">GitHub</span><span class="chip wp">Treatments menu</span><span class="chip out">Live</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= OUTCOME ======================= -->
+  <section class="outcome">
+    <span class="eyebrow" style="color:var(--live)">The result</span>
+    <h2 style="margin:8px 0 6px">A complete beta website the client can open and review</h2>
+    <p style="font-size:13.5px;color:var(--ink-3);max-width:70ch">
+      Everything below exists without anyone designing a page, writing copy, or touching the code — and
+      every change arrived through a reviewed pull request.
+    </p>
+    <div class="urls">
+      <div class="url"><div class="path">/</div><div class="what">Home — hero, treatments, providers, proof</div></div>
+      <div class="url"><div class="path">/services/</div><div class="what">Every treatment, in one place</div></div>
+      <div class="url"><div class="path">/&lt;treatment&gt;/</div><div class="what">A page per treatment, up to ten</div></div>
+      <div class="url"><div class="path">/brand-guide/</div><div class="what">The site's colours, type and rules</div></div>
+    </div>
+    <div class="scores">
+      <div class="score before"><b>53</b><span>Before</span></div>
+      <span aria-hidden="true" style="color:var(--muted);font-size:20px">→</span>
+      <div class="score after"><b>62</b><span>After</span></div>
+      <span class="delta">+9 conversion score</span>
+      <span style="font-size:12px;color:var(--muted)">measured on a real rebuild</span>
+    </div>
+  </section>
+
+  <!-- ======================= WHO DOES WHAT ======================= -->
+  <section class="phase">
+    <div class="phase-hd" style="--ph:var(--ink-3);--ph-bg:var(--surface-2)">
+      <span class="badge">·</span>
+      <div class="txt">
+        <h2>Where a person is needed — and where they aren't</h2>
+        <p class="sub">The whole value of the pipeline is how short the left-hand column is.</p>
+      </div>
+    </div>
+    <div class="split">
+      <article class="lane man">
+        <h3>A person does exactly two things</h3>
+        <ol>
+          <li>Records the GitHub repository and beta site address on the won deal.</li>
+          <li>Sends the onboarding form — and the client answers it.</li>
+        </ol>
+        <p class="note">Optional: someone can require sign-off before anything merges, per website.</p>
+      </article>
+      <article class="lane auto">
+        <h3>Everything else is automatic</h3>
+        <ul>
+          <li>Auditing the current site and scoring it</li>
+          <li>Reading the brand and writing the build brief</li>
+          <li>Designing and assembling every page</li>
+          <li>Committing code, opening and merging pull requests</li>
+          <li>Publishing, activating and re-auditing the site</li>
+          <li>Adding a page per treatment, plus the brand guide</li>
+        </ul>
+      </article>
+    </div>
+  </section>
+
+  <!-- ======================= SYSTEMS ======================= -->
+  <section class="phase">
+    <div class="phase-hd" style="--ph:var(--ink-3);--ph-bg:var(--surface-2)">
+      <span class="badge">·</span>
+      <div class="txt">
+        <h2>The systems involved</h2>
+        <p class="sub">Six moving parts, each with one job.</p>
+      </div>
+    </div>
+    <div class="systems">
+      <div class="sys" style="--ph:var(--crm)"><div class="nm">HubSpot</div><div class="role">Holds the deal, the existing website, the repository and the beta address</div></div>
+      <div class="sys" style="--ph:var(--plat)"><div class="nm">Growth99 platform</div><div class="role">Generates the onboarding form, creates the account, notifies the build</div></div>
+      <div class="sys" style="--ph:var(--ai)"><div class="nm">Website Build Tool</div><div class="role">Runs the build and the follow-up job, and shows live progress</div></div>
+      <div class="sys" style="--ph:var(--ai)"><div class="nm">Google Gemini</div><div class="role">Writes the build briefs and converts pages into a WordPress theme</div></div>
+      <div class="sys" style="--ph:var(--ai)"><div class="nm">Stitch</div><div class="role">Designs the pages from each brief</div></div>
+      <div class="sys" style="--ph:var(--live)"><div class="nm">GitHub &amp; WordPress</div><div class="role">Reviews and stores every change, then serves the published site</div></div>
+    </div>
+  </section>
+
+  <p class="footnote">
+    Growth99 onboarding pipeline · every stage from a closed-won deal to a published, audited beta website.
+    Each run is recorded step by step, with its pull requests, scores and live links kept for reference.
+  </p>
+
+</div>
+
+</body>
+</html>

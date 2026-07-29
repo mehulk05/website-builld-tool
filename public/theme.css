@@ -185,6 +185,10 @@ a:hover { color: var(--accent-2); }
 .banner.bad { background: var(--bad-soft); border-color: color-mix(in srgb, var(--bad) 30%, transparent); }
 .banner.bad svg { color: var(--bad); }
 .banner.bad .bt { color: #8c2b2f; } .banner.bad .bd { color: #a04044; }
+.banner.good { background: var(--good-soft); border-color: color-mix(in srgb, var(--good) 30%, transparent); }
+.banner.good svg { color: var(--good); }
+.banner.good .bt { color: #14532d; } .banner.good .bd { color: #1f7a44; }
+.banner.good .bd a { color: #14532d; font-weight: 700; }
 
 /* modal scrim + panel — shared by the confirm dialog, ⌘K palette and pickers */
 .g99scrim {

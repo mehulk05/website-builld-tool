@@ -2,8 +2,8 @@
 // what's in flight and what recently landed. Polls while anything is live.
 "use strict";
 
-const { esc, avatarColor, initials, relTime, getJSON, ensureAuth,
-        jobState, jobProgress, jobCost, jobStepLabel, isActiveJob } = window.G99;
+const { esc, avatarColor, initials, relTime, getJSON, postJSON, toast, ensureAuth,
+        jobState, jobProgress, jobCost, jobStepLabel, isActiveJob, confirm: confirmAction } = window.G99;
 
 const $ = (id) => document.getElementById(id);
 
@@ -34,6 +34,8 @@ function activeRow(j) {
         <div class="sub trunc">${esc(j.businessName)} · ${esc(jobStepLabel(j))}</div>
       </div>
       ${needsYou(j) ? `<span class="btn warn sm">Review &amp; approve</span>` : ""}
+      ${(j.status === "running" || j.status === "queued") && !j.cancelRequested ? `<button class="btn danger sm" data-cancel="${esc(j.draftId)}" data-name="${esc(j.businessName)}">Stop</button>` : ""}
+      ${j.cancelRequested && j.status === "running" ? `<span class="pill bad">Stopping…</span>` : ""}
       <span class="pill ${st.cls}">${esc(st.label)}</span>
     </div>
     <div class="mt">
@@ -118,6 +120,24 @@ $("filters").onclick = (e) => {
   render();
 };
 $("search").oninput = (e) => { QUERY = e.target.value.toLowerCase().trim(); shownCount = PAGE; render(); };
+
+// Stop button on active rows (delegated — rows re-render on every poll). The row
+// itself is a link, so swallow the navigation before cancelling.
+$("active").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-cancel]");
+  if (!b) return;
+  e.preventDefault(); e.stopPropagation();
+  const ok = await confirmAction({
+    title: "Stop this run?",
+    body: "The run stops at the next step boundary. Work already pushed stays on its branch — nothing is rolled back.",
+    details: { Site: b.dataset.name, Run: b.dataset.cancel },
+    confirmLabel: "Stop run", tone: "danger",
+  });
+  if (!ok) return;
+  b.disabled = true;
+  try { await postJSON("/api/job-cancel", { id: b.dataset.cancel }); toast("Stopping — the run ends at the next step boundary."); load(); }
+  catch (err) { b.disabled = false; toast("Could not stop: " + err.message); }
+});
 
 ensureAuth().then((ok) => {
   if (!ok) { $("active").innerHTML = '<p class="empty">Unauthorized — reload and enter the admin password.</p>'; return; }
