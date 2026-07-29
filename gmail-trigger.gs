@@ -91,7 +91,7 @@ function handleIncoming() {
       let body = null;
       try { body = JSON.parse(reply); } catch (e) { /* not JSON — skip the reply */ }
       if (body && body.reply) {
-        try { thread.reply(body.reply); } catch (e) { Logger.log('reply failed: ' + e); }
+        try { replyToRequester(thread, body.reply); } catch (e) { Logger.log("reply failed: " + e); }
       }
       thread.markRead().addLabel(done).moveToArchive();
     }
@@ -120,7 +120,7 @@ function sendQueuedReplies() {
     try {
       const thread = GmailApp.getThreadById(item.threadId);
       if (!thread) { sent.push(item.id); return; }   // thread gone — drop it
-      thread.reply(item.text);
+      replyToRequester(thread, item.text);
       sent.push(item.id);
       Logger.log('replied on ' + item.threadId);
     } catch (e) {
@@ -134,6 +134,21 @@ function sendQueuedReplies() {
     try { post(outboxUrl(), { ids: sent }); }
     catch (e) { Logger.log('ack failed: ' + e); }
   }
+}
+
+// thread.reply() answers the LAST message in the thread. Once we have replied
+// once, that last message is our own, so a second reply is addressed to this
+// mailbox instead of the person who asked — it appears in the thread but never
+// reaches them. Always answer the newest message that is not from us.
+function replyToRequester(thread, text) {
+  const msgs = thread.getMessages();
+  let me = '';
+  try { me = (Session.getEffectiveUser().getEmail() || '').toLowerCase(); } catch (e) { /* no scope */ }
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const from = (msgs[i].getFrom() || '').toLowerCase();
+    if (!me || from.indexOf(me) === -1) { msgs[i].reply(text); return; }
+  }
+  msgs[0].reply(text);   // whole thread is ours — answer the opening message
 }
 
 function post(url, payload) {
