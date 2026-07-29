@@ -66,6 +66,31 @@
   .hist .det .grid div.v { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); margin-top: 2px; }
   .toggle { background: none; border: none; color: var(--muted); cursor: pointer; font: inherit; font-size: 12px; font-weight: 600; display: inline-flex; align-items: center; gap: 3px; padding: 4px; }
   .toggle:hover { color: var(--ink); }
+
+  /* ---- "Edit with…" hand-off modal ---- */
+  .idepanel { width: min(600px, 94vw); max-height: 88vh; display: flex; flex-direction: column; }
+  .idepanel .ph { padding: 18px 22px 15px; border-bottom: 1px solid var(--line); display: flex; align-items: flex-start; gap: 12px; }
+  .idepanel .ph h2 { margin: 0 0 3px; font-size: 16px; }
+  .idepanel .ph p { margin: 0; font-size: 12.5px; color: var(--muted); line-height: 1.45; }
+  .idepanel .pbody { padding: 16px 22px 18px; overflow: auto; display: flex; flex-direction: column; gap: 14px; }
+  .idetabs { display: flex; gap: 2px; background: var(--line-2); padding: 3px; border-radius: 11px; }
+  .idetabs button {
+    flex: 1; font: inherit; font-size: 12.5px; font-weight: 700; border: none; border-radius: 8px;
+    padding: 8px 10px; cursor: pointer; background: transparent; color: var(--ink-3);
+    transition: background .14s, color .14s;
+  }
+  .idetabs button.on { background: var(--surface); color: var(--ink); box-shadow: var(--shadow-sm); }
+  .idefield label { display: block; font-size: 12px; font-weight: 700; color: var(--ink-2); margin-bottom: 6px; }
+  .idefield .ro {
+    font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .idefield textarea { resize: vertical; }
+  .idefield .final { font-family: var(--mono); font-size: 11.5px; line-height: 1.55; min-height: 150px; }
+  .idenote { font-size: 11.5px; color: var(--muted); line-height: 1.45; }
+  .idepanel .pf { display: flex; gap: 9px; align-items: center; padding: 14px 22px; border-top: 1px solid var(--line); background: var(--surface-2); flex-wrap: wrap; }
+  .idepanel .pf .end { margin-left: auto; display: flex; gap: 9px; }
 </style>
 </head>
 <body data-title="Site">

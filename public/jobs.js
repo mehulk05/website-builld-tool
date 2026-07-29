@@ -11,8 +11,10 @@ let JOBS = [], FILTER = "all", QUERY = "", timer;
 const PAGE = 30;
 let shownCount = PAGE;
 
-const needsYou = (j) => j.awaitingApproval && !j.approved;
-const title = (j) => j.editSummary || (j.payload && j.payload.prompt) || (j.type === "edit" ? "Website edit" : j.type === "enrich" ? "Service pages + brand guide" : "Build " + j.businessName);
+// isActiveJob guards against a stale awaitingApproval flag on a run that has
+// already ended — a finished job can't be waiting for you.
+const needsYou = (j) => j.awaitingApproval && !j.approved && isActiveJob(j);
+const title = (j) => j.editSummary || (j.payload && j.payload.prompt) || (j.type === "edit" ? "Website edit" : "Build " + j.businessName);
 
 function match(j) {
   if (QUERY && !((j.businessName || "") + " " + title(j)).toLowerCase().includes(QUERY)) return false;

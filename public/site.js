@@ -150,6 +150,151 @@ function runsCard() {
   </div>`;
 }
 
+// ------------------------------------------------- "Edit with…" hand-off
+// Sends this site's context to a coding agent instead of Studio's own pipeline —
+// for the complex changes (layout, new templates) the chat flow isn't for.
+// Only Cursor has a documented prompt deeplink; the others are launched locally
+// by the server, which only works when Studio runs on the operator's machine.
+const IDES = [
+  { id: "claude", label: "Claude Code", how: "local",
+    note: "Opens a terminal on this machine running Claude Code, already loaded with the task." },
+  { id: "cursor", label: "Cursor", how: "deeplink",
+    note: "Opens Cursor and drops the prompt straight into its chat. Works from any machine with Cursor installed." },
+  { id: "antigravity", label: "Antigravity", how: "local",
+    note: "Opens Antigravity on this machine in a fresh workspace with the task file alongside it." },
+];
+let IDE = "claude";
+let IDE_LOCAL = null;   // null = not checked yet
+
+function idePrompt(instruction) {
+  const repo = SITE.githubRepo ? `https://github.com/${SITE.githubRepo}` : "";
+  const lines = [
+    `# Website change — ${SITE.businessName}`,
+    "",
+    repo ? `Repository: ${repo}` : "Repository: (none set for this site yet)",
+  ];
+  if (SITE.liveUrl) lines.push(`Live site: ${SITE.liveUrl}`);
+  if (TARGET.themeSlug) lines.push(`Theme: web/app/themes/${TARGET.themeSlug}`);
+  lines.push("", "## Task", "", instruction.trim() || "(describe the change here)", "", "## Ground rules", "");
+  if (repo) lines.push(`- Clone ${repo} if you don't already have it, and work on a new branch.`);
+  if (TARGET.themeSlug) lines.push(`- Only change files under \`web/app/themes/${TARGET.themeSlug}\` — this repo hosts other clients' sites too.`);
+  lines.push("- Open a pull request against `main` when you're done. Never push straight to `main`.");
+  lines.push("- This is a live client website: keep existing content and links intact unless the task says otherwise.");
+  return lines.join("\n");
+}
+
+function ideModal() {
+  const old = document.querySelector(".g99scrim"); if (old) old.remove();
+  const scrim = document.createElement("div");
+  scrim.className = "g99scrim";
+  scrim.innerHTML = `
+    <div class="g99panel idepanel" role="dialog" aria-modal="true" aria-labelledby="idet">
+      <div class="ph">
+        <div style="flex:1;min-width:0">
+          <h2 id="idet">Edit with a coding agent</h2>
+          <p>For bigger changes than the chat flow handles — layouts, new templates, refactors. Studio builds the prompt; your tool does the work.</p>
+        </div>
+        <button class="btn sm" id="idex" aria-label="Close">${svg("close", 15, 2.2)}</button>
+      </div>
+      <div class="pbody">
+        <div class="idetabs" id="idetabs" role="tablist" aria-label="Choose a tool">
+          ${IDES.map((t) => `<button role="tab" data-ide="${t.id}" class="${t.id === IDE ? "on" : ""}" aria-selected="${t.id === IDE}">${esc(t.label)}</button>`).join("")}
+        </div>
+        <div class="idefield">
+          <label for="iderepo">Repository</label>
+          <div class="ro" id="iderepo">${esc(SITE.githubRepo ? "https://github.com/" + SITE.githubRepo : "No repository set for this site in NocoDB")}</div>
+        </div>
+        <div class="idefield">
+          <label for="ideinstr">What should it do?</label>
+          <textarea id="ideinstr" rows="3" placeholder="e.g. Redesign the complete UI of the home page"></textarea>
+        </div>
+        <div class="idefield" id="idefinalwrap" hidden>
+          <label for="idefinal">Prompt — edit it if you like</label>
+          <textarea id="idefinal" class="final" rows="12" spellcheck="false"></textarea>
+        </div>
+        <p class="idenote" id="idenote"></p>
+      </div>
+      <div class="pf">
+        <button class="btn" id="idegen">Generate prompt</button>
+        <div class="end">
+          <button class="btn" id="idecopy" disabled>Copy</button>
+          <button class="btn primary" id="idesend" disabled>Send</button>
+        </div>
+      </div>
+    </div>`;
+  const close = () => { scrim.remove(); window.removeEventListener("keydown", onKey, true); };
+  const onKey = (e) => { if (e.key === "Escape") close(); };
+  scrim.addEventListener("click", (e) => { if (e.target === scrim) close(); });
+  window.addEventListener("keydown", onKey, true);
+  document.body.appendChild(scrim);
+  scrim.querySelector("#idex").onclick = close;
+
+  const $$ = (id) => scrim.querySelector("#" + id);
+  const tool = () => IDES.find((t) => t.id === IDE);
+
+  // The launcher needs Studio to be running on this machine; ask once and cache.
+  const noteFor = () => {
+    const t = tool();
+    if (t.how === "deeplink") return t.note;
+    if (IDE_LOCAL === false) return `${t.label} can't be launched from here — Studio is running on a remote server, so use Copy and paste it into ${t.label} yourself.`;
+    return t.note;
+  };
+  const paint = () => {
+    scrim.querySelectorAll("[data-ide]").forEach((b) => {
+      const on = b.dataset.ide === IDE;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-selected", String(on));
+    });
+    $$("idenote").textContent = noteFor();
+    $$("idesend").textContent = "Send to " + tool().label;
+  };
+  const generate = () => {
+    $$("idefinal").value = idePrompt($$("ideinstr").value);
+    $$("idefinalwrap").hidden = false;
+    $$("idecopy").disabled = false;
+    $$("idesend").disabled = false;
+  };
+
+  $$("idetabs").onclick = (e) => {
+    const b = e.target.closest("[data-ide]"); if (!b) return;
+    IDE = b.dataset.ide; paint();
+  };
+  $$("idegen").onclick = generate;
+  $$("ideinstr").onkeydown = (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) generate(); };
+  $$("idecopy").onclick = async () => {
+    try { await navigator.clipboard.writeText($$("idefinal").value); toast("Prompt copied."); }
+    catch (e) { $$("idefinal").select(); toast("Press Ctrl+C to copy."); }
+  };
+  $$("idesend").onclick = async () => {
+    const text = $$("idefinal").value.trim();
+    if (!text) { toast("Generate the prompt first."); return; }
+    const t = tool();
+    if (t.how === "deeplink") {
+      // Cursor's documented deeplink caps out at 8000 characters once encoded.
+      const url = "cursor://anysphere.cursor-deeplink/prompt?text=" + encodeURIComponent(text);
+      if (url.length > 8000) { toast("Prompt is too long for Cursor's link — use Copy instead."); return; }
+      location.href = url;
+      toast("Opening Cursor… if nothing happens, use Copy.");
+      return;
+    }
+    const b = $$("idesend"); b.disabled = true; b.textContent = "Opening…";
+    try {
+      const d = await postJSON("/api/ide-launch", { ide: IDE, prompt: text, siteId: SITE.siteId });
+      toast(`${d.tool} is opening on this machine.`);
+      close();
+    } catch (e) {
+      toast(e.message);
+      b.disabled = false; b.textContent = "Send to " + t.label;
+    }
+  };
+
+  paint();
+  $$("ideinstr").focus();
+  if (IDE_LOCAL === null) {
+    getJSON("/api/ide-support").then((d) => { IDE_LOCAL = !!d.local; paint(); }).catch(() => { IDE_LOCAL = false; paint(); });
+  }
+}
+
 function render() {
   const color = avatarColor(SITE.businessName);
   const st = siteStatus(SITE, JOBS);
@@ -173,6 +318,7 @@ function render() {
       <div class="acts">
         <button class="btn" id="reauditTop"${AUDITING ? " disabled" : ""}>${svg("chart", 15)}${AUDIT ? "Re-audit" : "Run CRO audit"}</button>
         <button class="btn" id="enrichBtn">${svg("spark", 15)}Add service pages</button>
+        <button class="btn" id="editWith">${svg("code", 15)}Edit with…</button>
         <a class="btn primary" href="/edit?site=${encodeURIComponent(SITE.siteId)}">${svg("edit", 15)}Edit this site</a>
       </div>
     </div>
@@ -270,6 +416,7 @@ function wire() {
       setTimeout(() => { location.href = "/job?id=" + encodeURIComponent(d.jobId); }, 800);
     } catch (e) { eb.disabled = false; toast("Could not start: " + (e.message || "failed")); }
   };
+  const ew = $("editWith"); if (ew) ew.onclick = ideModal;
 
   const t = $("apprToggle");
   if (t) t.onchange = async () => {
