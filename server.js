@@ -1760,6 +1760,40 @@ async function launchIde(tool, text, siteId) {
 // poller can all POST the same shape.
 const urlHost = (u) => { try { return new URL(u).host; } catch (e) { return String(u || "").replace(/^https?:\/\//, "").replace(/\/.*$/, ""); } };
 const EMAIL_LOG_FILE = path.join(DIR, "email-requests.json");
+// Studio has no mail transport, so replies are handed back to the Apps Script
+// that is already polling every minute and sent from Gmail. Anything we cannot
+// answer inside the request - "ready to review", "shipped", "failed" - waits
+// here until that poll collects it.
+const EMAIL_OUTBOX_FILE = path.join(DIR, "email-outbox.json");
+function readOutbox() {
+  try { return JSON.parse(fs.readFileSync(EMAIL_OUTBOX_FILE, "utf8")); }
+  catch (e) { return { pending: [], refusedThreads: [] }; }
+}
+function writeOutbox(o) { try { fs.writeFileSync(EMAIL_OUTBOX_FILE, JSON.stringify(o, null, 2)); } catch (e) { /* non-fatal */ } }
+
+// Queue a reply on the thread a job came from. Does nothing for runs that did
+// not start as an email, so build and restore jobs are unaffected.
+function queueEmailReply(job, text) {
+  const p = job && job.payload;
+  if (!p || p.source !== "email" || !p.threadId || !text) return;
+  const o = readOutbox();
+  o.pending.push({ id: "r" + Date.now() + Math.random().toString(36).slice(2, 6), threadId: p.threadId, text, at: new Date().toISOString() });
+  o.pending = o.pending.slice(-100);
+  writeOutbox(o);
+}
+// One refusal per thread. Without this, an "I could not tell which site" reply
+// draws a "thanks!" that fails to match, which draws another refusal.
+function refusalAlreadySent(threadId) {
+  return !!threadId && readOutbox().refusedThreads.includes(threadId);
+}
+function markRefusalSent(threadId) {
+  if (!threadId) return;
+  const o = readOutbox();
+  if (o.refusedThreads.includes(threadId)) return;
+  o.refusedThreads.push(threadId);
+  o.refusedThreads = o.refusedThreads.slice(-300);
+  writeOutbox(o);
+}
 function readEmailLog() { try { return JSON.parse(fs.readFileSync(EMAIL_LOG_FILE, "utf8")); } catch (e) { return { requests: [] }; } }
 function logEmailRequest(entry) {
   const log = readEmailLog();
@@ -2049,6 +2083,16 @@ async function awaitApprovalIfNeeded(job, siteId, stepIdx) {
   job.awaitingApproval = true;
   jobStep(job, stepIdx, "running", "Build is green — waiting for approval to merge…");
   notify(`⏳ *${job.businessName}* build passed — needs approval to go live: ${job.prUrl || ""}`);
+  queueEmailReply(job, [
+    "This is ready and the build passed.",
+    "",
+    job.editSummary || "",
+    "",
+    "Review and approve: " + (process.env.G99_TOOL_PUBLIC_URL || "") + "/job?id=" + job.draftId,
+    job.prUrl ? "Pull request: " + job.prUrl : "",
+    "",
+    "Nothing goes live until someone approves it.",
+  ].join("\n").replace(/\n{3,}/g, "\n\n").trim());
   for (let i = 0; i < 240 && !job.approved; i++) {
     if (job.cancelRequested) { job.awaitingApproval = false; throw Object.assign(new Error("cancelled by user"), { cancelled: true }); }
     // Approving in Studio isn't the only way this PR can be resolved — someone
@@ -2490,6 +2534,12 @@ async function runEditJob(job) {
     jobStep(job, 5, "done", "Done — change is live on merge/deploy");
     await postEditPrComment(job);
     job.status = "done";
+    queueEmailReply(job, [
+      "This is now live on " + P.businessName + ".",
+      "",
+      job.editSummary || "",
+      job.prUrl ? "\nPull request: " + job.prUrl : "",
+    ].join("\n").trim());
     notify(`✏️ Edit merged for *${job.businessName}*: ${job.editSummary || ""} · ${job.prUrl || ""}`);
   } catch (e) {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
@@ -2498,6 +2548,13 @@ async function runEditJob(job) {
       job.error = e.message; job.status = "error";
       if (job.steps[job.currentStep] && job.steps[job.currentStep].status === "running") { job.steps[job.currentStep].status = "error"; job.steps[job.currentStep].detail = String(e.message).slice(0, 240); }
       console.error(`edit job ${job.draftId} failed:`, e.message);
+      queueEmailReply(job, [
+        "I could not complete this change.",
+        "",
+        String(e.message).slice(0, 300),
+        "",
+        "Nothing was changed on the live site. A developer will need to take a look.",
+      ].join("\n"));
       notify(`❌ Edit failed for *${job.businessName}*: ${e.message}`);
     }
   } finally {
@@ -2722,9 +2779,16 @@ const server = http.createServer(async (req, res) => {
       const subject = String(body.subject || "").trim();
       const dryRun = !!body.dryRun;
       const text = emailBodyText(body.body);
-      const reject = (reason, extra) => {
+      const threadId = String(body.threadId || "");
+      // `reply` is what the sender is told. Deliberately omitted for automated
+      // mail and unknown senders, and capped at one refusal per thread so a
+      // "thanks!" cannot start a ping-pong.
+      const reject = (reason, extra, reply) => {
         logEmailRequest({ from, subject, messageId: body.messageId || null, status: "rejected", reason, ...(extra || {}) });
-        return json(res, 200, { accepted: false, reason });   // 200: the sender is a mail hook, not a client to retry
+        const send = reply && !refusalAlreadySent(threadId);
+        if (send) markRefusalSent(threadId);
+        // 200: the caller is a mail hook, not a client that should retry.
+        return json(res, 200, { accepted: false, reason, ...(send ? { reply } : {}) });
       };
 
       // 1 — never let a robot conversation start a run
@@ -2738,26 +2802,34 @@ const server = http.createServer(async (req, res) => {
       if (!allowed.some(a => a.startsWith("@") ? addr.endsWith(a) : (addr === a || addr.endsWith("@" + a)))) {
         return reject(`sender ${addr || "(none)"} is not on EMAIL_ALLOWED_SENDERS`);
       }
-      if (!text) return reject("empty email body");
+      if (!text) return reject("empty email body", null,
+        "There was no request in this email — the body came through empty.\n\nReply with what you would like changed and which website it is for, and I will pick it up.");
 
       // 3 — which website? Subject carries the name far more often than the body.
-      let sites; try { sites = await getWebsites(false); } catch (e) { return reject("could not load the website list: " + e.message); }
+      let sites; try { sites = await getWebsites(false); } catch (e) { return reject("could not load the website list: " + e.message, null,
+        "I could not reach the website list just now, so I have not actioned this. Please resend in a few minutes."); }
       const whole = `${subject}\n\n${text}`;
       let hit = matchSiteDeterministic(whole, sites);
       let instruction = text;
-      if (hit && hit.ambiguous) return reject(`names more than one website (${hit.ambiguous.join(", ")}) — send one email per site`);
+      if (hit && hit.ambiguous) return reject(`names more than one website (${hit.ambiguous.join(", ")}) — send one email per site`, null,
+        `This email mentions ${hit.ambiguous.join(" and ")}. I can only work on one website per email — please send them separately and I will do both.`);
       if (!hit) {
-        try { hit = await matchSiteAI(whole, sites); } catch (e) { return reject("could not parse the email: " + e.message); }
+        try { hit = await matchSiteAI(whole, sites); } catch (e) { return reject("could not parse the email: " + e.message, null,
+          "I could not read a change request out of this email.\n\nReply with the website domain and what you would like changed."); }
         if (hit && hit.instruction) instruction = hit.instruction;
-        if (hit && hit.confidence < 0.6) return reject(`matched ${hit.site.businessName} but only ${Math.round(hit.confidence * 100)}% confident — needs a human`, { siteId: hit.site.siteId });
+        if (hit && hit.confidence < 0.6) return reject(`matched ${hit.site.businessName} but only ${Math.round(hit.confidence * 100)}% confident — needs a human`, { siteId: hit.site.siteId },
+          `I think this is about ${hit.site.businessName}, but I was not confident enough to act on it.\n\nReply with the website domain, for example prodteam.gogroth.com, and I will pick it up.`);
       }
-      if (!hit) return reject("could not tell which website this is about");
+      if (!hit) return reject("could not tell which website this is about", null,
+        "I could not tell which website this is about.\n\nReply with the domain, for example prodteam.gogroth.com, and what you would like changed, and I will pick it up.");
       const site = hit.site;
-      if (!site.githubRepo) return reject(`${site.businessName} has no repository set in NocoDB`, { siteId: site.siteId });
+      if (!site.githubRepo) return reject(`${site.businessName} has no repository set in NocoDB`, { siteId: site.siteId },
+        `${site.businessName} is not fully set up in Studio yet — it has no repository configured — so I cannot make changes to it. Someone will need to add that first.`);
 
       // 4 — confirm there's a theme to edit before promising anything
       let target; try { target = await resolveEditTarget(site); }
-      catch (e) { return reject("no editable theme for " + site.businessName + ": " + e.message, { siteId: site.siteId }); }
+      catch (e) { return reject("no editable theme for " + site.businessName + ": " + e.message, { siteId: site.siteId },
+        `I could not work out which theme to edit for ${site.businessName}, so I have not made any changes. A developer will need to check its setup.`); }
 
       if (dryRun) {
         logEmailRequest({ from, subject, messageId: body.messageId || null, status: "dry-run", siteId: site.siteId, matchedBy: hit.how, instruction });
@@ -2771,13 +2843,42 @@ const server = http.createServer(async (req, res) => {
         siteId: site.siteId, businessName: site.businessName, githubRepo: site.githubRepo,
         themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
         prompt: instruction, forceApproval: true,
-        source: "email", requestedBy: addr, emailSubject: subject,
+        source: "email", requestedBy: addr, emailSubject: subject, threadId,
       });
       logEmailRequest({ from, subject, messageId: body.messageId || null, status: "queued", siteId: site.siteId, matchedBy: hit.how, instruction, jobId: job.draftId });
       notify(`📧 Email request from ${addr} → *${site.businessName}*: ${instruction.slice(0, 140)} (needs your approval before merge)`);
+      // Echoing the parsed instruction back is the cheapest guard against a
+      // misread: the sender sees what will actually be done before it ships.
+      const ack = [
+        "Got it " + String.fromCharCode(8212) + " I am making this change to " + site.businessName + " now.",
+        "",
+        "What I understood:",
+        instruction.length > 600 ? instruction.slice(0, 600) + "..." : instruction,
+        "",
+        "I will reply when it is ready for review. This usually takes 2-4 minutes.",
+      ].join("\n");
       res.writeHead(202, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ accepted: true, jobId: job.draftId, siteId: site.siteId, businessName: site.businessName, matchedBy: hit.how, instruction, monitor: "/jobs" }));
+      return res.end(JSON.stringify({ accepted: true, jobId: job.draftId, siteId: site.siteId, businessName: site.businessName, matchedBy: hit.how, instruction, reply: ack, monitor: "/jobs" }));
     }
+    // Replies waiting to be sent. Studio has no mail transport, so the Apps
+    // Script collects these on its normal poll and sends them from Gmail.
+    // Under /api/webhook/ so it sits outside the admin gate and is protected by
+    // the same shared secret the inbound hook uses.
+    if (p === "/api/webhook/email-outbox") {
+      const secret = process.env.EMAIL_WEBHOOK_SECRET || process.env.WEBHOOK_SECRET || "";
+      if (!secret || (req.headers["x-webhook-secret"] || "") !== secret) return json(res, 401, { error: "bad webhook secret" });
+      if (req.method === "POST") {
+        // Acknowledge: drop the ids Gmail has now sent.
+        const { ids } = JSON.parse(await readBody(req) || "{}");
+        const done = new Set(Array.isArray(ids) ? ids : []);
+        const o = readOutbox();
+        o.pending = o.pending.filter(r => !done.has(r.id));
+        writeOutbox(o);
+        return json(res, 200, { ok: true, remaining: o.pending.length });
+      }
+      return json(res, 200, { pending: readOutbox().pending });
+    }
+
     // What the mailbox has sent us lately, matched or not — the place to look
     // when someone says "I emailed that and nothing happened".
     if (p === "/api/email-requests") return json(res, 200, readEmailLog());
