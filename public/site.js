@@ -317,6 +317,7 @@ function render() {
       </div>
       <div class="acts">
         <button class="btn" id="reauditTop"${AUDITING ? " disabled" : ""}>${svg("chart", 15)}${AUDIT ? "Re-audit" : "Run CRO audit"}</button>
+        <button class="btn" id="enrichBtn">${svg("spark", 15)}Add service pages</button>
         <button class="btn" id="editWith">${svg("code", 15)}Edit with…</button>
         <a class="btn primary" href="/edit?site=${encodeURIComponent(SITE.siteId)}">${svg("edit", 15)}Edit this site</a>
       </div>
@@ -405,6 +406,16 @@ function wire() {
   };
   ["reaudit2", "reauditTop"].forEach((id) => { const b = $(id); if (b) b.onclick = run; });
 
+  const eb = $("enrichBtn");
+  if (eb) eb.onclick = async () => {
+    if (!confirm(`Add revenue-first service pages + a brand guide for "${SITE.businessName}"?\n\nThis opens one PR on the theme and merges when the build is green.`)) return;
+    eb.disabled = true;
+    try {
+      const d = await postJSON("/api/enrich-run", { siteId: SITE.siteId });
+      toast("Enrichment started — opening Activity…");
+      setTimeout(() => { location.href = "/job?id=" + encodeURIComponent(d.jobId); }, 800);
+    } catch (e) { eb.disabled = false; toast("Could not start: " + (e.message || "failed")); }
+  };
   const ew = $("editWith"); if (ew) ew.onclick = ideModal;
 
   const t = $("apprToggle");

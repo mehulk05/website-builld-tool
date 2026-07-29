@@ -39,6 +39,31 @@
   }
   .diff .a { color: var(--good); }
   .diff .d { color: var(--bad); }
+
+  /* ---- per-step detail: brand swatches, build prompt, per-page status ---- */
+  .swatches { display: flex; flex-wrap: wrap; gap: 16px; }
+  .swatches .sw { display: flex; flex-direction: column; gap: 4px; font-size: 11px; }
+  .swatches .sw i { width: 62px; height: 40px; border-radius: 8px; border: 1px solid var(--line); display: block; }
+  .swatches .sw b { font-weight: 700; color: var(--ink-2); font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; }
+  .swatches .sw code { font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
+  .kv { font-size: 12.5px; color: var(--muted); margin-top: 10px; font-weight: 600; }
+
+  details.brief { margin-top: 10px; }
+  details.brief summary { cursor: pointer; font-size: 12.5px; font-weight: 700; color: var(--accent); }
+  details.brief > div {
+    white-space: pre-wrap; font-size: 12px; line-height: 1.6; color: var(--ink-2);
+    border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-top: 8px;
+    max-height: 280px; overflow: auto; background: var(--surface-2);
+  }
+
+  .pages { display: flex; flex-direction: column; gap: 2px; }
+  .pg { display: flex; align-items: center; gap: 9px; font-size: 12.5px; padding: 5px 0; }
+  .pg .pgn { font-weight: 600; color: var(--ink-2); min-width: 84px; }
+  .pg .pgs { color: var(--muted); }
+  .pg.done .pgs { color: var(--good); font-variant-numeric: tabular-nums; }
+  .pg.error .pgs { color: var(--bad); }
+  .pg.generating .pgn, .pg.generating .pgs { color: var(--accent); }
+  .pg.queued .pgn { color: var(--muted); }
 </style>
 </head>
 <body data-title="Run detail">

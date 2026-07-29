@@ -142,9 +142,9 @@ function parsePayload(raw) {
   for (const line of t.split("\n")) { const l = line.trim(); if (l.startsWith("data:")) { const d = l.slice(5).trim(); if (d) last = d; } }
   return last ? JSON.parse(last) : null;
 }
-async function callTool(name, args) {
+async function callTool(name, args, timeoutMs) {
   bumpUsage("stitch");
-  const r = await rpc("tools/call", { name, arguments: args });
+  const r = await rpc("tools/call", { name, arguments: args }, false, timeoutMs);
   if (r && r.isError) throw new Error(`tool ${name}: ${(r.content || []).map(c => c.text).join("")}`);
   return r;
 }
@@ -349,7 +349,11 @@ async function stitchGenerateInProject(pid, designSystem, prompt, deviceType) {
       // Stitch sometimes rejects a design-system'd generate as "invalid
       // argument", and generation is reliable WITHOUT it — so later retries drop it.
       if (designSystem && attempt <= 2) args.designSystem = designSystem;
-      const gen = await callTool("generate_screen_from_text", args);
+      // Escalating timeout: the default 90s is too short for big pages (the home
+      // page has ~11 sections and timed out on all 5 attempts), which then poisons
+      // the whole theme because header/footer/front-page derive from home.
+      const genTimeout = [150000, 210000, 270000, 300000, 300000][attempt - 1] || 300000;
+      const gen = await callTool("generate_screen_from_text", args, genTimeout);
       const ids = collectScreenIds(gen);
       if (!ids.length) throw new Error("no screen");
       let best = null, fallback = null;
@@ -370,7 +374,7 @@ async function stitchGenerateInProject(pid, designSystem, prompt, deviceType) {
       return { screenId: fallback.id, html: "", screenshotUrl: fallback.scr?.screenshot?.downloadUrl || "" };
     } catch (e) {
       lastErr = e;
-      if (attempt < 3) await sleep(6000 * attempt);
+      if (attempt < 5) await sleep(6000 * attempt);   // back off before every retry
     }
   }
   throw new Error(`stitch page failed: ${lastErr.message}`);
@@ -1505,7 +1509,11 @@ const JOB_STEPS = [
   "CRO audit — existing site", "Compose build prompt", "Generate pages (Stitch)",
   "Assemble site", "WordPress theme + PR", "CI checks → auto-merge",
   "Theme activation watch", "CRO after-audit + comparison",
+  // Runs as its OWN job (see runEnrichJob); this step mirrors its progress so the
+  // build timeline shows the whole story and can link straight to that run.
+  "Service pages + brand guide",
 ];
+const ENRICH_STEP_IDX = JOB_STEPS.length - 1;
 const JOBS = new Map();     // draftId -> job record
 const JOB_QUEUE = [];       // draftIds waiting (single concurrency — Stitch/Gemini quotas)
 let JOB_RUNNING = false;
@@ -2191,7 +2199,7 @@ async function processJobQueue() {
   if (!id) return;
   JOB_RUNNING = true;
   const job = JOBS.get(id);
-  const RUNNER = { edit: runEditJob, restore: runRestoreJob };
+  const RUNNER = { edit: runEditJob, restore: runRestoreJob, enrich: runEnrichJob };
   try { await ((job && RUNNER[job.type] ? RUNNER[job.type] : runJob)(job)); }
   catch (e) { console.error("job runner crashed:", e); }
   finally { JOB_RUNNING = false; processJobQueue(); }
@@ -2267,7 +2275,15 @@ async function runJob(job) {
       if (k) job.pages[k] = { status: pr.error ? "error" : "done", bytes: pr.htmlBytes || 0, error: pr.error || "" };
     }
     if (!ok.length) throw new Error("Stitch generated 0 pages: " + (((gen.pages || [])[0] || {}).error || "no output"));
-    jobStep(job, 2, "done", `${ok.length}/4 pages generated`);
+    // HOME is mandatory: buildWpTheme derives front-page.php AND the shared
+    // header.php/footer.php from it, so a failed home ships a theme with an empty
+    // homepage and no navigation. Fail loudly instead of releasing that.
+    const homeRes = (gen.pages || []).find((x) => (x.pageKey || x.page) === "home");
+    if (!homeRes || homeRes.error || !homeRes.htmlBytes) {
+      throw new Error("home page generation failed (" + ((homeRes && homeRes.error) || "no output") +
+        ") — the theme's header/footer/front page all derive from home, so the build was stopped rather than ship a homepage with no content or navigation. Re-run to retry.");
+    }
+    jobStep(job, 2, "done", `${ok.length}/${(gen.pages || []).length} pages generated`);
 
     // 4 — assemble into one coherent site
     jobStep(job, 3, "running", "Binding site with AI chrome…");
@@ -2332,6 +2348,30 @@ async function runJob(job) {
     jobStep(job, 7, "done", job.before ? `${job.before.overall} → ${job.after.overall} (${job.delta >= 0 ? "+" : ""}${job.delta})` : `New site: ${job.after.overall}/100`);
 
     try { await syncSiteRegistry(); } catch (e) { /* non-fatal: keep registry current so the new site is editable */ }
+
+    // Auto-enrich: fire a DECOUPLED post-beta job that adds service pages + a
+    // brand guide in its own PR. Fail-soft — the beta is already released, so an
+    // enrichment failure must never mark this build failed.
+    try {
+      if (slug) {
+        const ej = enqueueEnrichJob({
+          jobId: "enrich-" + Date.now(), businessId: job.businessId, parentDraftId: job.draftId,
+          siteId: "g99-" + slug, businessName: job.businessName, githubRepo: WP_REPO,
+          themeSlug: "g99-" + slug, themePath: `web/app/themes/g99-${slug}`,
+          muPath: `web/app/mu-plugins/g99-activate-${slug}.php`,
+          answers: A, composed: job.composed, referenceWebsite: onb.referenceWebsite || "",
+        });
+        job.enrichJobId = ej.draftId;   // frontend links to the run from this step
+        jobStep(job, ENRICH_STEP_IDX, "running", "Queued as its own run — generating service pages…");
+        notify(`✨ Auto-enrich queued for *${job.businessName}* (service pages + brand guide)`);
+      } else {
+        jobStep(job, ENRICH_STEP_IDX, "done", "Skipped — no theme slug");
+      }
+    } catch (e) {
+      console.error("auto-enrich enqueue failed (non-fatal):", e.message);
+      jobStep(job, ENRICH_STEP_IDX, "error", "Could not queue enrichment: " + e.message);
+    }
+
     job.status = "done";
     notify(`✅ Beta site *${job.businessName}*: CRO ${job.before ? job.before.overall + "→" + job.after.overall : job.after && job.after.overall} · ${job.prUrl || ""}`);
   } catch (e) {
@@ -2676,6 +2716,592 @@ async function postEditPrComment(job) {
   fs.rmSync(tmpFile, { force: true });
   if (r.code) console.warn("edit PR comment failed:", (r.stderr || "").slice(-160));
 }
+
+// ============================================================ ENRICH ENGINE
+// A DECOUPLED post-beta job: after a beta site is released, add (in ONE PR on the
+// already-built theme) revenue-first individual service pages + a public brand
+// guide, mimicking the reference site's per-service structure. Reuses the edit
+// job's clone → write → PR → CI → merge rails. Fail-soft: never touches the beta.
+const MAX_SERVICE_PAGES = 10;
+const BASE_SLUGS = new Set(["home", "services", "about", "contact", "branding", "seo", "brand-guide", "team"]);
+function slugify(s) {
+  return String(s || "").toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+}
+// services_offered arrives dirty — a name with a comma inside parens gets split
+// across array items ("Neurotoxins (Botox", "Dysport)"). Rejoin unclosed parens.
+function cleanServiceList(raw) {
+  const arr = Array.isArray(raw) ? raw.slice() : (raw ? [String(raw)] : []);
+  const out = []; let buf = null;
+  for (let t of arr) {
+    t = String(t).trim(); if (!t) continue;
+    if (buf != null) { buf += ", " + t; if (t.includes(")")) { out.push(buf); buf = null; } continue; }
+    const opens = (t.match(/\(/g) || []).length, closes = (t.match(/\)/g) || []).length;
+    if (opens > closes) buf = t; else out.push(t);
+  }
+  if (buf != null) out.push(buf);
+  return out;
+}
+// Revenue-first, then growth, then the rest of services_offered; dedupe; slugify;
+// cap at MAX_SERVICE_PAGES. Returns {services:[{name,slug}], total, truncated}.
+function selectServices(A, cap = MAX_SERVICE_PAGES) {
+  A = A || {};
+  const norm = (s) => String(s).replace(/\s+/g, " ").trim();
+  const ordered = []; const seen = new Set();
+  // dedupe key ignores a trailing parenthetical, so "Neurotoxins" and
+  // "Neurotoxins (Botox, Dysport)" collapse to one page (first-seen name wins).
+  const push = (name) => { const n = norm(name); const k = n.toLowerCase().replace(/\s*\(.*$/, "").trim(); if (!n || !k || seen.has(k)) return; seen.add(k); ordered.push(n); };
+  cleanServiceList(A.revenue_services).forEach(push);
+  cleanServiceList(A.growth_services).forEach(push);
+  cleanServiceList(A.services_offered).forEach(push);
+  const used = new Set(BASE_SLUGS); const services = [];
+  for (const name of ordered) {
+    if (services.length >= cap) break;
+    const base = slugify(name); if (!base) continue;
+    let s = base, n = 2; while (used.has(s)) s = base + "-" + (n++);
+    used.add(s); services.push({ name, slug: s });
+  }
+  return { services, total: ordered.length, truncated: ordered.length > cap };
+}
+function deriveCity(location) {
+  const parts = String(location || "").split(",").map((x) => x.trim()).filter(Boolean);
+  if (!parts.length) return "";
+  const c = parts.length >= 2 ? parts[parts.length - 2] : parts[0];
+  return c.replace(/\b[A-Z]{2}\b\s*\d{0,5}.*$/, "").trim();
+}
+// Best-effort discovery of the reference site's service pages (sitemap + keyword
+// filter). Used only to GROUND the template (structure + local-SEO URL pattern).
+// Fail-soft: any error → {count:0}.
+const SERVICE_KEYWORDS = /(botox|filler|dysport|sculptra|microneedl|laser|peel|facial|injectable|lift|threads?|prp|hydrafacial|kybella|coolsculpt|weight-?loss|hormone|hrt|iv-?therapy|dermaplan|morpheus|bbl|hair-?removal|lip|skin|wellness|aesthetic|treatment|service)/i;
+async function discoverServicePages(url) {
+  if (!url) return { count: 0, pages: [], localSeo: false };
+  const origin = (() => { try { return new URL(url).origin; } catch (e) { return null; } })();
+  if (!origin) return { count: 0, pages: [], localSeo: false };
+  const locs = new Set();
+  const grab = async (u) => {
+    try {
+      const r = await fetch(u, { headers: { "User-Agent": "Mozilla/5.0 G99Bot" } });
+      if (!r.ok) return;
+      const xml = await r.text();
+      (xml.match(/<loc>([^<]+)<\/loc>/g) || []).forEach((m) => locs.add(m.replace(/<\/?loc>/g, "").trim()));
+    } catch (e) { /* ignore */ }
+  };
+  await grab(origin + "/sitemap.xml"); await grab(origin + "/wp-sitemap.xml");
+  // sitemaps of sitemaps
+  const subs = [...locs].filter((l) => /sitemap.*\.xml$/i.test(l)).slice(0, 5);
+  locs.clear(); for (const s of subs) await grab(s);
+  const pages = [...locs]
+    .map((l) => { try { return new URL(l); } catch (e) { return null; } })
+    .filter((u) => u && u.origin === origin)
+    .map((u) => u.pathname.replace(/\/+$/, ""))
+    .filter((p) => p && p.split("/").filter(Boolean).length <= 2 && SERVICE_KEYWORDS.test(p))
+    .filter((p, i, a) => a.indexOf(p) === i)
+    .slice(0, MAX_SERVICE_PAGES);
+  const localSeo = pages.some((p) => /-in-[a-z-]+-[a-z]{2}\/?$/i.test(p) || /-[a-z]+-[a-z]{2}$/i.test(p));
+  return { count: pages.length, pages: pages.map((p) => ({ path: p })), localSeo };
+}
+
+// ---- content generation (one template → clone per service) --------------------
+function serviceSectionSpec(svc, A, composed, ref, city) {
+  const loc = city ? ` in ${city}` : "";
+  return [
+    `Build a single, conversion-optimized SERVICE page for the treatment "${svc.name}" offered by ${A.business_name || "the clinic"}${loc}.`,
+    `Sections (each a DISTINCT band; rich, real imagery via https://images.unsplash.com source URLs — 6-10 images total):`,
+    `1. HERO — full-width image under a dark gradient scrim; H1 "${svc.name}${loc}"; a benefit-led subhead; primary CTA "${A.primary_cta || "Book a consultation"}".`,
+    `2. WHAT IT IS — short editorial explainer of ${svc.name}, patient-outcome framed ("You get…" not "We provide…").`,
+    `3. BENEFITS — a 3-4 item grid of concrete benefits/results.`,
+    `4. TREATMENT AREAS / CANDIDACY — who it's for; areas treated.`,
+    `5. HOW IT WORKS — a numbered 3-step process (consult → treatment → aftercare).`,
+    `6. WHY ${(A.business_name || "US").toUpperCase()} — credentials/trust: ${(A.team_roster || []).map((t) => t.name).slice(0, 2).join(", ") || "board-certified providers"}.`,
+    `7. FAQ — 3 concise Q&As specific to ${svc.name}.`,
+    `8. CLOSING CTA band "${A.primary_cta || "Book a consultation"}" (booking: ${A.booking_platform || "online"}).`,
+    ref && ref.localSeo && city ? `Use a local-SEO tone throughout, weaving "${city}" into headings and copy (the reference site uses per-service local-SEO pages).` : ``,
+    `Match this brand system exactly — primary ${composed.primary}, secondary ${composed.secondary}, accent ${composed.accent}; headings in "${composed.headingFont}", body in "${composed.bodyFont}". Load Tailwind (CDN) + those Google Fonts in <head>.`,
+  ].filter(Boolean).join("\n");
+}
+// Produce the ONE representative service page (the template all others clone).
+// NOTE: swap this to Stitch when a working key is available — it's the single
+// place the template is generated; everything else clones it deterministically.
+async function generateServiceTemplate(svc, A, composed, ref, city) {
+  const prompt = `${composed.brief || ""}\n\n${serviceSectionSpec(svc, A, composed, ref, city)}\n\nReturn ONE complete, responsive, production-quality HTML document (<!doctype html> … </html>). No markdown fences, no commentary.`;
+  const html = stripFence(await geminiCall([{ text: prompt }], { temperature: 0.55, maxOutputTokens: 16000, timeoutMs: 120000 }));
+  const main = splitPage(html).main;
+  return (main && main.trim().length > 200) ? main : `<section style="padding:80px 24px;text-align:center"><h1>${svc.name}</h1></section>`;
+}
+// Clone the template's <main> for a different service — same layout/classes,
+// swapped name/copy/benefits/imagery. Keeps all 10 pages visually consistent.
+async function cloneServicePage(templateMain, svc, A, composed, city) {
+  const loc = city ? ` in ${city}` : "";
+  const prompt = [
+    `Below is the <main> HTML of a service page for one treatment. Rewrite it for a DIFFERENT treatment: "${svc.name}".`,
+    `Keep the EXACT same structure, section order, Tailwind classes and layout. Change ONLY: the H1 to "${svc.name}${loc}", all body copy to describe ${svc.name}, the benefits/FAQ to be specific to ${svc.name}, and swap image URLs to Unsplash images that depict ${svc.name} / relevant medical-aesthetic imagery. Keep the primary CTA "${A.primary_cta || "Book a consultation"}".`,
+    `Output ONLY the rewritten <main>…</main> — no <html>, no <head>, no commentary, no markdown fences.`,
+    `\nTEMPLATE <main>:\n${templateMain}`,
+  ].join("\n");
+  const out = stripFence(await geminiCall([{ text: prompt }], { temperature: 0.5, maxOutputTokens: 16000, timeoutMs: 120000 }));
+  const m = out.match(/<main[\s\S]*<\/main>/i);
+  return (m ? m[0] : out).trim() || templateMain;
+}
+// A deterministic services hub (grid of cards linking to each /<slug>/).
+function servicesHubMain(services, A, composed) {
+  const c = composed || {};
+  const cards = services.map((s) => `      <a class="g99svc-card" href="/${s.slug}/">
+        <span class="g99svc-name">${escHtml(s.name)}</span>
+        <span class="g99svc-go">Explore ${escHtml(s.name)} →</span>
+      </a>`).join("\n");
+  return `<section class="g99hub">
+  <style>
+    .g99hub{padding:96px 24px;background:${c.primary || "#111"};color:#fff;font-family:"${c.bodyFont || "Plus Jakarta Sans"}",sans-serif}
+    .g99hub .wrap{max-width:1120px;margin:0 auto}
+    .g99hub h1{font-family:"${c.headingFont || "Cormorant Garamond"}",serif;font-size:clamp(34px,5vw,56px);margin:0 0 12px;color:${c.accent || "#d4af37"}}
+    .g99hub p.sub{opacity:.8;max-width:640px;margin:0 0 40px}
+    .g99svc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:18px}
+    .g99svc-card{display:flex;flex-direction:column;gap:10px;padding:26px 24px;border:1px solid rgba(255,255,255,.14);border-radius:14px;text-decoration:none;color:#fff;transition:.18s;background:rgba(255,255,255,.03)}
+    .g99svc-card:hover{border-color:${c.accent || "#d4af37"};transform:translateY(-3px)}
+    .g99svc-name{font-family:"${c.headingFont || "Cormorant Garamond"}",serif;font-size:24px}
+    .g99svc-go{font-size:13px;letter-spacing:.04em;color:${c.accent || "#d4af37"}}
+  </style>
+  <div class="wrap">
+    <h1>Our Treatments</h1>
+    <p class="sub">${escHtml(A.business_description || `Explore the treatments offered at ${A.business_name || "our clinic"}.`)}</p>
+    <div class="g99svc-grid">
+${cards}
+    </div>
+  </div>
+</section>`;
+}
+function escHtml(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch])); }
+// Deterministic public brand-guide page built from job.composed + answers.
+function brandGuidePage(composed, A, biz) {
+  const c = composed || {}; A = A || {};
+  const tone = [];
+  const t = (v, lo, hi) => { const n = parseInt(v, 10); if (isNaN(n)) return null; return n >= 50 ? hi : lo; };
+  const add = (v, lo, hi) => { const r = t(v, lo, hi); if (r) tone.push(r); };
+  add(A.tone_clinical_warm, "clinical", "warm"); add(A.tone_lux_approachable, "luxurious", "approachable");
+  add(A.tone_bold_understated, "bold", "understated"); add(A.tone_playful_serious, "playful", "serious");
+  const imagery = (String(c.brief || "").match(/IMAGERY:\s*([\s\S]+)$/i) || [])[1] || "Editorial, high-end medical-aesthetic photography with warm, ambient lighting, shallow depth of field and authentic provider-patient moments.";
+  const swatch = (label, hex) => hex ? `    <div class="sw"><span class="chip" style="background:${escHtml(hex)}"></span><b>${escHtml(label)}</b><code>${escHtml(hex)}</code></div>` : "";
+  return `<section class="g99bg">
+  <style>
+    .g99bg{padding:80px 24px;background:#fff;color:#111;font-family:"${c.bodyFont || "Plus Jakarta Sans"}",sans-serif}
+    .g99bg .wrap{max-width:960px;margin:0 auto}
+    .g99bg h1{font-family:"${c.headingFont || "Cormorant Garamond"}",serif;font-size:clamp(34px,5vw,54px);margin:0 0 6px}
+    .g99bg .lead{color:#666;margin:0 0 40px}
+    .g99bg h2{font-family:"${c.headingFont || "Cormorant Garamond"}",serif;font-size:26px;margin:44px 0 14px}
+    .g99bg .pal{display:flex;flex-wrap:wrap;gap:18px}
+    .g99bg .sw{display:flex;flex-direction:column;gap:6px;font-size:13px}
+    .g99bg .chip{width:120px;height:88px;border-radius:12px;border:1px solid #e5e5e5}
+    .g99bg code{color:#888;font-size:12px}
+    .g99bg .type-h{font-family:"${c.headingFont || "Cormorant Garamond"}",serif;font-size:40px}
+    .g99bg .type-b{font-size:17px;color:#333;max-width:640px}
+    .g99bg .tags{display:flex;flex-wrap:wrap;gap:8px}
+    .g99bg .tag{background:${c.accent || "#d4af37"}22;color:${c.primary || "#111"};border:1px solid ${c.accent || "#d4af37"};border-radius:999px;padding:5px 14px;font-size:13px;font-weight:600;text-transform:capitalize}
+    .g99bg .logo{max-height:80px;margin-top:8px}
+  </style>
+  <div class="wrap">
+    <h1>Brand Guide</h1>
+    <p class="lead">The visual system for ${escHtml(biz || A.business_name || "the practice")} — colors, type, voice and imagery, generated with the beta site.</p>
+    ${A.logo_file ? `<h2>Logo</h2><img class="logo" src="${escHtml(A.logo_file)}" alt="${escHtml(biz || "")} logo">` : ""}
+    <h2>Color palette</h2>
+    <div class="pal">
+${[swatch("Primary", c.primary), swatch("Secondary", c.secondary), swatch("Accent", c.accent)].filter(Boolean).join("\n")}
+    </div>
+    <h2>Typography</h2>
+    <div class="type-h">${escHtml(c.headingFont || "Cormorant Garamond")}</div>
+    <p class="type-b" style="font-family:'${escHtml(c.bodyFont || "Plus Jakarta Sans")}',sans-serif">${escHtml(c.bodyFont || "Plus Jakarta Sans")} — used for all body copy. The quick brown fox jumps over the lazy dog.</p>
+    ${tone.length ? `<h2>Voice &amp; tone</h2><div class="tags">${tone.map((x) => `<span class="tag">${escHtml(x)}</span>`).join("")}</div>` : ""}
+    <h2>Imagery direction</h2>
+    <p class="type-b">${escHtml(imagery)}</p>
+  </div>
+</section>`;
+}
+// The generated theme header is STATIC HTML (no wp_nav_menu), so the provisioned
+// WP menu never renders. This self-contained enhancer is appended to header.php:
+// on load it finds the existing "/services/" (Treatments) nav link and attaches a
+// hover dropdown of the service pages — markup-agnostic (keys off the href), so it
+// works regardless of how the AI laid out the nav. Idempotent via the marker.
+function navDropdownSnippet(services, composed) {
+  const c = composed || {};
+  const items = JSON.stringify(services.map((s) => ({ name: s.name, url: "/" + s.slug + "/" })));
+  return `<!-- g99-treatments-dropdown -->
+<style>
+.g99-hasdrop{position:relative}
+.g99-drop{position:absolute;top:100%;left:0;min-width:230px;background:${c.primary || "#141414"};border:1px solid rgba(255,255,255,.14);border-radius:12px;padding:8px;display:none;flex-direction:column;gap:2px;z-index:99999;box-shadow:0 16px 40px rgba(0,0,0,.4)}
+.g99-hasdrop:hover .g99-drop,.g99-drop:hover{display:flex}
+.g99-drop a{display:block;padding:9px 14px;color:#fff !important;text-decoration:none;border-radius:8px;font-size:14px;white-space:nowrap;font-weight:500}
+.g99-drop a:hover{background:rgba(255,255,255,.08);color:${c.accent || "#d4af37"} !important}
+</style>
+<script>
+(function () {
+  var items = ${items};
+  function build() {
+    var link = document.querySelector('a[href="/services/"], a[href$="/services/"]');
+    if (!link || link.getAttribute('data-g99')) { return; }
+    link.setAttribute('data-g99', '1');
+    var li = link.closest('li') || link.parentElement;
+    if (!li) { return; }
+    li.classList.add('g99-hasdrop');
+    var d = document.createElement('div');
+    d.className = 'g99-drop';
+    items.forEach(function (it) { var a = document.createElement('a'); a.href = it.url; a.textContent = it.name; d.appendChild(a); });
+    li.appendChild(d);
+  }
+  if (document.readyState !== 'loading') { build(); } else { document.addEventListener('DOMContentLoaded', build); }
+})();
+</script>`;
+}
+function enrichPageTemplate(title, mainHtml) {
+  return `<?php /* Template Name: ${title} */ ?>
+<?php get_header(); ?>
+<main id="main">
+${mainHtml}
+</main>
+<?php get_footer(); ?>
+`;
+}
+// Regenerate the mu-plugin so it (re)provisions every page (base + services +
+// brand guide) and rebuilds the Primary menu with a "Treatments" parent whose
+// children are the service pages. A fresh buildId forces re-provisioning; the
+// menu is deleted + rebuilt so the dropdown always reflects the new pages.
+function wpActivatorPluginEnriched(slug, biz, buildId, services) {
+  const fn = "g99_provision_" + slug.replace(/[^a-z0-9]+/g, "_");
+  const pages = [
+    { title: "Home", slug: "home", template: "" },
+    { title: "Treatments", slug: "services", template: "page-services.php" },
+    { title: "Team", slug: "about", template: "page-about.php" },
+    { title: "Contact", slug: "contact", template: "page-contact.php" },
+    { title: "Branding", slug: "branding", template: "page-branding.php" },
+    { title: "SEO", slug: "seo", template: "page-seo.php" },
+    { title: "Brand Guide", slug: "brand-guide", template: "page-brand-guide.php" },
+    ...services.map((s) => ({ title: s.name, slug: s.slug, template: `page-service-${s.slug}.php` })),
+  ];
+  const phpStr = (s) => String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const pagesPhp = pages.map((p) => `            ['title' => '${phpStr(p.title)}', 'slug' => '${p.slug}', 'template' => '${p.template}'],`).join("\n");
+  const childrenPhp = services.map((s) => `            ['slug' => '${s.slug}', 'title' => '${phpStr(s.name)}'],`).join("\n");
+  return `<?php
+
+/**
+ * Growth99 beta theme auto-activator + page provisioner for "${biz}" (enriched).
+ *
+ * Activates the "g99-${slug}" theme once per build and provisions its Pages +
+ * a Primary menu with a "Treatments" dropdown of individual service pages and a
+ * public Brand Guide. Idempotent per build id. Delete this file to disable.
+ */
+
+add_action('init', function () {
+    $slug = 'g99-${slug}';
+    $build = '${buildId}';
+
+    $theme = wp_get_theme($slug);
+    if (! $theme->exists() || $theme->errors()) {
+        return;
+    }
+
+    if (get_option('g99_autoactivated_' . $slug) !== $build) {
+        if (get_stylesheet() !== $slug) {
+            switch_theme($slug);
+        }
+        update_option('g99_autoactivated_' . $slug, $build);
+    }
+
+    if (get_stylesheet() === $slug && get_option('g99_provisioned_' . $slug) !== $build) {
+        ${fn}();
+        update_option('g99_provisioned_' . $slug, $build);
+    }
+});
+
+if (! function_exists('${fn}')) {
+    function ${fn}()
+    {
+        $pages = [
+${pagesPhp}
+        ];
+
+        $service_children = [
+${childrenPhp || "            // no service pages"}
+        ];
+
+        $home_id = 0;
+        foreach ($pages as $p) {
+            $existing = get_page_by_path($p['slug']);
+            $id = $existing ? $existing->ID : wp_insert_post([
+                'post_title' => $p['title'],
+                'post_name' => $p['slug'],
+                'post_status' => 'publish',
+                'post_type' => 'page',
+                'post_content' => '',
+            ]);
+            if ($id && $p['template']) {
+                update_post_meta($id, '_wp_page_template', $p['template']);
+            }
+            if ($p['slug'] === 'home') {
+                $home_id = $id;
+            }
+        }
+
+        if ($home_id) {
+            update_option('show_on_front', 'page');
+            update_option('page_on_front', $home_id);
+        }
+
+        // Rebuild the Primary menu from scratch so the Treatments dropdown always
+        // reflects the current service pages.
+        $existing_menu = wp_get_nav_menu_object('Primary');
+        if ($existing_menu) {
+            wp_delete_nav_menu($existing_menu->term_id);
+        }
+        $menu_id = wp_create_nav_menu('Primary');
+
+        $home = get_page_by_path('home');
+        if ($home) {
+            wp_update_nav_menu_item($menu_id, 0, [
+                'menu-item-title' => 'Home',
+                'menu-item-object' => 'page',
+                'menu-item-object-id' => $home->ID,
+                'menu-item-type' => 'post_type',
+                'menu-item-status' => 'publish',
+            ]);
+        }
+
+        $treat_parent = 0;
+        $treat = get_page_by_path('services');
+        if ($treat) {
+            $treat_parent = wp_update_nav_menu_item($menu_id, 0, [
+                'menu-item-title' => 'Treatments',
+                'menu-item-object' => 'page',
+                'menu-item-object-id' => $treat->ID,
+                'menu-item-type' => 'post_type',
+                'menu-item-status' => 'publish',
+            ]);
+        }
+
+        foreach ($service_children as $c) {
+            $pg = get_page_by_path($c['slug']);
+            if ($pg) {
+                wp_update_nav_menu_item($menu_id, 0, [
+                    'menu-item-title' => $c['title'],
+                    'menu-item-object' => 'page',
+                    'menu-item-object-id' => $pg->ID,
+                    'menu-item-type' => 'post_type',
+                    'menu-item-status' => 'publish',
+                    'menu-item-parent-id' => $treat_parent,
+                ]);
+            }
+        }
+
+        foreach ([['about', 'Team'], ['contact', 'Contact'], ['brand-guide', 'Brand Guide']] as $item) {
+            $pg = get_page_by_path($item[0]);
+            if ($pg) {
+                wp_update_nav_menu_item($menu_id, 0, [
+                    'menu-item-title' => $item[1],
+                    'menu-item-object' => 'page',
+                    'menu-item-object-id' => $pg->ID,
+                    'menu-item-type' => 'post_type',
+                    'menu-item-status' => 'publish',
+                ]);
+            }
+        }
+
+        $locations = get_theme_mod('nav_menu_locations', []);
+        $locations['primary'] = $menu_id;
+        set_theme_mod('nav_menu_locations', $locations);
+    }
+}
+`;
+}
+
+const ENRICH_STEPS = ["Pull latest code", "Plan services + brand guide", "Generate pages (AI)", "Push + open PR", "CI checks → auto-merge", "Sync registry"];
+function newEnrichJob(payload) {
+  return {
+    type: "enrich",
+    draftId: String(payload.jobId), businessId: payload.businessId || null,
+    businessName: payload.businessName || payload.siteId || "Site",
+    status: "queued", currentStep: 0,
+    steps: ENRICH_STEPS.map((label) => ({ label, status: "pending", detail: "" })),
+    payload, prUrl: null, branch: null, siteUrl: null,
+    servicePages: null, brandGuide: true, editSummary: null, error: null,
+    cost: { gemini: 0, stitch: 0 }, cancelRequested: false, awaitingApproval: false,
+    createdAt: new Date().toISOString(), startedAt: null, finishedAt: null,
+  };
+}
+// Mirror the enrich run's outcome onto the parent build's final step, so the build
+// timeline tells the whole story (and keeps polling clients updated). No-op when the
+// enrich job was triggered manually (no parent).
+function mirrorToParent(job, status, detail) {
+  const pid = job.payload && job.payload.parentDraftId;
+  if (!pid) return;
+  const parent = JOBS.get(String(pid));
+  if (!parent || !parent.steps || !parent.steps[ENRICH_STEP_IDX]) return;
+  parent.steps[ENRICH_STEP_IDX].status = status;
+  parent.steps[ENRICH_STEP_IDX].detail = String(detail || "").slice(0, 240);
+  parent.enrichJobId = job.draftId;
+  saveJobs();
+}
+function enqueueEnrichJob(payload) {
+  const job = newEnrichJob(payload);
+  JOBS.set(job.draftId, job);
+  JOB_QUEUE.push(job.draftId); saveJobs();
+  processJobQueue();
+  return job;
+}
+async function runEnrichJob(job) {
+  job.status = "running";
+  job.startedAt = new Date().toISOString(); COST_SINK = job.cost;
+  const P = job.payload;                 // {siteId, businessName, githubRepo, themeSlug, themePath, muPath, answers, composed, referenceWebsite}
+  const repo = P.githubRepo || WP_REPO;
+  const slug = String(P.themeSlug || "").replace(/^g99-/, "");
+  const A = P.answers || {};
+  const composed = P.composed || {};
+  const city = deriveCity(A.location);
+  const tmp = path.join(os.tmpdir(), "g99enrich-" + Date.now());
+  const run = async (cmd, cwd) => sh(cmd, cwd);
+  const runRetry = async (cmd, cwd, n = 3) => { let r; for (let i = 1; i <= n; i++) { r = await run(cmd, cwd); if (!r.code) return r; await sleep(3000 * i); } return r; };
+  try {
+    // 1 — pull latest (or, for a dry run, a local preview dir — no clone/PR)
+    const dry = !!P.dryRun;
+    let r, themeAbs, muAbs;
+    if (dry) {
+      themeAbs = path.join(GEN, "enrich-preview", slug || "preview");
+      fs.rmSync(themeAbs, { recursive: true, force: true }); fs.mkdirSync(themeAbs, { recursive: true });
+      muAbs = path.join(themeAbs, "_mu-plugin.php");
+      jobStep(job, 0, "done", "Dry run — writing to " + themeAbs);
+    } else {
+      jobStep(job, 0, "running", "Cloning " + repo);
+      r = await runRetry(`gh repo clone ${repo} "${tmp}" -- --depth 1`);
+      const cloneUrl = process.env.GH_TOKEN ? `https://x-access-token:${process.env.GH_TOKEN}@github.com/${repo}.git` : `https://github.com/${repo}.git`;
+      if (r.code) r = await runRetry(`git clone --depth 1 "${cloneUrl}" "${tmp}"`);
+      if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
+      if (process.env.GH_TOKEN) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
+      themeAbs = path.join(tmp, P.themePath);
+      muAbs = path.join(tmp, P.muPath);
+      if (!fs.existsSync(themeAbs)) throw new Error("theme not found in repo: " + P.themePath);
+      jobStep(job, 0, "done", "Latest code pulled");
+    }
+
+    // 2 — plan services + reference structure
+    jobStep(job, 1, "running", "Selecting services…");
+    const { services, total, truncated } = selectServices(A);
+    let ref = { count: 0, localSeo: false };
+    try { ref = await discoverServicePages(P.referenceWebsite); } catch (e) { /* fail-soft */ }
+    job.servicePages = services;
+    job.enrichPlan = { services: services.map((s) => s.slug), total, truncated, refCount: ref.count };
+    if (truncated) log_srv(`services truncated: ${total} → ${MAX_SERVICE_PAGES}`);
+    jobStep(job, 1, "done", `${services.length} service page(s)${truncated ? ` (capped from ${total})` : ""} + brand guide${ref.count ? ` · ref has ${ref.count}` : ""}`);
+
+    // 3 — generate pages (one template → clone) + deterministic hub + brand guide
+    jobStep(job, 2, "running", services.length ? "Generating service template…" : "Building brand guide…");
+    const serviceMains = {};
+    if (services.length) {
+      const template = await generateServiceTemplate(services[0], A, composed, ref, city);
+      serviceMains[services[0].slug] = template;
+      for (let i = 1; i < services.length; i++) {
+        jobStep(job, 2, "running", `Cloning page ${i + 1}/${services.length}: ${services[i].name}`);
+        try { serviceMains[services[i].slug] = await cloneServicePage(template, services[i], A, composed, city); }
+        catch (e) { serviceMains[services[i].slug] = template; }
+      }
+    }
+    const brandMain = brandGuidePage(composed, A, P.businessName);
+    const hubMain = servicesHubMain(services, A, composed);
+    jobStep(job, 2, "done", `${services.length + 1} page(s) generated`);
+
+    // 4 — write files + push + PR
+    jobStep(job, 3, "running", "Writing pages + opening PR…");
+    const changed = [];
+    for (const s of services) {
+      const f = `page-service-${s.slug}.php`;
+      fs.writeFileSync(path.join(themeAbs, f), enrichPageTemplate(s.name, serviceMains[s.slug]));
+      changed.push(`${P.themePath}/${f}`);
+    }
+    if (services.length) { fs.writeFileSync(path.join(themeAbs, "page-services.php"), enrichPageTemplate("Treatments", hubMain)); changed.push(`${P.themePath}/page-services.php`); }
+    fs.writeFileSync(path.join(themeAbs, "page-brand-guide.php"), enrichPageTemplate("Brand Guide", brandMain));
+    changed.push(`${P.themePath}/page-brand-guide.php`);
+    // append the Treatments hover-dropdown enhancer to the (static) theme header,
+    // so the service pages show as a dropdown in the top nav. Idempotent.
+    if (services.length) {
+      const headerAbs = path.join(themeAbs, "header.php");
+      if (fs.existsSync(headerAbs)) {
+        let h = fs.readFileSync(headerAbs, "utf8");
+        if (!h.includes("g99-treatments-dropdown")) {
+          fs.writeFileSync(headerAbs, h + "\n" + navDropdownSnippet(services, composed) + "\n");
+          changed.push(`${P.themePath}/header.php`);
+        }
+      }
+    }
+    // regenerate the mu-plugin so the new pages + Treatments menu get provisioned
+    const buildId = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "");
+    fs.mkdirSync(path.dirname(muAbs), { recursive: true });
+    fs.writeFileSync(muAbs, wpActivatorPluginEnriched(slug, P.businessName, buildId, services));
+    changed.push(P.muPath);
+    job.editPlan = changed.map((p) => ({ path: p, op: "create" }));
+    job.editSummary = `${services.length} service page(s) + brand guide`;
+
+    if (dry) {
+      job.previewDir = themeAbs;
+      jobStep(job, 3, "done", `Dry run — wrote ${changed.length} file(s) to ${themeAbs}`);
+      jobStep(job, 4, "done", "skipped (dry run)");
+      jobStep(job, 5, "done", "skipped (dry run)");
+      job.status = "done";
+      notify(`✨ [dry run] Enrich preview for *${job.businessName}*: ${services.length} service pages + brand guide`);
+      return;
+    }
+
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
+    const branch = `g99/enrich-${slug}-${stamp}`;
+    await run(`git checkout -b "${branch}"`, tmp);
+    await run(`git add -A "${P.themePath}" "${P.muPath}"`, tmp);
+    r = await run(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "Enrich ${P.businessName}: ${services.length} service pages + brand guide"`, tmp);
+    if (r.code) throw new Error("commit failed (no changes?): " + (r.stderr || r.stdout).slice(-160));
+    r = await runRetry(`git push -u origin "${branch}"`, tmp);
+    if (r.code) throw new Error("push failed: " + r.stderr.slice(-200));
+    const prBody = `Automated enrichment for **${P.businessName}**.\\n\\nAdds ${services.length} individual service page(s) (${services.map((s) => s.name).join(", ") || "none"}) under a Treatments dropdown, a services hub, and a public Brand Guide.${truncated ? `\\n\\n> Services capped at ${MAX_SERVICE_PAGES} of ${total}.` : ""}`;
+    r = await runRetry(`gh pr create --repo ${repo} --base main --head "${branch}" --title "Enrich ${P.businessName}: service pages + brand guide" --body "${prBody}"`, tmp);
+    job.prUrl = (r.stdout.match(/https:\/\/github\.com\/\S+/) || [""])[0];
+    job.branch = branch;
+    fs.rmSync(tmp, { recursive: true, force: true });
+    if (!job.prUrl) throw new Error("PR create failed: " + r.stderr.slice(-200));
+    jobStep(job, 3, "done", job.prUrl);
+
+    // 5 — CI watch → auto-fix → merge on green (same rails as edit)
+    jobStep(job, 4, "running", "Watching CI build checks…");
+    let fixes = 0, merged = false;
+    for (let i = 0; i < 90 && !merged; i++) {
+      let st; try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); } catch (e) { await sleep(10000); continue; }
+      jobStep(job, 4, "running", (st.checks || []).map((c) => `${c.name}:${c.status}`).join(" ") || "CI starting…");
+      if (st.allPass) { await awaitApprovalIfNeeded(job, P.siteId, 4); await localApi("/api/pr-merge", { prUrl: job.prUrl }); merged = true; jobStep(job, 4, "done", `Merged${fixes ? ` after ${fixes} fix(es)` : ""}`); break; }
+      if (st.anyFail) {
+        if (fixes >= 3) throw new Error("CI still failing after 3 auto-fix attempts — " + job.prUrl);
+        fixes++; jobStep(job, 4, "running", `Build failed — Gemini auto-fix ${fixes}/3…`);
+        const fix = await localApi("/api/pr-autofix", { prUrl: job.prUrl }, 5 * 60 * 1000);
+        if (fix.billing) throw new Error(fix.message);
+        if (!fix.fixed || !fix.fixed.length) throw new Error("auto-fix could not resolve CI: " + (fix.message || ""));
+        await sleep(20000); continue;
+      }
+      await sleep(10000);
+    }
+    if (!merged) throw new Error("CI watch timed out — " + job.prUrl);
+
+    // 6 — refresh registry
+    jobStep(job, 5, "running", "Updating site registry…");
+    try { await syncSiteRegistry(); } catch (e) { /* non-fatal */ }
+    jobStep(job, 5, "done", "Done — service pages + brand guide live on deploy");
+    job.status = "done";
+    mirrorToParent(job, "done", `${services.length} service page(s) + brand guide merged`);
+    notify(`✨ Enriched *${job.businessName}*: ${services.length} service pages + brand guide · ${job.prUrl || ""}`);
+  } catch (e) {
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
+    if (e && e.cancelled) { job.status = "cancelled"; mirrorToParent(job, "error", "Enrichment cancelled"); }
+    else {
+      job.error = e.message; job.status = "error";
+      if (job.steps[job.currentStep] && job.steps[job.currentStep].status === "running") { job.steps[job.currentStep].status = "error"; job.steps[job.currentStep].detail = String(e.message).slice(0, 240); }
+      mirrorToParent(job, "error", e.message);
+      console.error(`enrich job ${job.draftId} failed:`, e.message);
+      notify(`❌ Enrichment failed for *${job.businessName}*: ${e.message}`);
+    }
+  } finally {
+    job.finishedAt = new Date().toISOString(); saveJobs(); COST_SINK = null;
+    postStatus(job);
+  }
+}
+function log_srv(m) { console.log("[enrich] " + m); }
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -3086,6 +3712,46 @@ const server = http.createServer(async (req, res) => {
         siteId, businessName: site.businessName, githubRepo: site.githubRepo,
         themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
         prompt: prompt.trim(),
+      });
+      return json(res, 202, { jobId: job.draftId, status: job.status, monitor: "/jobs" });
+    }
+
+    // Manual enrichment (service pages + brand guide) for a deployed site. Needs
+    // the onboarding answers + composed brand — reused from the most recent build
+    // job for this site (kept in memory / jobs.json). Auto-enrich after a build is
+    // the primary path; this button re-runs it on demand.
+    if (p === "/api/enrich-run" && req.method === "POST") {
+      const body0 = JSON.parse(await readBody(req) || "{}");
+      // Inline mode (ops/test): explicit themeSlug + answers → enqueue directly,
+      // bypassing the NocoDB/build-job lookup. dryRun:true writes to a preview dir
+      // and skips the PR; otherwise it's a real run (clone → files → PR → merge).
+      if (body0.dryRun || (body0.answers && body0.themeSlug)) {
+        const isDry = !!body0.dryRun;
+        let answers = body0.answers, composed = body0.composed || {};
+        if (!answers) { try { answers = JSON.parse(fs.readFileSync(path.join(DIR, "onboarding.json"), "utf8")).answers; } catch (e) { answers = {}; } }
+        const themeSlug = body0.themeSlug || "g99-preview";
+        const job = enqueueEnrichJob({
+          jobId: (isDry ? "enrich-dry-" : "enrich-") + Date.now(), dryRun: isDry,
+          siteId: body0.siteId || themeSlug, businessName: body0.businessName || answers.business_name || "Site",
+          githubRepo: WP_REPO, themeSlug, themePath: "web/app/themes/" + themeSlug,
+          muPath: "web/app/mu-plugins/g99-activate-" + themeSlug.replace(/^g99-/, "") + ".php",
+          answers, composed, referenceWebsite: body0.referenceWebsite || "",
+        });
+        return json(res, 202, { jobId: job.draftId, dryRun: isDry, monitor: "/jobs" });
+      }
+      const { siteId } = body0;
+      const site = await findWebsite(siteId);
+      if (!site) return json(res, 404, { error: "unknown siteId — refresh the site list" });
+      let target; try { target = await resolveEditTarget(site); } catch (e) { return json(res, 409, { error: e.message }); }
+      const build = [...JOBS.values()]
+        .filter((j) => j.type === "build" && j.composed && j.payload && j.payload.answers && j.businessName === site.businessName)
+        .sort((a, b) => (b.finishedAt || b.createdAt || "").localeCompare(a.finishedAt || a.createdAt || ""))[0];
+      if (!build) return json(res, 409, { error: "No onboarding data for this site in memory — enrichment auto-runs after a build; trigger it right after building." });
+      const job = enqueueEnrichJob({
+        jobId: "enrich-" + Date.now(), businessId: build.businessId,
+        siteId, businessName: site.businessName, githubRepo: site.githubRepo,
+        themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
+        answers: build.payload.answers, composed: build.composed, referenceWebsite: build.payload.referenceWebsite || "",
       });
       return json(res, 202, { jobId: job.draftId, status: job.status, monitor: "/jobs" });
     }

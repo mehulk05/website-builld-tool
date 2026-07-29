@@ -46,7 +46,7 @@ function activeRow(j) {
 
 function doneRow(j) {
   const st = jobState(j);
-  const sub = j.type === "build" ? "Generated & deployed" : j.prUrl ? "Change shipped" : "Run ended";
+  const sub = j.type === "build" ? "Generated & deployed" : j.type === "enrich" ? "Service pages + brand guide" : j.prUrl ? "Change shipped" : "Run ended";
   return `<a class="run compact" href="/job?id=${encodeURIComponent(j.draftId)}">
     <span class="ava" style="background:${avatarColor(j.businessName)}">${esc(initials(j.businessName))}</span>
     <div style="flex:1;min-width:0;margin-left:12px">
@@ -93,10 +93,15 @@ async function load() {
     const d = await getJSON("/api/jobs");
     JOBS = d.jobs || [];
     render();
+    // Always keep polling — a run can START at any time (e.g. the enrichment that
+    // auto-fires after a build), and the page must pick it up without a refresh.
+    // Fast cadence while something is in flight, slower when idle.
     clearInterval(timer);
-    if (JOBS.some(isActiveJob)) timer = setInterval(load, 3000);
+    timer = setInterval(load, JOBS.some(isActiveJob) ? 4000 : 10000);
   } catch (e) {
     $("active").innerHTML = `<p class="empty">Could not load runs: ${esc(e.message)}</p>`;
+    clearInterval(timer);
+    timer = setInterval(load, 10000);   // keep trying after a transient failure
   }
 }
 
