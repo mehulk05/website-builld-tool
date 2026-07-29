@@ -19,6 +19,10 @@ services:
         sync: false          # protects /api/* — REQUIRED on a public URL
       - key: WEBHOOK_SECRET
         sync: false          # shared secret for /api/webhook/onboarding-submitted
+      - key: EMAIL_WEBHOOK_SECRET
+        sync: false          # shared secret for /api/webhook/email-change — must match the Gmail Apps Script
+      - key: EMAIL_ALLOWED_SENDERS
+        value: growth99.com  # who may trigger a website change by email
       # Where build progress is reported back to Growth99 (dev). The G99 admin dashboard reads this
       # persisted status, so without it a build's outcome is never recorded on the platform side.
       # NOTE: this is the API-GATEWAY path. The gateway maps /publicv2/** -> public-api /api/public/v2/**;

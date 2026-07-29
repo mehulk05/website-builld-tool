@@ -5,7 +5,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { exec } = require("child_process");
+const { exec, spawn } = require("child_process");
 const { URL } = require("url");
 
 const DIR = __dirname;
@@ -46,7 +46,11 @@ if (!API_KEY) console.warn("⚠ STITCH_API_KEY not set — Stitch generation wil
 if (!NOCODB_TOKEN) console.warn("⚠ NOCODB_TOKEN not set — the All Sites / Edit Sites website list will be empty until it's added to .env.");
 if (!GEMINI_KEYS.length) console.warn("⚠ GEMINI_KEYS not set — all AI features (CRO, prompt, bind, QC) will fail.");
 let GEMINI_KEY = GEMINI_KEYS[0];                 // kept for legacy call sites
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-lite-latest";
+// Default off gemini-flash-lite-latest: on 2026-07-28 that alias accepted
+// connections and never responded, stalling every AI step until it timed out.
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite";
+const GEMINI_FALLBACK_MODELS = (process.env.GEMINI_FALLBACK_MODELS || "gemini-flash-latest,gemini-3.6-flash")
+  .split(",").map(s => s.trim()).filter(Boolean);
 let gkIdx = 0;
 // Cost/usage meter: the running job sets COST_SINK to its cost object; each
 // Gemini/Stitch call bumps a counter (single-concurrency, so no cross-talk).
@@ -54,30 +58,43 @@ let COST_SINK = null;
 function bumpUsage(kind) { if (COST_SINK) COST_SINK[kind] = (COST_SINK[kind] || 0) + 1; }
 // Rotating Gemini caller: cycles across all keys, skipping 429/503 (load-balance
 // + free-tier quota multiplied by key count). parts = Gemini content parts array.
+// Every model×key combination, in order, until one answers. Rotating keys alone
+// wasn't enough: with a single key the loop ran exactly once, so one sick model
+// took down the whole job. A model can fail four different ways — 429 (quota),
+// 503 (overloaded), 404 (retired), or accept the connection and never reply —
+// and only the last one is silent, which is what made it look like a network
+// fault. Falling through to another model covers all four.
 async function geminiCall(parts, opts = {}) {
-  const model = opts.model || GEMINI_MODEL;
   const body = { contents: [{ role: "user", parts }], generationConfig: { temperature: opts.temperature ?? 0.5, maxOutputTokens: opts.maxOutputTokens ?? 8000 } };
   if (opts.system) body.systemInstruction = { parts: [{ text: opts.system }] };
+  const models = opts.model ? [opts.model]
+    : [GEMINI_MODEL, ...GEMINI_FALLBACK_MODELS].filter((m, i, a) => m && a.indexOf(m) === i);
   let lastErr = null;
-  for (let i = 0; i < GEMINI_KEYS.length; i++) {
-    const key = GEMINI_KEYS[(gkIdx + i) % GEMINI_KEYS.length];
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), opts.timeoutMs || 45000);
-    try {
-      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
-        { method: "POST", signal: ctl.signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-      if (r.status === 429 || r.status === 503) { lastErr = new Error(`${model} ${r.status}`); continue; }
-      const d = await r.json();
-      if (!r.ok) throw new Error(`gemini ${r.status}: ${(d.error && d.error.message || "").slice(0, 140)}`);
-      gkIdx = (gkIdx + i + 1) % GEMINI_KEYS.length;
-      const txt = ((d.candidates || [])[0]?.content?.parts || []).map(p => p.text || "").join("");
-      if (!txt) throw new Error("empty response" + (d.candidates?.[0]?.finishReason ? ` (${d.candidates[0].finishReason})` : ""));
-      bumpUsage("gemini");
-      return txt;
-    } catch (e) { lastErr = e; }
-    finally { clearTimeout(timer); }
+  for (const model of models) {
+    for (let i = 0; i < GEMINI_KEYS.length; i++) {
+      const key = GEMINI_KEYS[(gkIdx + i) % GEMINI_KEYS.length];
+      const ctl = new AbortController();
+      // A hang costs the full timeout before we can try anything else, so keep
+      // it tight enough that the fallbacks still get a turn.
+      const timer = setTimeout(() => ctl.abort(), opts.timeoutMs || 30000);
+      try {
+        const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+          { method: "POST", signal: ctl.signal, headers: { "Content-Type": "application/json", "x-goog-api-key": key }, body: JSON.stringify(body) });
+        if (r.status === 429 || r.status === 503 || r.status === 404) { lastErr = new Error(`${model} → ${r.status}`); continue; }
+        const d = await r.json();
+        if (!r.ok) throw new Error(`gemini ${r.status}: ${(d.error && d.error.message || "").slice(0, 140)}`);
+        const txt = ((d.candidates || [])[0]?.content?.parts || []).map(p => p.text || "").join("");
+        if (!txt) { lastErr = new Error(`${model} → empty${d.candidates?.[0]?.finishReason ? ` (${d.candidates[0].finishReason})` : ""}`); continue; }
+        gkIdx = (gkIdx + i + 1) % GEMINI_KEYS.length;
+        if (model !== models[0]) console.warn(`gemini: fell back to ${model} (${lastErr && lastErr.message})`);
+        bumpUsage("gemini");
+        return txt;
+      } catch (e) {
+        lastErr = e.name === "AbortError" ? new Error(`${model} → no response in ${(opts.timeoutMs || 30000) / 1000}s`) : e;
+      } finally { clearTimeout(timer); }
+    }
   }
-  throw lastErr || new Error("all Gemini keys exhausted");
+  throw new Error("every Gemini model failed — last: " + (lastErr ? lastErr.message : "unknown"));
 }
 
 if (!fs.existsSync(GEN)) fs.mkdirSync(GEN, { recursive: true });
@@ -1508,8 +1525,16 @@ function loadJobs() {
   try {
     for (const j of JSON.parse(fs.readFileSync(JOBS_FILE, "utf8"))) {
       if (j.status === "running" || j.status === "queued") { j.status = "error"; j.error = "interrupted by a server restart"; }
+      // A finished run can't still be waiting on anybody. Leaving this set made
+      // dead jobs sit in the Activity screen's "In progress · Needs approval"
+      // list forever, behind a button that couldn't do anything. Clearing it
+      // here also heals records written before this was fixed.
+      if (j.status !== "running" && j.status !== "queued") j.awaitingApproval = false;
       JOBS.set(j.draftId, j);
     }
+    // Write the healed records straight back, so the file doesn't keep the bad
+    // state until the next job happens to trigger a save.
+    saveJobs();
   } catch (e) { /* none yet */ }
 }
 loadJobs();
@@ -1671,6 +1696,182 @@ async function resolveEditTarget(website) {
 // Per-site "require approval before merge" is stored locally (siteId -> bool),
 // independent of NocoDB, so operators can gate merges per website.
 const APPROVALS_FILE = path.join(DIR, "approvals.json");
+// ---- local IDE hand-off -----------------------------------------------------
+// Cursor is browser-side (documented prompt deeplink); the other two are launched
+// here because they have no equivalent URL scheme for a prefilled prompt.
+const IDE_TOOLS = [
+  { id: "claude", label: "Claude Code", bin: "claude", kind: "cli" },
+  { id: "cursor", label: "Cursor", bin: null, kind: "deeplink" },
+  { id: "antigravity", label: "Antigravity", bin: "antigravity", kind: "editor" },
+];
+// Only ever launch processes for a request that came from this machine. A
+// deployed instance (Render) refuses outright rather than running on the server.
+function isLocalRequest(req) {
+  const a = (req.socket && req.socket.remoteAddress) || "";
+  return a === "127.0.0.1" || a === "::1" || a === "::ffff:127.0.0.1";
+}
+// The operator's prompt is free text, so it never touches a command line: it's
+// written to g99-task.md and the agent is told to read that file. Everything on
+// the command line is a constant we generate, which leaves no room for quoting
+// bugs or injection.
+async function launchIde(tool, text, siteId) {
+  const slug = String(siteId || "site").replace(/[^a-zA-Z0-9_-]/g, "");
+  const dir = path.join(DIR, "ide-workspace", `${slug}-${Date.now()}`);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "g99-task.md"), text);
+
+  const READ = "Read g99-task.md in this folder and carry out the task described in it.";
+  // Detached, with stdio ignored: an editor session outlives this request by
+  // design, and anything that inherits our pipes would hold the HTTP response
+  // open until the operator quits their IDE.
+  const launch = (cmd, args) => new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { detached: true, stdio: "ignore", cwd: dir });
+    child.on("error", (e) => reject(new Error("could not launch: " + e.message)));
+    child.unref();
+    // spawn reports failure asynchronously, so give 'error' a tick to fire.
+    setTimeout(resolve, 150);
+  });
+
+  if (process.platform === "win32") {
+    const script = path.join(dir, "launch.cmd");
+    fs.writeFileSync(script, [
+      "@echo off",
+      `title Growth99 Studio - ${tool.label}`,
+      `cd /d "${dir}"`,
+      tool.kind === "cli" ? `call ${tool.bin} "${READ}"` : `call ${tool.bin} .`,
+      tool.kind === "cli" ? "" : "exit",
+    ].join("\r\n"));
+    // cmd /c start "" "<script>" — every argument is a path we just wrote.
+    await launch("cmd.exe", ["/c", "start", "", script]);
+  } else if (process.platform === "darwin") {
+    const cmd = tool.kind === "cli" ? `${tool.bin} '${READ}'` : `${tool.bin} .`;
+    await launch("osascript", ["-e", `tell app "Terminal" to do script "cd '${dir}' && ${cmd}"`]);
+  } else {
+    const cmd = tool.kind === "cli" ? `${tool.bin} '${READ}'` : `${tool.bin} .`;
+    await launch("x-terminal-emulator", ["-e", "sh", "-c", `cd '${dir}' && ${cmd}`]);
+  }
+  return { ok: true, tool: tool.label, workspace: dir };
+}
+
+// ---- email-triggered changes ------------------------------------------------
+// An inbound email names a website and describes a change; we match it to a
+// registered site and start the same edit run the chat UI would. Deliberately
+// transport-agnostic: Gmail/Apps Script, an inbound-parse service or an IMAP
+// poller can all POST the same shape.
+const urlHost = (u) => { try { return new URL(u).host; } catch (e) { return String(u || "").replace(/^https?:\/\//, "").replace(/\/.*$/, ""); } };
+const EMAIL_LOG_FILE = path.join(DIR, "email-requests.json");
+function readEmailLog() { try { return JSON.parse(fs.readFileSync(EMAIL_LOG_FILE, "utf8")); } catch (e) { return { requests: [] }; } }
+function logEmailRequest(entry) {
+  const log = readEmailLog();
+  log.requests.unshift({ at: new Date().toISOString(), ...entry });
+  log.requests = log.requests.slice(0, 200);
+  try { fs.writeFileSync(EMAIL_LOG_FILE, JSON.stringify(log, null, 2)); } catch (e) { /* non-fatal */ }
+}
+
+// Only the sender's own words: everything from the first quote/signature marker
+// down is the thread they replied to, and feeding that to the planner would mix
+// old requests into a new one.
+function emailBodyText(raw) {
+  let t = String(raw || "").replace(/\r/g, "");
+  // Quoted lines go first, wherever they sit: some clients quote with no
+  // "On … wrote:" header at all, and a reply can open with the quote.
+  t = t.split("\n").filter((l) => !/^\s*>/.test(l)).join("\n");
+  const cuts = [
+    /^On .+ wrote:$/m, /^-{2,}\s*Original Message\s*-{2,}/im, /^_{5,}$/m,
+    /^From:\s.+$/m, /^Sent from my /m, /^--\s*$/m,
+  ];
+  for (const re of cuts) {
+    const m = t.match(re);
+    // Cut only when something substantive survives. Keying this off the
+    // marker's position instead missed short requests — "Update the footer
+    // phone." sits at index 26, so a quoted thread below it stayed in.
+    if (m && t.slice(0, m.index).trim().length >= 10) t = t.slice(0, m.index);
+  }
+  // Drop the greeting and sign-off so the planner reads the request, not the
+  // pleasantries around it.
+  // A sign-off is usually followed by a name, and sometimes a title or phone —
+  // allow a few short trailing lines so "Thanks,\nYashwant" goes too.
+  t = t.replace(/^\s*(hi|hey|hello|dear)\b[^\n]{0,40}\n+/i, "")
+       .replace(/\n+\s*(thanks|thank you|thanks so much|regards|best regards|best|cheers|kind regards|sincerely)\b[^\n]{0,30}(\n[^\n]{0,45}){0,3}\s*$/i, "");
+  return t.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+// Mail loops are the classic way an automation like this melts down: an
+// auto-reply triggers a run, which notifies, which auto-replies…
+function looksAutomated(headers, subject) {
+  const h = headers || {};
+  const get = (k) => String(h[k] || h[k.toLowerCase()] || "");
+  if (get("Auto-Submitted") && get("Auto-Submitted").toLowerCase() !== "no") return "auto-submitted header";
+  if (get("X-Autoreply") || get("X-Autorespond") || get("Precedence").match(/bulk|auto_reply|list/i)) return "auto-reply header";
+  if (/^\s*(out of office|automatic reply|undeliverable|delivery status|mail delivery)/i.test(subject || "")) return "auto-reply subject";
+  return null;
+}
+
+// Unambiguous match first — a domain or an exact business name present in the
+// text. No AI, no cost, and no chance of inventing a site that wasn't named.
+function matchSiteDeterministic(text, sites) {
+  const hay = String(text || "").toLowerCase().replace(/\s+/g, " ");
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const hits = [];
+  for (const s of sites) {
+    const domain = urlHost(s.liveUrl).toLowerCase().replace(/^www\./, "");
+    if (domain && hay.includes(domain)) { hits.push({ site: s, how: "domain " + domain }); continue; }
+    if (s.githubRepo && hay.includes(s.githubRepo.toLowerCase())) { hits.push({ site: s, how: "repo " + s.githubRepo }); continue; }
+    // Word boundaries, not spaces: "Ecka Aesthetics." at the end of a sentence
+    // is still a mention, and missing it would make a two-site mail look
+    // unambiguous — the worst possible failure here.
+    const name = String(s.businessName || "").toLowerCase().trim();
+    if (name.length >= 4 && new RegExp("\\b" + esc(name) + "\\b").test(hay)) hits.push({ site: s, how: "name " + s.businessName });
+  }
+  const unique = [...new Map(hits.map(h => [h.site.siteId, h])).values()];
+  if (unique.length === 1) return unique[0];
+  // More than one website named: refuse outright rather than letting the AI
+  // fallback pick a favourite.
+  if (unique.length > 1) return { ambiguous: unique.map(h => h.site.businessName) };
+  return null;
+}
+
+// Fallback only: pick from the known list, or say none. The model is never
+// allowed to return a site id that isn't in the list it was given.
+async function matchSiteAI(text, sites) {
+  const list = sites.map(s => `${s.siteId} | ${s.businessName} | ${urlHost(s.liveUrl) || "no domain"}`).join("\n");
+  const prompt = [
+    "You route website change requests that arrive by email.",
+    "Below is the list of websites we manage, then the email.",
+    "Decide which ONE website the email is about, and restate the requested change as a single clear instruction for a developer.",
+    "",
+    "WEBSITES (siteId | name | domain):", list, "",
+    "EMAIL:", String(text || "").slice(0, 6000), "",
+    'Return ONLY JSON: {"siteId":"<exact siteId from the list, or empty if unclear>","instruction":"<the change, 1-3 sentences>","confidence":<0-1>}',
+    "If the email does not clearly name one of these websites, return an empty siteId. Never guess.",
+  ].join("\n");
+  const raw = await geminiCall([{ text: prompt }], { temperature: 0.1, maxOutputTokens: 500 });
+  let d = {}; try { d = JSON.parse(stripFence(raw)); } catch (e) { return null; }
+  const site = sites.find(s => s.siteId === String(d.siteId || "").trim());
+  if (!site) return null;
+  return { site, how: "ai", instruction: String(d.instruction || "").trim(), confidence: Number(d.confidence) || 0 };
+}
+
+// A PR URL already names its repository. These endpoints used to ask the global
+// WP_REPO instead, so a site living in a different repo could have its diff read
+// — or, far worse, a same-numbered PR merged — in the wrong repository.
+function repoFromPrUrl(prUrl) {
+  const m = String(prUrl || "").match(/github\.com\/([^\/]+\/[^\/]+)\/pull\//);
+  return m ? m[1] : WP_REPO;
+}
+// Merged / closed / open, straight from GitHub — the source of truth for
+// whether a PR still needs us.
+async function prLiveState(prUrl) {
+  const num = (String(prUrl || "").match(/\/pull\/(\d+)/) || [])[1];
+  if (!num) return {};
+  // No --jq here: its \(…) interpolation needs quoting that cmd.exe eats,
+  // which silently returned an empty state. Parsing the JSON in Node is
+  // shell-independent.
+  const r = await sh(`gh pr view ${num} --repo ${repoFromPrUrl(prUrl)} --json state,mergedAt`);
+  let d = {}; try { d = JSON.parse(r.stdout || "{}"); } catch (e) { return {}; }
+  return { state: String(d.state || "").toUpperCase(), mergedAt: d.mergedAt || null };
+}
+
 function readApprovals() { try { return JSON.parse(fs.readFileSync(APPROVALS_FILE, "utf8")); } catch (e) { return {}; } }
 function writeApprovals(m) { fs.writeFileSync(APPROVALS_FILE, JSON.stringify(m, null, 2)); }
 
@@ -1841,12 +2042,27 @@ function siteRequiresApproval(siteId) {
 // Per-site approval gate: with green CI, if the site requires approval, pause
 // (up to 60 min) until /api/job-approve flips job.approved — then merge.
 async function awaitApprovalIfNeeded(job, siteId, stepIdx) {
-  if (job.approved || !siteRequiresApproval(siteId)) return;
+  // forceApproval overrides the per-site setting: a run nobody typed into
+  // Studio by hand (an inbound email) always gets a human before it merges.
+  const forced = !!(job.payload && job.payload.forceApproval);
+  if (job.approved || (!forced && !siteRequiresApproval(siteId))) return;
   job.awaitingApproval = true;
   jobStep(job, stepIdx, "running", "Build is green — waiting for approval to merge…");
   notify(`⏳ *${job.businessName}* build passed — needs approval to go live: ${job.prUrl || ""}`);
   for (let i = 0; i < 240 && !job.approved; i++) {
     if (job.cancelRequested) { job.awaitingApproval = false; throw Object.assign(new Error("cancelled by user"), { cancelled: true }); }
+    // Approving in Studio isn't the only way this PR can be resolved — someone
+    // can merge or close it on GitHub, and until we checked, the run sat here
+    // until it timed out and reported "not merged" for a PR that was already in.
+    if (i % 4 === 3 && job.prUrl) {
+      let st = {}; try { st = await prLiveState(job.prUrl); } catch (e) { /* transient — keep waiting */ }
+      if (st.mergedAt) {
+        job.approved = true; job.mergedExternally = true;
+        jobStep(job, stepIdx, "running", "Merged on GitHub — picking up from there");
+        break;
+      }
+      if (st.state === "CLOSED") { job.awaitingApproval = false; throw new Error("the pull request was closed on GitHub without merging: " + job.prUrl); }
+    }
     await sleep(15000); saveJobs();
   }
   job.awaitingApproval = false;
@@ -2255,7 +2471,7 @@ async function runEditJob(job) {
     for (let i = 0; i < 90 && !merged; i++) {
       let st; try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); } catch (e) { await sleep(10000); continue; }
       jobStep(job, 4, "running", (st.checks || []).map(c => `${c.name}:${c.status}`).join(" ") || "CI starting…");
-      if (st.allPass) { await awaitApprovalIfNeeded(job, P.siteId, 4); await localApi("/api/pr-merge", { prUrl: job.prUrl }); merged = true; jobStep(job, 4, "done", `Merged${fixes ? ` after ${fixes} fix(es)` : ""}`); break; }
+      if (st.allPass) { await awaitApprovalIfNeeded(job, P.siteId, 4); if (!job.mergedExternally) await localApi("/api/pr-merge", { prUrl: job.prUrl }); merged = true; jobStep(job, 4, "done", job.mergedExternally ? "Merged on GitHub" : `Merged${fixes ? ` after ${fixes} fix(es)` : ""}`); break; }
       if (st.anyFail) {
         if (fixes >= 3) throw new Error("CI still failing after 3 auto-fix attempts — " + job.prUrl);
         fixes++; jobStep(job, 4, "running", `Build failed — Gemini auto-fix ${fixes}/3…`);
@@ -2368,7 +2584,7 @@ async function runRestoreJob(job) {
     for (let i = 0; i < 90 && !merged; i++) {
       let st; try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); } catch (e) { await sleep(10000); continue; }
       jobStep(job, 3, "running", (st.checks || []).map(c => `${c.name}:${c.status}`).join(" ") || "CI starting…");
-      if (st.allPass) { await awaitApprovalIfNeeded(job, P.siteId, 3); await localApi("/api/pr-merge", { prUrl: job.prUrl }); merged = true; jobStep(job, 3, "done", "Merged"); break; }
+      if (st.allPass) { await awaitApprovalIfNeeded(job, P.siteId, 3); if (!job.mergedExternally) await localApi("/api/pr-merge", { prUrl: job.prUrl }); merged = true; jobStep(job, 3, "done", job.mergedExternally ? "Merged on GitHub" : "Merged"); break; }
       if (st.anyFail) throw new Error("CI failed on the restore — review it by hand: " + job.prUrl);
       await sleep(10000);
     }
@@ -2495,6 +2711,77 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ accepted: true, dedupe, draftId: job.draftId, status: job.status, monitor: "/jobs" }));
     }
 
+    // Inbound email → website change. Any transport that can POST JSON works;
+    // it carries its own secret, so it sits outside the admin-key gate.
+    // Body: { from, subject, body, messageId?, headers?, dryRun? }
+    if (p === "/api/webhook/email-change" && req.method === "POST") {
+      const secret = process.env.EMAIL_WEBHOOK_SECRET || process.env.WEBHOOK_SECRET || "";
+      if (!secret || (req.headers["x-webhook-secret"] || "") !== secret) return json(res, 401, { error: "bad webhook secret" });
+      const body = JSON.parse(await readBody(req) || "{}");
+      const from = String(body.from || "").trim();
+      const subject = String(body.subject || "").trim();
+      const dryRun = !!body.dryRun;
+      const text = emailBodyText(body.body);
+      const reject = (reason, extra) => {
+        logEmailRequest({ from, subject, messageId: body.messageId || null, status: "rejected", reason, ...(extra || {}) });
+        return json(res, 200, { accepted: false, reason });   // 200: the sender is a mail hook, not a client to retry
+      };
+
+      // 1 — never let a robot conversation start a run
+      const auto = looksAutomated(body.headers, subject);
+      if (auto) return reject("ignored automated mail (" + auto + ")");
+
+      // 2 — sender allow-list. From is spoofable, so this is a second fence
+      //     behind the shared secret, not the lock itself.
+      const allowed = (process.env.EMAIL_ALLOWED_SENDERS || "growth99.com").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+      const addr = (from.match(/<([^>]+)>/) || [null, from])[1].toLowerCase().trim();
+      if (!allowed.some(a => a.startsWith("@") ? addr.endsWith(a) : (addr === a || addr.endsWith("@" + a)))) {
+        return reject(`sender ${addr || "(none)"} is not on EMAIL_ALLOWED_SENDERS`);
+      }
+      if (!text) return reject("empty email body");
+
+      // 3 — which website? Subject carries the name far more often than the body.
+      let sites; try { sites = await getWebsites(false); } catch (e) { return reject("could not load the website list: " + e.message); }
+      const whole = `${subject}\n\n${text}`;
+      let hit = matchSiteDeterministic(whole, sites);
+      let instruction = text;
+      if (hit && hit.ambiguous) return reject(`names more than one website (${hit.ambiguous.join(", ")}) — send one email per site`);
+      if (!hit) {
+        try { hit = await matchSiteAI(whole, sites); } catch (e) { return reject("could not parse the email: " + e.message); }
+        if (hit && hit.instruction) instruction = hit.instruction;
+        if (hit && hit.confidence < 0.6) return reject(`matched ${hit.site.businessName} but only ${Math.round(hit.confidence * 100)}% confident — needs a human`, { siteId: hit.site.siteId });
+      }
+      if (!hit) return reject("could not tell which website this is about");
+      const site = hit.site;
+      if (!site.githubRepo) return reject(`${site.businessName} has no repository set in NocoDB`, { siteId: site.siteId });
+
+      // 4 — confirm there's a theme to edit before promising anything
+      let target; try { target = await resolveEditTarget(site); }
+      catch (e) { return reject("no editable theme for " + site.businessName + ": " + e.message, { siteId: site.siteId }); }
+
+      if (dryRun) {
+        logEmailRequest({ from, subject, messageId: body.messageId || null, status: "dry-run", siteId: site.siteId, matchedBy: hit.how, instruction });
+        return json(res, 200, { accepted: true, dryRun: true, siteId: site.siteId, businessName: site.businessName, matchedBy: hit.how, themeSlug: target.themeSlug, instruction });
+      }
+
+      // 5 — same pipeline as the chat UI, but it always stops for a human
+      //     before merging: nobody typed this request into Studio.
+      const job = enqueueEditJob({
+        jobId: "edit-" + Date.now(),
+        siteId: site.siteId, businessName: site.businessName, githubRepo: site.githubRepo,
+        themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
+        prompt: instruction, forceApproval: true,
+        source: "email", requestedBy: addr, emailSubject: subject,
+      });
+      logEmailRequest({ from, subject, messageId: body.messageId || null, status: "queued", siteId: site.siteId, matchedBy: hit.how, instruction, jobId: job.draftId });
+      notify(`📧 Email request from ${addr} → *${site.businessName}*: ${instruction.slice(0, 140)} (needs your approval before merge)`);
+      res.writeHead(202, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ accepted: true, jobId: job.draftId, siteId: site.siteId, businessName: site.businessName, matchedBy: hit.how, instruction, monitor: "/jobs" }));
+    }
+    // What the mailbox has sent us lately, matched or not — the place to look
+    // when someone says "I emailed that and nothing happened".
+    if (p === "/api/email-requests") return json(res, 200, readEmailLog());
+
     // Jobs monitor data (newest first).
     if (p === "/api/jobs") {
       const list = [...JOBS.values()].sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
@@ -2544,7 +2831,7 @@ const server = http.createServer(async (req, res) => {
       const prUrl = u.searchParams.get("prUrl") || "";
       const prNum = (prUrl.match(/\/pull\/(\d+)/) || [])[1];
       if (!prNum) return json(res, 400, { error: "prUrl required" });
-      const r = await sh(`gh pr diff ${prNum} --repo ${WP_REPO}`);
+      const r = await sh(`gh pr diff ${prNum} --repo ${repoFromPrUrl(prUrl)}`);
       return json(res, 200, { diff: (r.stdout || r.stderr || "").slice(0, 200000) });
     }
     // Re-audit the currently-active live site now (also runs on a schedule).
@@ -2646,6 +2933,29 @@ const server = http.createServer(async (req, res) => {
         sha: String(sha), versionLabel: String(label || "").slice(0, 120),
       });
       return json(res, 202, { jobId: job.draftId, status: job.status, monitor: "/jobs" });
+    }
+
+    // ---- "Edit with an IDE" ------------------------------------------------
+    // Cursor has a documented prompt deeplink, so the browser can hand off to it
+    // directly. Claude Code and Antigravity are CLI/editor launches, which only
+    // work when the tool is running on the same machine as the operator.
+    if (p === "/api/ide-support") {
+      return json(res, 200, { local: isLocalRequest(req), platform: process.platform, tools: IDE_TOOLS.map(t => t.id) });
+    }
+    // Launch a local IDE with the prompt already loaded. Deliberately narrow:
+    // localhost only, a fixed allow-list of tools, and the operator's prompt
+    // never reaches a command line — it's written to a file the agent reads.
+    if (p === "/api/ide-launch" && req.method === "POST") {
+      if (!isLocalRequest(req)) return json(res, 403, { error: "the launcher only works when Studio runs on your own machine" });
+      const { ide, prompt: text, siteId } = JSON.parse(await readBody(req) || "{}");
+      const tool = IDE_TOOLS.find(t => t.id === ide);
+      if (!tool) return json(res, 400, { error: "unknown tool: " + ide });
+      if (!tool.bin) return json(res, 400, { error: tool.label + " opens by link, not from here" });
+      if (!text || !text.trim()) return json(res, 400, { error: "prompt required" });
+      const found = await sh(process.platform === "win32" ? `where ${tool.bin}` : `which ${tool.bin}`);
+      if (found.code) return json(res, 404, { error: `"${tool.bin}" isn't on this machine's PATH — install ${tool.label} or use Copy instead` });
+      try { return json(res, 200, await launchIde(tool, text, siteId)); }
+      catch (e) { return json(res, 500, { error: e.message }); }
     }
 
     // Expand a rough idea into a precise, unambiguous edit instruction (Gemini).
@@ -3140,7 +3450,7 @@ const server = http.createServer(async (req, res) => {
       const { prUrl } = JSON.parse(await readBody(req) || "{}");
       const prNum = ((prUrl || "").match(/\/pull\/(\d+)/) || [])[1];
       if (!prNum) return json(res, 400, { error: "prUrl with /pull/<n> required" });
-      const r = await sh(`gh pr checks ${prNum} --repo ${WP_REPO}`);
+      const r = await sh(`gh pr checks ${prNum} --repo ${repoFromPrUrl(prUrl)}`);
       // output lines: <name>\t<pass|fail|pending|skipping>\t<duration>\t<url>
       const rows = (r.stdout || "").split("\n").map(l => l.split("\t")).filter(c => c.length >= 2);
       const builds = rows.filter(c => /^build/i.test(c[0].trim()))
@@ -3167,7 +3477,7 @@ const server = http.createServer(async (req, res) => {
       const { prUrl } = JSON.parse(await readBody(req) || "{}");
       const prNum = ((prUrl || "").match(/\/pull\/(\d+)/) || [])[1];
       if (!prNum) return json(res, 400, { error: "prUrl with /pull/<n> required" });
-      const r = await sh(`gh pr merge ${prNum} --repo ${WP_REPO} --squash --delete-branch`);
+      const r = await sh(`gh pr merge ${prNum} --repo ${repoFromPrUrl(prUrl)} --squash --delete-branch`);
       if (r.code) return json(res, 500, { error: "merge failed: " + (r.stderr || r.stdout).slice(-300) });
       return json(res, 200, { merged: true, prNum });
     }
@@ -3191,20 +3501,20 @@ const server = http.createServer(async (req, res) => {
       const { prUrl } = JSON.parse(await readBody(req) || "{}");
       const prNum = ((prUrl || "").match(/\/pull\/(\d+)/) || [])[1];
       if (!prNum) return json(res, 400, { error: "prUrl with /pull/<n> required" });
-      const branch = (await sh(`gh pr view ${prNum} --repo ${WP_REPO} --json headRefName --jq .headRefName`)).stdout.trim();
+      const branch = (await sh(`gh pr view ${prNum} --repo ${repoFromPrUrl(prUrl)} --json headRefName --jq .headRefName`)).stdout.trim();
       if (!branch) return json(res, 500, { error: "could not resolve PR branch" });
       // find a failing build check and its run id
-      const checks = (await sh(`gh pr checks ${prNum} --repo ${WP_REPO}`)).stdout.split("\n").map(l => l.split("\t"));
+      const checks = (await sh(`gh pr checks ${prNum} --repo ${repoFromPrUrl(prUrl)}`)).stdout.split("\n").map(l => l.split("\t"));
       const failing = checks.find(c => /^build/i.test((c[0] || "").trim()) && (c[1] || "").trim() === "fail");
       if (!failing) return json(res, 200, { fixed: [], message: "no failing build check found" });
       const runId = ((failing[3] || "").match(/\/runs\/(\d+)/) || [])[1];
       // Detect the "Actions can't run" case (org billing / spending limit / disabled)
       // — Gemini can't fix that; surface it clearly instead of hunting a file.
-      const runSummary = runId ? (await sh(`gh run view ${runId} --repo ${WP_REPO}`)).stdout : "";
+      const runSummary = runId ? (await sh(`gh run view ${runId} --repo ${repoFromPrUrl(prUrl)}`)).stdout : "";
       if (/recent account payments|spending limit|not started because|Actions.*disabled|billing/i.test(runSummary)) {
         return json(res, 200, { fixed: [], billing: true, message: "GitHub Actions is not running for this repo (billing / spending-limit). CI can't pass until org billing is fixed." });
       }
-      const log = runId ? (await sh(`gh run view ${runId} --repo ${WP_REPO} --log-failed`)).stdout.slice(-8000) : "";
+      const log = runId ? (await sh(`gh run view ${runId} --repo ${repoFromPrUrl(prUrl)} --log-failed`)).stdout.slice(-8000) : "";
       // offending files: Pint prints "⨯ path/to/file.php" (often truncated with …) — also accept any .php path in the log
       const raw = [...new Set([...log.matchAll(/[⨯x]\s+(\S+?\.php)|((?:web|config)\/[\w\/.-]+?\.php)/g)].map(m => (m[1] || m[2])).filter(Boolean))];
       // resolve truncated paths against the branch tree

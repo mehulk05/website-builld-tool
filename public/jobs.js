@@ -11,7 +11,9 @@ let JOBS = [], FILTER = "all", QUERY = "", timer;
 const PAGE = 30;
 let shownCount = PAGE;
 
-const needsYou = (j) => j.awaitingApproval && !j.approved;
+// isActiveJob guards against a stale awaitingApproval flag on a run that has
+// already ended — a finished job can't be waiting for you.
+const needsYou = (j) => j.awaitingApproval && !j.approved && isActiveJob(j);
 const title = (j) => j.editSummary || (j.payload && j.payload.prompt) || (j.type === "edit" ? "Website edit" : "Build " + j.businessName);
 
 function match(j) {
