@@ -2572,12 +2572,11 @@ async function runEditJob(job) {
     jobStep(job, 5, "done", "Done — change is live on merge/deploy");
     await postEditPrComment(job);
     job.status = "done";
-    // The second and final message to the requester. No pull request link:
-    // that is internal plumbing, and by now it is merged anyway.
+    // The second and final message. One line saying what shipped, then the
+    // site. No pull request link: internal plumbing, and merged by now anyway.
+    // The summary already reads as a sentence, so nothing is appended to it.
     queueEmailReply(job, [
-      "This change is now live.",
-      "",
-      job.editSummary || "",
+      "The change is live now " + String.fromCharCode(8212) + " " + (job.editSummary || "your requested update").trim(),
       P.liveUrl ? "\n" + P.liveUrl : "",
     ].join("\n").trim());
     notify(`✏️ Edit merged for *${job.businessName}*: ${job.editSummary || ""} · ${job.prUrl || ""}`);
@@ -3475,14 +3474,10 @@ const server = http.createServer(async (req, res) => {
       notify(`📧 Email request from ${addr} → *${site.businessName}*: ${instruction.slice(0, 140)} (needs your approval before merge)`);
       // Echoing the parsed instruction back is the cheapest guard against a
       // misread: the sender sees what will actually be done before it ships.
-      // The first of only two messages the requester ever gets. The second
-      // comes when the change is live. Echoing the instruction back lets them
-      // catch a misread while it is still cheap to fix.
+      // The first of only two messages the requester ever gets. Deliberately
+      // short: they wrote the request, so quoting it back adds nothing.
       const ack = [
         "Got it " + String.fromCharCode(8212) + " I will review this and work on it.",
-        "",
-        "What I understood:",
-        instruction.length > 600 ? instruction.slice(0, 600) + "..." : instruction,
         "",
         "I will email you once the change is live on " + site.businessName + ".",
       ].join("\n");
