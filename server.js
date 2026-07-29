@@ -2095,16 +2095,10 @@ async function awaitApprovalIfNeeded(job, siteId, stepIdx) {
   job.awaitingApproval = true;
   jobStep(job, stepIdx, "running", "Build is green — waiting for approval to merge…");
   notify(`⏳ *${job.businessName}* build passed — needs approval to go live: ${job.prUrl || ""}`);
-  queueEmailReply(job, [
-    "This is ready and the build passed.",
-    "",
-    job.editSummary || "",
-    "",
-    "Review and approve: " + (process.env.G99_TOOL_PUBLIC_URL || "") + "/job?id=" + job.draftId,
-    job.prUrl ? "Pull request: " + job.prUrl : "",
-    "",
-    "Nothing goes live until someone approves it.",
-  ].join("\n").replace(/\n{3,}/g, "\n\n").trim());
+  // Deliberately no email here. Review and approval are ours, not the
+  // requester's: they get one acknowledgement when the request lands and one
+  // message when it is actually live. Pull requests and approval screens are
+  // internal detail they never need to see.
   for (let i = 0; i < 240 && !job.approved; i++) {
     if (job.cancelRequested) { job.awaitingApproval = false; throw Object.assign(new Error("cancelled by user"), { cancelled: true }); }
     // Approving in Studio isn't the only way this PR can be resolved — someone
@@ -2579,11 +2573,12 @@ async function runEditJob(job) {
     jobStep(job, 5, "done", "Done — change is live on merge/deploy");
     await postEditPrComment(job);
     job.status = "done";
+    // The second and final message. One line saying what shipped, then the
+    // site. No pull request link: internal plumbing, and merged by now anyway.
+    // The summary already reads as a sentence, so nothing is appended to it.
     queueEmailReply(job, [
-      "This is now live on " + P.businessName + ".",
-      "",
-      job.editSummary || "",
-      job.prUrl ? "\nPull request: " + job.prUrl : "",
+      "The change is live now " + String.fromCharCode(8212) + " " + (job.editSummary || "your requested update").trim(),
+      P.liveUrl ? "\n" + P.liveUrl : "",
     ].join("\n").trim());
     notify(`✏️ Edit merged for *${job.businessName}*: ${job.editSummary || ""} · ${job.prUrl || ""}`);
   } catch (e) {
@@ -3818,19 +3813,18 @@ const server = http.createServer(async (req, res) => {
         siteId: site.siteId, businessName: site.businessName, githubRepo: site.githubRepo,
         themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
         prompt: instruction, forceApproval: true,
-        source: "email", requestedBy: addr, emailSubject: subject, threadId,
+        source: "email", requestedBy: addr, emailSubject: subject, threadId, liveUrl: site.liveUrl || "",
       });
       logEmailRequest({ from, subject, messageId: body.messageId || null, status: "queued", siteId: site.siteId, matchedBy: hit.how, instruction, jobId: job.draftId });
       notify(`📧 Email request from ${addr} → *${site.businessName}*: ${instruction.slice(0, 140)} (needs your approval before merge)`);
       // Echoing the parsed instruction back is the cheapest guard against a
       // misread: the sender sees what will actually be done before it ships.
+      // The first of only two messages the requester ever gets. Deliberately
+      // short: they wrote the request, so quoting it back adds nothing.
       const ack = [
-        "Got it " + String.fromCharCode(8212) + " I am making this change to " + site.businessName + " now.",
+        "Got it " + String.fromCharCode(8212) + " I will review this and work on it.",
         "",
-        "What I understood:",
-        instruction.length > 600 ? instruction.slice(0, 600) + "..." : instruction,
-        "",
-        "I will reply when it is ready for review. This usually takes 2-4 minutes.",
+        "I will email you once the change is live on " + site.businessName + ".",
       ].join("\n");
       res.writeHead(202, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ accepted: true, jobId: job.draftId, siteId: site.siteId, businessName: site.businessName, matchedBy: hit.how, instruction, reply: ack, monitor: "/jobs" }));
