@@ -184,7 +184,8 @@
   const siteJobs = (siteId, jobs) => (jobs || []).filter((j) => j.payload && j.payload.siteId === siteId);
   function siteStatus(site, jobs) {
     const mine = siteJobs(site.siteId, jobs);
-    if (mine.some((j) => j.awaitingApproval && !j.approved)) return { key: "attention", label: "Needs approval", cls: "warn", dot: "var(--warn)" };
+    // Same guard as the Activity screen: only a live run can be awaiting you.
+    if (mine.some((j) => j.awaitingApproval && !j.approved && isActiveJob(j))) return { key: "attention", label: "Needs approval", cls: "warn", dot: "var(--warn)" };
     if (mine.some(isActiveJob)) return { key: "building", label: "Building", cls: "accent", dot: "var(--accent)" };
     if (!site.githubRepo || !site.liveUrl) return { key: "attention", label: "Needs setup", cls: "warn", dot: "var(--warn)" };
     if (mine.length && mine[0].status === "error") return { key: "attention", label: "Last run failed", cls: "bad", dot: "var(--bad)" };

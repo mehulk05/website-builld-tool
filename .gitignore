@@ -11,3 +11,5 @@ registry.json
 reaudit.json
 site-audits.json
 server.out
+ide-workspace/
+email-requests.json
