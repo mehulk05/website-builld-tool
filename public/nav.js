@@ -119,7 +119,10 @@
   async function getJSON(url) {
     const r = await fetch(url, { headers: authHeaders() });
     const d = await r.json().catch(() => ({}));
-    if (!r.ok || d.error) throw httpError(r.status, d.error);
+    // Trust the HTTP status only. A 200 body may legitimately carry an `error`
+    // field (a failed job, or a soft {active:false,error} status) — that is data
+    // to render, NOT a failed request. Throwing on it hid the whole job UI.
+    if (!r.ok) throw httpError(r.status, d.error || d.message);
     return d;
   }
   async function postJSON(url, body) {
