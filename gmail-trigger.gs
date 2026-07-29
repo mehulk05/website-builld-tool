@@ -3,8 +3,9 @@
  * Inbox: g99emailtrigger@gmail.com
  *
  * This mailbox exists only to receive website change requests, so there is no
- * filter or label to set up: every unread message in the inbox is a request.
- * Each one is POSTed to Studio, then archived so it is never sent twice.
+ * filter to set up: every message in the inbox is a request. Each one is
+ * POSTed to Studio, then labelled and archived so it is never sent twice.
+ * Reading a message here is safe — only the label decides what has been done.
  *
  * Studio cannot send email, so this script is also its outbox: each run it
  * collects any replies Studio has queued ("ready to review", "shipped",
@@ -49,7 +50,11 @@ function pollInbox() {
 // ── inbound: unread mail → Studio ───────────────────────────────────────────
 function handleIncoming() {
   const done = GmailApp.getUserLabelByName(PROCESSED_LABEL) || GmailApp.createLabel(PROCESSED_LABEL);
-  const threads = GmailApp.search('is:unread in:inbox', 0, MAX_PER_RUN);
+  // Keyed on the label, not on unread. Opening a message in Gmail marks it
+  // read, so anyone glancing at this mailbox used to make the request
+  // invisible to the trigger — it just never ran, with nothing in the log to
+  // say why. A label only changes when this script changes it.
+  const threads = GmailApp.search('in:inbox -label:' + PROCESSED_LABEL, 0, MAX_PER_RUN);
   if (!threads.length) return;
 
   threads.forEach(function (thread) {
