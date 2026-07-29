@@ -1,4 +1,7 @@
 .env
+# per-environment env files (.env.dev / .env.prod ...) — these hold live credentials.
+.env.*
+!.env.example
 generated/
 bin/
 *.log

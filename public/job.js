@@ -179,7 +179,14 @@ async function load() {
   try {
     JOB = await getJSON("/api/job?id=" + encodeURIComponent(ID));
   } catch (e) {
-    $("wrap").innerHTML = `<p class="empty">Run <b>${esc(ID)}</b> not found — it may have been cleared. <a href="/jobs">← all activity</a></p>`;
+    // Only a real 404 means the run is gone; anything else (401, network, 5xx) must say so rather
+    // than blaming "cleared" state — that mis-diagnosis sent us hunting for lost jobs that existed.
+    const msg = e && e.status === 404
+      ? `Run <b>${esc(ID)}</b> not found — it may have been cleared.`
+      : e && e.status === 401
+        ? `Unauthorized — reload the page and enter the admin password.`
+        : `Could not load run <b>${esc(ID)}</b>: ${esc(e && e.message ? e.message : "request failed")}`;
+    $("wrap").innerHTML = `<p class="empty">${msg} <a href="/jobs">← all activity</a></p>`;
     clearInterval(timer);
     return;
   }

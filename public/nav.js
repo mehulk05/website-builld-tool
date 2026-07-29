@@ -105,16 +105,34 @@
     return false;
   }
 
+  // Every /api/* route is gated by ADMIN_PASSWORD when deployed. app.js patches window.fetch to add
+  // the key, but pages that only load nav.js (job, jobs, ...) never got it and silently 401'd.
+  function authHeaders(extra) {
+    return { ...(extra || {}), "x-admin-key": localStorage.getItem("g99AdminKey") || "" };
+  }
+  // Surfaces the HTTP status so callers can tell "unauthorized" from "genuinely missing".
+  function httpError(status, message) {
+    const e = new Error(message || "request failed (" + status + ")");
+    e.status = status;
+    return e;
+  }
   async function getJSON(url) {
-    const r = await fetch(url);
+    const r = await fetch(url, { headers: authHeaders() });
     const d = await r.json().catch(() => ({}));
-    if (!r.ok || d.error) throw new Error(d.error || "request failed (" + r.status + ")");
+    // Trust the HTTP status only. A 200 body may legitimately carry an `error`
+    // field (a failed job, or a soft {active:false,error} status) — that is data
+    // to render, NOT a failed request. Throwing on it hid the whole job UI.
+    if (!r.ok) throw httpError(r.status, d.error || d.message);
     return d;
   }
   async function postJSON(url, body) {
-    const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+    const r = await fetch(url, {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(body || {}),
+    });
     const d = await r.json().catch(() => ({}));
-    if (!r.ok || d.error) throw new Error(d.error || "request failed (" + r.status + ")");
+    if (!r.ok || d.error) throw httpError(r.status, d.error);
     return d;
   }
 

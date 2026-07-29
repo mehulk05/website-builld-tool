@@ -23,5 +23,17 @@ services:
         sync: false          # shared secret for /api/webhook/email-change — must match the Gmail Apps Script
       - key: EMAIL_ALLOWED_SENDERS
         value: growth99.com  # who may trigger a website change by email
+      # Where build progress is reported back to Growth99 (dev). The G99 admin dashboard reads this
+      # persisted status, so without it a build's outcome is never recorded on the platform side.
+      # NOTE: this is the API-GATEWAY path. The gateway maps /publicv2/** -> public-api /api/public/v2/**;
+      # posting to the raw /api/public/v2/... URL is WAF-blocked (403) and /public/... is 404.
+      - key: G99_STATUS_CALLBACK_URL
+        value: https://pub-api-dev.growthemr.com/publicv2/webhook/website-build-status
+      - key: G99_STATUS_SECRET
+        sync: false          # same value as WEBHOOK_SECRET (falls back to it when unset)
+      # This service's own public base URL — used to turn /site/ and /reports/x.html into absolute
+      # links so they work when rendered in the G99 admin UI.
+      - key: G99_TOOL_PUBLIC_URL
+        value: https://g99-website-build-tool.onrender.com
       - key: WP_REPO
-        value: Growth99Infra/prodteam.gogroth.com
+        value: G99agency/prodteam.gogroth.com
