@@ -10,6 +10,9 @@ const ID = new URLSearchParams(location.search).get("id");
 
 let JOB = null, TECH_OPEN = false, diffLoaded = false, timer;
 let GENPROG = { phase: "idle", pages: {} };   // live per-page Stitch progress
+// Which disclosures the user opened. The page re-renders on every poll (3s), which
+// would otherwise wipe <details open> — that's why a brief collapsed while reading.
+const OPEN = new Set();
 
 const verdict = (d) => d == null ? "" : d >= 15 ? "Significant improvement" : d >= 5 ? "Improved" : d >= 0 ? "Stable" : "Regressed";
 
@@ -108,6 +111,63 @@ function actions(j) {
 }
 
 const TYPE_LABEL = { edit: "Edit", enrich: "Enrich", restore: "Restore", build: "Build" };
+
+// Green all-done banner with the clickable live URL (+ deep links once the
+// enrichment shipped service pages and the brand guide).
+function successBanner(j) {
+  const base = String(j.liveUrl).replace(/\/+$/, "");
+  const enriched = j.type === "enrich" || (j.steps || []).some((s) => /^Service pages/.test(s.label) && s.status === "done");
+  const links = [
+    `<a href="${esc(base)}/" target="_blank" rel="noopener">${esc(base.replace(/^https?:\/\//, ""))}</a>`,
+    enriched ? `<a href="${esc(base)}/services/" target="_blank" rel="noopener">Treatments</a>` : "",
+    enriched ? `<a href="${esc(base)}/brand-guide/" target="_blank" rel="noopener">Brand guide</a>` : "",
+  ].filter(Boolean).join(" · ");
+  return `<div class="banner good">${svg("check", 18)}<div style="flex:1"><div class="bt">All done — the site is live</div><div class="bd">${links}</div></div></div>`;
+}
+
+// Enrich "What this adds" card: per-service rows with the grounding source and
+// the AI-composed brief, plus where the design/content came from. Old runs
+// without serviceDetail fall back to plain pills.
+function enrichDetailCard(j) {
+  const plan = j.enrichPlan || {};
+  const P = j.payload || {};
+  const detail = j.serviceDetail;
+  const head = `<div class="card-h"><h2>What this adds</h2>${plan.truncated ? `<span class="right" style="font-size:12px;color:var(--muted)">capped at ${j.servicePages.length} of ${plan.total}</span>` : ""}</div>`;
+  const hostOf = (u) => { try { return new URL(u).hostname.replace(/^www\./, ""); } catch (e) { return u; } };
+  const srcLine = [
+    P.existingWebsite ? `content grounded in <a href="${esc(P.existingWebsite)}" target="_blank" rel="noopener">${esc(hostOf(P.existingWebsite))}</a>` : "",
+    plan.mimicked ? `design structure mimicked from <a href="${esc(plan.mimicked)}" target="_blank" rel="noopener">${esc(hostOf(plan.mimicked))}</a>` : (P.referenceWebsite ? `reference ${esc(hostOf(P.referenceWebsite))}` : ""),
+    plan.engine ? `generated with ${esc(plan.engine === "stitch" ? "Stitch" : "Gemini")}` : "",
+  ].filter(Boolean).join(" · ");
+  // live per-service status: prefer GEN_PROGRESS while generating, else the snapshot
+  const live = (j.steps || [])[2] && j.steps[2].status === "running" && GENPROG.pages && Object.keys(GENPROG.pages).length;
+  const ST = { queued: ["queued", "queued"], generating: ["generating…", "running"], "post-processing": ["optimising…", "running"], done: ["generated", "done"], error: ["failed", "error"] };
+  const body = detail && detail.length
+    ? `<div class="svc-list">${detail.map((s) => {
+        const st = (live && GENPROG.pages[s.slug] ? GENPROG.pages[s.slug].status : s.status) || (j.status === "done" ? "done" : "queued");
+        const [txt, cls] = ST[st] || [st, "queued"];
+        const key = "brief-" + s.slug;
+        return `
+        <div class="svc">
+          <div class="svc-hd">
+            <span class="dot ${cls}"></span>
+            <span class="svc-nm">${esc(s.name)}</span>
+            <code class="svc-slug">/${esc(s.slug)}/</code>
+            <span class="svc-st ${cls}">${esc(txt)}${s.engine ? ` · ${esc(s.engine)}` : ""}</span>
+            ${s.sourceUrl ? `<a class="svc-src" href="${esc(s.sourceUrl)}" target="_blank" rel="noopener" title="${esc(s.sourceUrl)}">from ${esc(hostOf(s.sourceUrl))}${svg("ext", 11)}</a>` : `<span class="svc-src none">no source page matched</span>`}
+          </div>
+          ${s.brief ? `<details class="brief" data-k="${esc(key)}"${OPEN.has(key) ? " open" : ""}><summary>View the AI-composed brief (${s.brief.length} chars)</summary><div class="brieftext">${esc(s.brief)}</div></details>` : ""}
+        </div>`;
+      }).join("")}
+        <div class="svc"><div class="svc-hd"><span class="dot ${j.status === "done" ? "done" : "queued"}"></span><span class="svc-nm">Brand guide</span><code class="svc-slug">/brand-guide/</code><span class="svc-src none">from this build's brand system</span></div></div>
+      </div>`
+    : `<div style="display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 4px">
+        ${j.servicePages.map((s) => `<span class="pill" style="background:var(--accent-soft);color:var(--accent)">${esc(s.name)}</span>`).join("")}
+        <span class="pill good">Brand guide</span>
+      </div>`;
+  return `<div class="card pad">${head}${body}
+    <div class="meta" style="margin-top:12px">${j.servicePages.length} service page(s) under a Treatments dropdown, a services hub, and a public /brand-guide page${plan.refCount ? ` · reference site has ${plan.refCount} service pages` : ""}${srcLine ? `<br>${srcLine}` : ""}</div></div>`;
+}
 function render() {
   const j = JOB;
   const st = jobState(j);
@@ -133,15 +193,11 @@ function render() {
 
     ${j.awaitingApproval && !j.approved ? `<div class="banner">${svg("warn", 18)}<div style="flex:1"><div class="bt">Paused for your approval</div><div class="bd">The change is written and the pull request is open — it merges only once you approve.</div></div></div>` : ""}
     ${j.status === "error" ? `<div class="banner bad">${svg("warn", 18)}<div style="flex:1"><div class="bt">This run failed</div><div class="bd">${esc((j.error || "").slice(0, 240))}</div></div></div>` : ""}
+    ${j.status === "done" && j.liveUrl ? successBanner(j) : ""}
 
     ${scoresCard(j)}
 
-    ${isEnrich && j.servicePages ? `<div class="card pad"><div class="card-h"><h2>What this adds</h2>${j.enrichPlan && j.enrichPlan.truncated ? `<span class="right" style="font-size:12px;color:var(--muted)">capped at ${j.servicePages.length} of ${j.enrichPlan.total}</span>` : ""}</div>
-      <div style="display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 4px">
-        ${j.servicePages.map((s) => `<span class="pill" style="background:var(--accent-soft);color:var(--accent)">${esc(s.name)}</span>`).join("")}
-        <span class="pill good">Brand guide</span>
-      </div>
-      <div class="meta" style="margin-top:8px">${j.servicePages.length} individual service page(s) under a Treatments dropdown, a services hub, and a public /brand-guide page${j.enrichPlan && j.enrichPlan.refCount ? ` · reference site has ${j.enrichPlan.refCount} service pages` : ""}.</div></div>` : ""}
+    ${isEnrich && j.servicePages ? enrichDetailCard(j) : ""}
 
     ${isEdit && j.payload && j.payload.prompt ? `<div class="card pad"><div class="card-h"><h2>The request</h2></div><p class="req">${esc(j.payload.prompt)}</p></div>` : ""}
 
@@ -165,6 +221,10 @@ function render() {
     $("techBtn").setAttribute("aria-expanded", String(TECH_OPEN));
     if (TECH_OPEN) loadDiff();
   };
+  // remember which briefs are open so the 3s re-render doesn't collapse them
+  document.querySelectorAll("details[data-k]").forEach((d) => {
+    d.addEventListener("toggle", () => { if (d.open) OPEN.add(d.dataset.k); else OPEN.delete(d.dataset.k); });
+  });
   document.querySelectorAll("[data-act]").forEach((b) => { b.onclick = () => act(b.dataset.act, b); });
   if (TECH_OPEN) loadDiff();
 }
@@ -244,7 +304,7 @@ async function load() {
   }
   // While pages are being generated, pull the live per-page progress too.
   const genStep = (JOB.steps || [])[2];
-  if (JOB.type !== "edit" && JOB.type !== "enrich" && genStep && genStep.status === "running") {
+  if (JOB.type !== "edit" && genStep && genStep.status === "running") {
     try { GENPROG = await getJSON("/api/generate-progress"); } catch (e) { /* keep last */ }
   }
   document.title = "Growth99 · " + JOB.businessName;

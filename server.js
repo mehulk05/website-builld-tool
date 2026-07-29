@@ -2359,7 +2359,7 @@ async function runJob(job) {
     try {
       if (slug) {
         const ej = enqueueEnrichJob({
-          jobId: "enrich-" + Date.now(), businessId: job.businessId, parentDraftId: job.draftId,
+          jobId: "enrich-" + Date.now(), businessId: job.businessId, parentDraftId: job.draftId, liveUrl: job.liveUrl,
           siteId: "g99-" + slug, businessName: job.businessName, githubRepo: job.repo,
           themeSlug: "g99-" + slug, themePath: `web/app/themes/g99-${slug}`,
           muPath: `web/app/mu-plugins/g99-activate-${slug}.php`,
@@ -2934,10 +2934,13 @@ function serviceSectionSpec(svc, A, composed, ref, city) {
 // Produce the ONE representative service page (the template all others clone).
 // NOTE: swap this to Stitch when a working key is available — it's the single
 // place the template is generated; everything else clones it deterministically.
-async function generateServiceTemplate(svc, A, composed, ref, city) {
-  const prompt = `${composed.brief || ""}\n\n${serviceSectionSpec(svc, A, composed, ref, city)}\n\nReturn ONE complete, responsive, production-quality HTML document (<!doctype html> … </html>). No markdown fences, no commentary.`;
+async function generateServiceTemplate(svc, A, composed, ref, city, brief) {
+  const spec = (brief && brief.length > 120) ? brief : serviceSectionSpec(svc, A, composed, ref, city);
+  const prompt = `${composed.brief || ""}\n\n${spec}${stylingConstraint(composed)}\n\nReturn ONE complete, responsive, production-quality HTML document (<!doctype html> … </html>). No markdown fences, no commentary.`;
   const html = stripFence(await geminiCall([{ text: prompt }], { temperature: 0.55, maxOutputTokens: 16000, timeoutMs: 120000 }));
-  const main = splitPage(html).main;
+  // embedPageAssets (not splitPage().main) — the <head>'s fonts/styles/config MUST
+  // travel with the markup, or every class defined there dies in the WP template.
+  const main = embedPageAssets(html);
   return (main && main.trim().length > 200) ? main : `<section style="padding:80px 24px;text-align:center"><h1>${svc.name}</h1></section>`;
 }
 // Clone the template's <main> for a different service — same layout/classes,
@@ -2947,7 +2950,8 @@ async function cloneServicePage(templateMain, svc, A, composed, city) {
   const prompt = [
     `Below is the <main> HTML of a service page for one treatment. Rewrite it for a DIFFERENT treatment: "${svc.name}".`,
     `Keep the EXACT same structure, section order, Tailwind classes and layout. Change ONLY: the H1 to "${svc.name}${loc}", all body copy to describe ${svc.name}, the benefits/FAQ to be specific to ${svc.name}, and swap image URLs to Unsplash images that depict ${svc.name} / relevant medical-aesthetic imagery. Keep the primary CTA "${A.primary_cta || "Book a consultation"}".`,
-    `Output ONLY the rewritten <main>…</main> — no <html>, no <head>, no commentary, no markdown fences.`,
+    `CRITICAL: reproduce every <style>, <script> and <link> block from the template VERBATIM — they define the page's CSS and the page breaks without them.`,
+    `Output ONLY the rewritten markup (the <main> plus any style/link/script blocks it came with) — no <html>, no <head>, no commentary, no markdown fences.`,
     `\nTEMPLATE <main>:\n${templateMain}`,
   ].join("\n");
   const out = stripFence(await geminiCall([{ text: prompt }], { temperature: 0.5, maxOutputTokens: 16000, timeoutMs: 120000 }));
@@ -2983,48 +2987,192 @@ ${cards}
 </section>`;
 }
 function escHtml(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch])); }
-// Deterministic public brand-guide page built from job.composed + answers.
+// ---- brand-guide color math ----------------------------------------------------
+function hexMix(hex, other, ratio) {
+  const p = (h) => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+  try {
+    const a = p(hex), b = p(other);
+    return "#" + a.map((v, i) => Math.round(v + (b[i] - v) * ratio).toString(16).padStart(2, "0")).join("").toUpperCase();
+  } catch (e) { return hex; }
+}
+function onColor(hex) {
+  try {
+    const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+    return (0.299 * r + 0.587 * g + 0.114 * b) > 150 ? "#1B1C1C" : "#FFFFFF";
+  } catch (e) { return "#FFFFFF"; }
+}
+// Full branding-guide page (modeled on infra-1.gogroth.com/branding-guide/):
+// logo → palette story, a derived color-role system, hero rationale, typography,
+// responsive strategy, live component samples, and Do/Don't rules — all
+// deterministic from the build's composed brand + onboarding answers.
 function brandGuidePage(composed, A, biz) {
   const c = composed || {}; A = A || {};
+  const name = biz || A.business_name || "The Practice";
+  const pri = c.primary || "#1A1A1A", sec = c.secondary || "#C5B39C", acc = c.accent || "#C5A059";
+  const hf = c.headingFont || "Cormorant Garamond", bf = c.bodyFont || "Montserrat";
+  const priCont = hexMix(pri, "#FFFFFF", 0.12), priInv = hexMix(pri, "#FFFFFF", 0.68);
+  const accDeep = hexMix(acc, "#000000", 0.28), accCont = hexMix(acc, "#FFFFFF", 0.62);
+  const surface = hexMix(sec, "#FFFFFF", 0.92), surfCont = hexMix(sec, "#FFFFFF", 0.82);
+  const onSurf = "#1B1C1C";
   const tone = [];
   const t = (v, lo, hi) => { const n = parseInt(v, 10); if (isNaN(n)) return null; return n >= 50 ? hi : lo; };
   const add = (v, lo, hi) => { const r = t(v, lo, hi); if (r) tone.push(r); };
   add(A.tone_clinical_warm, "clinical", "warm"); add(A.tone_lux_approachable, "luxurious", "approachable");
   add(A.tone_bold_understated, "bold", "understated"); add(A.tone_playful_serious, "playful", "serious");
-  const imagery = (String(c.brief || "").match(/IMAGERY:\s*([\s\S]+)$/i) || [])[1] || "Editorial, high-end medical-aesthetic photography with warm, ambient lighting, shallow depth of field and authentic provider-patient moments.";
-  const swatch = (label, hex) => hex ? `    <div class="sw"><span class="chip" style="background:${escHtml(hex)}"></span><b>${escHtml(label)}</b><code>${escHtml(hex)}</code></div>` : "";
-  return `<section class="g99bg">
+  const imagery = (String(c.brief || "").match(/IMAGERY:\s*([\s\S]+)$/i) || [])[1] ||
+    "Editorial, high-end medical-aesthetic photography with warm ambient lighting, shallow depth of field, and authentic provider-patient moments. No stocky smiles, no clip-art.";
+  const cta = A.primary_cta || "Book a consultation";
+  const heroH = A.hero_headline || `Refined, natural results`;
+  const review = A.featured_review || "";
+  const sw = (hex, role, use) => `
+      <div class="bgd-sw"><span class="bgd-chip" style="background:${escHtml(hex)}"><code style="color:${onColor(hex)}">${escHtml(hex)}</code></span><b>${escHtml(role)}</b><span>${escHtml(use)}</span></div>`;
+  return `<section class="bgd">
   <style>
-    .g99bg{padding:80px 24px;background:#fff;color:#111;font-family:"${c.bodyFont || "Plus Jakarta Sans"}",sans-serif}
-    .g99bg .wrap{max-width:960px;margin:0 auto}
-    .g99bg h1{font-family:"${c.headingFont || "Cormorant Garamond"}",serif;font-size:clamp(34px,5vw,54px);margin:0 0 6px}
-    .g99bg .lead{color:#666;margin:0 0 40px}
-    .g99bg h2{font-family:"${c.headingFont || "Cormorant Garamond"}",serif;font-size:26px;margin:44px 0 14px}
-    .g99bg .pal{display:flex;flex-wrap:wrap;gap:18px}
-    .g99bg .sw{display:flex;flex-direction:column;gap:6px;font-size:13px}
-    .g99bg .chip{width:120px;height:88px;border-radius:12px;border:1px solid #e5e5e5}
-    .g99bg code{color:#888;font-size:12px}
-    .g99bg .type-h{font-family:"${c.headingFont || "Cormorant Garamond"}",serif;font-size:40px}
-    .g99bg .type-b{font-size:17px;color:#333;max-width:640px}
-    .g99bg .tags{display:flex;flex-wrap:wrap;gap:8px}
-    .g99bg .tag{background:${c.accent || "#d4af37"}22;color:${c.primary || "#111"};border:1px solid ${c.accent || "#d4af37"};border-radius:999px;padding:5px 14px;font-size:13px;font-weight:600;text-transform:capitalize}
-    .g99bg .logo{max-height:80px;margin-top:8px}
+    @import url("https://fonts.googleapis.com/css2?family=${encodeURIComponent(hf)}:wght@400;600;700&family=${encodeURIComponent(bf)}:wght@400;500;600;700&display=swap");
+    .bgd{background:${surface};color:${onSurf};font-family:"${bf}",sans-serif;line-height:1.6}
+    .bgd .wrap{max-width:1040px;margin:0 auto;padding:0 24px}
+    .bgd .hero{background:${pri};color:${onColor(pri)};padding:96px 0 72px;text-align:center}
+    .bgd .eyebrow{display:inline-block;color:${acc};letter-spacing:.28em;text-transform:uppercase;font-size:12px;font-weight:600;margin-bottom:16px}
+    .bgd h1{font-family:"${hf}",serif;font-size:clamp(38px,6vw,64px);margin:0 0 14px;font-weight:600}
+    .bgd .hero p{opacity:.75;max-width:560px;margin:0 auto}
+    .bgd h2{font-family:"${hf}",serif;font-size:clamp(26px,3.4vw,36px);margin:0 0 10px;font-weight:600}
+    .bgd h3{font-size:14px;text-transform:uppercase;letter-spacing:.12em;color:${accDeep};margin:28px 0 14px}
+    .bgd .sec{padding:64px 0;border-bottom:1px solid ${hexMix(sec, "#FFFFFF", 0.55)}}
+    .bgd .sec.alt{background:${surfCont}}
+    .bgd .lead{color:#555;max-width:680px;margin:0 0 8px}
+    .bgd .logos{display:flex;gap:20px;flex-wrap:wrap;margin-top:22px}
+    .bgd .logocard{flex:1;min-width:240px;border-radius:16px;padding:38px 24px;display:grid;place-items:center;border:1px solid ${hexMix(sec, "#FFFFFF", 0.5)}}
+    .bgd .logocard img{max-height:72px;max-width:80%}
+    .bgd .logocard .mono{font-family:"${hf}",serif;font-size:40px}
+    .bgd .logocard small{display:block;margin-top:12px;font-size:11px;letter-spacing:.1em;text-transform:uppercase;opacity:.6}
+    .bgd .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px;margin-top:6px}
+    .bgd .bgd-sw{display:flex;flex-direction:column;gap:6px;font-size:13px}
+    .bgd .bgd-sw b{font-weight:700}
+    .bgd .bgd-sw span:last-child{color:#666;font-size:12.5px}
+    .bgd .bgd-chip{height:92px;border-radius:14px;border:1px solid rgba(0,0,0,.08);display:flex;align-items:flex-end;padding:10px 12px}
+    .bgd .bgd-chip code{font-size:12px;opacity:.9}
+    .bgd .heromock{border-radius:18px;overflow:hidden;position:relative;margin-top:22px}
+    .bgd .heromock .img{height:280px;background:linear-gradient(rgba(0,0,0,.35),rgba(0,0,0,.55)),url('https://images.unsplash.com/photo-1629909613654-28e377c37b09?auto=format&w=1400&q=70') center/cover}
+    .bgd .heromock .inner{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;color:#fff;padding:0 24px}
+    .bgd .heromock .inner .eyebrow{color:${acc}}
+    .bgd .heromock .inner h4{font-family:"${hf}",serif;font-size:clamp(26px,4vw,40px);margin:0 0 18px;font-weight:600}
+    .bgd .btn-p{display:inline-block;background:${acc};color:${onColor(acc)};border-radius:999px;padding:13px 30px;font-weight:600;font-size:14px;text-decoration:none}
+    .bgd .btn-o{display:inline-block;background:transparent;color:${onSurf};border:1.5px solid ${pri};border-radius:999px;padding:12px 28px;font-weight:600;font-size:14px;text-decoration:none}
+    .bgd .btn-o.inv{color:#fff;border-color:#fff}
+    .bgd .spec{border-left:3px solid ${acc};padding-left:20px;margin:18px 0}
+    .bgd .spec .d1{font-family:"${hf}",serif;font-size:clamp(34px,4.6vw,52px);line-height:1.15}
+    .bgd .spec .d2{font-family:"${hf}",serif;font-size:clamp(22px,3vw,30px)}
+    .bgd .spec small{display:block;color:#777;font-size:12px;margin-top:4px}
+    .bgd .cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin-top:8px}
+    .bgd .col{background:#fff;border:1px solid ${hexMix(sec, "#FFFFFF", 0.5)};border-radius:14px;padding:20px}
+    .bgd .col h4{margin:0 0 8px;font-size:14.5px}
+    .bgd .col ul{margin:0;padding-left:18px;font-size:13.5px;color:#555}
+    .bgd .col li{margin:4px 0}
+    .bgd .comp{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin:12px 0 6px}
+    .bgd .eyelabel{font-size:11px;letter-spacing:.28em;text-transform:uppercase;color:${accDeep};font-weight:600}
+    .bgd .quote{border-left:4px solid ${acc};background:#fff;border-radius:0 14px 14px 0;padding:18px 22px;font-family:"${hf}",serif;font-size:19px;font-style:italic;max-width:640px}
+    .bgd .dodont{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;margin-top:8px}
+    .bgd .rule{border-radius:14px;padding:22px}
+    .bgd .rule.do{background:${accCont}}
+    .bgd .rule.dont{background:#fff;border:1px solid ${hexMix(sec, "#FFFFFF", 0.45)}}
+    .bgd .rule h4{margin:0 0 10px;font-size:15px}
+    .bgd .rule ul{margin:0;padding-left:18px;font-size:13.5px;color:#444}
+    .bgd .rule li{margin:6px 0}
+    .bgd .tags{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+    .bgd .tag{background:${accCont};color:${accDeep};border-radius:999px;padding:6px 16px;font-size:13px;font-weight:600;text-transform:capitalize}
   </style>
-  <div class="wrap">
-    <h1>Brand Guide</h1>
-    <p class="lead">The visual system for ${escHtml(biz || A.business_name || "the practice")} — colors, type, voice and imagery, generated with the beta site.</p>
-    ${A.logo_file ? `<h2>Logo</h2><img class="logo" src="${escHtml(A.logo_file)}" alt="${escHtml(biz || "")} logo">` : ""}
-    <h2>Color palette</h2>
-    <div class="pal">
-${[swatch("Primary", c.primary), swatch("Secondary", c.secondary), swatch("Accent", c.accent)].filter(Boolean).join("\n")}
-    </div>
-    <h2>Typography</h2>
-    <div class="type-h">${escHtml(c.headingFont || "Cormorant Garamond")}</div>
-    <p class="type-b" style="font-family:'${escHtml(c.bodyFont || "Plus Jakarta Sans")}',sans-serif">${escHtml(c.bodyFont || "Plus Jakarta Sans")} — used for all body copy. The quick brown fox jumps over the lazy dog.</p>
-    ${tone.length ? `<h2>Voice &amp; tone</h2><div class="tags">${tone.map((x) => `<span class="tag">${escHtml(x)}</span>`).join("")}</div>` : ""}
-    <h2>Imagery direction</h2>
-    <p class="type-b">${escHtml(imagery)}</p>
+
+  <div class="hero">
+    <span class="eyebrow">Brand System</span>
+    <h1>${escHtml(name)} Branding Guide</h1>
+    <p>The single source of truth for how ${escHtml(name)} looks, speaks and feels — generated with the beta website.</p>
   </div>
+
+  <div class="sec"><div class="wrap">
+    <h2>1. The Logo — Where the Palette Comes From</h2>
+    <p class="lead">Every color in this system is derived from or calibrated against the brand's core tones: <code>${escHtml(pri)}</code> and <code>${escHtml(acc)}</code>. The logo must live comfortably on both light and dark surfaces.</p>
+    <div class="logos">
+      <div class="logocard" style="background:#fff">${A.logo_file ? `<img src="${escHtml(A.logo_file)}" alt="${escHtml(name)} logo">` : `<span class="mono">${escHtml(name.slice(0, 1))}</span>`}<small>On light surfaces</small></div>
+      <div class="logocard" style="background:${pri};color:${onColor(pri)}">${A.logo_file ? `<img src="${escHtml(A.logo_file)}" alt="${escHtml(name)} logo" style="filter:brightness(0) invert(1)">` : `<span class="mono" style="color:${acc}">${escHtml(name.slice(0, 1))}</span>`}<small style="opacity:.7">Inverted on primary</small></div>
+    </div>
+  </div></div>
+
+  <div class="sec alt"><div class="wrap">
+    <h2>2. Full Colour System</h2>
+    <p class="lead">A role-based system: use colors by role, never by taste. Every hex below is derived from the two anchors.</p>
+    <h3>Primary Group</h3>
+    <div class="grid">${sw(pri, "Primary", "Headers, footer, hero backgrounds, key text")}${sw(priCont, "Primary Container", "Hover states on primary elements")}${sw(priInv, "Inverse Primary", "Text/icons on dark primary surfaces")}</div>
+    <h3>Accent Group</h3>
+    <div class="grid">${sw(acc, "Accent", "CTAs, highlights, eyebrow labels")}${sw(accDeep, "Accent Deep", "Interactive text, hover indicators")}${sw(accCont, "Accent Container", "Light tinted backgrounds, badges")}</div>
+    <h3>Surface &amp; Neutral</h3>
+    <div class="grid">${sw(surface, "Surface", "Body background — warm off-white")}${sw(surfCont, "Surface Container", "Alternating section backgrounds")}${sw(sec, "Secondary", "Borders, dividers, soft fills")}${sw(onSurf, "On Surface", "Primary body text color")}</div>
+  </div></div>
+
+  <div class="sec"><div class="wrap">
+    <h2>3. Hero Section — Design Rationale</h2>
+    <p class="lead">Full-bleed imagery under a dark scrim guarantees WCAG-readable white text at any photo. The eyebrow is always ${escHtml(acc)}; the headline is always ${escHtml(hf)}; the primary CTA is a full-pill accent button.</p>
+    <div class="heromock"><div class="img"></div><div class="inner">
+      <span class="eyebrow">${escHtml((A.practice_type || "Medical Aesthetics").toUpperCase())}</span>
+      <h4>${escHtml(heroH)}</h4>
+      <span><a class="btn-p" href="#">${escHtml(cta)}</a>&nbsp;&nbsp;<a class="btn-o inv" href="#">Explore treatments</a></span>
+    </div></div>
+  </div></div>
+
+  <div class="sec alt"><div class="wrap">
+    <h2>4. Typography System</h2>
+    <p class="lead"><b>${escHtml(hf)}</b> carries every headline; <b>${escHtml(bf)}</b> carries everything else. Never swap the pairing.</p>
+    <div class="spec"><div class="d1">${escHtml(hf)} — display &amp; H1</div><small>Headlines, hero statements · weight 600 · tight leading</small></div>
+    <div class="spec"><div class="d2">Section headings sit at 28–36px</div><small>${escHtml(hf)} 600 · used for every H2/H3</small></div>
+    <div class="spec"><p style="max-width:620px;margin:0">${escHtml(bf)} handles body copy at 15–17px with relaxed 1.6 leading, buttons at 14px/600, and captions at 12–13px. The quick brown fox jumps over the lazy dog.</p><small>${escHtml(bf)} 400/500/600</small></div>
+  </div></div>
+
+  <div class="sec"><div class="wrap">
+    <h2>5. Responsive Design Strategy</h2>
+    <div class="cols">
+      <div class="col"><h4>Mobile (&lt; 640px)</h4><ul><li>Single column, generous 24px gutters</li><li>Hero headline clamps to ~32px</li><li>Sticky bottom "${escHtml(cta)}" bar</li><li>Nav collapses to a full-screen sheet</li></ul></div>
+      <div class="col"><h4>Tablet (640–1024px)</h4><ul><li>Two-column grids for cards &amp; benefits</li><li>Hero at 60vh with side-anchored copy</li><li>Treatments dropdown becomes accordion</li></ul></div>
+      <div class="col"><h4>Desktop (≥ 1024px)</h4><ul><li>Max content width 1120–1200px</li><li>Full-viewport cinematic hero</li><li>Hover states on all interactive elements</li></ul></div>
+    </div>
+  </div></div>
+
+  <div class="sec alt"><div class="wrap">
+    <h2>6. Component Language</h2>
+    <h3>Buttons</h3>
+    <div class="comp"><a class="btn-p" href="#">${escHtml(cta)}</a><a class="btn-o" href="#">Secondary action</a></div>
+    <p class="lead" style="font-size:13.5px">Primary = accent pill with ${onColor(acc) === "#FFFFFF" ? "white" : "dark"} text. Secondary = transparent pill with a 1.5px primary border. Always fully rounded.</p>
+    <h3>Eyebrow Labels</h3>
+    <div class="comp"><span class="eyelabel">Signature Treatments</span><span class="eyelabel">Meet the Team</span></div>
+    <h3>Testimonial Accent Bar</h3>
+    ${review ? `<div class="quote">“${escHtml(review)}”</div>` : `<div class="quote">“A 4px ${escHtml(acc)} bar anchors every testimonial pull-quote.”</div>`}
+  </div></div>
+
+  <div class="sec"><div class="wrap">
+    <h2>7. Voice &amp; Imagery</h2>
+    ${tone.length ? `<div class="tags">${tone.map((x) => `<span class="tag">${escHtml(x)}</span>`).join("")}</div>` : ""}
+    <p class="lead" style="margin-top:14px">${escHtml(imagery)}</p>
+  </div></div>
+
+  <div class="sec alt" style="border-bottom:none"><div class="wrap">
+    <h2>8. Brand Rules — Do &amp; Don't</h2>
+    <div class="dodont">
+      <div class="rule do"><h4>✓ Do</h4><ul>
+        <li>Use ${escHtml(pri)} for headers, footers and dark hero surfaces</li>
+        <li>Use ${escHtml(acc)} for CTAs and accents — never for body text</li>
+        <li>Always pair ${escHtml(hf)} headlines with ${escHtml(bf)} body</li>
+        <li>Use full-pill rounding on every CTA button</li>
+        <li>Keep surfaces in the ${escHtml(surface)} family</li>
+        <li>Place a dark scrim behind any text over photography</li>
+      </ul></div>
+      <div class="rule dont"><h4>✕ Don't</h4><ul>
+        <li>Don't use pure black (#000000) — it kills the warmth</li>
+        <li>Don't set body copy in ${escHtml(acc)} — reserve it for accents</li>
+        <li>Don't introduce a second serif or a new accent hue</li>
+        <li>Don't use square-cornered buttons</li>
+        <li>Don't place white text on photos without a scrim</li>
+        <li>Don't scale the logo below 40px height</li>
+      </ul></div>
+    </div>
+  </div></div>
 </section>`;
 }
 // The generated theme header is STATIC HTML (no wp_nav_menu), so the provisioned
@@ -3057,6 +3205,18 @@ function navDropdownSnippet(services, composed) {
     d.className = 'g99-drop';
     items.forEach(function (it) { var a = document.createElement('a'); a.href = it.url; a.textContent = it.name; d.appendChild(a); });
     li.appendChild(d);
+    // Brand Guide as a top-level nav item: clone the Treatments link so it
+    // inherits the theme's own nav styling, whatever markup the AI produced.
+    if (!document.querySelector('nav a[href="/brand-guide/"], header a[href="/brand-guide/"]')) {
+      var bg = link.cloneNode(true);
+      bg.textContent = 'Brand Guide';
+      bg.setAttribute('href', '/brand-guide/');
+      bg.removeAttribute('data-g99');
+      var wrap2 = li.cloneNode(false);
+      wrap2.classList.remove('g99-hasdrop');
+      wrap2.appendChild(bg);
+      li.parentElement.insertBefore(wrap2, li.nextSibling);
+    }
   }
   if (document.readyState !== 'loading') { build(); } else { document.addEventListener('DOMContentLoaded', build); }
 })();
@@ -3222,6 +3382,16 @@ ${childrenPhp || "            // no service pages"}
 `;
 }
 
+// Per-service generation status for the run detail (queued → generating → done/error).
+// Kept on job.serviceDetail so it survives a reload; the Stitch path also has live
+// GEN_PROGRESS, which the frontend prefers while the step is running.
+function svcStatus(job, slug, status, engine) {
+  const row = (job.serviceDetail || []).find((s) => s.slug === slug);
+  if (!row) return;
+  row.status = status;
+  if (engine) row.engine = engine;
+  saveJobs();
+}
 const ENRICH_STEPS = ["Pull latest code", "Plan services + brand guide", "Generate pages (AI)", "Push + open PR", "CI checks → auto-merge", "Sync registry"];
 function newEnrichJob(payload) {
   return {
@@ -3231,6 +3401,7 @@ function newEnrichJob(payload) {
     status: "queued", currentStep: 0,
     steps: ENRICH_STEPS.map((label) => ({ label, status: "pending", detail: "" })),
     payload, prUrl: null, branch: null, siteUrl: null,
+    liveUrl: payload.liveUrl || LIVE_URL || null,
     servicePages: null, brandGuide: true, editSummary: null, error: null,
     cost: { gemini: 0, stitch: 0 }, cancelRequested: false, awaitingApproval: false,
     createdAt: new Date().toISOString(), startedAt: null, finishedAt: null,
@@ -3321,6 +3492,14 @@ async function runEnrichJob(job) {
         catch (e) { briefs[s.slug] = null; }
       }
       const composedCount = Object.values(briefs).filter((b) => b && b.length > 120).length;
+      // Persist per-service provenance so the run detail can show WHAT was
+      // generated, FROM WHERE (existing-site source page), and WITH WHICH brief.
+      job.serviceDetail = services.map((s) => ({
+        name: s.name, slug: s.slug, status: "queued", engine: null,
+        sourceUrl: (refs[s.slug] || {}).url || null,
+        brief: (briefs[s.slug] || "").slice(0, 3000) || null,
+      }));
+      saveJobs();
       jobStep(job, 2, "running", `Generating ${services.length} service page(s) with Stitch (${composedCount} AI-composed briefs${refCount ? `, ${refCount} grounded in the existing site` : ""})…`);
       let results = null;
       try {
@@ -3339,24 +3518,28 @@ async function runEnrichJob(job) {
       const okStitch = (results || []).filter((r) => r.html);
       job.enrichPlan = { ...(job.enrichPlan || {}), engine: okStitch.length ? "stitch" : "gemini", grounded: refCount, composedBriefs: composedCount, mimicked: refStruct ? refStruct.url : null };
       if (okStitch.length) {
-        for (const r of okStitch) serviceMains[r.key] = embedPageAssets(r.html);
+        for (const r of okStitch) { serviceMains[r.key] = embedPageAssets(r.html); svcStatus(job, r.key, "done", "stitch"); }
         // any page Stitch missed: Gemini-clone it from the first good one
         const template = serviceMains[okStitch[0].key];
         for (const s of services) {
           if (serviceMains[s.slug]) continue;
+          svcStatus(job, s.slug, "generating", "gemini");
           jobStep(job, 2, "running", `Stitch missed ${s.name} — cloning from template…`);
-          try { serviceMains[s.slug] = await cloneServicePage(template, s, A, composed, city); }
-          catch (e) { serviceMains[s.slug] = template; }
+          try { serviceMains[s.slug] = await cloneServicePage(template, s, A, composed, city); svcStatus(job, s.slug, "done", "gemini"); }
+          catch (e) { serviceMains[s.slug] = template; svcStatus(job, s.slug, "error", "gemini"); }
         }
       } else {
-        // full fallback: previous Gemini template → clone path
+        // full fallback: Gemini template → clone path (uses the composed brief too)
         jobStep(job, 2, "running", "Stitch unavailable — generating with Gemini…");
-        const template = await generateServiceTemplate(services[0], A, composed, ref, city);
+        svcStatus(job, services[0].slug, "generating", "gemini");
+        const template = await generateServiceTemplate(services[0], A, composed, ref, city, briefs[services[0].slug]);
         serviceMains[services[0].slug] = template;
+        svcStatus(job, services[0].slug, "done", "gemini");
         for (let i = 1; i < services.length; i++) {
+          svcStatus(job, services[i].slug, "generating", "gemini");
           jobStep(job, 2, "running", `Cloning page ${i + 1}/${services.length}: ${services[i].name}`);
-          try { serviceMains[services[i].slug] = await cloneServicePage(template, services[i], A, composed, city); }
-          catch (e) { serviceMains[services[i].slug] = template; }
+          try { serviceMains[services[i].slug] = await cloneServicePage(template, services[i], A, composed, city); svcStatus(job, services[i].slug, "done", "gemini"); }
+          catch (e) { serviceMains[services[i].slug] = template; svcStatus(job, services[i].slug, "error", "gemini"); }
         }
       }
     }
@@ -3380,9 +3563,14 @@ async function runEnrichJob(job) {
     if (services.length) {
       const headerAbs = path.join(themeAbs, "header.php");
       if (fs.existsSync(headerAbs)) {
-        let h = fs.readFileSync(headerAbs, "utf8");
-        if (!h.includes("g99-treatments-dropdown")) {
-          fs.writeFileSync(headerAbs, h + "\n" + navDropdownSnippet(services, composed) + "\n");
+        const h = fs.readFileSync(headerAbs, "utf8");
+        // REPLACE any previous snippet rather than skipping when the marker exists —
+        // otherwise an improved enhancer (e.g. the Brand Guide nav item) never ships.
+        // The snippet is always appended last, so everything from the marker is ours.
+        const base = h.split("<!-- g99-treatments-dropdown -->")[0].replace(/\s+$/, "");
+        const next = base + "\n" + navDropdownSnippet(services, composed) + "\n";
+        if (next !== h) {
+          fs.writeFileSync(headerAbs, next);
           changed.push(`${P.themePath}/header.php`);
         }
       }
@@ -3931,7 +4119,7 @@ const server = http.createServer(async (req, res) => {
             : null;
       if (!src) return json(res, 409, { error: "No onboarding data for this theme in memory — enrichment auto-runs after a build; trigger it right after building." });
       const job = enqueueEnrichJob({
-        jobId: "enrich-" + Date.now(), businessId: src.businessId,
+        jobId: "enrich-" + Date.now(), businessId: src.businessId, liveUrl: site.liveUrl,
         siteId, businessName: site.businessName, githubRepo: site.githubRepo,
         themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
         answers: src.answers, composed: src.composed, referenceWebsite: src.referenceWebsite || "",
