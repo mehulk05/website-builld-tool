@@ -16,3 +16,4 @@ site-audits.json
 server.out
 ide-workspace/
 email-requests.json
+email-outbox.json
