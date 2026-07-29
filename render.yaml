@@ -21,10 +21,10 @@ services:
         sync: false          # shared secret for /api/webhook/onboarding-submitted
       # Where build progress is reported back to Growth99 (dev). The G99 admin dashboard reads this
       # persisted status, so without it a build's outcome is never recorded on the platform side.
-      # NOTE: must be the API-GATEWAY-exposed path (the raw /api/public/v2/... pattern is WAF-blocked);
-      # register the route like the existing HubSpot webhook and use that path here.
+      # NOTE: this is the API-GATEWAY path. The gateway maps /publicv2/** -> public-api /api/public/v2/**;
+      # posting to the raw /api/public/v2/... URL is WAF-blocked (403) and /public/... is 404.
       - key: G99_STATUS_CALLBACK_URL
-        value: https://pub-api-dev.growthemr.com/public/webhook/website-build-status
+        value: https://pub-api-dev.growthemr.com/publicv2/webhook/website-build-status
       - key: G99_STATUS_SECRET
         sync: false          # same value as WEBHOOK_SECRET (falls back to it when unset)
       # This service's own public base URL — used to turn /site/ and /reports/x.html into absolute
