@@ -86,7 +86,15 @@ function workOrder(j) {
       ? `<span class="vk yes" title="Confirmed in the diff${r.how ? " · " + r.how : ""}">${svg("check", 11, 3.4)}</span>`
       : `<span class="vk no" title="No change in the diff does this">${svg("close", 11, 3.4)}</span>`;
   };
-  const items = w.changes.map((c, i) => `<li>${mark(i)}${esc(c.what)}${c.where ? ` <span class="whr">· ${esc(c.where)}</span>` : ""}${c.literal ? `<span class="lit">${esc(c.literal)}</span>` : ""}</li>`).join("");
+  // A swap reads as old → new. Showing one blob of text made it impossible to
+  // tell what was being replaced from what it was becoming.
+  const text = (c) => {
+    if (c.replaces && c.literal) return `<span class="lit"><s>${esc(c.replaces)}</s> → ${esc(c.literal)}</span>`;
+    if (c.literal) return `<span class="lit">${esc(c.literal)}</span>`;
+    if (c.replaces) return `<span class="lit">remove: <s>${esc(c.replaces)}</s></span>`;
+    return "";
+  };
+  const items = w.changes.map((c, i) => `<li>${mark(i)}${esc(c.what)}${c.where ? ` <span class="whr">· ${esc(c.where)}</span>` : ""}${text(c)}</li>`).join("");
   const note = (label, list) => (list && list.length ? `<div class="wo-note"><b>${label}</b> ${esc(list.join("; "))}</div>` : "");
   const chk = j.verification;
   return (chk ? `<div class="wo-hd">${chk.done} of ${chk.total} confirmed in the changes${chk.missed ? ` · ${chk.missed} not done` : ""}${j.retried ? " · retried once" : ""}</div>` : "")
