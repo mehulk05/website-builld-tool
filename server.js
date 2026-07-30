@@ -1894,6 +1894,14 @@ function emailBodyText(raw) {
   const cuts = [
     /^On .+ wrote:$/m, /^-{2,}\s*Original Message\s*-{2,}/im, /^_{5,}$/m,
     /^From:\s.+$/m, /^Sent from my /m, /^--\s*$/m,
+    // A sign-off alone on its line ends the request — everything below it is
+    // the signature. This has to be a hard cut rather than a tidy-up at the
+    // end: a corporate signature is a name, a title, a logo and eight social
+    // links, which is far more text than the request itself and read as part
+    // of it. Requiring the line to hold nothing but the sign-off keeps
+    // "Thanks, that looks great — now please…" intact.
+    /^\s*(thanks|thank you|thanks so much|many thanks|thanks again|regards|best regards|best|cheers|kind regards|warm regards|sincerely)[,.!]?\s*$/im,
+    /^\s*\[image:/im,          // Gmail's plain-text stand-in for a signature logo
   ];
   for (const re of cuts) {
     const m = t.match(re);
@@ -1902,10 +1910,8 @@ function emailBodyText(raw) {
     // phone." sits at index 26, so a quoted thread below it stayed in.
     if (m && t.slice(0, m.index).trim().length >= 10) t = t.slice(0, m.index);
   }
-  // Drop the greeting and sign-off so the planner reads the request, not the
-  // pleasantries around it.
-  // A sign-off is usually followed by a name, and sometimes a title or phone —
-  // allow a few short trailing lines so "Thanks,\nYashwant" goes too.
+  // Drop the greeting, and the sign-off form the cut above cannot catch —
+  // "Thanks, Charan" with the name on the same line.
   t = t.replace(/^\s*(hi|hey|hello|dear)\b[^\n]{0,40}\n+/i, "")
        .replace(/\n+\s*(thanks|thank you|thanks so much|regards|best regards|best|cheers|kind regards|sincerely)\b[^\n]{0,30}(\n[^\n]{0,45}){0,3}\s*$/i, "");
   return t.replace(/\n{3,}/g, "\n\n").trim();
@@ -2061,7 +2067,7 @@ function newEditJob(payload) {
     status: "queued", currentStep: 0,
     steps: EDIT_STEPS.map((label) => ({ label, status: "pending", detail: "" })),
     payload, prUrl: null, branch: null, siteUrl: null,
-    editPlan: null, editSummary: null, workOrder: null, verification: null, retried: false, error: null,
+    editPlan: null, editSummary: null, workOrder: null, textSwaps: null, verification: null, retried: false, error: null,
     cost: { gemini: 0, stitch: 0 }, cancelRequested: false, awaitingApproval: false,
     createdAt: new Date().toISOString(), startedAt: null, finishedAt: null,
   };
@@ -2544,21 +2550,33 @@ async function buildWorkOrder(prompt, ctx, ai) {
     "",
     "RULES:",
     "- One entry per distinct change. A request asking for three things produces three entries.",
-    "- If the sender gave exact wording (usually in quotes), copy it character-for-character into \"literal\". Never reword, retitle or 'improve' it.",
-    "- \"where\" is the sender's own words for the location (\"homepage hero\", \"the footer\"). Do not guess a filename.",
+    "- \"replaces\" is the exact text that is on the site NOW and must go. \"literal\" is the exact text that must be on the site AFTERWARDS. Copy both character-for-character from the request, without the surrounding quote marks, and never reword or 'improve' either.",
+    "- For \"change X to Y\": replaces = X, literal = Y. Never put both in one field and never include the word 'to' joining them.",
+    "- For new text with nothing being replaced, leave \"replaces\" empty. For a removal, leave \"literal\" empty.",
+    "- If the sender did not dictate exact wording, leave both empty rather than inventing wording.",
+    "- \"where\" is the sender's own words for the location (\"homepage hero\", \"the footer\", a page URL). Do not guess a filename.",
     "- Anything the sender said to leave alone goes in \"constraints\".",
     "- Anything too vague to act on without guessing goes in \"unclear\", and NOT in \"changes\".",
     "- Ignore greetings, sign-offs, thanks, deadlines and background chat.",
     "",
     "REQUEST:", "-----", String(prompt || "").slice(0, 6000), "-----",
     "",
-    'Return ONLY minified JSON: {"summary":"one line covering the whole request","changes":[{"what":"the change, imperative","where":"where on the site, in the sender\'s words","literal":"exact text they specified, or empty"}],"constraints":["things to leave alone"],"unclear":["parts too vague to action"]}',
+    'Return ONLY minified JSON: {"summary":"one line covering the whole request","changes":[{"what":"the change, imperative","where":"where on the site, in the sender\'s words","replaces":"exact text being replaced, or empty","literal":"exact text it must become, or empty"}],"constraints":["things to leave alone"],"unclear":["parts too vague to action"]}',
   ].filter(Boolean).join("\n");
   const raw = await aiCall([{ text: p }], { ...(ai || {}), temperature: 0.1, maxOutputTokens: 1500, timeoutMs: 45000, json: true });
   const d = JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
   const arr = (v) => (Array.isArray(v) ? v.map((x) => String(x || "").trim()).filter(Boolean).slice(0, 10) : []);
+  // Strip quote marks the model sometimes carries across from the request, and
+  // rescue the "X to Y" answer the old single-field prompt used to produce —
+  // that whole phrase appears nowhere on the site, so it verified as not done.
+  const unquote = (s) => String(s || "").trim().replace(/^["“”'‘’]+|["“”'‘’]+$/g, "").trim();
   const changes = (Array.isArray(d.changes) ? d.changes : []).slice(0, 10)
-    .map((c) => ({ what: String((c && c.what) || "").trim(), where: String((c && c.where) || "").trim(), literal: String((c && c.literal) || "").trim() }))
+    .map((c) => {
+      let replaces = unquote(c && c.replaces), literal = unquote(c && c.literal);
+      const pair = literal.match(/^["“”](.+?)["“”]\s+(?:to|→|->|with)\s+["“”](.+?)["“”]$/i);
+      if (pair) { replaces = replaces || pair[1].trim(); literal = pair[2].trim(); }
+      return { what: String((c && c.what) || "").trim(), where: String((c && c.where) || "").trim(), replaces, literal };
+    })
     .filter((c) => c.what);
   // No usable items means the extraction misread the request, not that the
   // request was empty — the raw prose is a better brief than an empty list.
@@ -2572,11 +2590,39 @@ function workOrderText(wo) {
   const lines = ["WORK ORDER — do every numbered item, and nothing beyond them:"];
   wo.changes.forEach((c, i) => {
     lines.push(`${i + 1}. ${c.what}${c.where ? ` — location: ${c.where}` : ""}`);
-    if (c.literal) lines.push(`   EXACT TEXT, use character-for-character and do not reword: ${c.literal}`);
+    if (c.replaces) lines.push(`   REPLACE EXACTLY THIS TEXT: ${c.replaces}`);
+    if (c.literal) lines.push(`   ${c.replaces ? "WITH EXACTLY THIS TEXT" : "EXACT TEXT"}, character-for-character and not reworded: ${c.literal}`);
   });
   if (wo.constraints.length) lines.push("", "LEAVE ALONE:", ...wo.constraints.map((c) => `- ${c}`));
   if (wo.unclear.length) lines.push("", "TOO VAGUE TO ACTION — skip these entirely rather than guessing:", ...wo.unclear.map((c) => `- ${c}`));
   return lines.join("\n");
+}
+
+// ---- Exact text swaps, made without the model -------------------------------
+// "Change X to Y" needs no judgement: X is a string and Y is a string. Handing
+// that to a model which rewrites the whole file is what produced collateral
+// edits — a request to change one heading from 30 to 40 also had it rewrite a
+// nearby paragraph from "After 30" to "After 40", which nobody asked for.
+// Doing these in code means the diff can only contain what was requested.
+// Returns the items it resolved; those never reach the planner at all.
+function applyTextSwaps(workOrder, files, rootAbs) {
+  const done = [];
+  workOrder.changes.forEach((c, i) => {
+    if (!c.replaces || !c.literal || c.replaces === c.literal) return;
+    const touched = [];
+    for (const f of files) {
+      const parts = f.content.split(c.replaces);
+      if (parts.length < 2) continue;
+      f.content = parts.join(c.literal);     // keep the in-memory copy in step
+      fs.writeFileSync(path.join(rootAbs, f.rel), f.content);
+      touched.push({ rel: f.rel, count: parts.length - 1 });
+    }
+    if (touched.length) done.push({ n: i + 1, what: c.what, replaces: c.replaces, literal: c.literal, files: touched });
+  });
+  return done;
+}
+function swapsText(swaps) {
+  return swaps.map((s) => `"${s.replaces}" → "${s.literal}" in ${s.files.map((f) => `${f.rel.split("/").pop()}${f.count > 1 ? ` ×${f.count}` : ""}`).join(", ")}`).join("; ");
 }
 
 // ---- 2. Where things live ---------------------------------------------------
@@ -2697,7 +2743,13 @@ async function editFileContent(op, path_, instruction, currentContent, planConte
     (req && req.workOrder) ? "\n" + req.workOrder : "",
     op === "modify" ? `\nCURRENT CONTENT:\n-----\n${currentContent}\n-----` : "",
     `\nDO THIS TO ${path_}:\n${instruction}`,
-    op === "modify" ? `\nReturn the full modified file. Change only what the instruction above requires; keep every other byte exactly as it is.` : `\nReturn the full new file.`,
+    op === "modify"
+      // Spelled out because the plausible-sounding version of this failure is
+      // the common one: asked to change one heading from 30 to 40, the model
+      // also rewrote a nearby paragraph so the copy would agree. Nobody asked
+      // for that, and it lands in a diff a human then has to unpick.
+      ? `\nReturn the full modified file.\n\nCHANGE NOTHING ELSE. Not other text that now disagrees with the change, not wording you think reads better, not formatting, not indentation, not blank lines, not the trailing newline. If another number or phrase in this file contradicts the change once you have made it, leave it contradicting — reconciling it is the client's decision to ask for, not yours to take. Every byte you were not explicitly asked to change must come back exactly as it went in.`
+      : `\nReturn the full new file.`,
   ].filter(Boolean).join("\n");
   return stripFence(await aiCall([{ text: p }], { ...(ai || {}), temperature: 0.2, maxOutputTokens: 16000, timeoutMs: 90000 }));
 }
@@ -2771,14 +2823,26 @@ async function verifyWork(workOrder, diff, ai) {
   if (!workOrder || !workOrder.changes.length) return null;
   const changes = diffChanges(diff);
   const added = changes.filter((c) => c.sign === "+").map((c) => c.text).join("\n");
+  const removed = changes.filter((c) => c.sign === "-").map((c) => c.text).join("\n");
   const all = changes.map((c) => c.text).join("\n");
-  const results = workOrder.changes.map((c, i) => ({ n: i + 1, what: c.what, where: c.where, literal: c.literal, done: null, how: "", evidence: "" }));
+  const results = workOrder.changes.map((c, i) => ({ n: i + 1, what: c.what, where: c.where, replaces: c.replaces, literal: c.literal, done: null, how: "", evidence: "" }));
 
   for (const r of results) {
-    if (!r.literal) continue;
-    r.done = literalPresent(r.literal, added);
+    if (!r.literal && !r.replaces) continue;
     r.how = "exact text";
-    if (r.done) r.evidence = r.literal;
+    // A swap has to show both halves: new text among the added lines and old
+    // text among the removed ones. Checking only the new text would pass a
+    // change that added the replacement and left the original sitting there.
+    if (r.literal && r.replaces) {
+      r.done = literalPresent(r.literal, added) && literalPresent(r.replaces, removed);
+      if (r.done) r.evidence = `${r.replaces} → ${r.literal}`;
+    } else if (r.literal) {
+      r.done = literalPresent(r.literal, added);
+      if (r.done) r.evidence = r.literal;
+    } else {
+      r.done = literalPresent(r.replaces, removed);
+      if (r.done) r.evidence = "removed: " + r.replaces;
+    }
   }
   const judged = results.filter((r) => r.done === null);
   if (judged.length && changes.length) {
@@ -2861,7 +2925,7 @@ async function runEditJob(job) {
       }
       return { manifest, source };
     };
-    const { manifest, source } = scanTheme();
+    let { manifest, source } = scanTheme();
 
     // Understand the ask before working out where it lands. A failure here is
     // not fatal — the run continues on the raw request, exactly as it did
@@ -2875,22 +2939,41 @@ async function runEditJob(job) {
       saveJobs();
     }
 
-    const evidence = locateTerms(source, requestTerms(P.prompt, workOrder));
+    // Straight text swaps are settled here, in code. Whatever they resolve is
+    // removed from the brief, so the model never sees it and cannot embellish
+    // it. Only what is left needs judgement.
+    const swaps = workOrder ? applyTextSwaps(workOrder, source, tmp) : [];
+    job.textSwaps = swaps;
+    const swapped = new Set(swaps.map((s) => s.n));
+    const forAi = workOrder ? { ...workOrder, changes: workOrder.changes.filter((c, i) => !swapped.has(i + 1)) } : null;
+    if (swaps.length) {
+      ({ manifest, source } = scanTheme());     // re-read: the files just changed
+      jobStep(job, 1, "running", `${swaps.length} exact text change(s) made directly · ${forAi.changes.length} left to plan`);
+      saveJobs();
+    }
+
+    const evidence = locateTerms(source, requestTerms(P.prompt, forAi || workOrder));
     const outline = source.map((f) => ({ rel: f.rel, items: fileOutline(f.content) })).filter((o) => o.items.length);
     // What the planner and every file writer below both work from.
-    const brief = { prompt: P.prompt, businessName: P.businessName, workOrder: workOrderText(workOrder) };
-
-    jobStep(job, 1, "running", "Planning the edit…" + (job.aiModel !== "gemini" ? ` (${job.aiModel})` : ""));
-    const plan = await editPlan(manifest, { ...brief, evidence: evidenceText(evidence), outline: outlineText(outline) }, ai);
+    const brief = { prompt: P.prompt, businessName: P.businessName, workOrder: workOrderText(forAi) };
     const allowed = (rel) => rel === P.muPath || rel.startsWith(P.themePath + "/");
-    plan.files = (plan.files || []).filter(f => f && f.path && allowed(f.path)).slice(0, 8);
-    if (!plan.files.length) throw new Error("planner produced no in-scope file changes");
+
+    // With no work order there is only the raw prompt, so the model still runs.
+    // With one, it runs only if something is left that a swap could not settle.
+    const plan = { summary: "", files: [] };
+    if (!forAi || forAi.changes.length) {
+      jobStep(job, 1, "running", "Planning the edit…" + (job.aiModel !== "gemini" ? ` (${job.aiModel})` : ""));
+      const p = await editPlan(manifest, { ...brief, evidence: evidenceText(evidence), outline: outlineText(outline) }, ai);
+      plan.summary = String(p.summary || "");
+      plan.files = (p.files || []).filter(f => f && f.path && allowed(f.path)).slice(0, 8);
+      if (!plan.files.length && !swaps.length) throw new Error("planner produced no in-scope file changes");
+    }
     job.editPlan = plan.files.map(f => ({ path: f.path, op: f.op }));
-    job.editSummary = plan.summary || "";
-    jobStep(job, 1, "done", plan.summary || `${plan.files.length} file(s)`);
+    job.editSummary = plan.summary || swapsText(swaps);
+    jobStep(job, 1, "done", plan.summary || swapsText(swaps) || `${plan.files.length} file(s)`);
 
     // 3 — apply
-    jobStep(job, 2, "running", "Applying changes…");
+    jobStep(job, 2, "running", plan.files.length ? "Applying changes…" : "Nothing left for the model to write");
     const applyPlan = async (pl, wr) => {
       const planContext = pl.files.map(f => `${f.op} ${f.path}`).join("\n");
       for (const f of pl.files) {
@@ -2907,8 +2990,10 @@ async function runEditJob(job) {
         if (!fs.existsSync(path.join(themeAbs, req))) throw new Error(`edit would remove required ${req} — aborted`);
       }
     };
-    await applyPlan(plan);
-    jobStep(job, 2, "done", `${plan.files.length} file(s) written`);
+    if (plan.files.length) await applyPlan(plan);
+    jobStep(job, 2, "done", plan.files.length
+      ? `${plan.files.length} file(s) written`
+      : `${swaps.length} exact swap(s) applied — no model rewrite needed`);
 
     // 4 — check the work against the work order, while nothing has left this
     //     machine yet. Staging first is what puts newly created files into the
@@ -2928,7 +3013,7 @@ async function runEditJob(job) {
       if (check && check.missed) {
         jobStep(job, 3, "running", `${check.missed} of ${check.total} item(s) not done — trying once more…`);
         const again = check.results.filter((r) => r.done === false);
-        const retryWo = { changes: again.map((r) => ({ what: r.what, where: r.where, literal: r.literal })), constraints: workOrder.constraints, unclear: [] };
+        const retryWo = { changes: again.map((r) => ({ what: r.what, where: r.where, replaces: r.replaces, literal: r.literal })), constraints: workOrder.constraints, unclear: [] };
         const scan = scanTheme();     // the files as the first pass left them
         const retryBrief = {
           prompt: P.prompt, businessName: P.businessName,
