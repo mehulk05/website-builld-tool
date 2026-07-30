@@ -1083,6 +1083,92 @@ async function qcStitchImages(html) {
   return html;
 }
 
+// ------------------------------------------------------------ Image resolution QC
+// A "blurry" hero is almost always a small image stretched wide, so the reliable
+// test is the image's INTRINSIC pixel width — not a perceptual blur score. Read it
+// straight from the file header (JPEG SOF / PNG IHDR / WebP VP8) using a ranged
+// fetch, so we download a few KB instead of the whole photo.
+function dimsFromBuffer(b) {
+  if (!b || b.length < 24) return null;
+  // PNG: 8-byte signature, then IHDR width/height as big-endian uint32
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) {
+    return { w: b.readUInt32BE(16), h: b.readUInt32BE(20) };
+  }
+  // GIF87a/89a: little-endian uint16 at 6/8
+  if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) {
+    return { w: b.readUInt16LE(6), h: b.readUInt16LE(8) };
+  }
+  // WebP: RIFF....WEBP + VP8 / VP8L / VP8X
+  if (b.slice(0, 4).toString("ascii") === "RIFF" && b.slice(8, 12).toString("ascii") === "WEBP") {
+    const c = b.slice(12, 16).toString("ascii");
+    try {
+      if (c === "VP8X") return { w: 1 + b.readUIntLE(24, 3), h: 1 + b.readUIntLE(27, 3) };
+      if (c === "VP8 ") return { w: b.readUInt16LE(26) & 0x3fff, h: b.readUInt16LE(28) & 0x3fff };
+      if (c === "VP8L") {
+        const n = b.readUInt32LE(21);
+        return { w: (n & 0x3fff) + 1, h: ((n >> 14) & 0x3fff) + 1 };
+      }
+    } catch (e) { return null; }
+  }
+  // JPEG: walk the segment chain to a Start-Of-Frame marker
+  if (b[0] === 0xff && b[1] === 0xd8) {
+    let i = 2;
+    while (i + 9 < b.length) {
+      if (b[i] !== 0xff) { i++; continue; }
+      const m = b[i + 1];
+      if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) {
+        return { h: b.readUInt16BE(i + 5), w: b.readUInt16BE(i + 7) };
+      }
+      if (m === 0xd8 || m === 0xd9 || (m >= 0xd0 && m <= 0xd7)) { i += 2; continue; }
+      i += 2 + b.readUInt16BE(i + 2);
+    }
+  }
+  return null;
+}
+async function imageDims(url) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 12000);
+  try {
+    const r = await fetch(url, { signal: ctl.signal, headers: { Range: "bytes=0-65535", "User-Agent": "Mozilla/5.0 G99Bot" } });
+    if (!r.ok && r.status !== 206) return null;
+    return dimsFromBuffer(Buffer.from(await r.arrayBuffer()));
+  } catch (e) { return null; }
+  finally { clearTimeout(t); }
+}
+// Check every <img> / CSS background image on a page. Anything whose real pixel
+// width is below the threshold would visibly soften when stretched, so swap it for
+// a curated 1600px photo. Returns the cleaned html + a per-image report.
+async function qcImageResolution(html, minWidth = 1000) {
+  if (!html) return { html, report: [] };
+  const urls = [...new Set(
+    [...String(html).matchAll(/https:\/\/[^"'()\s]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"'()\s]*)?/gi)].map((m) => m[0])
+      .concat([...String(html).matchAll(/https:\/\/images\.unsplash\.com\/[^"'()\s]+/gi)].map((m) => m[0]))
+      .concat([...String(html).matchAll(/https:\/\/lh3\.googleusercontent\.com\/aida-public\/[^"'()\s]+/gi)].map((m) => m[0]))
+  )].slice(0, 24);
+  if (!urls.length) return { html, report: [] };
+  const dims = await Promise.all(urls.map((u) => imageDims(u)));
+  const report = []; let ci = 0, swapped = 0;
+  urls.forEach((u, i) => {
+    const d = dims[i];
+    const ok = d && d.w >= minWidth;
+    const row = { url: u.slice(0, 120), w: d ? d.w : null, h: d ? d.h : null, ok: !!ok, action: "kept" };
+    if (!ok) {
+      // unreadable header ≠ broken image (some CDNs refuse ranged reads), so only
+      // replace when we positively measured it as too small
+      if (d) {
+        const repl = CURATED_IMAGES[ci++ % CURATED_IMAGES.length];
+        html = html.split(u).join(repl);
+        row.action = "replaced (too small)"; swapped++;
+      } else {
+        row.action = "unmeasured — kept";
+      }
+    }
+    report.push(row);
+  });
+  if (swapped) console.log(`  image QC: replaced ${swapped}/${urls.length} low-resolution image(s)`);
+  return { html, report };
+}
+
 // ------------------------------------------------------------ Canonical chrome
 // Stitch/Gemini frequently hallucinate nav labels ("CAREES", "SKINRALES") and
 // bake a blurry logo image into the header. Never trust the model's chrome:
@@ -2300,7 +2386,7 @@ async function runJob(job) {
     // 6 — CI watch → auto-fix → auto-merge
     jobStep(job, 5, "running", "Watching CI build checks…");
     let fixes = 0, merged = false;
-    for (let i = 0; i < 90 && !merged; i++) {
+    for (let i = 0; i < 240 && !merged; i++) {
       let st;
       try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); }
       catch (e) { await sleep(10000); continue; }
@@ -2325,7 +2411,7 @@ async function runJob(job) {
       }
       await sleep(10000);
     }
-    if (!merged) throw new Error("CI watch timed out (~15 min) — " + job.prUrl);
+    if (!merged) throw new Error("CI watch timed out after ~40 min — " + job.prUrl);
 
     // 7 — wait for the mu-plugin to activate the theme on the live site
     jobStep(job, 6, "running", "Waiting for deploy + activation on " + job.liveUrl);
@@ -2551,7 +2637,7 @@ async function runEditJob(job) {
     // 5 — CI watch → auto-fix → merge on green
     jobStep(job, 4, "running", "Watching CI build checks…");
     let fixes = 0, merged = false;
-    for (let i = 0; i < 90 && !merged; i++) {
+    for (let i = 0; i < 240 && !merged; i++) {
       let st; try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); } catch (e) { await sleep(10000); continue; }
       jobStep(job, 4, "running", (st.checks || []).map(c => `${c.name}:${c.status}`).join(" ") || "CI starting…");
       if (st.allPass) { await awaitApprovalIfNeeded(job, P.siteId, 4); if (!job.mergedExternally) await localApi("/api/pr-merge", { prUrl: job.prUrl }); merged = true; jobStep(job, 4, "done", job.mergedExternally ? "Merged on GitHub" : `Merged${fixes ? ` after ${fixes} fix(es)` : ""}`); break; }
@@ -2565,7 +2651,7 @@ async function runEditJob(job) {
       }
       await sleep(10000);
     }
-    if (!merged) throw new Error("CI watch timed out — " + job.prUrl);
+    if (!merged) throw new Error("CI watch timed out after ~40 min — " + job.prUrl);
 
     // 6 — refresh registry so lastChange reflects this edit
     jobStep(job, 5, "running", "Updating site registry…");
@@ -2678,14 +2764,14 @@ async function runRestoreJob(job) {
     // a failing build on a known-good tree means something outside it changed).
     jobStep(job, 3, "running", "Watching CI build checks…");
     let merged = false;
-    for (let i = 0; i < 90 && !merged; i++) {
+    for (let i = 0; i < 240 && !merged; i++) {
       let st; try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); } catch (e) { await sleep(10000); continue; }
       jobStep(job, 3, "running", (st.checks || []).map(c => `${c.name}:${c.status}`).join(" ") || "CI starting…");
       if (st.allPass) { await awaitApprovalIfNeeded(job, P.siteId, 3); if (!job.mergedExternally) await localApi("/api/pr-merge", { prUrl: job.prUrl }); merged = true; jobStep(job, 3, "done", job.mergedExternally ? "Merged on GitHub" : "Merged"); break; }
       if (st.anyFail) throw new Error("CI failed on the restore — review it by hand: " + job.prUrl);
       await sleep(10000);
     }
-    if (!merged) throw new Error("CI watch timed out — " + job.prUrl);
+    if (!merged) throw new Error("CI watch timed out after ~40 min — " + job.prUrl);
 
     // 5 — registry
     jobStep(job, 4, "running", "Updating site registry…");
@@ -2940,6 +3026,14 @@ async function generateServiceTemplate(svc, A, composed, ref, city, brief) {
 }
 // Clone the template's <main> for a different service — same layout/classes,
 // swapped name/copy/benefits/imagery. Keeps all 10 pages visually consistent.
+// Shared post-processing for Gemini-generated service pages: same image pipeline
+// as the Stitch path, so a fallback page is never blurrier than a Stitch one.
+async function polishServiceHtml(html) {
+  let h = sharpenStitchImages(html);
+  h = await fixImages(h);
+  const qc = await qcImageResolution(h);
+  return { html: qc.html, report: qc.report };
+}
 async function cloneServicePage(templateMain, svc, A, composed, city) {
   const loc = city ? ` in ${city}` : "";
   const prompt = [
@@ -3489,7 +3583,12 @@ async function runEnrichJob(job) {
     // when the <head> is stripped for the WP template.
     jobStep(job, 2, "running", services.length ? "Scraping existing site's service pages…" : "Building brand guide…");
     const serviceMains = {};
-    if (services.length) {
+    // headerOnly: re-apply just the nav enhancer (dropdown / Brand Guide link) to an
+    // already-built theme. Skips all generation — no AI calls, no page rewrites — so a
+    // nav fix ships in seconds instead of regenerating every service page.
+    if (P.headerOnly) {
+      jobStep(job, 2, "done", "Header-only run — navigation refresh, no pages regenerated");
+    } else if (services.length) {
       let refs = {};
       try { refs = await scrapeExistingServiceRefs(P.existingWebsite, services); } catch (e) { /* fail-soft */ }
       const refCount = Object.keys(refs).length;
@@ -3530,27 +3629,51 @@ async function runEnrichJob(job) {
       const okStitch = (results || []).filter((r) => r.html);
       job.enrichPlan = { ...(job.enrichPlan || {}), engine: okStitch.length ? "stitch" : "gemini", grounded: refCount, composedBriefs: composedCount, mimicked: refStruct ? refStruct.url : null };
       if (okStitch.length) {
-        for (const r of okStitch) { serviceMains[r.key] = embedPageAssets(r.html); svcStatus(job, r.key, "done", "stitch"); }
+        // Run the SAME image pipeline the build path uses — this was the gap that
+        // made service-page heroes blurry: Stitch serves a ~512px thumbnail unless
+        // the URL asks for full resolution, and enrich skipped the sharpener.
+        job.imageReport = job.imageReport || {};
+        for (const r of okStitch) {
+          let h = sharpenStitchImages(r.html);        // 512px thumb -> native 1600px
+          h = await fixImages(h);                     // drop broken/expiring URLs
+          h = await qcStitchImages(h);                // swap text-baked images
+          const qc = await qcImageResolution(h);      // measure + replace low-res
+          h = qc.html;
+          job.imageReport[r.key] = qc.report;
+          serviceMains[r.key] = embedPageAssets(h);
+          svcStatus(job, r.key, "done", "stitch");
+        }
+        saveJobs();
         // any page Stitch missed: Gemini-clone it from the first good one
         const template = serviceMains[okStitch[0].key];
         for (const s of services) {
           if (serviceMains[s.slug]) continue;
           svcStatus(job, s.slug, "generating", "gemini");
           jobStep(job, 2, "running", `Stitch missed ${s.name} — cloning from template…`);
-          try { serviceMains[s.slug] = await cloneServicePage(template, s, A, composed, city); svcStatus(job, s.slug, "done", "gemini"); }
+          try {
+            const p = await polishServiceHtml(await cloneServicePage(template, s, A, composed, city));
+            serviceMains[s.slug] = p.html; job.imageReport[s.slug] = p.report;
+            svcStatus(job, s.slug, "done", "gemini");
+          }
           catch (e) { serviceMains[s.slug] = template; svcStatus(job, s.slug, "error", "gemini"); }
         }
       } else {
         // full fallback: Gemini template → clone path (uses the composed brief too)
         jobStep(job, 2, "running", "Stitch unavailable — generating with Gemini…");
         svcStatus(job, services[0].slug, "generating", "gemini");
-        const template = await generateServiceTemplate(services[0], A, composed, ref, city, briefs[services[0].slug]);
+        let template = await generateServiceTemplate(services[0], A, composed, ref, city, briefs[services[0].slug]);
+        job.imageReport = job.imageReport || {};
+        { const p = await polishServiceHtml(template); template = p.html; job.imageReport[services[0].slug] = p.report; }
         serviceMains[services[0].slug] = template;
         svcStatus(job, services[0].slug, "done", "gemini");
         for (let i = 1; i < services.length; i++) {
           svcStatus(job, services[i].slug, "generating", "gemini");
           jobStep(job, 2, "running", `Cloning page ${i + 1}/${services.length}: ${services[i].name}`);
-          try { serviceMains[services[i].slug] = await cloneServicePage(template, services[i], A, composed, city); svcStatus(job, services[i].slug, "done", "gemini"); }
+          try {
+            const p = await polishServiceHtml(await cloneServicePage(template, services[i], A, composed, city));
+            serviceMains[services[i].slug] = p.html; job.imageReport[services[i].slug] = p.report;
+            svcStatus(job, services[i].slug, "done", "gemini");
+          }
           catch (e) { serviceMains[services[i].slug] = template; svcStatus(job, services[i].slug, "error", "gemini"); }
         }
       }
@@ -3560,16 +3683,18 @@ async function runEnrichJob(job) {
     jobStep(job, 2, "done", `${services.length + 1} page(s) generated`);
 
     // 4 — write files + push + PR
-    jobStep(job, 3, "running", "Writing pages + opening PR…");
+    jobStep(job, 3, "running", P.headerOnly ? "Rewriting the header + opening PR…" : "Writing pages + opening PR…");
     const changed = [];
-    for (const s of services) {
-      const f = `page-service-${s.slug}.php`;
-      fs.writeFileSync(path.join(themeAbs, f), enrichPageTemplate(s.name, serviceMains[s.slug]));
-      changed.push(`${P.themePath}/${f}`);
+    if (!P.headerOnly) {
+      for (const s of services) {
+        const f = `page-service-${s.slug}.php`;
+        fs.writeFileSync(path.join(themeAbs, f), enrichPageTemplate(s.name, serviceMains[s.slug]));
+        changed.push(`${P.themePath}/${f}`);
+      }
+      if (services.length) { fs.writeFileSync(path.join(themeAbs, "page-services.php"), enrichPageTemplate("Treatments", hubMain)); changed.push(`${P.themePath}/page-services.php`); }
+      fs.writeFileSync(path.join(themeAbs, "page-brand-guide.php"), enrichPageTemplate("Brand Guide", brandMain));
+      changed.push(`${P.themePath}/page-brand-guide.php`);
     }
-    if (services.length) { fs.writeFileSync(path.join(themeAbs, "page-services.php"), enrichPageTemplate("Treatments", hubMain)); changed.push(`${P.themePath}/page-services.php`); }
-    fs.writeFileSync(path.join(themeAbs, "page-brand-guide.php"), enrichPageTemplate("Brand Guide", brandMain));
-    changed.push(`${P.themePath}/page-brand-guide.php`);
     // append the Treatments hover-dropdown enhancer to the (static) theme header,
     // so the service pages show as a dropdown in the top nav. Idempotent.
     if (services.length) {
@@ -3588,12 +3713,16 @@ async function runEnrichJob(job) {
       }
     }
     // regenerate the mu-plugin so the new pages + Treatments menu get provisioned
-    const buildId = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "");
-    fs.mkdirSync(path.dirname(muAbs), { recursive: true });
-    fs.writeFileSync(muAbs, wpActivatorPluginEnriched(slug, P.businessName, buildId, services));
-    changed.push(P.muPath);
-    job.editPlan = changed.map((p) => ({ path: p, op: "create" }));
-    job.editSummary = `${services.length} service page(s) + brand guide`;
+    // (skipped for a header-only run — the pages are already provisioned)
+    if (!P.headerOnly) {
+      const buildId = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "");
+      fs.mkdirSync(path.dirname(muAbs), { recursive: true });
+      fs.writeFileSync(muAbs, wpActivatorPluginEnriched(slug, P.businessName, buildId, services));
+      changed.push(P.muPath);
+    }
+    if (!changed.length) throw new Error("nothing to change — the header already matches the current enhancer");
+    job.editPlan = changed.map((p) => ({ path: p, op: P.headerOnly ? "modify" : "create" }));
+    job.editSummary = P.headerOnly ? "Navigation fix (Treatments dropdown scope)" : `${services.length} service page(s) + brand guide`;
 
     if (dry) {
       job.previewDir = themeAbs;
@@ -3606,15 +3735,20 @@ async function runEnrichJob(job) {
     }
 
     const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
-    const branch = `g99/enrich-${slug}-${stamp}`;
+    const branch = `g99/${P.headerOnly ? "nav" : "enrich"}-${slug}-${stamp}`;
+    const title = P.headerOnly
+      ? `Fix ${P.businessName}: scope the Treatments dropdown to its own nav item`
+      : `Enrich ${P.businessName}: service pages + brand guide`;
     await run(`git checkout -b "${branch}"`, tmp);
     await run(`git add -A "${P.themePath}" "${P.muPath}"`, tmp);
-    r = await run(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "Enrich ${P.businessName}: ${services.length} service pages + brand guide"`, tmp);
+    r = await run(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "${title.replace(/"/g, "'")}"`, tmp);
     if (r.code) throw new Error("commit failed (no changes?): " + (r.stderr || r.stdout).slice(-160));
     r = await runRetry(`git push -u origin "${branch}"`, tmp);
     if (r.code) throw new Error("push failed: " + r.stderr.slice(-200));
-    const prBody = `Automated enrichment for **${P.businessName}**.\\n\\nAdds ${services.length} individual service page(s) (${services.map((s) => s.name).join(", ") || "none"}) under a Treatments dropdown, a services hub, and a public Brand Guide.${truncated ? `\\n\\n> Services capped at ${MAX_SERVICE_PAGES} of ${total}.` : ""}`;
-    r = await runRetry(`gh pr create --repo ${repo} --base main --head "${branch}" --title "Enrich ${P.businessName}: service pages + brand guide" --body "${prBody}"`, tmp);
+    const prBody = P.headerOnly
+      ? `Navigation fix for **${P.businessName}**.\\n\\nThe dropdown enhancer wrapped the whole nav container (these themes have no <li>), so hovering Home / Team / Contact opened the Treatments menu. It now wraps only the Treatments link.\\n\\nHeader template only — no pages regenerated.`
+      : `Automated enrichment for **${P.businessName}**.\\n\\nAdds ${services.length} individual service page(s) (${services.map((s) => s.name).join(", ") || "none"}) under a Treatments dropdown, a services hub, and a public Brand Guide.${truncated ? `\\n\\n> Services capped at ${MAX_SERVICE_PAGES} of ${total}.` : ""}`;
+    r = await runRetry(`gh pr create --repo ${repo} --base main --head "${branch}" --title "${title.replace(/"/g, "'")}" --body "${prBody}"`, tmp);
     job.prUrl = (r.stdout.match(/https:\/\/github\.com\/\S+/) || [""])[0];
     job.branch = branch;
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -3624,7 +3758,7 @@ async function runEnrichJob(job) {
     // 5 — CI watch → auto-fix → merge on green (same rails as edit)
     jobStep(job, 4, "running", "Watching CI build checks…");
     let fixes = 0, merged = false;
-    for (let i = 0; i < 90 && !merged; i++) {
+    for (let i = 0; i < 240 && !merged; i++) {
       let st; try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); } catch (e) { await sleep(10000); continue; }
       jobStep(job, 4, "running", (st.checks || []).map((c) => `${c.name}:${c.status}`).join(" ") || "CI starting…");
       if (st.allPass) { await awaitApprovalIfNeeded(job, P.siteId, 4); await localApi("/api/pr-merge", { prUrl: job.prUrl }); merged = true; jobStep(job, 4, "done", `Merged${fixes ? ` after ${fixes} fix(es)` : ""}`); break; }
@@ -3638,7 +3772,7 @@ async function runEnrichJob(job) {
       }
       await sleep(10000);
     }
-    if (!merged) throw new Error("CI watch timed out — " + job.prUrl);
+    if (!merged) throw new Error("CI watch timed out after ~40 min — " + job.prUrl);
 
     // 6 — refresh registry
     jobStep(job, 5, "running", "Updating site registry…");
@@ -3945,6 +4079,77 @@ const server = http.createServer(async (req, res) => {
       catch (e) { return json(res, 502, { error: e.message }); }
     }
 
+    // Image-quality audit of a LIVE site: measures every image's true pixel size on
+    // the home page + services hub + each service page, so "are the images blurry?"
+    // is answered from inside the tool instead of by hand.
+    if (p === "/api/image-audit" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req) || "{}");
+      let base = body.url || "";
+      let slugs = Array.isArray(body.pages) ? body.pages : null;
+      if (!base && body.siteId) {
+        const site = await findWebsite(body.siteId);
+        if (!site) return json(res, 404, { error: "unknown site — refresh the list" });
+        if (!site.liveUrl) return json(res, 400, { error: "This website has no Domain set in NocoDB — nothing to audit." });
+        base = site.liveUrl;
+        if (!slugs) {
+          // derive the page list from the newest enrich run for this site
+          const e = [...JOBS.values()]
+            .filter((j) => j.type === "enrich" && j.servicePages && j.payload && j.payload.siteId === body.siteId)
+            .sort((a, b) => (b.finishedAt || b.createdAt || "").localeCompare(a.finishedAt || a.createdAt || ""))[0];
+          slugs = e ? e.servicePages.map((s) => s.slug) : [];
+        }
+      }
+      if (!base) return json(res, 400, { error: "siteId or url required" });
+      const origin = String(base).replace(/\/+$/, "");
+      const paths = ["/", "/services/", ...(slugs || []).map((s) => "/" + s + "/"), "/brand-guide/"];
+      const MIN = Number(body.minWidth) || 1000;
+      const pages = [];
+      for (const p2 of paths) {
+        const url = origin + p2 + "?g99imgqc=" + Date.now();
+        let html = "";
+        try { html = await (await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 G99Bot", "Cache-Control": "no-cache" } })).text(); }
+        catch (e) { pages.push({ path: p2, error: e.message.slice(0, 120), images: [] }); continue; }
+        const main = (html.match(/<main[\s\S]*?<\/main>/i) || [html])[0];
+        const urls = [...new Set(
+          [...main.matchAll(/https:\/\/lh3\.googleusercontent\.com\/aida-public\/[^"'()\s]+/g)].map((m) => m[0])
+            .concat([...main.matchAll(/https:\/\/images\.unsplash\.com\/[^"'()\s]+/g)].map((m) => m[0]))
+            .concat([...main.matchAll(/https:\/\/[^"'()\s]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"'()\s]*)?/gi)].map((m) => m[0]))
+        )].slice(0, 30);
+        const dims = await Promise.all(urls.map((x) => imageDims(x)));
+        const images = urls.map((x, i) => ({
+          url: x.slice(0, 140), w: dims[i] ? dims[i].w : null, h: dims[i] ? dims[i].h : null,
+          ok: !!(dims[i] && dims[i].w >= MIN),
+          measured: !!dims[i],
+        }));
+        const measured = images.filter((x) => x.measured);
+        pages.push({
+          path: p2, total: images.length,
+          measured: measured.length,
+          low: measured.filter((x) => !x.ok).length,
+          minWidth: measured.length ? Math.min(...measured.map((x) => x.w)) : null,
+          maxWidth: measured.length ? Math.max(...measured.map((x) => x.w)) : null,
+          images,
+        });
+      }
+      const totals = pages.reduce((a, p2) => ({ total: a.total + (p2.total || 0), low: a.low + (p2.low || 0) }), { total: 0, low: 0 });
+      const out = { site: origin, minWidth: MIN, checkedAt: new Date().toISOString(), pages, totals, pass: totals.low === 0 };
+      try {
+        const f = path.join(GEN, "image-audits.json");
+        const all = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, "utf8")) : {};
+        all[body.siteId || origin] = out;
+        fs.writeFileSync(f, JSON.stringify(all, null, 2));
+      } catch (e) { /* non-fatal */ }
+      return json(res, 200, out);
+    }
+    if (p === "/api/image-audit") {
+      try {
+        const f = path.join(GEN, "image-audits.json");
+        const all = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, "utf8")) : {};
+        const k = u.searchParams.get("siteId") || "";
+        return json(res, 200, k ? (all[k] || {}) : all);
+      } catch (e) { return json(res, 200, {}); }
+    }
+
     // Real websites from NocoDB (name / domain / repo). ?refresh=1 bypasses the
     // 60s cache. Approval flags are merged in from the local store.
     if (p === "/api/sites") {
@@ -4130,11 +4335,14 @@ const server = http.createServer(async (req, res) => {
             : null;
       if (!src) return json(res, 409, { error: "No onboarding data for this theme in memory — enrichment auto-runs after a build; trigger it right after building." });
       const job = enqueueEnrichJob({
-        jobId: "enrich-" + Date.now(), businessId: src.businessId, liveUrl: site.liveUrl,
+        jobId: (body0.headerOnly ? "nav-" : "enrich-") + Date.now(), businessId: src.businessId, liveUrl: site.liveUrl,
         siteId, businessName: site.businessName, githubRepo: site.githubRepo,
         themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
         answers: src.answers, composed: src.composed, referenceWebsite: src.referenceWebsite || "",
-        existingWebsite: src.existingWebsite || "",
+        // fall back to the answers' current-site field so content grounding isn't
+        // silently skipped when the source build's payload lacks existingWebsite
+        existingWebsite: src.existingWebsite || (src.answers || {}).existing_website || (src.answers || {}).current_website || "",
+        headerOnly: !!body0.headerOnly,
       });
       return json(res, 202, { jobId: job.draftId, status: job.status, monitor: "/jobs" });
     }

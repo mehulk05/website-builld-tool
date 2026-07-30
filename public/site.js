@@ -12,6 +12,41 @@ let SITE = null, JOBS = [], AUDIT = null, TARGET = { history: [] };
 // A CRO audit fetches the page, screenshots it and runs a Gemini pass — tens of
 // seconds. Track it so the UI can show elapsed time instead of a bare spinner.
 let AUDITING = false, auditStarted = 0, auditTick;
+// Image-quality audit of the live site (true pixel size of every image).
+let IMG = null, IMG_RUNNING = false;
+
+function imageCard() {
+  if (!IMG && !IMG_RUNNING) return "";
+  if (IMG_RUNNING) {
+    return `<div class="card pad">
+      <div class="card-h"><h2>Image quality</h2></div>
+      <p class="empty" style="padding:16px 0"><span class="spin"></span>Measuring every image on the live site…</p>
+    </div>`;
+  }
+  const t = IMG.totals || { total: 0, low: 0 };
+  const rows = (IMG.pages || []).filter((p) => p.total || p.error).map((p) => {
+    const bad = p.low > 0;
+    return `<div class="disc" style="align-items:center">
+      <span class="lb" style="font-family:var(--mono);font-size:11.5px">${esc(p.path)}</span>
+      <span style="flex:1;font-size:12.5px;color:var(--muted)">${p.error
+        ? esc(p.error)
+        : `${p.total} image${p.total === 1 ? "" : "s"}${p.minWidth ? ` · ${p.minWidth}–${p.maxWidth}px wide` : ""}`}</span>
+      <span class="pill ${p.error ? "" : bad ? "bad" : "good"}">${p.error ? "unreachable" : bad ? p.low + " low-res" : "sharp"}</span>
+    </div>`;
+  }).join("");
+  return `<div class="card pad">
+    <div class="card-h">
+      <h2>Image quality</h2>
+      <span class="right pill ${IMG.pass ? "good" : "bad"}">${IMG.pass ? "All sharp" : t.low + " need attention"}</span>
+    </div>
+    <p style="font-size:12.5px;color:var(--ink-3);margin:0 0 10px">
+      ${t.total} image${t.total === 1 ? "" : "s"} measured at their true pixel size across ${(IMG.pages || []).length} page(s).
+      Anything under ${IMG.minWidth}px wide looks soft when stretched.
+    </p>
+    ${rows}
+    <div style="font-size:11.5px;color:var(--muted);margin-top:10px">Checked ${esc(relTime(IMG.checkedAt))}</div>
+  </div>`;
+}
 
 const verdict = (d) => d == null ? "Not audited yet" : d >= 15 ? "Significant improvement" : d >= 5 ? "Improved" : d >= 0 ? "Stable" : "Regressed";
 
@@ -318,6 +353,7 @@ function render() {
       <div class="acts">
         <button class="btn" id="reauditTop"${AUDITING ? " disabled" : ""}>${svg("chart", 15)}${AUDIT ? "Re-audit" : "Run CRO audit"}</button>
         <button class="btn" id="enrichBtn">${svg("spark", 15)}Add service pages</button>
+        <button class="btn" id="imgBtn"${IMG_RUNNING ? " disabled" : ""}>${svg("panel", 15)}${IMG_RUNNING ? "Checking images…" : "Check images"}</button>
         <button class="btn" id="editWith">${svg("code", 15)}Edit with…</button>
         <a class="btn primary" href="/edit?site=${encodeURIComponent(SITE.siteId)}">${svg("edit", 15)}Edit this site</a>
       </div>
@@ -343,6 +379,8 @@ function render() {
       </div>
       ${healthCard()}
     </div>
+
+    ${imageCard()}
 
     <div class="two flip">
       ${targetCard()}
@@ -416,6 +454,16 @@ function wire() {
       setTimeout(() => { location.href = "/job?id=" + encodeURIComponent(d.jobId); }, 800);
     } catch (e) { eb.disabled = false; toast("Could not start: " + (e.message || "failed")); }
   };
+  const ib = $("imgBtn");
+  if (ib) ib.onclick = async () => {
+    IMG_RUNNING = true; render();
+    try { IMG = await postJSON("/api/image-audit", { siteId: SITE.siteId }); }
+    catch (e) { toast("Image check failed: " + (e.message || "failed")); }
+    finally {
+      IMG_RUNNING = false; render();
+      if (IMG) toast(IMG.pass ? `All ${IMG.totals.total} images are sharp` : `${IMG.totals.low} low-resolution image(s) found`);
+    }
+  };
   const ew = $("editWith"); if (ew) ew.onclick = ideModal;
 
   const t = $("apprToggle");
@@ -438,15 +486,17 @@ function wire() {
 async function load() {
   if (!ID) { $("wrap").innerHTML = '<p class="empty">No site id. <a href="/sites">← all sites</a></p>'; return; }
   try {
-    const [sitesRes, jobsRes, auditRes] = await Promise.all([
+    const [sitesRes, jobsRes, auditRes, imgRes] = await Promise.all([
       getJSON("/api/sites"),
       getJSON("/api/jobs").catch(() => ({ jobs: [] })),
       getJSON("/api/site-audit?siteId=" + encodeURIComponent(ID)).catch(() => null),
+      getJSON("/api/image-audit?siteId=" + encodeURIComponent(ID)).catch(() => null),
     ]);
     SITE = (sitesRes.sites || []).find((s) => s.siteId === ID);
     if (!SITE) { $("wrap").innerHTML = '<p class="empty">That website is no longer in NocoDB. <a href="/sites">← all sites</a></p>'; return; }
     JOBS = jobsRes.jobs || [];
     AUDIT = auditRes && typeof auditRes.overall === "number" ? auditRes : null;
+    IMG = imgRes && imgRes.pages ? imgRes : null;   // last image audit, if any
     document.title = "Growth99 · " + SITE.businessName;
 
     render();
