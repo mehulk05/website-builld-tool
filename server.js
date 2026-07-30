@@ -104,6 +104,79 @@ let PROTO = "2025-06-18";
 let rpcId = 0;
 let PROJECT = null; // reused across pages within a run
 
+// ---- Ollama Cloud, as a second provider for the edit chat only -------------
+// Gemini remains the default and the only provider for builds, CRO audits,
+// enrichment and the email matcher. This exists so an operator editing a site
+// from the chat can try a different model, and so the tool is not wholly
+// dependent on one Gemini key.
+const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || "";
+const OLLAMA_MODELS = [
+  { id: "glm-5.2:cloud",      label: "GLM 5.2" },
+  { id: "kimi-k3:cloud",      label: "Kimi K3" },
+  { id: "gemma4:31b-cloud",   label: "Gemma 4 31B" },
+  { id: "qwen3.5:397b-cloud", label: "Qwen 3.5 397B" },
+];
+const isOllamaModel = (m) => OLLAMA_MODELS.some((x) => x.id === m);
+
+// OpenAI-compatible endpoint rather than the native one: it gives a real JSON
+// mode, which the edit planner depends on.
+async function ollamaCall(parts, opts = {}) {
+  if (!OLLAMA_API_KEY) throw new Error("OLLAMA_API_KEY is not set");
+  const content = parts.map((p) => p.text || "").join("\n");
+  const body = {
+    model: opts.model,
+    messages: [
+      ...(opts.system ? [{ role: "system", content: opts.system }] : []),
+      { role: "user", content },
+    ],
+    temperature: opts.temperature ?? 0.5,
+    // Every model offered here reasons before answering, and that reasoning
+    // spends the same budget as the answer. Too small a ceiling returns an
+    // empty message rather than an error, so keep a floor under it.
+    max_tokens: Math.max(opts.maxOutputTokens ?? 8000, 4000),
+    stream: false,
+  };
+  if (opts.json) body.response_format = { type: "json_object" };
+
+  const ctl = new AbortController();
+  // These are large models; the Gemini-sized timeouts are not enough.
+  const timer = setTimeout(() => ctl.abort(), opts.timeoutMs || 180000);
+  try {
+    const r = await fetch("https://ollama.com/v1/chat/completions", {
+      method: "POST", signal: ctl.signal,
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${OLLAMA_API_KEY}` },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(`ollama ${r.status}: ${String((d.error && (d.error.message || d.error)) || "").slice(0, 140)}`);
+    const choice = (d.choices || [])[0] || {};
+    const txt = (choice.message && choice.message.content) || "";
+    if (!txt) {
+      throw new Error(choice.finish_reason === "length"
+        ? `${opts.model} ran out of output budget before answering (reasoning consumed it)`
+        : `${opts.model} returned an empty response`);
+    }
+    bumpUsage("gemini");   // one meter for AI calls; provider is recorded on the job
+    return txt;
+  } finally { clearTimeout(timer); }
+}
+
+// Single entry point for the edit path. Anything that is not a known Ollama
+// model — including no choice at all — goes to Gemini untouched.
+async function aiCall(parts, opts = {}) {
+  const model = String(opts.aiModel || "").trim();
+  if (!model || model === "gemini" || !isOllamaModel(model)) return geminiCall(parts, opts);
+  try {
+    return await ollamaCall(parts, { ...opts, model });
+  } catch (e) {
+    // A model someone picked to experiment with must not kill a real request.
+    // The job records which model actually produced the change.
+    console.warn(`ollama ${model} failed — falling back to Gemini:`, e.message);
+    if (typeof opts.onFallback === "function") opts.onFallback(model, e.message);
+    return geminiCall(parts, opts);
+  }
+}
+
 async function rpc(method, params, notify = false, timeoutMs = 90000) {
   const body = { jsonrpc: "2.0", method };
   if (!notify) body.id = ++rpcId;
@@ -1979,7 +2052,7 @@ function newJob(payload) {
   };
 }
 
-const EDIT_STEPS = ["Pull latest code", "Plan the edit (AI)", "Apply changes (AI)", "Push + open PR", "CI checks → auto-merge", "Sync registry"];
+const EDIT_STEPS = ["Pull latest code", "Plan the edit (AI)", "Apply changes (AI)", "Check the work", "Push + open PR", "CI checks → auto-merge", "Sync registry"];
 function newEditJob(payload) {
   return {
     type: "edit",
@@ -1988,7 +2061,7 @@ function newEditJob(payload) {
     status: "queued", currentStep: 0,
     steps: EDIT_STEPS.map((label) => ({ label, status: "pending", detail: "" })),
     payload, prUrl: null, branch: null, siteUrl: null,
-    editPlan: null, editSummary: null, error: null,
+    editPlan: null, editSummary: null, workOrder: null, verification: null, retried: false, error: null,
     cost: { gemini: 0, stitch: 0 }, cancelRequested: false, awaitingApproval: false,
     createdAt: new Date().toISOString(), startedAt: null, finishedAt: null,
   };
@@ -2456,27 +2529,281 @@ const THEME_CONVENTIONS = `This is a classic WordPress (Roots Bedrock) theme at 
 
 function stripFence(t) { return String(t || "").replace(/^```(?:json|php|html)?\s*\n?/i, "").replace(/\n?```\s*$/i, "").trim(); }
 
-async function editPlan(manifest, prompt) {
+// ---- 1. The work order ------------------------------------------------------
+// A change request arrives as prose. An email especially: background, three
+// separate asks buried in one paragraph, a constraint, and a sign-off. The
+// planner used to read that raw while it was also choosing files, so it was
+// inferring intent and locating code in the same breath. Doing this first
+// splits the two — a flat, checkable list of changes with the sender's exact
+// wording preserved, so the planner only has to decide where each one lands.
+async function buildWorkOrder(prompt, ctx, ai) {
   const p = [
-    `You are editing an existing WordPress theme. Decide the MINIMAL set of files to create/modify/delete to satisfy the change request. Touch only files under the theme dir or its mu-plugin.`,
+    "Read the website change request below and restate it as a work order.",
+    "You are not designing anything and not improving anything — only restating what was actually asked, precisely.",
+    (ctx && ctx.businessName) ? `The website is "${ctx.businessName}".` : "",
+    "",
+    "RULES:",
+    "- One entry per distinct change. A request asking for three things produces three entries.",
+    "- If the sender gave exact wording (usually in quotes), copy it character-for-character into \"literal\". Never reword, retitle or 'improve' it.",
+    "- \"where\" is the sender's own words for the location (\"homepage hero\", \"the footer\"). Do not guess a filename.",
+    "- Anything the sender said to leave alone goes in \"constraints\".",
+    "- Anything too vague to act on without guessing goes in \"unclear\", and NOT in \"changes\".",
+    "- Ignore greetings, sign-offs, thanks, deadlines and background chat.",
+    "",
+    "REQUEST:", "-----", String(prompt || "").slice(0, 6000), "-----",
+    "",
+    'Return ONLY minified JSON: {"summary":"one line covering the whole request","changes":[{"what":"the change, imperative","where":"where on the site, in the sender\'s words","literal":"exact text they specified, or empty"}],"constraints":["things to leave alone"],"unclear":["parts too vague to action"]}',
+  ].filter(Boolean).join("\n");
+  const raw = await aiCall([{ text: p }], { ...(ai || {}), temperature: 0.1, maxOutputTokens: 1500, timeoutMs: 45000, json: true });
+  const d = JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
+  const arr = (v) => (Array.isArray(v) ? v.map((x) => String(x || "").trim()).filter(Boolean).slice(0, 10) : []);
+  const changes = (Array.isArray(d.changes) ? d.changes : []).slice(0, 10)
+    .map((c) => ({ what: String((c && c.what) || "").trim(), where: String((c && c.where) || "").trim(), literal: String((c && c.literal) || "").trim() }))
+    .filter((c) => c.what);
+  // No usable items means the extraction misread the request, not that the
+  // request was empty — the raw prose is a better brief than an empty list.
+  if (!changes.length) return null;
+  return { summary: String(d.summary || "").trim(), changes, constraints: arr(d.constraints), unclear: arr(d.unclear) };
+}
+
+// The work order as both the planner and the file writer see it.
+function workOrderText(wo) {
+  if (!wo) return "";
+  const lines = ["WORK ORDER — do every numbered item, and nothing beyond them:"];
+  wo.changes.forEach((c, i) => {
+    lines.push(`${i + 1}. ${c.what}${c.where ? ` — location: ${c.where}` : ""}`);
+    if (c.literal) lines.push(`   EXACT TEXT, use character-for-character and do not reword: ${c.literal}`);
+  });
+  if (wo.constraints.length) lines.push("", "LEAVE ALONE:", ...wo.constraints.map((c) => `- ${c}`));
+  if (wo.unclear.length) lines.push("", "TOO VAGUE TO ACTION — skip these entirely rather than guessing:", ...wo.unclear.map((c) => `- ${c}`));
+  return lines.join("\n");
+}
+
+// ---- 2. Where things live ---------------------------------------------------
+// The planner used to receive filenames and byte counts, so "change the hero
+// headline" meant guessing between front-page.php, header.php and index.php.
+// These replace the guess with a lookup: an outline of what each file actually
+// contains, and the exact lines where the request's own words already appear.
+const TEXTUAL = /\.(php|html|css|js|txt|md)$/i;
+
+function fileOutline(content) {
+  const out = [];
+  const push = (s) => {
+    s = String(s).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    if (s.length >= 3 && s.length <= 80 && !out.includes(s)) out.push(s);
+  };
+  // Stop at the comment terminator: these headers sit inside "/* … */ ?>", and
+  // taking the rest of the line put that punctuation in the outline.
+  const tpl = content.match(/Template Name:\s*(.+?)\s*(?:\*\/|-->|\?>|$)/);
+  if (tpl) push("template: " + tpl[1]);
+  for (const m of content.matchAll(/<h([1-3])[^>]*>([\s\S]{0,160}?)<\/h\1>/gi)) push("h" + m[1] + ": " + m[2]);
+  for (const m of content.matchAll(/\sid="([a-z][a-z0-9_-]{2,28})"/gi)) push("#" + m[1]);
+  for (const m of content.matchAll(/<!--\s*([^>]{3,60}?)\s*-->/g)) push("note: " + m[1]);
+  return out.slice(0, 14);
+}
+
+// Worth searching for: the things a sender names that either already exist in
+// the code or deliberately don't — copy they quoted, a phone number, an email,
+// a URL. Ordinary prose words are left out; they match everywhere and prove
+// nothing.
+function requestTerms(prompt, wo) {
+  const terms = [];
+  // Compared on letters and digits only. "(602) 555-9090" and "602) 555-9090"
+  // are the same search, and keeping both wasted a slot and printed the same
+  // answer twice.
+  const keys = new Set();
+  const add = (s) => {
+    s = String(s || "").trim();
+    const key = s.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (s.length < 4 || s.length > 90 || key.length < 3 || keys.has(key)) return;
+    keys.add(key); terms.push(s);
+  };
+  const text = String(prompt || "");
+  // Double quotes only. A straight ' is an apostrophe far more often than a
+  // quote mark — treating it as a delimiter turned "it's now … Don't" into a
+  // search for "s now … Don".
+  for (const m of text.matchAll(/["“”]([^"“”]{4,90})["“”]/g)) add(m[1]);
+  for (const m of text.matchAll(/‘([^’]{4,90})’/g)) add(m[1]);
+  for (const m of text.matchAll(/\+?\(?\d[\d\s().-]{7,}\d/g)) add(m[0].trim());
+  for (const m of text.matchAll(/[\w.+-]+@[\w-]+\.[\w.]{2,}/g)) add(m[0]);
+  for (const m of text.matchAll(/https?:\/\/\S{4,}/g)) add(m[0].replace(/[.,)]+$/, ""));
+  if (wo) for (const c of wo.changes) if (c.literal) add(c.literal);
+  return terms.slice(0, 12);
+}
+
+function locateTerms(files, terms) {
+  const hits = [];
+  for (const t of terms) {
+    const needle = t.toLowerCase();
+    // A phone number in the markup is rarely punctuated the way it is in an
+    // email, so match those on their digits alone.
+    const digits = (t.match(/\d/g) || []).join("");
+    const tail = digits.length >= 7 ? digits.slice(-7) : null;
+    const found = [];
+    for (const f of files) {
+      if (found.length >= 4) break;
+      const lines = f.content.split("\n");
+      for (let i = 0; i < lines.length && found.length < 4; i++) {
+        const L = lines[i];
+        if (L.toLowerCase().includes(needle) || (tail && (L.match(/\d/g) || []).join("").includes(tail))) {
+          found.push(`${f.rel}:${i + 1} → ${L.trim().slice(0, 110)}`);
+        }
+      }
+    }
+    hits.push({ term: t, found });
+  }
+  return hits;
+}
+
+function evidenceText(hits) {
+  if (!hits.length) return "";
+  const lines = ["WHERE THE REQUEST'S OWN WORDS ALREADY APPEAR (found by searching the theme, not by guessing):"];
+  for (const h of hits) {
+    if (h.found.length) { lines.push(`"${h.term}"`); for (const f of h.found) lines.push("   " + f); }
+    else lines.push(`"${h.term}" — appears nowhere in the theme, so this is new content rather than an edit to existing text.`);
+  }
+  return lines.join("\n");
+}
+function outlineText(outline) {
+  if (!outline.length) return "";
+  return ["WHAT EACH FILE ACTUALLY CONTAINS (headings, section ids and template names read out of the code):",
+    ...outline.map((o) => `- ${o.rel}: ${o.items.join(" | ")}`)].join("\n");
+}
+
+async function editPlan(manifest, req, ai) {
+  const p = [
+    `You are editing an existing WordPress theme${req.businessName ? ` for "${req.businessName}"` : ""}. Decide the MINIMAL set of files to create/modify/delete that satisfies the request — nothing more. Touch only files under the theme dir or its mu-plugin.`,
     THEME_CONVENTIONS,
     `\nFILES PRESENT (path — bytes):\n${manifest.map(f => `- ${f.path} (${f.bytes})`).join("\n")}`,
-    `\nCHANGE REQUEST:\n${prompt}`,
+    req.outline ? "\n" + req.outline : "",
+    req.evidence ? "\n" + req.evidence : "",
+    `\nCHANGE REQUEST, VERBATIM:\n-----\n${req.prompt}\n-----`,
+    req.workOrder ? "\n" + req.workOrder : "",
+    `\nEvery item in the request needs a file entry, and nothing that was not asked for gets one. Each "instruction" must stand on its own — the model writing that file sees only it — and must repeat any exact wording the sender gave.`,
     `\nReturn ONLY minified JSON: {"summary":"one line of what you'll change","files":[{"path":"web/app/…","op":"create|modify|delete","instruction":"precise instruction for THIS file"}]}`,
-  ].join("\n");
-  const raw = await geminiCall([{ text: p }], { temperature: 0.2, maxOutputTokens: 3000, timeoutMs: 60000 });
+  ].filter(Boolean).join("\n");
+  const raw = await aiCall([{ text: p }], { ...(ai || {}), temperature: 0.2, maxOutputTokens: 3000, timeoutMs: 60000, json: true });
   return JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
 }
-async function editFileContent(op, path_, instruction, currentContent, planContext) {
+async function editFileContent(op, path_, instruction, currentContent, planContext, ai, req) {
   const p = [
     `You are ${op === "create" ? "creating" : "rewriting"} the file ${path_} in a WordPress theme. Output the COMPLETE final file content — no markdown fences, no commentary.`,
     THEME_CONVENTIONS,
     planContext ? `\nThis change spans multiple files — use these EXACT paths/filenames when one references another (e.g. a mu-plugin 'template' must match the created page-*.php filename here):\n${planContext}` : "",
+    // 3. The per-file instruction is the planner's summary of someone else's
+    // words. Carrying the request itself down here as well is what stops copy
+    // the client dictated from being quietly reworded on the way to the file.
+    (req && req.prompt) ? `\nWHAT THE CLIENT ASKED FOR, VERBATIM. Anything they put in quotes is literal — reproduce it character-for-character rather than writing your own version:\n-----\n${String(req.prompt).slice(0, 4000)}\n-----` : "",
+    (req && req.workOrder) ? "\n" + req.workOrder : "",
     op === "modify" ? `\nCURRENT CONTENT:\n-----\n${currentContent}\n-----` : "",
-    `\nDO THIS:\n${instruction}`,
-    op === "modify" ? `\nReturn the full modified file. Keep everything not related to the change byte-for-byte.` : `\nReturn the full new file.`,
+    `\nDO THIS TO ${path_}:\n${instruction}`,
+    op === "modify" ? `\nReturn the full modified file. Change only what the instruction above requires; keep every other byte exactly as it is.` : `\nReturn the full new file.`,
+  ].filter(Boolean).join("\n");
+  return stripFence(await aiCall([{ text: p }], { ...(ai || {}), temperature: 0.2, maxOutputTokens: 16000, timeoutMs: 90000 }));
+}
+
+// ---- 4. Did it actually do what was asked? ----------------------------------
+// Checked against the diff, not the request and not the live site: the only
+// evidence that a change happened is a line that changed. Everything below
+// works on the added/removed lines alone.
+
+// Whole-file rewrites are the norm here, so an unabridged diff is mostly
+// unchanged context. Only the +/- lines carry any evidence.
+function diffChanges(diff) {
+  const out = [];
+  let file = "";
+  for (const L of String(diff || "").split("\n")) {
+    const m = L.match(/^\+\+\+ b\/(.+)$/);
+    if (m) { file = m[1]; continue; }
+    if (/^(\+\+\+|---|@@|diff |index |new file|deleted file|similarity|rename )/.test(L)) continue;
+    if (/^[+-]/.test(L) && L.trim().length > 1) out.push({ file, sign: L[0], text: L.slice(1).trim().slice(0, 200) });
+  }
+  return out;
+}
+function changesText(changes, cap = 500) {
+  const shown = changes.slice(0, cap);
+  return shown.map((c) => `${c.sign} [${c.file.split("/").pop()}] ${c.text}`).join("\n")
+    + (changes.length > cap ? `\n… and ${changes.length - cap} more changed line(s)` : "");
+}
+
+// The check that cannot be wrong. Three passes, loosest last: as written, then
+// on digits (a phone number is punctuated differently in markup than in an
+// email), then on letters-and-digits only (so &#039; and curly quotes in the
+// rendered markup don't read as a miss).
+function literalPresent(literal, haystack) {
+  const norm = (s) => String(s).toLowerCase().replace(/\s+/g, " ").trim();
+  const hay = norm(haystack), lit = norm(literal);
+  if (!lit) return false;
+  if (hay.includes(lit)) return true;
+  const digits = (lit.match(/\d/g) || []).join("");
+  if (digits.length >= 7 && (hay.match(/\d/g) || []).join("").includes(digits)) return true;
+  const alnum = (s) => s.replace(/[^a-z0-9]/g, "");
+  return alnum(lit).length >= 6 && alnum(hay).includes(alnum(lit));
+}
+
+// Only for items with no exact text to search for — "remove the second
+// testimonial" has no string to match, so something has to read the diff.
+async function reviewChanges(items, changes, ai) {
+  const p = [
+    "Below are the changed lines from one edit to a WordPress theme, then a list of items that were requested.",
+    "For each item, decide whether that change is visible in the changed lines.",
+    "",
+    "An item is done ONLY if you can quote one changed line that shows it. Quote the line exactly as it appears below, including its leading + or -.",
+    "If you cannot quote such a line, the item is not done. Do not reason about what the code probably does elsewhere — you are only judging these lines.",
+    "'+' means the line was added, '-' means it was removed.",
+    "",
+    "CHANGED LINES:", "-----", changesText(changes), "-----",
+    "",
+    "ITEMS:",
+    ...items.map((it) => `${it.n}. ${it.what}${it.where ? ` (${it.where})` : ""}`),
+    "",
+    'Return ONLY minified JSON: {"results":[{"n":<item number>,"done":<true|false>,"evidence":"<the exact changed line, or empty if not done>"}]}',
   ].join("\n");
-  return stripFence(await geminiCall([{ text: p }], { temperature: 0.2, maxOutputTokens: 16000, timeoutMs: 90000 }));
+  const raw = await aiCall([{ text: p }], { ...(ai || {}), temperature: 0.1, maxOutputTokens: 1500, timeoutMs: 60000, json: true });
+  const d = JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
+  return Array.isArray(d.results) ? d.results : [];
+}
+
+// One verdict per work-order item. Exact-text items are settled by search; the
+// rest go to the model, and a "done" it cannot back with a real changed line is
+// downgraded — that quote is checked against the diff here, not taken on trust.
+async function verifyWork(workOrder, diff, ai) {
+  if (!workOrder || !workOrder.changes.length) return null;
+  const changes = diffChanges(diff);
+  const added = changes.filter((c) => c.sign === "+").map((c) => c.text).join("\n");
+  const all = changes.map((c) => c.text).join("\n");
+  const results = workOrder.changes.map((c, i) => ({ n: i + 1, what: c.what, where: c.where, literal: c.literal, done: null, how: "", evidence: "" }));
+
+  for (const r of results) {
+    if (!r.literal) continue;
+    r.done = literalPresent(r.literal, added);
+    r.how = "exact text";
+    if (r.done) r.evidence = r.literal;
+  }
+  const judged = results.filter((r) => r.done === null);
+  if (judged.length && changes.length) {
+    let verdicts = [];
+    try { verdicts = await reviewChanges(judged, changes, ai); }
+    catch (e) { console.warn("work check: review failed —", e.message); }
+    for (const r of judged) {
+      const v = verdicts.find((x) => Number(x && x.n) === r.n);
+      const quote = String((v && v.evidence) || "").replace(/^[+-]\s*/, "").trim();
+      // Grounded or it doesn't count: an unquotable "done" is the failure mode
+      // this whole step exists to catch, so it is not accepted on the model's
+      // word alone.
+      const grounded = quote.length > 2 && all.includes(quote.slice(0, 60));
+      r.done = !!(v && v.done && grounded);
+      r.how = "reviewed";
+      if (r.done) r.evidence = quote.slice(0, 160);
+      // No verdict at all (the review failed, or the model skipped the item)
+      // is not evidence of a miss — say so rather than claiming it failed.
+      if (!v) { r.done = null; r.how = "not checked"; }
+    }
+  } else if (judged.length) {
+    for (const r of judged) { r.done = false; r.how = "no lines changed"; }
+  }
+  const missed = results.filter((r) => r.done === false);
+  return { results, missed: missed.length, total: results.length, done: results.filter((r) => r.done === true).length };
 }
 
 async function runEditJob(job) {
@@ -2500,11 +2827,61 @@ async function runEditJob(job) {
     jobStep(job, 0, "done", "Latest code pulled");
 
     // 2 — plan
-    jobStep(job, 1, "running", "Planning the edit…");
-    const manifest = [];
-    for (const f of fs.readdirSync(themeAbs)) manifest.push({ path: `${P.themePath}/${f}`, bytes: fs.statSync(path.join(themeAbs, f)).size });
-    if (P.muPath && fs.existsSync(path.join(tmp, P.muPath))) manifest.push({ path: P.muPath, bytes: fs.statSync(path.join(tmp, P.muPath)).size });
-    const plan = await editPlan(manifest, P.prompt);
+    // Which model does the thinking. Set only by the edit chat; an email
+    // request carries nothing here and so runs on Gemini.
+    job.aiModel = isOllamaModel(P.aiModel) ? P.aiModel : "gemini";
+    const ai = {
+      aiModel: job.aiModel,
+      // If the chosen model fails we still finish on Gemini, but the job has
+      // to say so — otherwise a model looks better than it was.
+      onFallback: (model, why) => {
+        job.aiFallback = `${model} failed (${String(why).slice(0, 120)}) — completed on Gemini`;
+        job.aiModel = "gemini";
+        saveJobs();
+      },
+    };
+    jobStep(job, 1, "running", "Reading the request…" + (job.aiModel !== "gemini" ? ` (${job.aiModel})` : ""));
+    // Re-runnable: the retry below needs to see the files as the first pass
+    // left them, not as they were when the run started.
+    const scanTheme = () => {
+      const manifest = [], source = [];
+      const readSource = (rel, abs) => {
+        if (!TEXTUAL.test(rel)) return;
+        try { if (fs.statSync(abs).size <= 400000) source.push({ rel, content: fs.readFileSync(abs, "utf8") }); }
+        catch (e) { /* unreadable: it simply contributes no outline */ }
+      };
+      for (const f of fs.readdirSync(themeAbs)) {
+        const abs = path.join(themeAbs, f);
+        manifest.push({ path: `${P.themePath}/${f}`, bytes: fs.statSync(abs).size });
+        readSource(`${P.themePath}/${f}`, abs);
+      }
+      if (P.muPath && fs.existsSync(path.join(tmp, P.muPath))) {
+        manifest.push({ path: P.muPath, bytes: fs.statSync(path.join(tmp, P.muPath)).size });
+        readSource(P.muPath, path.join(tmp, P.muPath));
+      }
+      return { manifest, source };
+    };
+    const { manifest, source } = scanTheme();
+
+    // Understand the ask before working out where it lands. A failure here is
+    // not fatal — the run continues on the raw request, exactly as it did
+    // before this step existed.
+    let workOrder = null;
+    try { workOrder = await buildWorkOrder(P.prompt, { businessName: P.businessName }, ai); }
+    catch (e) { console.warn(`edit job ${job.draftId}: work order failed, using the raw request —`, e.message); }
+    job.workOrder = workOrder;
+    if (workOrder) {
+      jobStep(job, 1, "running", `${workOrder.changes.length} change(s) understood${workOrder.unclear.length ? `, ${workOrder.unclear.length} too vague to action` : ""} — locating them…`);
+      saveJobs();
+    }
+
+    const evidence = locateTerms(source, requestTerms(P.prompt, workOrder));
+    const outline = source.map((f) => ({ rel: f.rel, items: fileOutline(f.content) })).filter((o) => o.items.length);
+    // What the planner and every file writer below both work from.
+    const brief = { prompt: P.prompt, businessName: P.businessName, workOrder: workOrderText(workOrder) };
+
+    jobStep(job, 1, "running", "Planning the edit…" + (job.aiModel !== "gemini" ? ` (${job.aiModel})` : ""));
+    const plan = await editPlan(manifest, { ...brief, evidence: evidenceText(evidence), outline: outlineText(outline) }, ai);
     const allowed = (rel) => rel === P.muPath || rel.startsWith(P.themePath + "/");
     plan.files = (plan.files || []).filter(f => f && f.path && allowed(f.path)).slice(0, 8);
     if (!plan.files.length) throw new Error("planner produced no in-scope file changes");
@@ -2514,24 +2891,76 @@ async function runEditJob(job) {
 
     // 3 — apply
     jobStep(job, 2, "running", "Applying changes…");
-    const planContext = plan.files.map(f => `${f.op} ${f.path}`).join("\n");
-    for (const f of plan.files) {
-      const abs = path.join(tmp, f.path);
-      if (f.op === "delete") { fs.rmSync(abs, { force: true }); continue; }
-      const cur = f.op === "modify" && fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : "";
-      const content = await editFileContent(f.op, f.path, f.instruction || plan.summary, cur, planContext);
-      if (!content || (abs.endsWith(".php") && !content.includes("<?php") && cur.includes("<?php"))) throw new Error("AI returned empty/invalid content for " + f.path);
-      fs.mkdirSync(path.dirname(abs), { recursive: true });
-      fs.writeFileSync(abs, content);
-    }
-    // guardrail: theme must still have its required files
-    for (const req of ["index.php", "style.css"]) {
-      if (!fs.existsSync(path.join(themeAbs, req))) throw new Error(`edit would remove required ${req} — aborted`);
-    }
+    const applyPlan = async (pl, wr) => {
+      const planContext = pl.files.map(f => `${f.op} ${f.path}`).join("\n");
+      for (const f of pl.files) {
+        const abs = path.join(tmp, f.path);
+        if (f.op === "delete") { fs.rmSync(abs, { force: true }); continue; }
+        const cur = f.op === "modify" && fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : "";
+        const content = await editFileContent(f.op, f.path, f.instruction || pl.summary, cur, planContext, ai, wr || brief);
+        if (!content || (abs.endsWith(".php") && !content.includes("<?php") && cur.includes("<?php"))) throw new Error("AI returned empty/invalid content for " + f.path);
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        fs.writeFileSync(abs, content);
+      }
+      // guardrail: theme must still have its required files
+      for (const req of ["index.php", "style.css"]) {
+        if (!fs.existsSync(path.join(themeAbs, req))) throw new Error(`edit would remove required ${req} — aborted`);
+      }
+    };
+    await applyPlan(plan);
     jobStep(job, 2, "done", `${plan.files.length} file(s) written`);
 
-    // 4 — push + PR
-    jobStep(job, 3, "running", "Pushing + opening PR…");
+    // 4 — check the work against the work order, while nothing has left this
+    //     machine yet. Staging first is what puts newly created files into the
+    //     diff; the push step below stages the same paths again and commits.
+    jobStep(job, 3, "running", "Checking the work…");
+    const paths = `"${P.themePath}"${P.muPath ? ` "${P.muPath}"` : ""}`;
+    const stagedDiff = async () => {
+      await run(`git add -A -- ${paths}`, tmp);
+      return (await run(`git --no-pager diff --cached --unified=1 -- ${paths}`, tmp)).stdout || "";
+    };
+    let check = null;
+    try {
+      check = await verifyWork(workOrder, await stagedDiff(), ai);
+      // One retry, for the items the diff shows no evidence of. A second miss
+      // is reported rather than retried again: past one attempt this stops
+      // converging and starts churning the same files.
+      if (check && check.missed) {
+        jobStep(job, 3, "running", `${check.missed} of ${check.total} item(s) not done — trying once more…`);
+        const again = check.results.filter((r) => r.done === false);
+        const retryWo = { changes: again.map((r) => ({ what: r.what, where: r.where, literal: r.literal })), constraints: workOrder.constraints, unclear: [] };
+        const scan = scanTheme();     // the files as the first pass left them
+        const retryBrief = {
+          prompt: P.prompt, businessName: P.businessName,
+          workOrder: workOrderText(retryWo) + "\n\nAn earlier attempt at this same request already made its other changes. Do ONLY the items above and leave everything else exactly as it now stands.",
+        };
+        const plan2 = await editPlan(scan.manifest, {
+          ...retryBrief,
+          evidence: evidenceText(locateTerms(scan.source, requestTerms(P.prompt, retryWo))),
+          outline: outlineText(scan.source.map((f) => ({ rel: f.rel, items: fileOutline(f.content) })).filter((o) => o.items.length)),
+        }, ai);
+        plan2.files = (plan2.files || []).filter(f => f && f.path && allowed(f.path)).slice(0, 6);
+        if (plan2.files.length) {
+          await applyPlan(plan2, retryBrief);
+          job.retried = true;
+          job.editPlan = [...job.editPlan, ...plan2.files.map(f => ({ path: f.path, op: f.op }))]
+            .filter((f, i, a) => a.findIndex((x) => x.path === f.path) === i);
+          check = await verifyWork(workOrder, await stagedDiff(), ai);
+        }
+      }
+    } catch (e) {
+      // A failed check must not sink an otherwise good edit — it reports on the
+      // work, it does not do the work.
+      console.warn(`edit job ${job.draftId}: work check failed —`, e.message);
+    }
+    job.verification = check;
+    saveJobs();
+    jobStep(job, 3, "done", check
+      ? `${check.done} of ${check.total} confirmed${check.missed ? ` · ${check.missed} not done` : ""}${job.retried ? " (after a retry)" : ""}`
+      : "Nothing checkable — skipped");
+
+    // 5 — push + PR
+    jobStep(job, 4, "running", "Pushing + opening PR…");
     const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
     const branch = `g99/edit-${P.themeSlug.replace(/^g99-/, "")}-${stamp}`;
     await run(`git checkout -b "${branch}"`, tmp);
@@ -2540,24 +2969,30 @@ async function runEditJob(job) {
     if (r.code) throw new Error("commit failed (no changes?): " + (r.stderr || r.stdout).slice(-160));
     r = await runRetry(`git push -u origin "${branch}"`, tmp);
     if (r.code) throw new Error("push failed: " + r.stderr.slice(-200));
-    const prBody = `Automated edit for **${P.businessName}**.\\n\\n**Request:** ${P.prompt.replace(/"/g, "'").slice(0, 300)}\\n\\n**Plan:** ${(plan.summary || "").replace(/"/g, "'")}\\n\\nFiles: ${plan.files.map(f => `${f.op} ${f.path}`).join(", ")}`;
+    // Whoever opens this on GitHub sees the same verdict the Studio job page
+    // shows, so the PR is readable without going back to the tool.
+    const checkLine = check
+      ? `\\n\\n**Checked against the request:** ${check.done}/${check.total} confirmed in the diff${job.retried ? " (after one retry)" : ""}.`
+        + check.results.map((r2) => `\\n- ${r2.done === true ? "[x]" : r2.done === false ? "[ ] NOT DONE —" : "[ ] unverified —"} ${String(r2.what).replace(/"/g, "'").slice(0, 120)}`).join("")
+      : "";
+    const prBody = `Automated edit for **${P.businessName}**.\\n\\n**Request:** ${P.prompt.replace(/"/g, "'").slice(0, 300)}\\n\\n**Plan:** ${(plan.summary || "").replace(/"/g, "'")}\\n\\nFiles: ${plan.files.map(f => `${f.op} ${f.path}`).join(", ")}${checkLine}`;
     r = await runRetry(`gh pr create --repo ${repo} --base main --head "${branch}" --title "Edit ${P.businessName}: ${(plan.summary || "AI change").replace(/"/g, "'").slice(0, 60)}" --body "${prBody}"`, tmp);
     job.prUrl = (r.stdout.match(/https:\/\/github\.com\/\S+/) || [""])[0];
     job.branch = branch;
     fs.rmSync(tmp, { recursive: true, force: true });
     if (!job.prUrl) throw new Error("PR create failed: " + r.stderr.slice(-200));
-    jobStep(job, 3, "done", job.prUrl);
+    jobStep(job, 4, "done", job.prUrl);
 
-    // 5 — CI watch → auto-fix → merge on green
-    jobStep(job, 4, "running", "Watching CI build checks…");
+    // 6 — CI watch → auto-fix → merge on green
+    jobStep(job, 5, "running", "Watching CI build checks…");
     let fixes = 0, merged = false;
     for (let i = 0; i < 90 && !merged; i++) {
       let st; try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); } catch (e) { await sleep(10000); continue; }
-      jobStep(job, 4, "running", (st.checks || []).map(c => `${c.name}:${c.status}`).join(" ") || "CI starting…");
-      if (st.allPass) { await awaitApprovalIfNeeded(job, P.siteId, 4); if (!job.mergedExternally) await localApi("/api/pr-merge", { prUrl: job.prUrl }); merged = true; jobStep(job, 4, "done", job.mergedExternally ? "Merged on GitHub" : `Merged${fixes ? ` after ${fixes} fix(es)` : ""}`); break; }
+      jobStep(job, 5, "running", (st.checks || []).map(c => `${c.name}:${c.status}`).join(" ") || "CI starting…");
+      if (st.allPass) { await awaitApprovalIfNeeded(job, P.siteId, 5); if (!job.mergedExternally) await localApi("/api/pr-merge", { prUrl: job.prUrl }); merged = true; jobStep(job, 5, "done", job.mergedExternally ? "Merged on GitHub" : `Merged${fixes ? ` after ${fixes} fix(es)` : ""}`); break; }
       if (st.anyFail) {
         if (fixes >= 3) throw new Error("CI still failing after 3 auto-fix attempts — " + job.prUrl);
-        fixes++; jobStep(job, 4, "running", `Build failed — Gemini auto-fix ${fixes}/3…`);
+        fixes++; jobStep(job, 5, "running", `Build failed — Gemini auto-fix ${fixes}/3…`);
         const fix = await localApi("/api/pr-autofix", { prUrl: job.prUrl }, 5 * 60 * 1000);
         if (fix.billing) throw new Error(fix.message);
         if (!fix.fixed || !fix.fixed.length) throw new Error("auto-fix could not resolve CI: " + (fix.message || ""));
@@ -2567,10 +3002,10 @@ async function runEditJob(job) {
     }
     if (!merged) throw new Error("CI watch timed out — " + job.prUrl);
 
-    // 6 — refresh registry so lastChange reflects this edit
-    jobStep(job, 5, "running", "Updating site registry…");
+    // 7 — refresh registry so lastChange reflects this edit
+    jobStep(job, 6, "running", "Updating site registry…");
     try { await syncSiteRegistry(); } catch (e) { /* non-fatal */ }
-    jobStep(job, 5, "done", "Done — change is live on merge/deploy");
+    jobStep(job, 6, "done", "Done — change is live on merge/deploy");
     await postEditPrComment(job);
     job.status = "done";
     // The second and final message. One line saying what shipped, then the
@@ -2580,7 +3015,15 @@ async function runEditJob(job) {
       "The change is live now " + String.fromCharCode(8212) + " " + (job.editSummary || "your requested update").trim(),
       P.liveUrl ? "\n" + P.liveUrl : "",
     ].join("\n").trim());
-    notify(`✏️ Edit merged for *${job.businessName}*: ${job.editSummary || ""} · ${job.prUrl || ""}`);
+    // Anything skipped has to be said out loud — otherwise "done" reads as "all
+    // of it done". Two ways an item can be missing: too vague to attempt, or
+    // attempted and not found in the diff afterwards.
+    const skipped = (job.workOrder && job.workOrder.unclear) || [];
+    const notDone = check ? check.results.filter((r2) => r2.done !== true) : [];
+    notify(`✏️ Edit merged for *${job.businessName}*: ${job.editSummary || ""} · ${job.prUrl || ""}`
+      + (check ? `\n${check.done}/${check.total} item(s) confirmed in the diff${job.retried ? " (after one retry)" : ""}` : "")
+      + (notDone.length ? `\n⚠️ ${notDone.map((r2) => `${r2.done === false ? "not done" : "unverified"}: ${r2.what}`).join("; ")}` : "")
+      + (skipped.length ? `\n⚠️ Not actioned (too vague to do without guessing): ${skipped.join("; ")}` : ""));
   } catch (e) {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
     if (e && e.cancelled) { job.status = "cancelled"; }
@@ -3840,24 +4283,22 @@ const server = http.createServer(async (req, res) => {
       catch (e) { return json(res, 500, { error: e.message }); }
     }
 
-    // Expand a rough idea into a precise, unambiguous edit instruction (Gemini).
-    if (p === "/api/edit-suggest" && req.method === "POST") {
-      const { siteId, idea } = JSON.parse(await readBody(req) || "{}");
-      const site = (await findWebsite(siteId)) || {};
-      const prompt = [
-        `You help an operator phrase a website change request for an AI that edits a WordPress theme for "${site.businessName || "a medspa"}".`,
-        `Rewrite the rough idea below into ONE precise, unambiguous instruction: what to add/change, where, and any concrete copy/labels. Keep it to 2-4 sentences. If it's a new page, say the page title and that it should be linked in the nav.`,
-        `\nRough idea: ${idea || ""}`,
-        `\nReturn ONLY the improved instruction text.`,
-      ].join("\n");
-      try { return json(res, 200, { prompt: (await geminiCall([{ text: prompt }], { temperature: 0.4, maxOutputTokens: 500 })).trim() }); }
-      catch (e) { return json(res, 502, { error: "suggest failed: " + e.message }); }
+    // What the edit chat may offer. Gemini is always there; Ollama Cloud shows
+    // up only when a key is configured, and is marked unavailable otherwise so
+    // the picker can say why rather than failing at send time.
+    if (p === "/api/ai-models") {
+      return json(res, 200, {
+        default: "gemini",
+        ollamaConfigured: !!OLLAMA_API_KEY,
+        models: [
+          { id: "gemini", label: "Gemini", group: "Google", available: true },
+          ...OLLAMA_MODELS.map((m) => ({ ...m, group: "Ollama Cloud", available: !!OLLAMA_API_KEY })),
+        ],
+      });
     }
 
-    // Start an edit job for a NocoDB website. Resolve its repo + active theme
-    // server-side so the edit only ever touches the selected website's repo.
     if (p === "/api/edit-run" && req.method === "POST") {
-      const { siteId, prompt } = JSON.parse(await readBody(req) || "{}");
+      const { siteId, prompt, aiModel } = JSON.parse(await readBody(req) || "{}");
       if (!prompt || !prompt.trim()) return json(res, 400, { error: "prompt required" });
       const site = await findWebsite(siteId);
       if (!site) return json(res, 404, { error: "unknown siteId — refresh the site list" });
@@ -3867,6 +4308,9 @@ const server = http.createServer(async (req, res) => {
         siteId, businessName: site.businessName, githubRepo: site.githubRepo,
         themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
         prompt: prompt.trim(),
+        // Only honoured for chat-initiated edits; anything unrecognised (and
+        // every email request, which never sets it) falls through to Gemini.
+        aiModel: isOllamaModel(aiModel) ? aiModel : "",
       });
       return json(res, 202, { jobId: job.draftId, status: job.status, monitor: "/jobs" });
     }
