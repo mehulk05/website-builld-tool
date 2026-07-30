@@ -20,6 +20,11 @@ let MODE = "desktop";
 // Chat panel collapsed → the live preview gets the full width. Remembered
 // across sites and reloads; below 900px the tabs own this instead.
 let COLLAPSED = localStorage.getItem("g99chatCollapsed") === "1";
+// Which model writes the change. Gemini unless the operator picks otherwise;
+// remembered per browser. Only chat-initiated edits carry this — email
+// requests never set it and always run on Gemini.
+let MODEL = localStorage.getItem("g99editModel") || "gemini";
+let MODELS = [];
 let poll;
 
 const threadKey = () => "g99thread:" + (SITE ? SITE.siteId : "none");
@@ -284,8 +289,11 @@ function render() {
             `<button class="chip" data-p="${i}"><svg style="width:12px;height:12px" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="${p[1]}"/></svg>${esc(p[0])}</button>`).join("")}</div>
           <div class="box">
             <textarea id="input" rows="1" placeholder="Describe a change — e.g. make the hero headline bolder"></textarea>
-            <button class="iconbtn ghost" id="improve" title="Sharpen this instruction with AI">${svg("spark", 16)}</button>
             <button class="iconbtn" id="send" title="Ship this change">${svg("arrow", 16, 2.2)}</button>
+          </div>
+          <div class="modelrow">
+            <label for="model">Model</label>
+            <select id="model" title="Which model writes this change"></select>
           </div>
         </div>
       </div>
@@ -315,7 +323,6 @@ function wire() {
   input.oninput = () => { input.style.height = "auto"; input.style.height = Math.min(120, input.scrollHeight) + "px"; };
   input.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } };
   $("send").onclick = send;
-  $("improve").onclick = improve;
   $("chips").onclick = (e) => {
     const b = e.target.closest("[data-p]");
     if (!b) return;
@@ -329,6 +336,11 @@ function wire() {
       SITE.requireApproval = d.requireApproval;
       toast(d.requireApproval ? "Changes will pause for your approval before merge" : "Changes auto-merge once the build is green");
     } catch (err) { e.target.checked = !e.target.checked; toast("Could not update: " + err.message); }
+  };
+  fillModels();
+  $("model").onchange = (e) => {
+    MODEL = e.target.value;
+    localStorage.setItem("g99editModel", MODEL);
   };
   $("history").onclick = showVersions;
   $("togglePane").onclick = () => {
@@ -362,6 +374,24 @@ function wire() {
   });
 }
 
+// Groups the options by provider so "Ollama" reads as a provider with models
+// under it, rather than five unrelated names in a flat list.
+function fillModels() {
+  const sel = $("model");
+  if (!sel) return;
+  const list = MODELS.length ? MODELS : [{ id: "gemini", label: "Gemini", group: "Google", available: true }];
+  if (!list.some((m) => m.id === MODEL && m.available)) MODEL = "gemini";
+  const groups = [];
+  list.forEach((m) => {
+    const g = groups.find((x) => x.name === m.group) || (groups.push({ name: m.group, items: [] }), groups[groups.length - 1]);
+    g.items.push(m);
+  });
+  sel.innerHTML = groups.map((g) => `<optgroup label="${esc(g.name)}">${g.items.map((m) =>
+    `<option value="${esc(m.id)}"${m.id === MODEL ? " selected" : ""}${m.available ? "" : " disabled"}>${esc(m.label)}${m.available ? "" : " — key not set"}</option>`
+  ).join("")}</optgroup>`).join("");
+  sel.value = MODEL;
+}
+
 function reloadPreview() {
   const f = $("pv");
   if (!f) return;
@@ -372,19 +402,6 @@ function reloadPreview() {
 }
 
 // ------------------------------------------------------------------ actions
-async function improve() {
-  const idea = $("input").value.trim();
-  if (!idea) { toast("Type a rough idea first."); return; }
-  const b = $("improve"); b.disabled = true;
-  try {
-    const d = await postJSON("/api/edit-suggest", { siteId: SITE.siteId, idea });
-    $("input").value = d.prompt || idea;
-    $("input").dispatchEvent(new Event("input"));
-    toast("Sharpened — review it, then send.");
-  } catch (e) { toast("Could not improve: " + e.message); }
-  finally { b.disabled = false; }
-}
-
 async function send() {
   if (SENDING) return;
   const text = $("input").value.trim();
@@ -420,7 +437,7 @@ async function send() {
   renderThread(); save();
 
   try {
-    const d = await postJSON("/api/edit-run", { siteId: SITE.siteId, prompt: text });
+    const d = await postJSON("/api/edit-run", { siteId: SITE.siteId, prompt: text, aiModel: MODEL });
     ai.jobId = d.jobId;
     save(); renderThread(); startPolling();
   } catch (e) {
@@ -498,6 +515,7 @@ async function load() {
   }
 
   document.title = "Growth99 · Editing " + SITE.businessName;
+  getJSON("/api/ai-models").then((d) => { MODELS = d.models || []; fillModels(); }).catch(() => {});
   restore();
   render();
   startPolling();

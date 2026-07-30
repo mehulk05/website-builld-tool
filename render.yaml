@@ -19,6 +19,8 @@ services:
         sync: false          # protects /api/* — REQUIRED on a public URL
       - key: WEBHOOK_SECRET
         sync: false          # shared secret for /api/webhook/onboarding-submitted
+      - key: OLLAMA_API_KEY
+        sync: false          # optional 2nd provider, offered only in the Edit-with-AI chat
       - key: EMAIL_WEBHOOK_SECRET
         sync: false          # shared secret for /api/webhook/email-change — must match the Gmail Apps Script
       - key: EMAIL_ALLOWED_SENDERS
