@@ -94,15 +94,115 @@
     });
   }
 
+  // ---------------------------------------------------------- password gate
+  // A link to this tool should not be the same thing as access to it. This is a
+  // doorlock, not an identity system: one shared password, checked by the same
+  // /api/auth-check the API gate uses, and remembered in localStorage so it is
+  // asked once per browser rather than once per visit.
+  //
+  // Carries its own stylesheet because edit.html sets data-shell="none" and so
+  // never reaches the chrome CSS below.
+  function gateStyles() {
+    if (document.getElementById("g99gatecss")) return;
+    const s = document.createElement("style");
+    s.id = "g99gatecss";
+    s.textContent = `
+      .g99gate {
+        position: fixed; inset: 0; z-index: 200; display: grid; place-items: center;
+        padding: 24px; background: var(--surface-2, #f7f7f5); font-family: var(--sans, system-ui, sans-serif);
+      }
+      .g99gate form {
+        width: 100%; max-width: 344px; text-align: center;
+        background: var(--surface, #fff); border: 1px solid var(--line, #e6e6e3);
+        border-radius: 16px; padding: 34px 30px 30px;
+        box-shadow: 0 1px 2px rgba(16,16,20,.04), 0 12px 32px rgba(16,16,20,.07);
+      }
+      .g99gate .lg {
+        width: 40px; height: 40px; border-radius: 11px; margin: 0 auto 16px;
+        background: var(--ink-btn, #1b1b1f); color: var(--ink-btn-ink, #fff);
+        display: grid; place-items: center; font-weight: 800; font-size: 19px;
+      }
+      .g99gate h1 { margin: 0; font-size: 19px; font-weight: 800; letter-spacing: -.02em; color: var(--ink, #1b1b1f); }
+      .g99gate .sub { margin: 3px 0 24px; font-size: 12.5px; font-weight: 600; color: var(--muted, #6e6e75); }
+      .g99gate label { display: block; text-align: left; font-size: 12.5px; font-weight: 700; color: var(--ink-2, #52525b); margin-bottom: 7px; }
+      .g99gate input {
+        width: 100%; box-sizing: border-box; padding: 11px 13px; font: inherit; font-size: 14px;
+        color: var(--ink, #1b1b1f); background: var(--surface, #fff);
+        border: 1px solid var(--line, #e6e6e3); border-radius: 10px; transition: border-color .14s, box-shadow .14s;
+      }
+      .g99gate input:focus-visible {
+        outline: none; border-color: var(--accent, #5b4df0);
+        box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent, #5b4df0) 18%, transparent);
+      }
+      /* Reserved so the card does not jump the first time it says no. */
+      .g99gate .err { min-height: 17px; margin: 8px 0 0; text-align: left; font-size: 12.5px; font-weight: 600; color: var(--bad, #e5484d); }
+      .g99gate button {
+        width: 100%; margin-top: 14px; padding: 11px 16px; font: inherit; font-size: 14px; font-weight: 700;
+        color: var(--ink-btn-ink, #fff); background: var(--ink-btn, #1b1b1f);
+        border: none; border-radius: 10px; cursor: pointer; transition: opacity .14s;
+      }
+      .g99gate button:hover { opacity: .88; }
+      .g99gate button[disabled] { opacity: .55; cursor: default; }
+      .g99gate .foot { margin: 16px 0 0; font-size: 11.5px; color: var(--muted, #6e6e75); }`;
+    document.head.appendChild(s);
+  }
+
+  function passwordGate() {
+    return new Promise((resolve) => {
+      gateStyles();
+      const el = document.createElement("div");
+      el.className = "g99gate";
+      el.innerHTML = `
+        <form role="dialog" aria-modal="true" aria-labelledby="g99gt" novalidate>
+          <span class="lg" aria-hidden="true">g</span>
+          <h1 id="g99gt">Growth99</h1>
+          <p class="sub">Website Build Tool</p>
+          <label for="g99pw">Enter password to access</label>
+          <input id="g99pw" type="password" autocomplete="current-password" spellcheck="false" autocapitalize="off">
+          <p class="err" role="alert"></p>
+          <button type="submit">Continue</button>
+          <p class="foot">You will only be asked once on this browser.</p>
+        </form>`;
+      document.body.appendChild(el);
+      const prevOverflow = document.documentElement.style.overflow;
+      document.documentElement.style.overflow = "hidden";
+
+      const form = el.querySelector("form"), input = el.querySelector("#g99pw");
+      const err = el.querySelector(".err"), btn = el.querySelector("button");
+      input.focus();
+
+      form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const key = input.value.trim();
+        if (!key) { err.textContent = "Enter the password to continue."; return; }
+        btn.disabled = true; btn.textContent = "Checking…"; err.textContent = "";
+        // The fetch wrapper above reads the key straight out of localStorage,
+        // so the candidate is written before it is tested — and removed again
+        // if it turns out to be wrong, so a bad key is never left behind.
+        localStorage.setItem("g99AdminKey", key);
+        let ok = false, reachable = true;
+        try { ok = (await fetch("/api/auth-check", { headers: { "x-login": "1" } })).status !== 401; }
+        catch (e2) { reachable = false; }
+        btn.disabled = false; btn.textContent = "Continue";
+        if (ok) {
+          document.documentElement.style.overflow = prevOverflow;
+          el.remove();
+          return resolve(true);
+        }
+        localStorage.removeItem("g99AdminKey");
+        err.textContent = reachable ? "That password is not right." : "Could not reach the server — try again.";
+        input.value = ""; input.focus();
+      });
+    });
+  }
+
   async function ensureAuth() {
-    for (let i = 0; i < 3; i++) {
-      const r = await fetch("/api/auth-check", { headers: { "x-login": "1" } });
-      if (r.status !== 401) return true;
-      const k = prompt("This tool is password-protected. Enter the admin password:");
-      if (k == null) return false;
-      localStorage.setItem("g99AdminKey", k.trim());
-    }
-    return false;
+    // No password set on this deployment, or one already stored and still good:
+    // nothing is shown at all.
+    const r = await fetch("/api/auth-check", { headers: { "x-login": "1" } }).catch(() => null);
+    if (!r) return false;              // server unreachable — not an auth failure
+    if (r.status !== 401) return true;
+    return passwordGate();             // stays up until the password is right
   }
 
   // Every /api/* route is gated by ADMIN_PASSWORD when deployed. app.js patches window.fetch to add

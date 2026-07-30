@@ -7,15 +7,14 @@ window.fetch = (url, opts = {}) => {
   if (String(url).startsWith("/api/")) opts.headers = { ...(opts.headers || {}), "x-admin-key": localStorage.getItem("g99AdminKey") || "" };
   return _fetch(url, opts);
 };
+// nav.js loads first and owns the branded password screen; this page only keeps
+// a fallback for the case where the shell script failed to load, and that
+// fallback deliberately does not ask for anything it cannot present properly.
 async function ensureAuth() {
-  for (let i = 0; i < 3; i++) {
-    const r = await fetch("/api/auth-check", { headers: { "x-login": "1" } }); // x-login: empty key counts as a failed login (health checks omit it)
-    if (r.status !== 401) return true;
-    const k = prompt("This tool is password-protected. Enter the admin password:");
-    if (k == null) return false;
-    localStorage.setItem("g99AdminKey", k.trim());
-  }
-  return false;
+  if (window.G99 && window.G99.ensureAuth) return window.G99.ensureAuth();
+  // x-login: an empty key counts as a failed login (health checks omit it)
+  const r = await fetch("/api/auth-check", { headers: { "x-login": "1" } }).catch(() => null);
+  return !!r && r.status !== 401;
 }
 
 const $ = (id) => document.getElementById(id);
