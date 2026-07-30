@@ -68,6 +68,33 @@ function stepper(j) {
   }).join("")}</div>`;
 }
 
+// What the tool understood the request to mean, before it went looking for
+// files. Shown next to the request itself so a misread is obvious at a glance —
+// and so the parts it deliberately did not action are stated rather than
+// silently missing from the result.
+function workOrder(j) {
+  const w = j.workOrder;
+  if (!w || !w.changes || !w.changes.length) return "";
+  // Once the run has checked its own work, each item carries a verdict from the
+  // diff. Before that — and if the check could not run — they stay unmarked
+  // rather than showing a tick nothing has earned.
+  const v = (j.verification && j.verification.results) || [];
+  const mark = (i) => {
+    const r = v.find((x) => x.n === i + 1);
+    if (!r || r.done == null) return `<span class="vk none" title="Not checked"></span>`;
+    return r.done
+      ? `<span class="vk yes" title="Confirmed in the diff${r.how ? " · " + r.how : ""}">${svg("check", 11, 3.4)}</span>`
+      : `<span class="vk no" title="No change in the diff does this">${svg("close", 11, 3.4)}</span>`;
+  };
+  const items = w.changes.map((c, i) => `<li>${mark(i)}${esc(c.what)}${c.where ? ` <span class="whr">· ${esc(c.where)}</span>` : ""}${c.literal ? `<span class="lit">${esc(c.literal)}</span>` : ""}</li>`).join("");
+  const note = (label, list) => (list && list.length ? `<div class="wo-note"><b>${label}</b> ${esc(list.join("; "))}</div>` : "");
+  const chk = j.verification;
+  return (chk ? `<div class="wo-hd">${chk.done} of ${chk.total} confirmed in the changes${chk.missed ? ` · ${chk.missed} not done` : ""}${j.retried ? " · retried once" : ""}</div>` : "")
+    + `<ul class="wo">${items}</ul>`
+    + note("Left alone as asked:", w.constraints)
+    + note("Not actioned — too vague to do without guessing:", w.unclear);
+}
+
 function scoresCard(j) {
   if (!j.before && !j.after) return "";
   const before = j.before ? j.before.overall : null;
@@ -191,7 +218,7 @@ function render() {
       <div class="acts">${actions(j)}</div>
     </div>
 
-    ${j.awaitingApproval && !j.approved ? `<div class="banner">${svg("warn", 18)}<div style="flex:1"><div class="bt">Paused for your approval</div><div class="bd">The change is written and the pull request is open — it merges only once you approve.</div></div></div>` : ""}
+    ${j.awaitingApproval && !j.approved ? `<div class="banner">${svg("warn", 18)}<div style="flex:1"><div class="bt">Paused for your approval${j.verification ? ` — ${j.verification.done} of ${j.verification.total} item(s) done` : ""}</div><div class="bd">${j.verification && j.verification.missed ? `${j.verification.missed} requested item(s) could not be found in the changes — listed above.` : "The change is written and the pull request is open — it merges only once you approve."}</div></div></div>` : ""}
     ${j.status === "error" ? `<div class="banner bad">${svg("warn", 18)}<div style="flex:1"><div class="bt">This run failed</div><div class="bd">${esc((j.error || "").slice(0, 240))}</div></div></div>` : ""}
     ${j.status === "done" && j.liveUrl ? successBanner(j) : ""}
 
@@ -199,7 +226,7 @@ function render() {
 
     ${isEnrich && j.servicePages ? enrichDetailCard(j) : ""}
 
-    ${isEdit && j.payload && j.payload.prompt ? `<div class="card pad"><div class="card-h"><h2>The request</h2></div><p class="req">${esc(j.payload.prompt)}</p></div>` : ""}
+    ${isEdit && j.payload && j.payload.prompt ? `<div class="card pad"><div class="card-h"><h2>The request</h2></div><p class="req">${esc(j.payload.prompt)}</p>${workOrder(j)}</div>` : ""}
 
     <div class="card pad">
       <div class="card-h"><h2>Progress</h2>${j.prUrl ? `<a class="right linkbtn" href="${esc(j.prUrl)}" target="_blank" rel="noopener">Pull request${svg("ext", 13)}</a>` : ""}</div>
