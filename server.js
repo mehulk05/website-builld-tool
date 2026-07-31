@@ -5188,6 +5188,20 @@ add_filter('pre_get_document_title', function ($title) {
     return ($seo && $seo['title']) ? $seo['title'] : $title;
 });
 
+/**
+ * Belt and braces for the <title> tag.
+ *
+ * WordPress prints one only when the theme declared title-tag support during
+ * after_setup_theme. A mu-plugin that switches the theme on 'init' misses that
+ * hook for the request it switches on, so the page ships with no title at all —
+ * which is how removing the theme's hardcoded <title> took the site's title
+ * away on a fresh install. Declaring support here covers later requests, and
+ * the wp_head hook below prints one directly if WordPress still will not.
+ */
+add_action('after_setup_theme', function () {
+    add_theme_support('title-tag');
+});
+
 // WordPress emits its own canonical; ours is page-specific and replaces it.
 remove_action('wp_head', 'rel_canonical');
 
@@ -5199,6 +5213,14 @@ add_action('wp_head', function () {
     }
 
     $out = [];
+
+    // Runs at the same priority as _wp_render_title_tag but is added later, so
+    // by now WordPress has printed its title or declined to. If it declined,
+    // print ours — a page with no <title> at all is the worse failure.
+    if (! current_theme_supports('title-tag')) {
+        $out[] = '<title>' . esc_html($seo['title']) . '</title>';
+    }
+
     $out[] = '<meta name="description" content="' . esc_attr($seo['description']) . '">';
     $out[] = '<meta name="robots" content="' . esc_attr($seo['robots']) . '">';
 
