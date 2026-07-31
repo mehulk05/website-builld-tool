@@ -2287,10 +2287,22 @@ async function auditWebsite(site) {
   return entry;
 }
 
+// The deal may hold a full GitHub URL, an SSH remote, or already-clean owner/repo.
+// `gh` wants owner/repo, so normalise whatever arrives.
+function normalizeRepo(v) {
+  let s = String(v || "").trim();
+  if (!s) return "";
+  s = s.replace(/^git@github\.com:/i, "").replace(/^https?:\/\/(www\.)?github\.com\//i, "").replace(/\.git$/i, "").replace(/\/+$/, "");
+  const m = s.match(/^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)/);
+  return m ? `${m[1]}/${m[2]}` : "";
+}
 function newJob(payload) {
   return {
     type: "build",
     draftId: String(payload.draftId), businessId: payload.businessId || null,
+    // when the onboarding form actually arrived, and where it came from
+    receivedAt: payload.receivedAt || new Date().toISOString(),
+    source: payload.source || "manual",
     // Per-client build target, sent by G99 from the HubSpot deal (beta_site_repo / beta_site_url).
     // Absent => fall back to this deployment's own defaults, so existing clients are unaffected.
     repo: payload.betaSiteRepo || payload.githubRepo || WP_REPO,
@@ -4593,12 +4605,28 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req) || "{}");
       if (!body.draftId) return json(res, 400, { error: "draftId required" });
       const mapped = mapG99Answers(body.answers);
+      // The HubSpot deal carries the build target (beta site URL + repo). G99 may
+      // send it under any of several names, and the answers array can carry it too,
+      // so accept every spelling rather than silently falling back to this
+      // deployment's own defaults (which is what used to happen).
+      const pick = (...keys) => {
+        for (const k of keys) {
+          if (body[k]) return String(body[k]).trim();
+          if (mapped.answers && mapped.answers[k]) return String(mapped.answers[k]).trim();
+        }
+        return "";
+      };
+      const betaSiteUrl = pick("betaSiteUrl", "beta_site_url", "betaUrl", "beta_url", "siteUrl", "site_url");
+      const betaSiteRepoRaw = pick("betaSiteRepo", "beta_site_repo", "githubRepo", "github_repo", "repoUrl", "repo_url", "repo");
+      const betaSiteRepo = normalizeRepo(betaSiteRepoRaw);
+      const receivedAt = new Date().toISOString();
       // Persist it as the current onboarding response, so "Build a site" shows
       // the client who actually submitted rather than whatever was there before.
       try {
         fs.writeFileSync(path.join(DIR, "onboarding.json"), JSON.stringify({
           draftId: body.draftId, businessId: body.businessId || null, template: body.template || "WEBSITE",
-          receivedAt: new Date().toISOString(),
+          receivedAt,
+          betaSiteUrl, betaSiteRepo,
           referenceWebsite: body.referenceWebsite || mapped.referenceWebsite || "",
           existingWebsite: body.existingWebsite || mapped.existingWebsite || "",
           answers: mapped.answers,
@@ -4608,7 +4636,10 @@ const server = http.createServer(async (req, res) => {
         draftId: body.draftId, businessId: body.businessId, businessName: body.businessName,
         answers: mapped.answers, existingWebsite: body.existingWebsite || mapped.existingWebsite,
         referenceWebsite: body.referenceWebsite || mapped.referenceWebsite,
+        // the build target from the deal — without these the job used env defaults
+        betaSiteUrl, betaSiteRepo, receivedAt, source: "onboarding form",
       });
+      console.log(`webhook: ${job.businessName} · repo ${job.repo} · beta ${job.liveUrl}${betaSiteUrl || betaSiteRepo ? "" : " (deal properties missing — using this deployment's defaults)"}`);
       res.writeHead(202, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ accepted: true, dedupe, draftId: job.draftId, status: job.status, monitor: "/jobs" }));
     }
