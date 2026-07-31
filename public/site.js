@@ -353,6 +353,7 @@ function render() {
       <div class="acts">
         <button class="btn" id="reauditTop"${AUDITING ? " disabled" : ""}>${svg("chart", 15)}${AUDIT ? "Re-audit" : "Run CRO audit"}</button>
         <button class="btn" id="enrichBtn">${svg("spark", 15)}Add service pages</button>
+        <button class="btn" id="seoBtn">${svg("search", 15)}Perform SEO</button>
         <button class="btn" id="imgBtn"${IMG_RUNNING ? " disabled" : ""}>${svg("panel", 15)}${IMG_RUNNING ? "Checking images…" : "Check images"}</button>
         <button class="btn" id="editWith">${svg("code", 15)}Edit with…</button>
         <a class="btn primary" href="/edit?site=${encodeURIComponent(SITE.siteId)}">${svg("edit", 15)}Edit this site</a>
@@ -453,6 +454,16 @@ function wire() {
       toast("Enrichment started — opening Activity…");
       setTimeout(() => { location.href = "/job?id=" + encodeURIComponent(d.jobId); }, 800);
     } catch (e) { eb.disabled = false; toast("Could not start: " + (e.message || "failed")); }
+  };
+  const sb = $("seoBtn");
+  if (sb) sb.onclick = async () => {
+    if (!confirm(`Run the full SEO pass over every page of "${SITE.businessName}"?\n\nKeywords, titles, descriptions, canonicals, social cards, headings, image alt text, internal links and schema — plus a content audit. One PR, merged when the build is green.`)) return;
+    sb.disabled = true;
+    try {
+      const d = await postJSON("/api/seo-run", { siteId: SITE.siteId });
+      toast(d.dedupe ? "An SEO run is already going — opening it…" : "SEO run started — opening Activity…");
+      setTimeout(() => { location.href = "/job?id=" + encodeURIComponent(d.jobId); }, 800);
+    } catch (e) { sb.disabled = false; toast("Could not start: " + (e.message || "failed")); }
   };
   const ib = $("imgBtn");
   if (ib) ib.onclick = async () => {
