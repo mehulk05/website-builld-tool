@@ -4794,8 +4794,13 @@ async function seoHeadCopy(page, biz, businessName, ai) {
 // the page's standing even with a redirect behind it, so this only fires on a
 // clear mismatch between the slug and what the page is about. The home page is
 // never renamed — its URL is the domain.
+// Never renamed. The home page's URL is the domain, and the brand guide and SEO
+// report are client deliverables whose links have already been sent to people —
+// a redirect would keep them working, but there is no search benefit to weigh
+// against breaking a link somebody has in their inbox.
+const SEO_FIXED_SLUGS = new Set(["home", "branding", "brand-guide", "seo", "seo-report"]);
 async function seoUrlStrategy(pages, ai) {
-  const list = pages.filter((p) => p.slug !== "home")
+  const list = pages.filter((p) => !SEO_FIXED_SLUGS.has(p.slug))
     .map((p) => `${p.slug} | ${p.title} | primary keyword: ${p.seo.primaryKeyword} | about: ${p.text.slice(0, 200)}`).join("\n");
   if (!list) return [];
   const raw = await aiCall([{ text: [
@@ -4813,7 +4818,7 @@ async function seoUrlStrategy(pages, ai) {
   const seen = new Set();
   return (Array.isArray(d.renames) ? d.renames : [])
     .map((r) => ({ from: clean(r && r.from), to: clean(r && r.to), why: String((r && r.why) || "").trim() }))
-    .filter((r) => r.from && r.to && r.from !== r.to && r.from !== "home" && known.has(r.from) && !known.has(r.to) && !seen.has(r.to) && seen.add(r.to));
+    .filter((r) => r.from && r.to && r.from !== r.to && !SEO_FIXED_SLUGS.has(r.from) && known.has(r.from) && !known.has(r.to) && !seen.has(r.to) && seen.add(r.to));
 }
 
 // ---- 12. heading hierarchy ---------------------------------------------------
@@ -4984,10 +4989,15 @@ async function seoContentAudit(page, ai) {
       'Return ONLY minified JSON: {"onTopicPercent":<0-100>,"verdict":"one sentence","missing":["what a page on this subject should cover but does not"]}',
     ].join("\n") }], { ...(ai || {}), temperature: 0.2, maxOutputTokens: 800, timeoutMs: 60000, json: true });
     const d = JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
-    const pct = Math.max(0, Math.min(100, Math.round(Number(d.onTopicPercent) || 0)));
+    // A missing answer is "not audited", not "0% on topic". Reporting a page as
+    // entirely generic because the model returned nothing would be a confident
+    // claim about content nobody actually judged.
+    const n = Number(d.onTopicPercent);
+    const verdict = String(d.verdict || "").trim();
+    const pct = Number.isFinite(n) && verdict ? Math.max(0, Math.min(100, Math.round(n))) : null;
     return {
       slug: page.slug, title: page.title, onTopicPercent: pct,
-      verdict: String(d.verdict || "").trim(),
+      verdict: verdict || "Could not be audited — the model returned no verdict for this page.",
       missing: (Array.isArray(d.missing) ? d.missing : []).map((x) => String(x || "").trim()).filter(Boolean).slice(0, 6),
       words: page.text.split(/\s+/).filter(Boolean).length,
     };
@@ -5289,6 +5299,21 @@ function seoVerify(entries, pages) {
   return { rows, pass, total, failed: total - pass };
 }
 
+// A theme folder on disk has no mu-plugin, and the mu-plugin is what says which
+// template serves which slug. Rebuilding that from the Template Name headers is
+// what lets a dry run point straight at generated/wp-theme/<slug>.
+function synthMuSource(themeAbs) {
+  const rows = [`    ['title' => 'Home', 'slug' => 'home', 'template' => ''],`];
+  for (const f of fs.readdirSync(themeAbs).sort()) {
+    const m = f.match(/^page-(.+)\.php$/);
+    if (!m) continue;
+    const src = fs.readFileSync(path.join(themeAbs, f), "utf8");
+    const tpl = (src.match(/Template Name:\s*(.+?)\s*(?:\*\/|-->|\?>|$)/m) || [])[1] || m[1];
+    rows.push(`    ['title' => '${tpl.replace(/'/g, "\\'")}', 'slug' => '${m[1]}', 'template' => '${f}'],`);
+  }
+  return `<?php\n\n$pages = [\n${rows.join("\n")}\n];\n`;
+}
+
 function newSeoJob(payload) {
   return {
     type: "seo",
@@ -5323,18 +5348,54 @@ async function runSeoJob(job) {
   // No domain on file means no canonical and no og:url. Writing a guess is what
   // produced the cross-client canonical this job exists to clear up.
   const origin = P.liveUrl ? String(P.liveUrl).replace(/\/+$/, "") : "";
+  // A dry run does every piece of real work and stops before anything reaches
+  // GitHub: no branch, no push, no PR, no merge. `themeDir` goes further and
+  // skips the clone too, reading a theme folder straight off disk — which makes
+  // iterating on the engine itself instant and offline.
+  const dry = !!P.dryRun;
+  const workRoot = dry ? path.join(GEN, "seo-preview", String(P.themeSlug || "preview").replace(/[^a-z0-9-]/gi, "")) : tmp;
   try {
     // 1 — pull latest
-    jobStep(job, 0, "running", "Cloning " + repo);
-    let r = await runRetry(`gh repo clone ${repo} "${tmp}" -- --depth 1`);
-    const cloneUrl = process.env.GH_TOKEN ? `https://x-access-token:${process.env.GH_TOKEN}@github.com/${repo}.git` : `https://github.com/${repo}.git`;
-    if (r.code) r = await runRetry(`git clone --depth 1 "${cloneUrl}" "${tmp}"`);
-    if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
-    if (process.env.GH_TOKEN) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
-    const themeAbs = path.join(tmp, P.themePath);
-    if (!fs.existsSync(themeAbs)) throw new Error("theme not found in repo: " + P.themePath);
-    const muAbs = P.muPath ? path.join(tmp, P.muPath) : "";
-    jobStep(job, 0, "done", "Latest code pulled");
+    let r;
+    if (dry) {
+      jobStep(job, 0, "running", P.themeDir ? "Copying " + P.themeDir : "Cloning " + repo);
+      fs.rmSync(workRoot, { recursive: true, force: true });
+      fs.mkdirSync(path.join(workRoot, P.themePath), { recursive: true });
+      if (P.themeDir) {
+        // Relative to the tool, not to wherever node happened to be launched.
+        const from = path.isAbsolute(P.themeDir) ? P.themeDir : path.resolve(DIR, P.themeDir);
+        if (!fs.existsSync(from)) throw new Error("themeDir does not exist: " + from);
+        fs.cpSync(from, path.join(workRoot, P.themePath), { recursive: true });
+      } else {
+        const scratch = tmp + "-src";
+        r = await runRetry(`gh repo clone ${repo} "${scratch}" -- --depth 1`);
+        if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
+        fs.cpSync(path.join(scratch, P.themePath), path.join(workRoot, P.themePath), { recursive: true });
+        if (P.muPath && fs.existsSync(path.join(scratch, P.muPath))) {
+          fs.mkdirSync(path.dirname(path.join(workRoot, P.muPath)), { recursive: true });
+          fs.cpSync(path.join(scratch, P.muPath), path.join(workRoot, P.muPath));
+        }
+        fs.rmSync(scratch, { recursive: true, force: true });
+      }
+      // No mu-plugin came along (a theme folder on disk has none), so rebuild
+      // the page map from the Template Name headers instead.
+      if (P.muPath && !fs.existsSync(path.join(workRoot, P.muPath))) {
+        fs.mkdirSync(path.dirname(path.join(workRoot, P.muPath)), { recursive: true });
+        fs.writeFileSync(path.join(workRoot, P.muPath), synthMuSource(path.join(workRoot, P.themePath)));
+      }
+      jobStep(job, 0, "done", "Dry run — working in " + workRoot);
+    } else {
+      jobStep(job, 0, "running", "Cloning " + repo);
+      r = await runRetry(`gh repo clone ${repo} "${tmp}" -- --depth 1`);
+      const cloneUrl = process.env.GH_TOKEN ? `https://x-access-token:${process.env.GH_TOKEN}@github.com/${repo}.git` : `https://github.com/${repo}.git`;
+      if (r.code) r = await runRetry(`git clone --depth 1 "${cloneUrl}" "${tmp}"`);
+      if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
+      if (process.env.GH_TOKEN) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
+      jobStep(job, 0, "done", "Latest code pulled");
+    }
+    const themeAbs = path.join(workRoot, P.themePath);
+    if (!fs.existsSync(themeAbs)) throw new Error("theme not found: " + P.themePath);
+    const muAbs = P.muPath ? path.join(workRoot, P.muPath) : "";
 
     // 2 — read every page
     jobStep(job, 1, "running", "Reading the theme…");
@@ -5468,6 +5529,18 @@ async function runSeoJob(job) {
 
     if (!changed.length) throw new Error("nothing to change — the SEO layer already matches this content");
 
+    if (dry) {
+      // The report is the deliverable here, since there is no PR to carry it.
+      const reportAbs = path.join(workRoot, "SEO-REPORT.md");
+      fs.writeFileSync(reportAbs, seoPrBody(job, entries, renames, audit, check, stripped, origin));
+      job.previewDir = workRoot;
+      job.reportPath = reportAbs;
+      for (const i of [8, 9, 10]) jobStep(job, i, "done", "skipped (dry run)");
+      job.status = "done";
+      notify(`🔎 [dry run] SEO preview for *${job.businessName}*: ${pages.length} page(s) · ${check.pass}/${check.total} checks · ${workRoot}`);
+      return;
+    }
+
     // 9 — push + PR
     jobStep(job, 8, "running", "Pushing + opening PR…");
     const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
@@ -5517,13 +5590,16 @@ async function runSeoJob(job) {
     job.status = "done";
     notify(`🔎 SEO merged for *${job.businessName}*: ${pages.length} page(s) · ${check.pass}/${check.total} checks${renames.length ? ` · ${renames.length} URL(s) renamed` : ""}${weak.length ? `\n⚠️ ${weak.length} page(s) are mostly generic copy — see the content audit` : ""} · ${job.prUrl || ""}`);
   } catch (e) {
+    // A dry run's working directory IS its output, so it survives a failure —
+    // that is where you look to find out what went wrong.
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
     if (e && e.cancelled) { job.status = "cancelled"; }
     else {
       job.error = e.message; job.status = "error";
+      if (dry) job.previewDir = workRoot;
       if (job.steps[job.currentStep] && job.steps[job.currentStep].status === "running") { job.steps[job.currentStep].status = "error"; job.steps[job.currentStep].detail = String(e.message).slice(0, 240); }
       console.error(`seo job ${job.draftId} failed:`, e.message);
-      notify(`❌ SEO failed for *${job.businessName}*: ${e.message}`);
+      notify(`❌ SEO${dry ? " [dry run]" : ""} failed for *${job.businessName}*: ${e.message}`);
     }
   } finally {
     job.finishedAt = new Date().toISOString(); saveJobs(); COST_SINK = null;
@@ -6088,7 +6164,22 @@ const server = http.createServer(async (req, res) => {
     // One click, every SEO task, one PR. Same rails as enrich: clone → work →
     // PR → CI → the site's own merge policy.
     if (p === "/api/seo-run" && req.method === "POST") {
-      const { siteId } = JSON.parse(await readBody(req) || "{}");
+      const body0 = JSON.parse(await readBody(req) || "{}");
+      const { siteId } = body0;
+      // Offline dry run: point straight at a theme folder on disk. No NocoDB,
+      // no clone, no network beyond the AI calls — for iterating on the engine.
+      if (body0.dryRun && body0.themeDir) {
+        const slug = body0.themeSlug || path.basename(path.resolve(body0.themeDir));
+        const job = enqueueSeoJob({
+          jobId: "seo-dry-" + Date.now(), dryRun: true, themeDir: body0.themeDir,
+          siteId: body0.siteId || slug, businessName: body0.businessName || slug,
+          githubRepo: WP_REPO, themeSlug: slug,
+          themePath: "web/app/themes/" + slug,
+          muPath: "web/app/mu-plugins/g99-activate-" + slug.replace(/^g99-/, "") + ".php",
+          liveUrl: body0.liveUrl || "",
+        });
+        return json(res, 202, { jobId: job.draftId, dryRun: true, monitor: "/jobs" });
+      }
       const site = await findWebsite(siteId);
       if (!site) return json(res, 404, { error: "unknown siteId — refresh the site list" });
       if (!site.githubRepo) return json(res, 409, { error: `${site.businessName} has no repository set in NocoDB` });
@@ -6096,12 +6187,12 @@ const server = http.createServer(async (req, res) => {
       const running = [...JOBS.values()].find((j) => j.type === "seo" && (j.status === "queued" || j.status === "running") && j.payload && j.payload.siteId === site.siteId);
       if (running) return json(res, 202, { jobId: running.draftId, dedupe: true, monitor: "/jobs" });
       const job = enqueueSeoJob({
-        jobId: "seo-" + Date.now(),
+        jobId: (body0.dryRun ? "seo-dry-" : "seo-") + Date.now(), dryRun: !!body0.dryRun,
         siteId: site.siteId, businessName: site.businessName, githubRepo: site.githubRepo,
         themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
         liveUrl: site.liveUrl || "",
       });
-      return json(res, 202, { jobId: job.draftId, monitor: "/jobs" });
+      return json(res, 202, { jobId: job.draftId, dryRun: !!body0.dryRun, monitor: "/jobs" });
     }
 
     if (p === "/api/enrich-run" && req.method === "POST") {

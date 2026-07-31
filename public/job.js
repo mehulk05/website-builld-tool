@@ -154,6 +154,15 @@ const TYPE_LABEL = { edit: "Edit", enrich: "Enrich", restore: "Restore", build: 
 function seoCards(j) {
   if (j.type !== "seo") return "";
   const out = [];
+
+  // A dry run's whole output is on disk, so the paths are the result.
+  if (j.payload && j.payload.dryRun) {
+    out.push(`<div class="card pad"><div class="card-h"><h2>Dry run</h2><span class="right" style="font-size:12px;color:var(--muted)">nothing reached GitHub</span></div>
+      <div class="wo-note" style="margin-top:4px">Every step ran and the result was written to disk — no branch, no pull request.</div>
+      ${j.previewDir ? `<div class="seorow"><div class="seohd"><span class="seokw">Preview folder</span></div><div class="seot"><code>${esc(j.previewDir)}</code></div></div>` : ""}
+      ${j.reportPath ? `<div class="seorow"><div class="seohd"><span class="seokw">Report</span></div><div class="seot"><code>${esc(j.reportPath)}</code></div></div>` : ""}
+    </div>`);
+  }
   const chk = j.seoCheck;
   const rowFor = (slug) => (chk && chk.rows.find((r) => r.slug === slug)) || null;
 
