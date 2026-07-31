@@ -2840,7 +2840,20 @@ async function buildWorkOrder(prompt, ctx, ai) {
   // No usable items means the extraction misread the request, not that the
   // request was empty — the raw prose is a better brief than an empty list.
   if (!changes.length) return null;
-  return { summary: String(d.summary || "").trim(), changes, constraints: arr(d.constraints), unclear: arr(d.unclear) };
+  // An item cannot be both actionable and too vague to action, but the model
+  // sometimes files the same change under each. On the job page that read as a
+  // numbered item with a verdict AND a note saying it was never attempted —
+  // two statements about the same thing that contradicted each other.
+  const words = (s) => new Set(String(s).toLowerCase().match(/[a-z0-9]+/g) || []);
+  const sameThing = (a, b) => {
+    const A = words(a), B = words(b);
+    if (!A.size || !B.size) return false;
+    let hit = 0;
+    for (const w of A) if (B.has(w)) hit++;
+    return hit / Math.min(A.size, B.size) >= 0.6;
+  };
+  const unclear = arr(d.unclear).filter((u) => !changes.some((c) => sameThing(c.what, u)));
+  return { summary: String(d.summary || "").trim(), changes, constraints: arr(d.constraints), unclear };
 }
 
 // The work order as both the planner and the file writer see it.
@@ -3027,14 +3040,22 @@ function diffChanges(diff) {
     const m = L.match(/^\+\+\+ b\/(.+)$/);
     if (m) { file = m[1]; continue; }
     if (/^(\+\+\+|---|@@|diff |index |new file|deleted file|similarity|rename )/.test(L)) continue;
-    if (/^[+-]/.test(L) && L.trim().length > 1) out.push({ file, sign: L[0], text: L.slice(1).trim().slice(0, 200) });
+    // 400, not 200: a Tailwind class list runs long, and the evidence for a
+    // style change is often the class that got truncated away.
+    if (/^[+-]/.test(L) && L.trim().length > 1) out.push({ file, sign: L[0], text: L.slice(1).trim().slice(0, 400) });
   }
   return out;
 }
-function changesText(changes, cap = 500) {
+const CHANGE_CAP = 500;
+// Every line carries an id, and the reviewer cites ids rather than quoting
+// text. Quoting could not be checked reliably: the lines are shown with a
+// filename on them, so a model that quoted "exactly as it appears" produced a
+// string that was never going to be found in the diff itself — which silently
+// failed every judgement-call item regardless of whether it had been done.
+function changesText(changes, cap = CHANGE_CAP) {
   const shown = changes.slice(0, cap);
-  return shown.map((c) => `${c.sign} [${c.file.split("/").pop()}] ${c.text}`).join("\n")
-    + (changes.length > cap ? `\n… and ${changes.length - cap} more changed line(s)` : "");
+  return shown.map((c, i) => `${String(i + 1).padStart(4)}  ${c.sign} ${c.file.split("/").pop()} │ ${c.text}`).join("\n")
+    + (changes.length > cap ? `\n… and ${changes.length - cap} more changed line(s), not shown` : "");
 }
 
 // The check that cannot be wrong. Three passes, loosest last: as written, then
@@ -3054,22 +3075,35 @@ function literalPresent(literal, haystack) {
 
 // Only for items with no exact text to search for — "remove the second
 // testimonial" has no string to match, so something has to read the diff.
-async function reviewChanges(items, changes, ai) {
+async function reviewChanges(items, changes, ai, request) {
   const p = [
-    "Below are the changed lines from one edit to a WordPress theme, then a list of items that were requested.",
-    "For each item, decide whether that change is visible in the changed lines.",
+    "An edit was made to a WordPress theme. Below are the lines it changed, then the things the client asked for.",
+    "For each item, decide whether these changed lines show it was done.",
+    "'+' means the line was added, '-' means it was removed. A modified line appears as a '-' and a '+' next to each other.",
     "",
-    "An item is done ONLY if you can quote one changed line that shows it. Quote the line exactly as it appears below, including its leading + or -.",
-    "If you cannot quote such a line, the item is not done. Do not reason about what the code probably does elsewhere — you are only judging these lines.",
-    "'+' means the line was added, '-' means it was removed.",
+    // A change is only ever visible as code, and code has many shapes. Listing
+    // them is what makes this work for anything beyond a text edit: on the
+    // first version the reviewer had no idea that a Tailwind class swap was
+    // what "make the button black" looks like once written.
+    "WHAT COUNTS AS DONE — judge the shape the change actually takes in code:",
+    "- Text changed: the old wording on a '-' line, the new wording on a '+' line.",
+    "- Colour, size, spacing, font or any styling changed: a CSS class, style attribute or CSS rule that differs between the '-' and '+' version of a line. Tailwind utility classes count — 'border border-white/30' becoming 'bg-black' IS the button being made black. So is a hex value, an rgb(), or a CSS custom property changing.",
+    "- Something added — a section, button, page, field, image, link: new '+' lines containing it.",
+    "- Something removed: '-' lines containing it, and no '+' line putting it back.",
+    "- Grammar, spelling, punctuation or wording fixed: a '-' line and a '+' line whose wording differs.",
+    "- Something moved or reordered: the same content on a '-' line in one place and a '+' line in another.",
     "",
+    "Judge only what the lines show. Not whether you would have done it that way, not whether it is complete, not whether it is good. If the lines show it was done, it is done.",
+    "Every line has an id on the left. Cite the ids of the lines that show the item was done. If nothing shows it, the item is not done and you cite no ids.",
+    "",
+    request ? `WHAT THE CLIENT WROTE, VERBATIM — use this to understand what each item means:\n-----\n${String(request).slice(0, 1500)}\n-----\n` : "",
     "CHANGED LINES:", "-----", changesText(changes), "-----",
     "",
-    "ITEMS:",
-    ...items.map((it) => `${it.n}. ${it.what}${it.where ? ` (${it.where})` : ""}`),
+    "ITEMS TO JUDGE:",
+    ...items.map((it) => `${it.n}. ${it.what}${it.where ? ` (where the client said: ${it.where})` : ""}`),
     "",
-    'Return ONLY minified JSON: {"results":[{"n":<item number>,"done":<true|false>,"evidence":"<the exact changed line, or empty if not done>"}]}',
-  ].join("\n");
+    'Return ONLY minified JSON: {"results":[{"n":<item number>,"done":<true|false>,"lines":[<ids of the changed lines that show it, empty if not done>]}]}',
+  ].filter(Boolean).join("\n");
   const raw = await aiCall([{ text: p }], { ...(ai || {}), temperature: 0.1, maxOutputTokens: 1500, timeoutMs: 60000, json: true });
   const d = JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
   return Array.isArray(d.results) ? d.results : [];
@@ -3078,12 +3112,11 @@ async function reviewChanges(items, changes, ai) {
 // One verdict per work-order item. Exact-text items are settled by search; the
 // rest go to the model, and a "done" it cannot back with a real changed line is
 // downgraded — that quote is checked against the diff here, not taken on trust.
-async function verifyWork(workOrder, diff, ai) {
+async function verifyWork(workOrder, diff, ai, request) {
   if (!workOrder || !workOrder.changes.length) return null;
   const changes = diffChanges(diff);
   const added = changes.filter((c) => c.sign === "+").map((c) => c.text).join("\n");
   const removed = changes.filter((c) => c.sign === "-").map((c) => c.text).join("\n");
-  const all = changes.map((c) => c.text).join("\n");
   const results = workOrder.changes.map((c, i) => ({ n: i + 1, what: c.what, where: c.where, replaces: c.replaces, literal: c.literal, done: null, how: "", evidence: "" }));
 
   for (const r of results) {
@@ -3106,21 +3139,24 @@ async function verifyWork(workOrder, diff, ai) {
   const judged = results.filter((r) => r.done === null);
   if (judged.length && changes.length) {
     let verdicts = [];
-    try { verdicts = await reviewChanges(judged, changes, ai); }
+    try { verdicts = await reviewChanges(judged, changes, ai, request); }
     catch (e) { console.warn("work check: review failed —", e.message); }
+    const top = Math.min(changes.length, CHANGE_CAP);
     for (const r of judged) {
       const v = verdicts.find((x) => Number(x && x.n) === r.n);
-      const quote = String((v && v.evidence) || "").replace(/^[+-]\s*/, "").trim();
-      // Grounded or it doesn't count: an unquotable "done" is the failure mode
-      // this whole step exists to catch, so it is not accepted on the model's
-      // word alone.
-      const grounded = quote.length > 2 && all.includes(quote.slice(0, 60));
-      r.done = !!(v && v.done && grounded);
+      // No verdict at all — the review failed, or the model skipped the item —
+      // is not evidence of a miss. Say "not checked" rather than claim it
+      // failed; a wrong cross is worse than an honest blank.
+      if (!v) { r.done = null; r.how = "not checked"; continue; }
+      // Grounded or it doesn't count, but grounding is now "did it cite real
+      // lines" rather than "did its quote match a string I reassembled".
+      const ids = (Array.isArray(v.lines) ? v.lines : []).map(Number)
+        .filter((k) => Number.isInteger(k) && k >= 1 && k <= top);
+      r.done = !!(v.done && ids.length);
       r.how = "reviewed";
-      if (r.done) r.evidence = quote.slice(0, 160);
-      // No verdict at all (the review failed, or the model skipped the item)
-      // is not evidence of a miss — say so rather than claiming it failed.
-      if (!v) { r.done = null; r.how = "not checked"; }
+      if (r.done) {
+        r.evidence = ids.slice(0, 2).map((k) => `${changes[k - 1].sign} ${changes[k - 1].text}`).join("   ").slice(0, 220);
+      }
     }
   } else if (judged.length) {
     for (const r of judged) { r.done = false; r.how = "no lines changed"; }
@@ -3265,7 +3301,7 @@ async function runEditJob(job) {
     };
     let check = null;
     try {
-      check = await verifyWork(workOrder, await stagedDiff(), ai);
+      check = await verifyWork(workOrder, await stagedDiff(), ai, P.prompt);
       // One retry, for the items the diff shows no evidence of. A second miss
       // is reported rather than retried again: past one attempt this stops
       // converging and starts churning the same files.
@@ -3289,7 +3325,7 @@ async function runEditJob(job) {
           job.retried = true;
           job.editPlan = [...job.editPlan, ...plan2.files.map(f => ({ path: f.path, op: f.op }))]
             .filter((f, i, a) => a.findIndex((x) => x.path === f.path) === i);
-          check = await verifyWork(workOrder, await stagedDiff(), ai);
+          check = await verifyWork(workOrder, await stagedDiff(), ai, P.prompt);
         }
       }
     } catch (e) {
