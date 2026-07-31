@@ -14,7 +14,7 @@ let shownCount = PAGE;
 // isActiveJob guards against a stale awaitingApproval flag on a run that has
 // already ended — a finished job can't be waiting for you.
 const needsYou = (j) => j.awaitingApproval && !j.approved && isActiveJob(j);
-const title = (j) => j.editSummary || (j.payload && j.payload.prompt) || (j.type === "edit" ? "Website edit" : "Build " + j.businessName);
+const title = (j) => j.editSummary || (j.payload && j.payload.prompt) || (j.type === "edit" ? "Website edit" : j.type === "seo" ? "SEO — " + j.businessName : "Build " + j.businessName);
 
 // Client info the onboarding form brought with it: the build target from the
 // HubSpot deal, plus when the submission actually arrived. Shown on every row so

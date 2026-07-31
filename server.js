@@ -2535,7 +2535,7 @@ async function processJobQueue() {
   if (!id) return;
   JOB_RUNNING = true;
   const job = JOBS.get(id);
-  const RUNNER = { edit: runEditJob, restore: runRestoreJob, enrich: runEnrichJob };
+  const RUNNER = { edit: runEditJob, restore: runRestoreJob, enrich: runEnrichJob, seo: runSeoJob };
   try { await ((job && RUNNER[job.type] ? RUNNER[job.type] : runJob)(job)); }
   catch (e) { console.error("job runner crashed:", e); }
   finally { JOB_RUNNING = false; processJobQueue(); }
@@ -4570,6 +4570,1106 @@ async function runEnrichJob(job) {
 }
 function log_srv(m) { console.log("[enrich] " + m); }
 
+// ============================================================ SEO ENGINE
+// One click runs the whole of the SEO team's manual checklist over every page:
+// keywords, head assets, URLs + redirects, headings, image alt, internal links,
+// schema, and a content-relevance audit. Everything is derived from the theme in
+// the repo rather than from a crawl, so it works whether or not a domain is live
+// and can never lag behind a deploy.
+
+// The head block these themes ship with is HARDCODED in header.php, which
+// get_header() puts on every page. So today every page carries the same title,
+// the same description and the same canonical — and on at least one theme that
+// canonical names a different client's domain, which tells Google every page is
+// a duplicate of somebody else's site. Everything below exists to replace that
+// with a per-page layer.
+const SEO_STEPS = [
+  "Pull latest code",
+  "Read every page",
+  "Keywords + head copy",
+  "URL strategy + redirects",
+  "Headings, image alt, internal links",
+  "Schema + SEO layer",
+  "Content audit",
+  "Check the work",
+  "Push + open PR",
+  "CI checks → merge",
+  "Sync registry",
+];
+
+// ---- reading the theme -------------------------------------------------------
+// The mu-plugin's $pages array is the authority on which template serves which
+// slug and under what nav title — the templates themselves only carry a display
+// name in their Template Name header.
+function readMuPages(src) {
+  const out = [];
+  const block = (String(src || "").match(/\$pages\s*=\s*\[([\s\S]*?)\n\s*\];/) || [])[1] || "";
+  const re = /\[\s*['"]title['"]\s*=>\s*['"]([^'"]*)['"]\s*,\s*['"]slug['"]\s*=>\s*['"]([^'"]*)['"]\s*,\s*['"]template['"]\s*=>\s*['"]([^'"]*)['"]/g;
+  for (const m of block.matchAll(re)) out.push({ title: m[1], slug: m[2], template: m[3] });
+  return out;
+}
+
+// Everything a page says, with the PHP and the chrome taken out. Scripts and
+// styles go first: a Tailwind config block is thousands of characters of noise
+// that would otherwise dominate the content the model reads.
+function pageText(php) {
+  return String(php || "")
+    .replace(/<\?php[\s\S]*?\?>/g, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&#\d+;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function pageHeadings(php) {
+  const out = [];
+  for (const m of String(php || "").matchAll(/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi)) {
+    const text = m[2].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    if (text) out.push({ level: Number(m[1]), text, raw: m[0] });
+  }
+  return out;
+}
+function pageImages(php) {
+  const out = [];
+  for (const m of String(php || "").matchAll(/<img\b([^>]*)>/gi)) {
+    const attrs = m[1];
+    out.push({
+      raw: m[0],
+      src: (attrs.match(/\bsrc=["']([^"']+)["']/i) || [])[1] || "",
+      alt: (attrs.match(/\balt=["']([^"']*)["']/i) || [])[1],
+    });
+  }
+  return out;
+}
+function pageLinks(php) {
+  const out = [];
+  for (const m of String(php || "").matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
+    const href = (m[1].match(/\bhref=["']([^"']*)["']/i) || [])[1] || "";
+    out.push({ href, text: m[2].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim() });
+  }
+  return out;
+}
+
+// front-page.php is the home page; every other page is a template named in the
+// mu-plugin. A template on disk that the mu-plugin never references is dead
+// weight and is left alone rather than optimised.
+function readSeoPages(themeAbs, muSrc) {
+  const muPages = readMuPages(muSrc);
+  const pages = [];
+  const add = (slug, title, file) => {
+    const abs = path.join(themeAbs, file);
+    if (!fs.existsSync(abs)) return;
+    const php = fs.readFileSync(abs, "utf8");
+    pages.push({
+      slug, title, file, php,
+      text: pageText(php),
+      headings: pageHeadings(php),
+      images: pageImages(php),
+      links: pageLinks(php),
+    });
+  };
+  add("home", (muPages.find((p) => !p.template) || {}).title || "Home", "front-page.php");
+  for (const p of muPages) {
+    if (!p.template || p.slug === "home") continue;
+    add(p.slug, p.title, p.template);
+  }
+  return { pages, muPages };
+}
+
+// ---- 1. business facts, from the contact page --------------------------------
+// Not from onboarding answers: a repo Studio did not build has none, and the
+// contact page is the one place every site states this for itself.
+async function readBusinessFacts(pages, businessName, ai) {
+  const contact = pages.find((p) => /contact/i.test(p.slug)) || pages.find((p) => /contact/i.test(p.text.slice(0, 4000)));
+  const src = [contact && contact.text, (pages.find((p) => p.slug === "home") || {}).text].filter(Boolean).join("\n\n").slice(0, 6000);
+  const fallback = { name: businessName, phone: "", email: "", street: "", city: "", region: "", postalCode: "", hours: "", priceRange: "" };
+  if (!src) return fallback;
+  try {
+    const raw = await aiCall([{ text: [
+      `Read this website's contact and home page text and pull out the business's real details. The business is "${businessName}".`,
+      "Copy values exactly as written. Leave a field empty rather than guessing or inventing one — wrong contact details in structured data are worse than absent ones.",
+      "", "PAGE TEXT:", "-----", src, "-----", "",
+      'Return ONLY minified JSON: {"name":"","phone":"","email":"","street":"","city":"","region":"state or province","postalCode":"","hours":"e.g. Mo-Fr 09:00-18:00","priceRange":"e.g. $$"}',
+    ].join("\n") }], { ...(ai || {}), temperature: 0.1, maxOutputTokens: 700, timeoutMs: 45000, json: true });
+    const d = JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
+    const s = (k) => String(d[k] || "").trim();
+    return { ...fallback, name: s("name") || businessName, phone: s("phone"), email: s("email"), street: s("street"), city: s("city"), region: s("region"), postalCode: s("postalCode"), hours: s("hours"), priceRange: s("priceRange") };
+  } catch (e) {
+    console.warn("seo: business facts failed —", e.message);
+    return fallback;
+  }
+}
+
+// ---- 2+3+4+7+8+10. keywords and head copy, one page at a time ----------------
+// Grouped into a single call per page because they are one judgement: the
+// primary keyword decides the title, the title decides the description, and the
+// Open Graph copy is those two restated. Splitting them into five calls let the
+// title drift away from the keyword the description was written for.
+const SEO_ROBOTS = "index,follow,max-snippet:-1,max-video-preview:-1,max-image-preview:large";
+async function seoHeadCopy(page, biz, businessName, ai) {
+  const loc = [biz.city, biz.region].filter(Boolean).join(", ");
+  const raw = await aiCall([{ text: [
+    `You are the SEO lead for "${businessName}"${loc ? `, based in ${loc}` : ""}. Read this page and produce its SEO assets.`,
+    "Work only from what the page actually says. Do not promise services it does not offer.",
+    "",
+    "RULES, all mandatory:",
+    "- metaTitle: 50-60 characters. Primary keyword first, then location, then brand. Never longer than 60.",
+    "- metaDescription: 150-160 characters. Contains the primary keyword and ends with a call to action. Never longer than 160.",
+    "- h1: one line, the page's single H1. Carries the primary keyword and reads as a headline, not a sentence.",
+    "- primaryKeyword: the one phrase this page should rank for. Include the location when the page is local in nature.",
+    "- secondaryKeywords: 3-5 supporting phrases. semanticKeywords: 5-8 related terms a search engine would expect on this topic.",
+    "- ogTitle up to 60 chars, ogDescription up to 110 — these are read on a social card, not in search results.",
+    "",
+    `PAGE: ${page.title} (slug: ${page.slug})`,
+    `EXISTING HEADINGS: ${page.headings.slice(0, 12).map((h) => "H" + h.level + " " + h.text).join(" | ") || "none"}`,
+    "PAGE TEXT:", "-----", page.text.slice(0, 7000), "-----", "",
+    'Return ONLY minified JSON: {"primaryKeyword":"","secondaryKeywords":[],"semanticKeywords":[],"metaTitle":"","metaDescription":"","h1":"","ogTitle":"","ogDescription":""}',
+  ].join("\n") }], { ...(ai || {}), temperature: 0.3, maxOutputTokens: 1200, timeoutMs: 60000, json: true });
+  const d = JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
+  const s = (k) => String(d[k] || "").trim();
+  const arr = (k) => (Array.isArray(d[k]) ? d[k].map((x) => String(x || "").trim()).filter(Boolean) : []);
+  const out = {
+    primaryKeyword: s("primaryKeyword"),
+    secondaryKeywords: arr("secondaryKeywords").slice(0, 5),
+    semanticKeywords: arr("semanticKeywords").slice(0, 8),
+    metaTitle: s("metaTitle"),
+    metaDescription: s("metaDescription"),
+    h1: s("h1"),
+    ogTitle: s("ogTitle") || s("metaTitle"),
+    ogDescription: s("ogDescription") || s("metaDescription"),
+  };
+
+  // Models land near a character range rather than inside it. Reporting that as
+  // a failed check and shipping it anyway would be no use to anyone, so ask
+  // once for a corrected pair, quoting the exact miss.
+  const off = () => {
+    const t = out.metaTitle.length, dd = out.metaDescription.length;
+    const bad = [];
+    if (t < 50 || t > 60) bad.push(`metaTitle is ${t} characters, needs 50-60`);
+    if (dd < 150 || dd > 160) bad.push(`metaDescription is ${dd} characters, needs 150-160`);
+    return bad;
+  };
+  const bad = off();
+  if (bad.length) {
+    try {
+      const fix = await aiCall([{ text: [
+        "Rewrite these two SEO fields so they land inside their character ranges. Keep the same meaning, the same keyword and the same call to action — change only the length.",
+        "Count characters exactly. This is the one thing that must be right.",
+        "", ...bad.map((b) => "- " + b), "",
+        `CURRENT metaTitle: ${out.metaTitle}`,
+        `CURRENT metaDescription: ${out.metaDescription}`,
+        `PAGE SUBJECT: ${out.primaryKeyword}`,
+        "",
+        'Return ONLY minified JSON: {"metaTitle":"","metaDescription":""}',
+      ].join("\n") }], { ...(ai || {}), temperature: 0.2, maxOutputTokens: 500, timeoutMs: 45000, json: true });
+      const f = JSON.parse((stripFence(fix).match(/\{[\s\S]*\}/) || ["{}"])[0]);
+      const ft = String(f.metaTitle || "").trim(), fd = String(f.metaDescription || "").trim();
+      // Only take the retry where it actually improved that field.
+      const closer = (next, cur, lo, hi) => {
+        const miss = (n) => (n.length < lo ? lo - n.length : n.length > hi ? n.length - hi : 0);
+        return next && miss(next) < miss(cur) ? next : cur;
+      };
+      out.metaTitle = closer(ft, out.metaTitle, 50, 60);
+      out.metaDescription = closer(fd, out.metaDescription, 150, 160);
+    } catch (e) {
+      console.warn("seo: length repair failed —", e.message);
+    }
+  }
+  // Backstop. Over-length is the harmful direction — Google truncates it mid
+  // sentence — so it is cut at a word boundary no matter what the model said.
+  // Under-length is merely a wasted opportunity and is left visible in the check.
+  const trim = (t, max) => (t.length <= max ? t : t.slice(0, max).replace(/\s+\S*$/, "").replace(/[\s,;:–—-]+$/, ""));
+  out.metaTitle = trim(out.metaTitle, 60);
+  out.metaDescription = trim(out.metaDescription, 160);
+  out.ogTitle = trim(out.ogTitle, 60);
+  out.ogDescription = trim(out.ogDescription, 110);
+  return out;
+}
+
+// ---- 1. URL strategy ---------------------------------------------------------
+// The spec says "keep existing URL if valuable; otherwise recommend an
+// SEO-friendly URL", and that restraint is the whole point: every rename risks
+// the page's standing even with a redirect behind it, so this only fires on a
+// clear mismatch between the slug and what the page is about. The home page is
+// never renamed — its URL is the domain.
+// Never renamed. The home page's URL is the domain, and the brand guide and SEO
+// report are client deliverables whose links have already been sent to people —
+// a redirect would keep them working, but there is no search benefit to weigh
+// against breaking a link somebody has in their inbox.
+const SEO_FIXED_SLUGS = new Set(["home", "branding", "brand-guide", "seo", "seo-report"]);
+async function seoUrlStrategy(pages, ai) {
+  const list = pages.filter((p) => !SEO_FIXED_SLUGS.has(p.slug))
+    .map((p) => `${p.slug} | ${p.title} | primary keyword: ${p.seo.primaryKeyword} | about: ${p.text.slice(0, 200)}`).join("\n");
+  if (!list) return [];
+  const raw = await aiCall([{ text: [
+    "Below are the URL slugs of one website's pages, with what each page is actually about.",
+    "Judge each slug. Keep it unless it is genuinely poor — misleading, meaningless, abbreviated past recognition, or unrelated to the page's subject.",
+    "Do NOT propose a rename for a slug that is merely shorter or longer than you would have chosen. A rename costs the page some of its standing in search even with a redirect, so it must be worth that.",
+    "A replacement slug is lowercase, hyphen-separated, 1-4 words, no stop words, and describes the page's subject.",
+    "", "PAGES (slug | title | keyword | about):", list, "",
+    'Return ONLY minified JSON: {"renames":[{"from":"current-slug","to":"new-slug","why":"one line on why the current slug fails"}]}',
+    "Return an empty array when every slug is fine. That is the expected answer for a well-built site.",
+  ].join("\n") }], { ...(ai || {}), temperature: 0.1, maxOutputTokens: 900, timeoutMs: 60000, json: true });
+  const d = JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
+  const known = new Set(pages.map((p) => p.slug));
+  const clean = (s) => String(s || "").trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+  const seen = new Set();
+  return (Array.isArray(d.renames) ? d.renames : [])
+    .map((r) => ({ from: clean(r && r.from), to: clean(r && r.to), why: String((r && r.why) || "").trim() }))
+    .filter((r) => r.from && r.to && r.from !== r.to && !SEO_FIXED_SLUGS.has(r.from) && known.has(r.from) && !known.has(r.to) && !seen.has(r.to) && seen.add(r.to));
+}
+
+// ---- 12. heading hierarchy ---------------------------------------------------
+// Deterministic, because it is a structural rule and not a matter of taste:
+// exactly one H1, and no level skipped on the way down.
+function seoFixHeadings(php, h1Text) {
+  let out = String(php);
+  const notes = [];
+  const hs = () => pageHeadings(out);
+  let heads = hs();
+  const h1s = heads.filter((h) => h.level === 1);
+
+  if (h1s.length === 0) {
+    const first = heads.find((h) => h.level === 2);
+    if (first) {
+      out = out.replace(first.raw, first.raw.replace(/^<h2/i, "<h1").replace(/<\/h2>$/i, "</h1>"));
+      notes.push(`no H1 — promoted "${first.text.slice(0, 60)}" from H2`);
+    }
+  } else if (h1s.length > 1) {
+    for (const extra of h1s.slice(1)) {
+      out = out.replace(extra.raw, extra.raw.replace(/^<h1/i, "<h2").replace(/<\/h1>$/i, "</h2>"));
+    }
+    notes.push(`${h1s.length} H1s — demoted ${h1s.length - 1} to H2`);
+  }
+  // Rewrite the H1's words only when the page had none worth keeping: an
+  // existing headline is the designer's, and replacing it is a content change
+  // nobody asked for.
+  heads = hs();
+  const h1 = heads.find((h) => h.level === 1);
+  if (h1 && !h1.text.trim() && h1Text) {
+    out = out.replace(h1.raw, h1.raw.replace(/>([\s\S]*)<\/h1>/i, `>${h1Text}</h1>`));
+    notes.push("empty H1 — filled from the page's primary keyword");
+  }
+  // Skipped levels: an H4 directly under an H2 becomes an H3. Only ever
+  // promotes, so nothing can be pushed below its own parent.
+  heads = hs();
+  let prev = 1;
+  for (const h of heads) {
+    if (h.level > prev + 1) {
+      const want = prev + 1;
+      out = out.replace(h.raw, h.raw.replace(new RegExp(`^<h${h.level}`, "i"), `<h${want}`).replace(new RegExp(`</h${h.level}>$`, "i"), `</h${want}>`));
+      notes.push(`H${h.level} after H${prev} — raised to H${want}`);
+      prev = want;
+    } else {
+      prev = h.level;
+    }
+  }
+  return { php: out, notes };
+}
+
+// ---- 9. image alt ------------------------------------------------------------
+async function seoImageAlts(page, biz, businessName, ai) {
+  const missing = page.images.filter((im) => im.alt === undefined || !String(im.alt).trim());
+  if (!missing.length) return { php: page.php, filled: 0 };
+  const loc = [biz.city, biz.region].filter(Boolean).join(", ");
+  let alts = [];
+  try {
+    const raw = await aiCall([{ text: [
+      `Write ALT text for the images on the "${page.title}" page of ${businessName}${loc ? ` in ${loc}` : ""}.`,
+      "ALT text describes what the image shows for someone who cannot see it. Keep it under 125 characters, describe the subject, and do not stuff keywords or start with \"image of\".",
+      `The page is about: ${page.seo.primaryKeyword || page.title}.`,
+      "PAGE TEXT (for context):", page.text.slice(0, 2500), "",
+      "IMAGES, in order:", ...missing.map((im, i) => `${i + 1}. ${im.src.slice(0, 120) || "(no src)"}`), "",
+      `Return ONLY minified JSON: {"alts":["one entry per image, in the same order"]}`,
+    ].join("\n") }], { ...(ai || {}), temperature: 0.4, maxOutputTokens: 900, timeoutMs: 60000, json: true });
+    const d = JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
+    alts = Array.isArray(d.alts) ? d.alts.map((a) => String(a || "").trim()) : [];
+  } catch (e) {
+    console.warn("seo: alt text failed —", e.message);
+  }
+  let out = page.php, filled = 0;
+  missing.forEach((im, i) => {
+    const text = (alts[i] || `${page.seo.primaryKeyword || page.title}${loc ? ` — ${loc}` : ""}`).replace(/"/g, "&quot;").slice(0, 125);
+    const next = /\balt\s*=/i.test(im.raw)
+      ? im.raw.replace(/\balt=["'][^"']*["']/i, `alt="${text}"`)
+      : im.raw.replace(/^<img\b/i, `<img alt="${text}"`);
+    if (out.includes(im.raw)) { out = out.replace(im.raw, next); filled++; }
+  });
+  return { php: out, filled };
+}
+
+// ---- 11. internal links ------------------------------------------------------
+// The page inventory is what makes this decidable without a human: we know every
+// page, its subject and its URL, so a mention of one page's subject inside
+// another page is a link with a known destination. The rules below are what keep
+// it from turning into link spam.
+const SEO_MAX_LINKS_PER_PAGE = 5;
+async function seoInternalLinks(pages, ai) {
+  const inventory = pages.map((p) => `/${p.slug === "home" ? "" : p.slug + "/"} | ${p.title} | ${p.seo.primaryKeyword}`).join("\n");
+  const out = [];
+  for (const page of pages) {
+    const others = pages.filter((p) => p.slug !== page.slug);
+    if (!others.length) continue;
+    // Only text outside headings, existing anchors and the chrome is eligible.
+    let plan = [];
+    try {
+      const raw = await aiCall([{ text: [
+        `Find internal links to add to the "${page.title}" page of this website.`,
+        "An anchor is a phrase ALREADY PRESENT in the page's body text that names another page's subject. Copy it exactly as it appears — if the phrase is not in the text below, character for character, do not propose it.",
+        "Propose the first, most natural mention only. Never the same phrase twice, never a link to this page itself, and nothing that already sits inside a link.",
+        `At most ${SEO_MAX_LINKS_PER_PAGE}. Fewer is correct and normal — propose none rather than reaching.`,
+        "", "PAGES ON THIS SITE (url | title | subject):", inventory, "",
+        `THIS PAGE IS: /${page.slug === "home" ? "" : page.slug + "/"}`,
+        "PAGE TEXT:", "-----", page.text.slice(0, 6000), "-----", "",
+        'Return ONLY minified JSON: {"links":[{"anchor":"exact phrase from the text","to":"/target-slug/","why":"a few words"}]}',
+      ].join("\n") }], { ...(ai || {}), temperature: 0.2, maxOutputTokens: 800, timeoutMs: 60000, json: true });
+      const d = JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
+      plan = Array.isArray(d.links) ? d.links : [];
+    } catch (e) {
+      console.warn(`seo: internal links failed for ${page.slug} —`, e.message);
+    }
+    const valid = new Set(pages.map((p) => "/" + (p.slug === "home" ? "" : p.slug + "/")));
+    const added = [];
+    let php = page.php;
+    for (const l of plan) {
+      if (added.length >= SEO_MAX_LINKS_PER_PAGE) break;
+      const anchor = String((l && l.anchor) || "").trim();
+      const to = String((l && l.to) || "").trim();
+      if (anchor.length < 4 || anchor.length > 80 || !valid.has(to) || to === "/" + (page.slug === "home" ? "" : page.slug + "/")) continue;
+      if (added.some((a) => a.anchor.toLowerCase() === anchor.toLowerCase())) continue;
+      // The anchor must sit in plain body text: not inside an attribute, not
+      // already linked, not in a heading, the nav or the footer. Checked
+      // against the markup rather than taken on the model's word.
+      //
+      // Every occurrence is tested, not just the first. A phrase is usually
+      // named by a heading before it appears in the copy below it, so stopping
+      // at the first match meant the most natural anchors could never be used.
+      const lower = php.toLowerCase(), needle = anchor.toLowerCase();
+      const BLOCKS = /<(a|h[1-6]|nav|footer|title|button|script|style)\b/gi;
+      const BLOCKE = /<\/(a|h[1-6]|nav|footer|title|button|script|style)>/gi;
+      let idx = -1, at = lower.indexOf(needle);
+      while (at !== -1) {
+        const before = php.slice(0, at);
+        const inTag = before.lastIndexOf("<") > before.lastIndexOf(">");
+        const open = (before.match(BLOCKS) || []).length;
+        const close = (before.match(BLOCKE) || []).length;
+        if (!inTag && open <= close) { idx = at; break; }
+        at = lower.indexOf(needle, at + 1);
+      }
+      if (idx === -1) continue;
+      php = php.slice(0, idx) + `<a href="${to}">` + php.slice(idx, idx + anchor.length) + "</a>" + php.slice(idx + anchor.length);
+      added.push({ anchor, to, why: String((l && l.why) || "").trim() });
+    }
+    // Broken internal hrefs: a link pointing at a slug this site does not have.
+    const broken = page.links
+      .filter((l) => /^\/[a-z0-9-]*\/?$/i.test(l.href) && !valid.has(l.href.endsWith("/") ? l.href : l.href + "/"))
+      .map((l) => ({ href: l.href, text: l.text.slice(0, 60) }));
+    out.push({ slug: page.slug, php, added, broken });
+  }
+  return out;
+}
+
+// ---- 14. content audit -------------------------------------------------------
+// Not readability, not EEAT boxes: the question is whether a page about Botox is
+// actually about Botox, or whether it is mostly clinic boilerplate wearing a
+// Botox headline. Reported, never rewritten — writing the copy is a different
+// job.
+async function seoContentAudit(page, ai) {
+  try {
+    const raw = await aiCall([{ text: [
+      `Judge whether this page's content is genuinely about its subject.`,
+      `PAGE: "${page.title}" — its subject is: ${page.seo.primaryKeyword || page.title}`,
+      "",
+      "Estimate what share of the body copy is specific to that subject, as opposed to generic clinic or business copy that would sit equally well on any other page.",
+      "Then say what a strong page on this subject would cover that this one does not. Be concrete and specific to the subject — not general SEO advice.",
+      "",
+      "PAGE TEXT:", "-----", page.text.slice(0, 8000), "-----", "",
+      'Return ONLY minified JSON: {"onTopicPercent":<0-100>,"verdict":"one sentence","missing":["what a page on this subject should cover but does not"]}',
+    ].join("\n") }], { ...(ai || {}), temperature: 0.2, maxOutputTokens: 800, timeoutMs: 60000, json: true });
+    const d = JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
+    // A missing answer is "not audited", not "0% on topic". Reporting a page as
+    // entirely generic because the model returned nothing would be a confident
+    // claim about content nobody actually judged.
+    const n = Number(d.onTopicPercent);
+    const verdict = String(d.verdict || "").trim();
+    const pct = Number.isFinite(n) && verdict ? Math.max(0, Math.min(100, Math.round(n))) : null;
+    return {
+      slug: page.slug, title: page.title, onTopicPercent: pct,
+      verdict: verdict || "Could not be audited — the model returned no verdict for this page.",
+      missing: (Array.isArray(d.missing) ? d.missing : []).map((x) => String(x || "").trim()).filter(Boolean).slice(0, 6),
+      words: page.text.split(/\s+/).filter(Boolean).length,
+    };
+  } catch (e) {
+    console.warn(`seo: content audit failed for ${page.slug} —`, e.message);
+    return { slug: page.slug, title: page.title, onTopicPercent: null, verdict: "Could not be audited — " + e.message.slice(0, 80), missing: [], words: page.text.split(/\s+/).filter(Boolean).length };
+  }
+}
+
+// ---- 13. schema --------------------------------------------------------------
+// Built in code rather than by the model: schema is a set of facts in a fixed
+// shape, and a model asked to produce it will cheerfully fill gaps with
+// plausible opening hours. Review and rating markup is emitted ONLY when the
+// page carries real reviews — inventing it is a manual action from Google.
+function seoSchema(page, pages, biz, origin) {
+  const url = origin ? origin + (page.slug === "home" ? "/" : `/${page.slug}/`) : "";
+  const graph = [];
+  const org = { "@type": "MedicalBusiness", "@id": origin ? origin + "/#business" : undefined, name: biz.name };
+  if (biz.phone) org.telephone = biz.phone;
+  if (biz.email) org.email = biz.email;
+  if (origin) org.url = origin + "/";
+  if (biz.street || biz.city) {
+    org.address = { "@type": "PostalAddress" };
+    if (biz.street) org.address.streetAddress = biz.street;
+    if (biz.city) org.address.addressLocality = biz.city;
+    if (biz.region) org.address.addressRegion = biz.region;
+    if (biz.postalCode) org.address.postalCode = biz.postalCode;
+  }
+  if (biz.hours) org.openingHours = biz.hours;
+  if (biz.priceRange) org.priceRange = biz.priceRange;
+
+  if (page.slug === "home") {
+    graph.push(org);
+    if (origin) graph.push({ "@type": "WebSite", "@id": origin + "/#website", url: origin + "/", name: biz.name, publisher: { "@id": origin + "/#business" } });
+  }
+  const webPage = { "@type": "WebPage", name: page.seo.metaTitle || page.title, description: page.seo.metaDescription || undefined };
+  if (url) webPage.url = url;
+  if (origin) webPage.isPartOf = { "@id": origin + "/#website" };
+  graph.push(webPage);
+
+  if (page.slug !== "home" && origin) {
+    graph.push({
+      "@type": "BreadcrumbList",
+      itemListElement: [
+        { "@type": "ListItem", position: 1, name: "Home", item: origin + "/" },
+        { "@type": "ListItem", position: 2, name: page.title, item: url },
+      ],
+    });
+  }
+  // A page that exists to sell one treatment is a Service. Hub pages ("our
+  // treatments") list many and are not.
+  if (/^(page-)?service/i.test(page.file) || (page.slug !== "home" && !/services|about|contact|team|brand|blog|seo/i.test(page.slug))) {
+    const svc = { "@type": "Service", name: page.title, description: page.seo.metaDescription || undefined };
+    if (origin) svc.provider = { "@id": origin + "/#business" };
+    if (biz.city) svc.areaServed = [biz.city, biz.region].filter(Boolean).join(", ");
+    graph.push(svc);
+  }
+  // FAQPage only when the page really carries question/answer pairs.
+  const qs = (page.text.match(/[A-Z][^.?!]{10,120}\?/g) || []).slice(0, 8);
+  if (qs.length >= 3 && /faq|frequently asked/i.test(page.text)) {
+    graph.push({
+      "@type": "FAQPage",
+      mainEntity: qs.map((q) => ({ "@type": "Question", name: q.trim(), acceptedAnswer: { "@type": "Answer", text: "" } })),
+    });
+  }
+  const strip = (o) => JSON.parse(JSON.stringify(o, (k, v) => (v === undefined || v === "" ? undefined : v)));
+  return strip({ "@context": "https://schema.org", "@graph": graph });
+}
+
+// ---- the generated SEO layer -------------------------------------------------
+// One file, regenerated whole on every run, so the diff reads as "here is the
+// site's SEO" rather than as scattered edits across a dozen templates.
+// Formatted for Laravel Pint's PER preset: blank line after <?php, a named
+// function's brace on its own line, one statement per line.
+function phpQuote(s) {
+  return "'" + String(s == null ? "" : s).replace(/\\/g, "\\\\").replace(/'/g, "\\'") + "'";
+}
+function phpArray(obj, indent) {
+  const pad = " ".repeat(indent);
+  const inner = " ".repeat(indent + 4);
+  const rows = Object.entries(obj).map(([k, v]) => {
+    if (Array.isArray(v)) return `${inner}${phpQuote(k)} => [${v.map(phpQuote).join(", ")}],`;
+    if (v && typeof v === "object") return `${inner}${phpQuote(k)} => ${phpArray(v, indent + 4)},`;
+    return `${inner}${phpQuote(k)} => ${phpQuote(v)},`;
+  });
+  return `[\n${rows.join("\n")}\n${pad}]`;
+}
+function seoIncludePhp(entries, redirects, businessName) {
+  const map = entries.map((e) => {
+    const row = {
+      title: e.metaTitle,
+      description: e.metaDescription,
+      canonical: e.canonical || "",
+      robots: SEO_ROBOTS,
+      og_title: e.ogTitle,
+      og_description: e.ogDescription,
+      og_image: e.ogImage || "",
+      og_image_alt: e.ogImageAlt || "",
+      keywords: [e.primaryKeyword, ...e.secondaryKeywords].filter(Boolean).join(", "),
+      schema: JSON.stringify(e.schema),
+    };
+    return `        ${phpQuote(e.slug)} => ${phpArray(row, 8)},`;
+  }).join("\n");
+  const red = redirects.map((r) => `        ${phpQuote(r.from)} => ${phpQuote(r.to)},`).join("\n");
+  return `<?php
+
+/**
+ * ${businessName} — SEO layer, generated by the Growth99 "Perform SEO" job.
+ *
+ * Every page gets its own title, description, canonical, social cards and
+ * structured data. Regenerated whole on each run — edit the site content, not
+ * this file, and re-run the job.
+ */
+
+if (! defined('ABSPATH')) {
+    exit;
+}
+
+function g99_seo_map()
+{
+    return [
+${map}
+    ];
+}
+
+/**
+ * Slugs this job renamed, old => new. Kept so links and search results that
+ * still point at the old URL land on the new page instead of a 404.
+ */
+function g99_seo_redirects()
+{
+    return [
+${red}
+    ];
+}
+
+function g99_seo_slug()
+{
+    if (is_front_page() || is_home()) {
+        return 'home';
+    }
+
+    $post = get_post();
+
+    return $post ? $post->post_name : '';
+}
+
+function g99_seo_current()
+{
+    $map = g99_seo_map();
+    $slug = g99_seo_slug();
+
+    return isset($map[$slug]) ? $map[$slug] : null;
+}
+
+/**
+ * A renamed page keeps its identity: the existing post is renamed rather than a
+ * second one being created alongside it. Idempotent — once the rename has
+ * happened the old slug no longer resolves and this does nothing.
+ */
+add_action('init', function () {
+    foreach (g99_seo_redirects() as $old => $new) {
+        $existing = get_page_by_path($old);
+
+        if ($existing && ! get_page_by_path($new)) {
+            wp_update_post(['ID' => $existing->ID, 'post_name' => $new]);
+        }
+    }
+}, 20);
+
+add_action('template_redirect', function () {
+    if (! is_404()) {
+        return;
+    }
+
+    $path = trim(parse_url(add_query_arg([]), PHP_URL_PATH), '/');
+    $redirects = g99_seo_redirects();
+
+    if (isset($redirects[$path])) {
+        wp_redirect(home_url('/' . $redirects[$path] . '/'), 301);
+        exit;
+    }
+}, 1);
+
+add_filter('pre_get_document_title', function ($title) {
+    $seo = g99_seo_current();
+
+    return ($seo && $seo['title']) ? $seo['title'] : $title;
+});
+
+/**
+ * Belt and braces for the <title> tag.
+ *
+ * WordPress prints one only when the theme declared title-tag support during
+ * after_setup_theme. A mu-plugin that switches the theme on 'init' misses that
+ * hook for the request it switches on, so the page ships with no title at all —
+ * which is how removing the theme's hardcoded <title> took the site's title
+ * away on a fresh install. Declaring support here covers later requests, and
+ * the wp_head hook below prints one directly if WordPress still will not.
+ */
+add_action('after_setup_theme', function () {
+    add_theme_support('title-tag');
+});
+
+// WordPress emits its own canonical; ours is page-specific and replaces it.
+remove_action('wp_head', 'rel_canonical');
+
+add_action('wp_head', function () {
+    $seo = g99_seo_current();
+
+    if (! $seo) {
+        return;
+    }
+
+    $out = [];
+
+    // Runs at the same priority as _wp_render_title_tag but is added later, so
+    // by now WordPress has printed its title or declined to. If it declined,
+    // print ours — a page with no <title> at all is the worse failure.
+    if (! current_theme_supports('title-tag')) {
+        $out[] = '<title>' . esc_html($seo['title']) . '</title>';
+    }
+
+    $out[] = '<meta name="description" content="' . esc_attr($seo['description']) . '">';
+    $out[] = '<meta name="robots" content="' . esc_attr($seo['robots']) . '">';
+
+    if ($seo['keywords']) {
+        $out[] = '<meta name="keywords" content="' . esc_attr($seo['keywords']) . '">';
+    }
+
+    if ($seo['canonical']) {
+        $out[] = '<link rel="canonical" href="' . esc_url($seo['canonical']) . '">';
+        $out[] = '<meta property="og:url" content="' . esc_url($seo['canonical']) . '">';
+    }
+
+    $out[] = '<meta property="og:type" content="website">';
+    $out[] = '<meta property="og:site_name" content="' . esc_attr(get_bloginfo('name')) . '">';
+    $out[] = '<meta property="og:title" content="' . esc_attr($seo['og_title']) . '">';
+    $out[] = '<meta property="og:description" content="' . esc_attr($seo['og_description']) . '">';
+    $out[] = '<meta name="twitter:card" content="summary_large_image">';
+    $out[] = '<meta name="twitter:title" content="' . esc_attr($seo['og_title']) . '">';
+    $out[] = '<meta name="twitter:description" content="' . esc_attr($seo['og_description']) . '">';
+
+    if ($seo['og_image']) {
+        $out[] = '<meta property="og:image" content="' . esc_url($seo['og_image']) . '">';
+        $out[] = '<meta property="og:image:alt" content="' . esc_attr($seo['og_image_alt']) . '">';
+        $out[] = '<meta name="twitter:image" content="' . esc_url($seo['og_image']) . '">';
+    }
+
+    if ($seo['schema']) {
+        $out[] = '<script type="application/ld+json">' . $seo['schema'] . '</script>';
+    }
+
+    echo "\\n" . implode("\\n", $out) . "\\n";
+}, 1);
+`;
+}
+
+// The hardcoded head block in header.php is what made every page identical.
+// Removing it is not optional cleanup — leaving it means two titles, two
+// canonicals and two sets of Open Graph tags fighting each other.
+function seoStripLegacyHead(header) {
+  let out = String(header || "");
+  const removed = [];
+  const cut = (re, label) => {
+    if (re.test(out)) { out = out.replace(re, ""); removed.push(label); }
+  };
+  cut(/[ \t]*<title\b[^>]*>[\s\S]*?<\/title>\s*\n?/gi, "title");
+  cut(/[ \t]*<meta\s+name=["']description["'][^>]*>\s*\n?/gi, "meta description");
+  cut(/[ \t]*<meta\s+name=["']keywords["'][^>]*>\s*\n?/gi, "meta keywords");
+  cut(/[ \t]*<meta\s+name=["']robots["'][^>]*>\s*\n?/gi, "meta robots");
+  cut(/[ \t]*<link\s+rel=["']canonical["'][^>]*>\s*\n?/gi, "canonical");
+  cut(/[ \t]*<meta\s+property=["']og:[^"']*["'][^>]*>\s*\n?/gi, "Open Graph");
+  cut(/[ \t]*<meta\s+name=["']twitter:[^"']*["'][^>]*>\s*\n?/gi, "Twitter cards");
+  cut(/[ \t]*<script\s+type=["']application\/ld\+json["'][\s\S]*?<\/script>\s*\n?/gi, "JSON-LD");
+  // Without wp_head() nothing we generate is ever printed.
+  if (!/wp_head\s*\(/.test(out)) {
+    out = out.replace(/<\/head>/i, "<?php wp_head(); ?>\n</head>");
+    removed.push("added missing wp_head()");
+  }
+  return { php: out.replace(/\n{3,}/g, "\n\n"), removed };
+}
+
+function seoEnsureInclude(functionsPhp, themeSlug) {
+  const line = "require_once get_template_directory() . '/inc/g99-seo.php';";
+  if (functionsPhp.includes("inc/g99-seo.php")) return functionsPhp;
+  const marker = /<\?php\s*\n/;
+  return marker.test(functionsPhp)
+    ? functionsPhp.replace(marker, (m) => m + "\n// Generated per-page SEO layer — see the \"Perform SEO\" job.\n" + line + "\n")
+    : `<?php\n\n${line}\n\n` + functionsPhp;
+}
+
+// ---- checking the work -------------------------------------------------------
+// Almost all of it is a rule with a number attached, so unlike an edit job this
+// needs no model to verify: the checks below either pass or they do not.
+function seoVerify(entries, pages) {
+  const rows = [];
+  for (const e of entries) {
+    const page = pages.find((p) => p.slug === e.slug) || {};
+    const heads = pageHeadings(page.php || "");
+    const h1s = heads.filter((h) => h.level === 1).length;
+    const imgs = pageImages(page.php || "");
+    const noAlt = imgs.filter((im) => im.alt === undefined || !String(im.alt).trim()).length;
+    let skipped = 0, prev = 1;
+    for (const h of heads) { if (h.level > prev + 1) skipped++; prev = h.level; }
+    let schemaOk = true;
+    try { JSON.parse(JSON.stringify(e.schema)); } catch (err) { schemaOk = false; }
+    const checks = [
+      { k: "Meta title 50–60 chars", ok: e.metaTitle.length >= 50 && e.metaTitle.length <= 60, got: `${e.metaTitle.length} chars` },
+      { k: "Meta description 150–160 chars", ok: e.metaDescription.length >= 150 && e.metaDescription.length <= 160, got: `${e.metaDescription.length} chars` },
+      { k: "Exactly one H1", ok: h1s === 1, got: `${h1s} H1` },
+      { k: "No skipped heading levels", ok: skipped === 0, got: skipped ? `${skipped} skipped` : "clean" },
+      { k: "Every image has alt text", ok: noAlt === 0, got: noAlt ? `${noAlt} missing` : `${imgs.length} ok` },
+      { k: "Canonical set", ok: !!e.canonical, got: e.canonical || "no domain on file" },
+      { k: "Schema valid JSON-LD", ok: schemaOk, got: schemaOk ? `${(e.schema["@graph"] || []).length} types` : "invalid" },
+    ];
+    rows.push({ slug: e.slug, title: e.title, checks, pass: checks.filter((c) => c.ok).length, total: checks.length });
+  }
+  const pass = rows.reduce((n, r) => n + r.pass, 0);
+  const total = rows.reduce((n, r) => n + r.total, 0);
+  return { rows, pass, total, failed: total - pass };
+}
+
+// A theme folder on disk has no mu-plugin, and the mu-plugin is what says which
+// template serves which slug. Rebuilding that from the Template Name headers is
+// what lets a dry run point straight at generated/wp-theme/<slug>.
+function synthMuSource(themeAbs) {
+  const rows = [`    ['title' => 'Home', 'slug' => 'home', 'template' => ''],`];
+  for (const f of fs.readdirSync(themeAbs).sort()) {
+    const m = f.match(/^page-(.+)\.php$/);
+    if (!m) continue;
+    const src = fs.readFileSync(path.join(themeAbs, f), "utf8");
+    const tpl = (src.match(/Template Name:\s*(.+?)\s*(?:\*\/|-->|\?>|$)/m) || [])[1] || m[1];
+    rows.push(`    ['title' => '${tpl.replace(/'/g, "\\'")}', 'slug' => '${m[1]}', 'template' => '${f}'],`);
+  }
+  return `<?php\n\n$pages = [\n${rows.join("\n")}\n];\n`;
+}
+
+function newSeoJob(payload) {
+  return {
+    type: "seo",
+    draftId: String(payload.jobId), businessId: null,
+    businessName: payload.businessName || payload.siteId || "Site",
+    status: "queued", currentStep: 0,
+    steps: SEO_STEPS.map((label) => ({ label, status: "pending", detail: "" })),
+    payload, prUrl: null, branch: null, siteUrl: null,
+    seoPages: null, seoRenames: null, seoLinks: null, contentAudit: null, seoCheck: null,
+    editPlan: null, editSummary: null, error: null,
+    cost: { gemini: 0, stitch: 0 }, cancelRequested: false, awaitingApproval: false,
+    createdAt: new Date().toISOString(), startedAt: null, finishedAt: null,
+  };
+}
+function enqueueSeoJob(payload) {
+  const job = newSeoJob(payload);
+  JOBS.set(job.draftId, job);
+  JOB_QUEUE.push(job.draftId); saveJobs();
+  processJobQueue();
+  return job;
+}
+
+async function runSeoJob(job) {
+  job.status = "running";
+  job.startedAt = new Date().toISOString(); COST_SINK = job.cost;
+  const P = job.payload;
+  const repo = P.githubRepo || WP_REPO;
+  const tmp = path.join(os.tmpdir(), "g99seo-" + Date.now());
+  const run = async (cmd, cwd) => sh(cmd, cwd);
+  const runRetry = async (cmd, cwd, n = 3) => { let r; for (let i = 1; i <= n; i++) { r = await run(cmd, cwd); if (!r.code) return r; await sleep(3000 * i); } return r; };
+  const ai = { aiModel: "gemini" };
+  // No domain on file means no canonical and no og:url. Writing a guess is what
+  // produced the cross-client canonical this job exists to clear up.
+  const origin = P.liveUrl ? String(P.liveUrl).replace(/\/+$/, "") : "";
+  // A dry run does every piece of real work and stops before anything reaches
+  // GitHub: no branch, no push, no PR, no merge. `themeDir` goes further and
+  // skips the clone too, reading a theme folder straight off disk — which makes
+  // iterating on the engine itself instant and offline.
+  const dry = !!P.dryRun;
+  const workRoot = dry ? path.join(GEN, "seo-preview", String(P.themeSlug || "preview").replace(/[^a-z0-9-]/gi, "")) : tmp;
+  try {
+    // 1 — pull latest
+    let r;
+    if (dry) {
+      jobStep(job, 0, "running", P.themeDir ? "Copying " + P.themeDir : "Cloning " + repo);
+      fs.rmSync(workRoot, { recursive: true, force: true });
+      fs.mkdirSync(path.join(workRoot, P.themePath), { recursive: true });
+      if (P.themeDir) {
+        // Relative to the tool, not to wherever node happened to be launched.
+        const from = path.isAbsolute(P.themeDir) ? P.themeDir : path.resolve(DIR, P.themeDir);
+        if (!fs.existsSync(from)) throw new Error("themeDir does not exist: " + from);
+        fs.cpSync(from, path.join(workRoot, P.themePath), { recursive: true });
+      } else {
+        const scratch = tmp + "-src";
+        r = await runRetry(`gh repo clone ${repo} "${scratch}" -- --depth 1`);
+        if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
+        fs.cpSync(path.join(scratch, P.themePath), path.join(workRoot, P.themePath), { recursive: true });
+        if (P.muPath && fs.existsSync(path.join(scratch, P.muPath))) {
+          fs.mkdirSync(path.dirname(path.join(workRoot, P.muPath)), { recursive: true });
+          fs.cpSync(path.join(scratch, P.muPath), path.join(workRoot, P.muPath));
+        }
+        fs.rmSync(scratch, { recursive: true, force: true });
+      }
+      // No mu-plugin came along (a theme folder on disk has none), so rebuild
+      // the page map from the Template Name headers instead.
+      if (P.muPath && !fs.existsSync(path.join(workRoot, P.muPath))) {
+        fs.mkdirSync(path.dirname(path.join(workRoot, P.muPath)), { recursive: true });
+        fs.writeFileSync(path.join(workRoot, P.muPath), synthMuSource(path.join(workRoot, P.themePath)));
+      }
+      jobStep(job, 0, "done", "Dry run — working in " + workRoot);
+    } else {
+      jobStep(job, 0, "running", "Cloning " + repo);
+      r = await runRetry(`gh repo clone ${repo} "${tmp}" -- --depth 1`);
+      const cloneUrl = process.env.GH_TOKEN ? `https://x-access-token:${process.env.GH_TOKEN}@github.com/${repo}.git` : `https://github.com/${repo}.git`;
+      if (r.code) r = await runRetry(`git clone --depth 1 "${cloneUrl}" "${tmp}"`);
+      if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
+      if (process.env.GH_TOKEN) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
+      jobStep(job, 0, "done", "Latest code pulled");
+    }
+    const themeAbs = path.join(workRoot, P.themePath);
+    if (!fs.existsSync(themeAbs)) throw new Error("theme not found: " + P.themePath);
+    const muAbs = P.muPath ? path.join(workRoot, P.muPath) : "";
+
+    // 2 — read every page
+    jobStep(job, 1, "running", "Reading the theme…");
+    const muSrc = muAbs && fs.existsSync(muAbs) ? fs.readFileSync(muAbs, "utf8") : "";
+    const { pages } = readSeoPages(themeAbs, muSrc);
+    if (!pages.length) throw new Error("no pages found — the mu-plugin lists none and there is no front-page.php");
+    const biz = await readBusinessFacts(pages, P.businessName, ai);
+    job.seoBusiness = biz;
+    jobStep(job, 1, "done", `${pages.length} page(s)${biz.city ? ` · ${[biz.city, biz.region].filter(Boolean).join(", ")}` : ""}${origin ? "" : " · no domain on file, canonical will be skipped"}`);
+
+    // 3 — keywords + head copy, per page
+    jobStep(job, 2, "running", `Writing head copy for ${pages.length} page(s)…`);
+    for (let i = 0; i < pages.length; i++) {
+      jobStep(job, 2, "running", `${pages[i].title} (${i + 1}/${pages.length})`);
+      try {
+        pages[i].seo = await seoHeadCopy(pages[i], biz, P.businessName, ai);
+      } catch (e) {
+        throw new Error(`head copy failed on "${pages[i].title}": ${e.message}`);
+      }
+    }
+    jobStep(job, 2, "done", `${pages.length} page(s) · keywords, title, description, H1, social copy`);
+
+    // 4 — URL strategy. Renames the template, the mu-plugin entry, every
+    //     internal href, and leaves a 301 behind. The WordPress page itself is
+    //     renamed by the generated layer on the next init.
+    jobStep(job, 3, "running", "Judging the URLs…");
+    let renames = [];
+    try { renames = await seoUrlStrategy(pages, ai); }
+    catch (e) { console.warn("seo: url strategy failed —", e.message); }
+    let muNext = muSrc;
+    for (const rn of renames) {
+      const page = pages.find((p) => p.slug === rn.from);
+      if (!page) continue;
+      const nextFile = `page-${rn.to}.php`;
+      fs.renameSync(path.join(themeAbs, page.file), path.join(themeAbs, nextFile));
+      muNext = muNext.split(`'slug' => '${rn.from}'`).join(`'slug' => '${rn.to}'`)
+        .split(`'template' => '${page.file}'`).join(`'template' => '${nextFile}'`);
+      const from = `/${rn.from}/`, to = `/${rn.to}/`;
+      for (const p of pages) p.php = p.php.split(`"${from}"`).join(`"${to}"`).split(`'${from}'`).join(`'${to}'`);
+      page.file = nextFile;
+      page.slug = rn.to;
+    }
+    job.seoRenames = renames;
+    jobStep(job, 3, renames.length ? "done" : "done", renames.length ? `${renames.length} slug(s) renamed, 301s written` : "every slug is fine — nothing renamed");
+
+    // 5 — headings, image alt, internal links
+    jobStep(job, 4, "running", "Headings and image alt…");
+    const headingNotes = [];
+    let altsFilled = 0;
+    for (const page of pages) {
+      const h = seoFixHeadings(page.php, page.seo.h1);
+      page.php = h.php;
+      if (h.notes.length) headingNotes.push({ slug: page.slug, notes: h.notes });
+      const im = await seoImageAlts({ ...page, php: page.php }, biz, P.businessName, ai);
+      page.php = im.php;
+      altsFilled += im.filled;
+    }
+    jobStep(job, 4, "running", "Internal links…");
+    const linkPlan = await seoInternalLinks(pages, ai);
+    let linksAdded = 0;
+    const broken = [];
+    for (const lp of linkPlan) {
+      const page = pages.find((p) => p.slug === lp.slug);
+      if (!page) continue;
+      page.php = lp.php;
+      linksAdded += lp.added.length;
+      if (lp.broken.length) broken.push({ slug: lp.slug, broken: lp.broken });
+    }
+    job.seoLinks = { added: linkPlan.filter((l) => l.added.length).map((l) => ({ slug: l.slug, links: l.added })), broken };
+    job.seoHeadings = headingNotes;
+    jobStep(job, 4, "done", `${headingNotes.length} heading fix(es) · ${altsFilled} alt text · ${linksAdded} internal link(s)${broken.length ? ` · ${broken.length} page(s) with broken links` : ""}`);
+
+    // 6 — schema + the generated layer
+    jobStep(job, 5, "running", "Building schema…");
+    const entries = pages.map((page) => {
+      const hero = (page.images.find((im) => /^https?:/i.test(im.src)) || {}).src || "";
+      return {
+        slug: page.slug, title: page.title,
+        ...page.seo,
+        canonical: origin ? origin + (page.slug === "home" ? "/" : `/${page.slug}/`) : "",
+        ogImage: hero,
+        ogImageAlt: page.seo.primaryKeyword || page.title,
+        schema: seoSchema(page, pages, biz, origin),
+      };
+    });
+    const changed = [];
+    for (const page of pages) {
+      const abs = path.join(themeAbs, page.file);
+      if (fs.readFileSync(abs, "utf8") !== page.php) { fs.writeFileSync(abs, page.php); changed.push(`${P.themePath}/${page.file}`); }
+    }
+    fs.mkdirSync(path.join(themeAbs, "inc"), { recursive: true });
+    fs.writeFileSync(path.join(themeAbs, "inc", "g99-seo.php"), seoIncludePhp(entries, renames, P.businessName));
+    changed.push(`${P.themePath}/inc/g99-seo.php`);
+
+    const headerAbs = path.join(themeAbs, "header.php");
+    let stripped = [];
+    if (fs.existsSync(headerAbs)) {
+      const h = seoStripLegacyHead(fs.readFileSync(headerAbs, "utf8"));
+      stripped = h.removed;
+      if (h.removed.length) { fs.writeFileSync(headerAbs, h.php); changed.push(`${P.themePath}/header.php`); }
+    }
+    const fnAbs = path.join(themeAbs, "functions.php");
+    if (fs.existsSync(fnAbs)) {
+      const before = fs.readFileSync(fnAbs, "utf8");
+      const after = seoEnsureInclude(before, P.themeSlug);
+      if (after !== before) { fs.writeFileSync(fnAbs, after); changed.push(`${P.themePath}/functions.php`); }
+    }
+    if (muAbs && muNext !== muSrc) { fs.writeFileSync(muAbs, muNext); changed.push(P.muPath); }
+    job.seoStripped = stripped;
+    jobStep(job, 5, "done", `SEO layer written${stripped.length ? ` · stale ${stripped.join(", ")} removed from header.php` : ""}`);
+
+    // 7 — content audit (reported, never rewritten)
+    jobStep(job, 6, "running", "Auditing content relevance…");
+    const audit = [];
+    for (let i = 0; i < pages.length; i++) {
+      jobStep(job, 6, "running", `${pages[i].title} (${i + 1}/${pages.length})`);
+      audit.push(await seoContentAudit(pages[i], ai));
+    }
+    job.contentAudit = audit;
+    const weak = audit.filter((a) => a.onTopicPercent != null && a.onTopicPercent < 60);
+    jobStep(job, 6, "done", weak.length ? `${weak.length} of ${audit.length} page(s) are mostly generic copy` : `all ${audit.length} page(s) on topic`);
+
+    // 8 — check the work
+    jobStep(job, 7, "running", "Checking the work…");
+    const check = seoVerify(entries, pages);
+    job.seoCheck = check;
+    job.seoPages = entries.map((e) => ({ slug: e.slug, title: e.title, metaTitle: e.metaTitle, metaDescription: e.metaDescription, primaryKeyword: e.primaryKeyword, canonical: e.canonical }));
+    job.editPlan = changed.map((p) => ({ path: p, op: "modify" }));
+    job.editSummary = `SEO across ${pages.length} page(s)`;
+    jobStep(job, 7, "done", `${check.pass} of ${check.total} checks pass${check.failed ? ` · ${check.failed} to review` : ""}`);
+
+    if (!changed.length) throw new Error("nothing to change — the SEO layer already matches this content");
+
+    if (dry) {
+      // The report is the deliverable here, since there is no PR to carry it.
+      const reportAbs = path.join(workRoot, "SEO-REPORT.md");
+      fs.writeFileSync(reportAbs, seoPrBody(job, entries, renames, audit, check, stripped, origin));
+      job.previewDir = workRoot;
+      job.reportPath = reportAbs;
+      for (const i of [8, 9, 10]) jobStep(job, i, "done", "skipped (dry run)");
+      job.status = "done";
+      notify(`🔎 [dry run] SEO preview for *${job.businessName}*: ${pages.length} page(s) · ${check.pass}/${check.total} checks · ${workRoot}`);
+      return;
+    }
+
+    // 9 — push + PR
+    jobStep(job, 8, "running", "Pushing + opening PR…");
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
+    const branch = `g99/seo-${String(P.themeSlug).replace(/^g99-/, "")}-${stamp}`;
+    const title = `SEO ${P.businessName}: ${pages.length} page(s)`;
+    await run(`git checkout -b "${branch}"`, tmp);
+    await run(`git add -A "${P.themePath}" ${P.muPath ? `"${P.muPath}"` : ""}`, tmp);
+    r = await run(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "${title.replace(/"/g, "'")}"`, tmp);
+    if (r.code) throw new Error("commit failed (no changes?): " + (r.stderr || r.stdout).slice(-160));
+    r = await runRetry(`git push -u origin "${branch}"`, tmp);
+    if (r.code) throw new Error("push failed: " + r.stderr.slice(-200));
+    // The body is a full report with tables — far past what survives being
+    // quoted into a shell argument, so it goes via a file.
+    const bodyFile = path.join(os.tmpdir(), `seo-pr-${Date.now()}.md`);
+    fs.writeFileSync(bodyFile, seoPrBody(job, entries, renames, audit, check, stripped, origin));
+    r = await runRetry(`gh pr create --repo ${repo} --base main --head "${branch}" --title "${title.replace(/"/g, "'")}" --body-file "${bodyFile}"`, tmp);
+    fs.rmSync(bodyFile, { force: true });
+    job.prUrl = (r.stdout.match(/https:\/\/github\.com\/\S+/) || [""])[0];
+    job.branch = branch;
+    fs.rmSync(tmp, { recursive: true, force: true });
+    if (!job.prUrl) throw new Error("PR create failed: " + r.stderr.slice(-200));
+    jobStep(job, 8, "done", job.prUrl);
+
+    // 10 — CI watch → merge
+    jobStep(job, 9, "running", "Watching CI build checks…");
+    let fixes = 0, merged = false;
+    for (let i = 0; i < 240 && !merged; i++) {
+      let st; try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); } catch (e) { await sleep(10000); continue; }
+      jobStep(job, 9, "running", (st.checks || []).map((c) => `${c.name}:${c.status}`).join(" ") || "CI starting…");
+      if (st.allPass) { await awaitApprovalIfNeeded(job, P.siteId, 9); if (!job.mergedExternally) await localApi("/api/pr-merge", { prUrl: job.prUrl }); merged = true; jobStep(job, 9, "done", `Merged${fixes ? ` after ${fixes} fix(es)` : ""}`); break; }
+      if (st.anyFail) {
+        if (fixes >= 3) throw new Error("CI still failing after 3 auto-fix attempts — " + job.prUrl);
+        fixes++; jobStep(job, 9, "running", `Build failed — auto-fix ${fixes}/3…`);
+        const fix = await localApi("/api/pr-autofix", { prUrl: job.prUrl }, 5 * 60 * 1000);
+        if (fix.billing) throw new Error(fix.message);
+        if (!fix.fixed || !fix.fixed.length) throw new Error("auto-fix could not resolve CI: " + (fix.message || ""));
+        await sleep(20000); continue;
+      }
+      await sleep(10000);
+    }
+    if (!merged) throw new Error("CI watch timed out — " + job.prUrl);
+
+    // 11 — registry
+    jobStep(job, 10, "running", "Updating site registry…");
+    try { await syncSiteRegistry(); } catch (e) { /* non-fatal */ }
+    jobStep(job, 10, "done", "Done — SEO live on deploy");
+    job.status = "done";
+    notify(`🔎 SEO merged for *${job.businessName}*: ${pages.length} page(s) · ${check.pass}/${check.total} checks${renames.length ? ` · ${renames.length} URL(s) renamed` : ""}${weak.length ? `\n⚠️ ${weak.length} page(s) are mostly generic copy — see the content audit` : ""} · ${job.prUrl || ""}`);
+  } catch (e) {
+    // A dry run's working directory IS its output, so it survives a failure —
+    // that is where you look to find out what went wrong.
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
+    if (e && e.cancelled) { job.status = "cancelled"; }
+    else {
+      job.error = e.message; job.status = "error";
+      if (dry) job.previewDir = workRoot;
+      if (job.steps[job.currentStep] && job.steps[job.currentStep].status === "running") { job.steps[job.currentStep].status = "error"; job.steps[job.currentStep].detail = String(e.message).slice(0, 240); }
+      console.error(`seo job ${job.draftId} failed:`, e.message);
+      notify(`❌ SEO${dry ? " [dry run]" : ""} failed for *${job.businessName}*: ${e.message}`);
+    }
+  } finally {
+    job.finishedAt = new Date().toISOString(); saveJobs(); COST_SINK = null;
+    postStatus(job);
+  }
+}
+
+// The report that travels with the change: the three advisory tasks plus what
+// was applied, so the PR is readable without opening Studio.
+function seoPrBody(job, entries, renames, audit, check, stripped, origin) {
+  const L = [];
+  L.push(`Automated SEO for **${job.businessName}** — ${entries.length} page(s).`, "");
+  if (stripped.length) L.push(`Removed the hardcoded ${stripped.join(", ")} from \`header.php\` — it was shared by every page. Each page now has its own, generated in \`inc/g99-seo.php\`.`, "");
+  if (!origin) L.push("> No domain is set for this site in NocoDB, so canonical and `og:url` were left out rather than guessed.", "");
+  L.push(`**Checks:** ${check.pass} of ${check.total} pass.`, "");
+  L.push("| Page | Title | Chars | Primary keyword |", "|---|---|---|---|");
+  for (const e of entries) L.push(`| \`/${e.slug === "home" ? "" : e.slug + "/"}\` | ${e.metaTitle.replace(/\|/g, "\\|")} | ${e.metaTitle.length} | ${e.primaryKeyword.replace(/\|/g, "\\|")} |`);
+  L.push("");
+  if (renames.length) {
+    L.push("### URLs renamed", "", "| From | To | Why |", "|---|---|---|");
+    for (const r of renames) L.push(`| \`/${r.from}/\` | \`/${r.to}/\` | ${r.why.replace(/\|/g, "\\|")} |`);
+    L.push("", "301 redirects for the old URLs ship in the same file.", "");
+  }
+  const links = (job.seoLinks && job.seoLinks.added) || [];
+  if (links.length) {
+    L.push("### Internal links added", "");
+    for (const p of links) L.push(`- \`/${p.slug}/\` → ${p.links.map((l) => `"${l.anchor}" → \`${l.to}\``).join(", ")}`);
+    L.push("");
+  }
+  const broken = (job.seoLinks && job.seoLinks.broken) || [];
+  if (broken.length) {
+    L.push("### Broken internal links found", "");
+    for (const p of broken) L.push(`- \`/${p.slug}/\` → ${p.broken.map((b) => `\`${b.href}\``).join(", ")}`);
+    L.push("");
+  }
+  const weak = audit.filter((a) => a.onTopicPercent != null && a.onTopicPercent < 60);
+  if (weak.length) {
+    L.push("### Content audit — pages that are mostly generic copy", "");
+    for (const a of weak) {
+      L.push(`**\`/${a.slug}/\` — ${a.onTopicPercent}% on topic.** ${a.verdict}`);
+      if (a.missing.length) L.push(...a.missing.map((m) => `- ${m}`));
+      L.push("");
+    }
+    L.push("> Content is reported, never rewritten — that is a writing job, not an SEO one.", "");
+  }
+  return L.join("\n");
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const u = new URL(req.url, `http://localhost:${PORT}`);
@@ -5083,6 +6183,40 @@ const server = http.createServer(async (req, res) => {
     // the onboarding answers + composed brand — reused from the most recent build
     // job for this site (kept in memory / jobs.json). Auto-enrich after a build is
     // the primary path; this button re-runs it on demand.
+    // One click, every SEO task, one PR. Same rails as enrich: clone → work →
+    // PR → CI → the site's own merge policy.
+    if (p === "/api/seo-run" && req.method === "POST") {
+      const body0 = JSON.parse(await readBody(req) || "{}");
+      const { siteId } = body0;
+      // Offline dry run: point straight at a theme folder on disk. No NocoDB,
+      // no clone, no network beyond the AI calls — for iterating on the engine.
+      if (body0.dryRun && body0.themeDir) {
+        const slug = body0.themeSlug || path.basename(path.resolve(body0.themeDir));
+        const job = enqueueSeoJob({
+          jobId: "seo-dry-" + Date.now(), dryRun: true, themeDir: body0.themeDir,
+          siteId: body0.siteId || slug, businessName: body0.businessName || slug,
+          githubRepo: WP_REPO, themeSlug: slug,
+          themePath: "web/app/themes/" + slug,
+          muPath: "web/app/mu-plugins/g99-activate-" + slug.replace(/^g99-/, "") + ".php",
+          liveUrl: body0.liveUrl || "",
+        });
+        return json(res, 202, { jobId: job.draftId, dryRun: true, monitor: "/jobs" });
+      }
+      const site = await findWebsite(siteId);
+      if (!site) return json(res, 404, { error: "unknown siteId — refresh the site list" });
+      if (!site.githubRepo) return json(res, 409, { error: `${site.businessName} has no repository set in NocoDB` });
+      let target; try { target = await resolveEditTarget(site); } catch (e) { return json(res, 409, { error: e.message }); }
+      const running = [...JOBS.values()].find((j) => j.type === "seo" && (j.status === "queued" || j.status === "running") && j.payload && j.payload.siteId === site.siteId);
+      if (running) return json(res, 202, { jobId: running.draftId, dedupe: true, monitor: "/jobs" });
+      const job = enqueueSeoJob({
+        jobId: (body0.dryRun ? "seo-dry-" : "seo-") + Date.now(), dryRun: !!body0.dryRun,
+        siteId: site.siteId, businessName: site.businessName, githubRepo: site.githubRepo,
+        themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
+        liveUrl: site.liveUrl || "",
+      });
+      return json(res, 202, { jobId: job.draftId, dryRun: !!body0.dryRun, monitor: "/jobs" });
+    }
+
     if (p === "/api/enrich-run" && req.method === "POST") {
       const body0 = JSON.parse(await readBody(req) || "{}");
       // Inline mode (ops/test): explicit themeSlug + answers → enqueue directly,
