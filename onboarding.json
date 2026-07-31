@@ -1,49 +1,17 @@
 {
-  "draftId": "final-1785319787",
-  "businessId": 2274,
+  "draftId": "clientinfo-test-1",
+  "businessId": 4242,
   "template": "WEBSITE",
-  "receivedAt": "2026-07-29T10:09:47.606Z",
+  "receivedAt": "2026-07-30T13:31:09.763Z",
+  "betaSiteUrl": "https://elan-beta.gogroth.com/",
+  "betaSiteRepo": "G99agency/elan.gogroth.com",
   "referenceWebsite": "https://ruma.com",
   "existingWebsite": "https://nuvoaestheticsclinic.com",
   "answers": {
-    "business_name": "NUVO Aesthetics Clinic - GIA Upsell - June 2026 (clone)",
-    "primary_contact": "Medryck Ghadieh",
-    "phone_for_website": "+13203387829",
-    "location": "437 W State St, Sycamore, IL 60178",
-    "business_description": "NUVO Aesthetics Clinic is a premier medical spa in Sycamore, IL, specializing in regenerative treatments for facial aesthetics and general well-being.",
+    "business_name": "Elan Medical Aesthetics",
     "services_offered": [
-      "Neurotoxins (Botox",
-      "Dysport)",
-      "Dermal Fillers",
-      "Sculptra Aesthetic",
-      "Medical Weight Loss",
-      "Bio-identical HRT"
-    ],
-    "why_patients_choose": "Patients choose NUVO for its focus on regenerative medicine and natural-looking results.",
-    "revenue_services": [
-      "Dermal Fillers",
-      "Neurotoxins",
-      "Bio-identical HRT"
-    ],
-    "site_love_1_url": "https://ruma.com",
-    "primary_cta": "Book online",
-    "booking_platform": "GlossGenius",
-    "team_roster": [
-      {
-        "name": "Jeannine Fair MSN FPA APRN NP-C",
-        "role": "Owner and Medical Director"
-      },
-      {
-        "name": "Olivia Burton APRN FNP-BC",
-        "role": "Certified Nurse Practitioner and Aesthetic Injector"
-      }
-    ],
-    "practice_type": "Med spa",
-    "tone_clinical_warm": "85",
-    "tone_lux_approachable": "13",
-    "tone_bold_understated": "90",
-    "tone_playful_serious": "85",
-    "hero_headline": "Refined, natural results",
-    "hero_subheadline": "Physician-led aesthetics & wellness in Sycamore, IL"
+      "Botox",
+      "Dermal Fillers"
+    ]
   }
 }

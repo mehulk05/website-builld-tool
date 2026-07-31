@@ -16,6 +16,21 @@ let shownCount = PAGE;
 const needsYou = (j) => j.awaitingApproval && !j.approved && isActiveJob(j);
 const title = (j) => j.editSummary || (j.payload && j.payload.prompt) || (j.type === "edit" ? "Website edit" : "Build " + j.businessName);
 
+// Client info the onboarding form brought with it: the build target from the
+// HubSpot deal, plus when the submission actually arrived. Shown on every row so
+// you can tell which client and which site a run belongs to without opening it.
+const hostOf = (u) => { try { return new URL(u).hostname.replace(/^www\./, ""); } catch (e) { return String(u || "").replace(/^https?:\/\//, "").replace(/\/+$/, ""); } };
+function clientMeta(j) {
+  const repo = j.repo || (j.payload && (j.payload.githubRepo || j.payload.betaSiteRepo)) || null;
+  const beta = j.liveUrl || (j.payload && j.payload.betaSiteUrl) || null;
+  const when = j.receivedAt || j.createdAt;
+  const bits = [
+    beta ? `<span class="cm" title="Beta site">${esc(hostOf(beta))}</span>` : "",
+    repo ? `<span class="cm" title="Repository">${esc(repo)}</span>` : "",
+    when ? `<span class="cm" title="Form received ${esc(when)}">${esc(relTime(when))}</span>` : "",
+  ].filter(Boolean).join("");
+  return bits ? `<div class="cmeta">${bits}</div>` : "";
+}
 function match(j) {
   if (QUERY && !((j.businessName || "") + " " + title(j)).toLowerCase().includes(QUERY)) return false;
   if (FILTER === "all") return true;
@@ -32,6 +47,7 @@ function activeRow(j) {
       <div style="flex:1;min-width:0">
         <div class="nm trunc">${esc(title(j))}</div>
         <div class="sub trunc">${esc(j.businessName)} · ${esc(jobStepLabel(j))}</div>
+        ${clientMeta(j)}
       </div>
       ${needsYou(j) ? `<span class="btn warn sm">Review &amp; approve</span>` : ""}
       ${(j.status === "running" || j.status === "queued") && !j.cancelRequested ? `<button class="btn danger sm" data-cancel="${esc(j.draftId)}" data-name="${esc(j.businessName)}">Stop</button>` : ""}
@@ -54,6 +70,7 @@ function doneRow(j) {
     <div style="flex:1;min-width:0;margin-left:12px">
       <div class="nm trunc">${esc(title(j))}</div>
       <div class="sub trunc">${esc(j.businessName)} · ${esc(sub)} · ${esc(relTime(j.finishedAt || j.createdAt))}</div>
+      ${clientMeta(j)}
     </div>
     ${j.delta != null ? `<span class="pill ${j.delta >= 0 ? "good" : "bad"}" style="margin-right:8px">CRO ${j.delta >= 0 ? "+" : ""}${j.delta}</span>` : ""}
     <span class="pill ${st.cls}">${esc(st.label)}</span>

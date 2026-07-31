@@ -126,7 +126,7 @@ function techCard(j) {
     </button>
     <div class="tech${TECH_OPEN ? " open" : ""}" id="tech">
       <div class="grid">
-        <div><span class="k">Repository</span><div class="v">${esc((j.payload && j.payload.githubRepo) || "—")}</div></div>
+        <div><span class="k">Repository</span><div class="v">${esc(jobRepo(j) || "—")}</div></div>
         <div><span class="k">Theme</span><div class="v">${esc((j.payload && j.payload.themeSlug) || "—")}</div></div>
         <div><span class="k">Branch</span><div class="v">${esc(j.branch || "—")}</div></div>
         <div><span class="k">Usage</span><div class="v">${c.gemini || 0} Gemini · ${c.stitch || 0} Stitch · ${esc(jobCost(j))}</div></div>
@@ -146,6 +146,39 @@ function actions(j) {
 }
 
 const TYPE_LABEL = { edit: "Edit", enrich: "Enrich", restore: "Restore", build: "Build" };
+
+// Build jobs carry the target on the job record (from the HubSpot deal); edit and
+// enrich jobs carry it on the payload. Read both so the value is never blank.
+const jobRepo = (j) => j.repo || (j.payload && (j.payload.githubRepo || j.payload.betaSiteRepo)) || null;
+const jobBeta = (j) => j.liveUrl || (j.payload && j.payload.betaSiteUrl) || null;
+
+// Who this run is for, and where it builds to — the information the onboarding
+// form brought in. Sits at the top so a run is identifiable at a glance.
+function clientCard(j) {
+  const repo = jobRepo(j), beta = jobBeta(j);
+  const ex = j.payload && j.payload.existingWebsite;
+  const ref = j.payload && j.payload.referenceWebsite;
+  const when = j.receivedAt || j.createdAt;
+  const row = (k, v, href) => v
+    ? `<div class="kv"><span class="k">${esc(k)}</span>${href
+        ? `<a class="v" href="${esc(href)}" target="_blank" rel="noopener">${esc(v)}</a>`
+        : `<span class="v">${esc(v)}</span>`}</div>`
+    : "";
+  const body = [
+    row("Client", j.businessName),
+    row("Beta site", beta, beta),
+    row("Repository", repo, repo ? "https://github.com/" + repo : null),
+    row("Existing site", ex, ex),
+    row("Reference site", ref, ref),
+    row("Form received", when ? new Date(when).toLocaleString() + " · " + relTime(when) : null),
+    row("Draft", j.draftId),
+  ].filter(Boolean).join("");
+  if (!body) return "";
+  return `<div class="card pad">
+    <div class="card-h"><h2>Client &amp; build target</h2>${j.source ? `<span class="right pill">${esc(j.source)}</span>` : ""}</div>
+    ${body}
+  </div>`;
+}
 
 // Green all-done banner with the clickable live URL (+ deep links once the
 // enrichment shipped service pages and the brand guide).
@@ -229,6 +262,8 @@ function render() {
     ${j.awaitingApproval && !j.approved ? `<div class="banner">${svg("warn", 18)}<div style="flex:1"><div class="bt">Paused for your approval${j.verification ? ` — ${j.verification.done} of ${j.verification.total} item(s) done` : ""}</div><div class="bd">${j.verification && j.verification.missed ? `${j.verification.missed} requested item(s) could not be found in the changes — listed above.` : "The change is written and the pull request is open — it merges only once you approve."}</div></div></div>` : ""}
     ${j.status === "error" ? `<div class="banner bad">${svg("warn", 18)}<div style="flex:1"><div class="bt">This run failed</div><div class="bd">${esc((j.error || "").slice(0, 240))}</div></div></div>` : ""}
     ${j.status === "done" && j.liveUrl ? successBanner(j) : ""}
+
+    ${clientCard(j)}
 
     ${scoresCard(j)}
 

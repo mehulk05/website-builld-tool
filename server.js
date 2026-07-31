@@ -1156,6 +1156,144 @@ async function qcStitchImages(html) {
   return html;
 }
 
+// ------------------------------------------------------------ Real brand extraction
+// A screenshot can't tell you a font's NAME, so the vision pass could only ever
+// describe a style — which is why generated sites silently fell back to
+// Playfair/Inter. Sites declare their real families in markup, so read them.
+// Everything that is a system/fallback face, an icon font, or a theme-plugin font
+// rather than a brand choice. WordPress themes ship a long default stack
+// (-apple-system, …, Oxygen-Sans, Ubuntu, Cantarell, …) which is NOT the brand.
+const GENERIC_FONTS = /^(sans-serif|serif|monospace|cursive|fantasy|inherit|initial|unset|revert|auto|system-ui|ui-sans-serif|ui-serif|ui-monospace|-apple-system|BlinkMacSystemFont|Segoe UI|Roboto|Roboto Slab|Roboto Condensed|Helvetica|Helvetica Neue|Arial|Arial Black|Times|Times New Roman|Georgia|Courier|Courier New|Verdana|Tahoma|Trebuchet MS|Palatino|Garamond|Oxygen|Oxygen-Sans|Ubuntu|Cantarell|Fira Sans|Droid Sans|Noto Sans|Noto Serif|Liberation Sans|DejaVu Sans|Segoe UI Emoji|Segoe UI Symbol|Apple Color Emoji|Consolas|Menlo|Monaco|Lucida.*|MS .*|.*Emoji.*|.*icons?|.*Icons?|dashicons|eicons|elementskit.*|fontawesome|Font Awesome.*|swiper.*|revicons|bootstrap-icons|feather|simple-line-icons|themify|linearicons)$/i;
+function extractFontFamilies(html) {
+  const s = String(html);
+  const norm = (raw) => String(raw || "").replace(/\+/g, " ").replace(/["']/g, "").trim();
+  const keep = (n) => n && n.length <= 40 && !GENERIC_FONTS.test(n) && !/^var\(|^\$|^#|^\d/.test(n);
+  const push = (list, n) => { if (keep(n) && !list.some((x) => x.toLowerCase() === n.toLowerCase())) list.push(n); };
+
+  // 1) Google Fonts links — the authoritative signal for a site's brand type.
+  const google = [];
+  for (const m of s.matchAll(/fonts\.googleapis\.com\/css2?\?([^"'>\s]+)/g)) {
+    for (const f of m[1].matchAll(/family=([^&:]+)/g)) push(google, norm(decodeURIComponent(f[1])));
+  }
+  if (google.length) return google;   // don't dilute a real answer with fallbacks
+
+  // 2) No webfonts declared: fall back to font-family rules, taking only the
+  // FIRST family in each stack — the intended face, not its fallback chain.
+  const declared = [];
+  for (const m of s.matchAll(/font-family\s*:\s*([^;}]+)/g)) push(declared, norm(m[1].split(",")[0]));
+  return declared;
+}
+// Dominant non-neutral hexes, most frequent first — the site's real palette.
+function extractPalette(html) {
+  const count = {};
+  for (const m of String(html).matchAll(/#([0-9a-fA-F]{6})\b/g)) {
+    const hex = "#" + m[1].toUpperCase();
+    const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+    const nearWhite = mx > 244 && mn > 238, nearBlack = mx < 18;
+    if (nearWhite || nearBlack) continue;                 // page ground, not brand
+    count[hex] = (count[hex] || 0) + 1;
+  }
+  return Object.entries(count).sort((a, b) => b[1] - a[1]).map(([h]) => h);
+}
+// Fetch a live site and read its ACTUAL type + palette.
+async function readSiteBrand(url) {
+  if (!url) return null;
+  try {
+    const r = await fetch(url, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 G99Bot", "Cache-Control": "no-cache" } });
+    if (!r.ok) return null;
+    const html = await r.text();
+    const fonts = extractFontFamilies(html), pal = extractPalette(html);
+    if (!fonts.length && !pal.length) return null;
+    return { fonts, headingFont: fonts[0] || null, bodyFont: fonts[1] || fonts[0] || null, palette: pal };
+  } catch (e) { return null; }
+}
+// The brand a THEME actually renders. Derived from the theme's own files rather
+// than a job record, so it can't drift from the site it's editing (job history is
+// in-memory and vanishes on redeploy, which is how the brand guide went stale).
+// Font ROLE detection. A Google Fonts URL lists families alphabetically, so
+// position tells you nothing — reading fonts[0] as "the heading font" got Inter
+// and Playfair Display exactly backwards. Decide by how each family is USED.
+const DISPLAY_FACES = /(playfair|cormorant|lora|tenor|garamond|didot|bodoni|prata|marcellus|cinzel|libre baskerville|crimson|spectral|fraunces|canela|serif)/i;
+function detectHeadingFont(html, fonts) {
+  const s = String(html);
+  if (!fonts.length) return null;
+  const isFont = (n) => fonts.find((f) => f.toLowerCase() === String(n || "").toLowerCase().replace(/["']/g, "").trim());
+  // 1) Explicit role keys, MOST specific first. These themes invent their own
+  // names — one declares headline:["Playfair Display"] next to
+  // display:["Public Sans"] — so "display" must never outrank "headline".
+  for (const key of ["headline", "heading", "title", "serif", "display"]) {
+    const re = new RegExp(key + "\\s*:\\s*\\[?\\s*['\"]([^'\"]+)['\"]", "gi");
+    for (const m of s.matchAll(re)) {
+      const hit = isFont(m[1]);
+      // a sans face under a "display" key is a utility, not the heading face
+      if (hit && !(key === "display" && !DISPLAY_FACES.test(hit))) return hit;
+    }
+  }
+  for (const m of s.matchAll(/--(?:display|heading|font-display)\s*:\s*['"]?([^;'",]+)/gi)) {
+    const hit = isFont(m[1]); if (hit) return hit;
+  }
+  // 2) a family applied directly to heading selectors
+  for (const m of s.matchAll(/(?:^|[},;\s])(h1|h2|h3)[^{}]{0,120}\{[^{}]{0,400}?font-family\s*:\s*([^;}]+)/gi)) {
+    const hit = isFont(String(m[2]).split(",")[0]); if (hit) return hit;
+  }
+  // 3) otherwise the display/serif-looking family is the heading one
+  return fonts.find((f) => DISPLAY_FACES.test(f)) || null;
+}
+// Colour ROLES by measurement, not frequency: primary = darkest, accent = most
+// saturated, secondary = what's left. (Frequency picked #D4C5B9 — a light beige —
+// as "primary", which is a background, not a brand primary.)
+function assignPaletteRoles(pal) {
+  const info = pal.slice(0, 10).map((hex) => {
+    const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+    return { hex, lum: (0.299 * r + 0.587 * g + 0.114 * b) / 255, sat: mx ? (mx - mn) / mx : 0 };
+  });
+  if (!info.length) return {};
+  const primary = info.slice().sort((a, b) => a.lum - b.lum)[0];
+  const accent = info.filter((x) => x.hex !== primary.hex).sort((a, b) => b.sat - a.sat)[0] || primary;
+  const secondary = info.find((x) => x.hex !== primary.hex && x.hex !== accent.hex) || accent;
+  return { primary: primary.hex, secondary: secondary.hex, accent: accent.hex };
+}
+function readThemeBrand(themeDir) {
+  try {
+    let html = "";
+    for (const f of ["header.php", "front-page.php", "page-services.php", "style.css"]) {
+      const p = path.join(themeDir, f);
+      if (fs.existsSync(p)) html += "\n" + fs.readFileSync(p, "utf8");
+    }
+    if (!html.trim()) return null;
+    const fonts = extractFontFamilies(html), pal = extractPalette(html);
+    if (!fonts.length && !pal.length) return null;
+    const headingFont = detectHeadingFont(html, fonts);
+    const bodyFont = fonts.find((f) => f !== headingFont) || headingFont || null;
+    return { headingFont, bodyFont, ...assignPaletteRoles(pal), fonts, palette: pal.slice(0, 6), html };
+  } catch (e) { return null; }
+}
+// Stitch bakes its OWN font links into the page chrome and ignores the brand we
+// asked for — the real reason a generated site's type doesn't match. So state the
+// brand explicitly on every page instead of hoping the model complied.
+function enforceBrandFonts(html, composed) {
+  const c = composed || {};
+  const h = c.headingFont, b = c.bodyFont;
+  if (!html || (!h && !b)) return html;
+  if (String(html).includes("g99-brand-type")) return html;      // idempotent
+  const fam = [h, b].filter(Boolean).map((f) => "family=" + encodeURIComponent(f).replace(/%20/g, "+") + ":wght@300;400;500;600;700").join("&");
+  const serif = h && DISPLAY_FACES.test(h) ? "serif" : "sans-serif";
+  const block = `
+<!-- g99-brand-type -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?${fam}&display=swap">
+<style>
+${h ? `h1,h2,h3,h4,.font-display,.font-serif,[class*="font-display"]{font-family:'${h}',${serif} !important}` : ""}
+${b ? `body,p,li,a,span,div,button,input,textarea,select,.font-body,.font-sans{font-family:'${b}',sans-serif}` : ""}
+${h ? `h1,h2,h3,h4{letter-spacing:-.01em}` : ""}
+</style>`;
+  // sits last so it wins the cascade over whatever the model emitted
+  return String(html).replace(/<\/head>/i, block + "\n</head>").includes("g99-brand-type")
+    ? String(html).replace(/<\/head>/i, block + "\n</head>")
+    : String(html) + block;
+}
+
 // ------------------------------------------------------------ Image resolution QC
 // A "blurry" hero is almost always a small image stretched wide, so the reliable
 // test is the image's INTRINSIC pixel width — not a perceptual blur score. Read it
@@ -1211,6 +1349,26 @@ async function imageDims(url) {
 // Check every <img> / CSS background image on a page. Anything whose real pixel
 // width is below the threshold would visibly soften when stretched, so swap it for
 // a curated 1600px photo. Returns the cleaned html + a per-image report.
+// Stitch's AI images top out at 1408x768 — fine for a card, not for a full-bleed
+// hero on a modern display (~1.8x upscale = visibly soft). So heroes get a higher
+// bar and are replaced with 2400px photography; small images keep the normal one.
+const HERO_MIN_WIDTH = 1600;
+const CURATED_HERO_IMAGES = CURATED_IMAGES.map((u) => u.replace(/([?&])w=\d+/, "$1w=2400"));
+// Which image URLs are used as a hero / full-bleed band? Keyed off the markup
+// around each occurrence, so it works whatever classes the model invented.
+function heroImageUrls(html) {
+  const hero = new Set();
+  const s = String(html);
+  const HINT = /(hero|min-h-screen|h-screen|h-\[\d{2,3}vh\]|min-h-\[\d{2,3}vh\]|object-cover[^"]*absolute|absolute[^"]*inset-0)/i;
+  for (const m of s.matchAll(/https:\/\/(?:lh3\.googleusercontent\.com\/aida-public\/|images\.unsplash\.com\/)[^"'()\s]+/g)) {
+    const around = s.slice(Math.max(0, m.index - 700), m.index + 400);
+    if (HINT.test(around)) hero.add(m[0]);
+  }
+  // the first image on the page is the hero often enough to treat it as one
+  const first = (s.match(/https:\/\/(?:lh3\.googleusercontent\.com\/aida-public\/|images\.unsplash\.com\/)[^"'()\s]+/) || [])[0];
+  if (first) hero.add(first);
+  return hero;
+}
 async function qcImageResolution(html, minWidth = 1000) {
   if (!html) return { html, report: [] };
   const urls = [...new Set(
@@ -1220,25 +1378,28 @@ async function qcImageResolution(html, minWidth = 1000) {
   )].slice(0, 24);
   if (!urls.length) return { html, report: [] };
   const dims = await Promise.all(urls.map((u) => imageDims(u)));
-  const report = []; let ci = 0, swapped = 0;
+  const heroes = heroImageUrls(html);
+  const report = []; let ci = 0, hi = 0, swapped = 0;
   urls.forEach((u, i) => {
     const d = dims[i];
-    const ok = d && d.w >= minWidth;
-    const row = { url: u.slice(0, 120), w: d ? d.w : null, h: d ? d.h : null, ok: !!ok, action: "kept" };
+    const isHero = heroes.has(u);
+    const need = isHero ? HERO_MIN_WIDTH : minWidth;
+    const ok = d && d.w >= need;
+    const row = { url: u.slice(0, 120), w: d ? d.w : null, h: d ? d.h : null, role: isHero ? "hero" : "inline", need, ok: !!ok, action: "kept" };
     if (!ok) {
       // unreadable header ≠ broken image (some CDNs refuse ranged reads), so only
       // replace when we positively measured it as too small
       if (d) {
-        const repl = CURATED_IMAGES[ci++ % CURATED_IMAGES.length];
+        const repl = isHero ? CURATED_HERO_IMAGES[hi++ % CURATED_HERO_IMAGES.length] : CURATED_IMAGES[ci++ % CURATED_IMAGES.length];
         html = html.split(u).join(repl);
-        row.action = "replaced (too small)"; swapped++;
+        row.action = `replaced (${d.w}px < ${need}px${isHero ? ", hero" : ""})`; swapped++;
       } else {
         row.action = "unmeasured — kept";
       }
     }
     report.push(row);
   });
-  if (swapped) console.log(`  image QC: replaced ${swapped}/${urls.length} low-resolution image(s)`);
+  if (swapped) console.log(`  image QC: replaced ${swapped}/${urls.length} under-resolution image(s) (hero bar ${HERO_MIN_WIDTH}px, inline ${minWidth}px)`);
   return { html, report };
 }
 
@@ -2126,10 +2287,22 @@ async function auditWebsite(site) {
   return entry;
 }
 
+// The deal may hold a full GitHub URL, an SSH remote, or already-clean owner/repo.
+// `gh` wants owner/repo, so normalise whatever arrives.
+function normalizeRepo(v) {
+  let s = String(v || "").trim();
+  if (!s) return "";
+  s = s.replace(/^git@github\.com:/i, "").replace(/^https?:\/\/(www\.)?github\.com\//i, "").replace(/\.git$/i, "").replace(/\/+$/, "");
+  const m = s.match(/^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)/);
+  return m ? `${m[1]}/${m[2]}` : "";
+}
 function newJob(payload) {
   return {
     type: "build",
     draftId: String(payload.draftId), businessId: payload.businessId || null,
+    // when the onboarding form actually arrived, and where it came from
+    receivedAt: payload.receivedAt || new Date().toISOString(),
+    source: payload.source || "manual",
     // Per-client build target, sent by G99 from the HubSpot deal (beta_site_repo / beta_site_url).
     // Absent => fall back to this deployment's own defaults, so existing clients are unaffected.
     repo: payload.betaSiteRepo || payload.githubRepo || WP_REPO,
@@ -3592,8 +3765,9 @@ async function generateServiceTemplate(svc, A, composed, ref, city, brief) {
 // swapped name/copy/benefits/imagery. Keeps all 10 pages visually consistent.
 // Shared post-processing for Gemini-generated service pages: same image pipeline
 // as the Stitch path, so a fallback page is never blurrier than a Stitch one.
-async function polishServiceHtml(html) {
-  let h = sharpenStitchImages(html);
+async function polishServiceHtml(html, composed) {
+  let h = enforceBrandFonts(html, composed);
+  h = sharpenStitchImages(h);
   h = await fixImages(h);
   const qc = await qcImageResolution(h);
   return { html: qc.html, report: qc.report };
@@ -4104,7 +4278,7 @@ async function runEnrichJob(job) {
   const repo = P.githubRepo || WP_REPO;
   const slug = String(P.themeSlug || "").replace(/^g99-/, "");
   const A = P.answers || {};
-  const composed = P.composed || {};
+  let composed = P.composed || {};   // may be overridden by the theme's real brand below
   const city = deriveCity(A.location);
   const tmp = path.join(os.tmpdir(), "g99enrich-" + Date.now());
   const run = async (cmd, cwd) => sh(cmd, cwd);
@@ -4130,6 +4304,39 @@ async function runEnrichJob(job) {
       if (!fs.existsSync(themeAbs)) throw new Error("theme not found in repo: " + P.themePath);
       jobStep(job, 0, "done", "Latest code pulled");
     }
+    // Trust the THEME, not the job record. `composed` is inherited from an
+    // in-memory build job, which can be stale or belong to a different theme —
+    // that's how the brand guide ended up documenting a palette the site never
+    // used. The theme's own files are the source of truth for what it renders.
+    // Which brand is authoritative depends on LINEAGE, not on what the theme
+    // happens to declare. Auto-enrich is handed `composed` by the very build that
+    // just pushed this theme, so that IS the intended brand — Stitch merely failed
+    // to honour it in its chrome (enforceBrandFonts fixes that separately). A
+    // manual run, by contrast, guesses `composed` from job history, which is how
+    // the brand guide went stale — there, read the theme instead.
+    const themeBrand = readThemeBrand(themeAbs);
+    const fromBuild = !!(P.parentDraftId || P.brandAuthoritative) && composed && composed.headingFont;
+    if (themeBrand && !fromBuild) {
+      const before = `${composed.headingFont || "?"}/${composed.bodyFont || "?"} ${composed.primary || "?"}`;
+      composed = {
+        ...composed,
+        headingFont: themeBrand.headingFont || composed.headingFont,
+        bodyFont: themeBrand.bodyFont || composed.bodyFont,
+        primary: themeBrand.primary || composed.primary,
+        secondary: themeBrand.secondary || composed.secondary,
+        accent: themeBrand.accent || composed.accent,
+      };
+      const after = `${composed.headingFont}/${composed.bodyFont} ${composed.primary}`;
+      if (before !== after) log_srv(`brand re-read from theme: ${before} -> ${after}`);
+    }
+    job.brandSource = {
+      from: fromBuild ? "build (authoritative)" : themeBrand ? "theme" : "inherited",
+      theme: P.themeSlug,
+      headingFont: composed.headingFont, bodyFont: composed.bodyFont,
+      primary: composed.primary, secondary: composed.secondary, accent: composed.accent,
+      themeDeclares: themeBrand ? { headingFont: themeBrand.headingFont, bodyFont: themeBrand.bodyFont, palette: themeBrand.palette } : null,
+    };
+    saveJobs();
 
     // 2 — plan services + reference structure
     jobStep(job, 1, "running", "Selecting services…");
@@ -4198,7 +4405,8 @@ async function runEnrichJob(job) {
         // the URL asks for full resolution, and enrich skipped the sharpener.
         job.imageReport = job.imageReport || {};
         for (const r of okStitch) {
-          let h = sharpenStitchImages(r.html);        // 512px thumb -> native 1600px
+          let h = enforceBrandFonts(r.html, composed); // Stitch ignores our fonts — state them
+          h = sharpenStitchImages(h);                 // 512px thumb -> native 1600px
           h = await fixImages(h);                     // drop broken/expiring URLs
           h = await qcStitchImages(h);                // swap text-baked images
           const qc = await qcImageResolution(h);      // measure + replace low-res
@@ -4215,7 +4423,7 @@ async function runEnrichJob(job) {
           svcStatus(job, s.slug, "generating", "gemini");
           jobStep(job, 2, "running", `Stitch missed ${s.name} — cloning from template…`);
           try {
-            const p = await polishServiceHtml(await cloneServicePage(template, s, A, composed, city));
+            const p = await polishServiceHtml(await cloneServicePage(template, s, A, composed, city), composed);
             serviceMains[s.slug] = p.html; job.imageReport[s.slug] = p.report;
             svcStatus(job, s.slug, "done", "gemini");
           }
@@ -4227,14 +4435,14 @@ async function runEnrichJob(job) {
         svcStatus(job, services[0].slug, "generating", "gemini");
         let template = await generateServiceTemplate(services[0], A, composed, ref, city, briefs[services[0].slug]);
         job.imageReport = job.imageReport || {};
-        { const p = await polishServiceHtml(template); template = p.html; job.imageReport[services[0].slug] = p.report; }
+        { const p = await polishServiceHtml(template, composed); template = p.html; job.imageReport[services[0].slug] = p.report; }
         serviceMains[services[0].slug] = template;
         svcStatus(job, services[0].slug, "done", "gemini");
         for (let i = 1; i < services.length; i++) {
           svcStatus(job, services[i].slug, "generating", "gemini");
           jobStep(job, 2, "running", `Cloning page ${i + 1}/${services.length}: ${services[i].name}`);
           try {
-            const p = await polishServiceHtml(await cloneServicePage(template, services[i], A, composed, city));
+            const p = await polishServiceHtml(await cloneServicePage(template, services[i], A, composed, city), composed);
             serviceMains[services[i].slug] = p.html; job.imageReport[services[i].slug] = p.report;
             svcStatus(job, services[i].slug, "done", "gemini");
           }
@@ -4433,12 +4641,28 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req) || "{}");
       if (!body.draftId) return json(res, 400, { error: "draftId required" });
       const mapped = mapG99Answers(body.answers);
+      // The HubSpot deal carries the build target (beta site URL + repo). G99 may
+      // send it under any of several names, and the answers array can carry it too,
+      // so accept every spelling rather than silently falling back to this
+      // deployment's own defaults (which is what used to happen).
+      const pick = (...keys) => {
+        for (const k of keys) {
+          if (body[k]) return String(body[k]).trim();
+          if (mapped.answers && mapped.answers[k]) return String(mapped.answers[k]).trim();
+        }
+        return "";
+      };
+      const betaSiteUrl = pick("betaSiteUrl", "beta_site_url", "betaUrl", "beta_url", "siteUrl", "site_url");
+      const betaSiteRepoRaw = pick("betaSiteRepo", "beta_site_repo", "githubRepo", "github_repo", "repoUrl", "repo_url", "repo");
+      const betaSiteRepo = normalizeRepo(betaSiteRepoRaw);
+      const receivedAt = new Date().toISOString();
       // Persist it as the current onboarding response, so "Build a site" shows
       // the client who actually submitted rather than whatever was there before.
       try {
         fs.writeFileSync(path.join(DIR, "onboarding.json"), JSON.stringify({
           draftId: body.draftId, businessId: body.businessId || null, template: body.template || "WEBSITE",
-          receivedAt: new Date().toISOString(),
+          receivedAt,
+          betaSiteUrl, betaSiteRepo,
           referenceWebsite: body.referenceWebsite || mapped.referenceWebsite || "",
           existingWebsite: body.existingWebsite || mapped.existingWebsite || "",
           answers: mapped.answers,
@@ -4448,7 +4672,10 @@ const server = http.createServer(async (req, res) => {
         draftId: body.draftId, businessId: body.businessId, businessName: body.businessName,
         answers: mapped.answers, existingWebsite: body.existingWebsite || mapped.existingWebsite,
         referenceWebsite: body.referenceWebsite || mapped.referenceWebsite,
+        // the build target from the deal — without these the job used env defaults
+        betaSiteUrl, betaSiteRepo, receivedAt, source: "onboarding form",
       });
+      console.log(`webhook: ${job.businessName} · repo ${job.repo} · beta ${job.liveUrl}${betaSiteUrl || betaSiteRepo ? "" : " (deal properties missing — using this deployment's defaults)"}`);
       res.writeHead(202, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ accepted: true, dedupe, draftId: job.draftId, status: job.status, monitor: "/jobs" }));
     }
@@ -4680,11 +4907,17 @@ const server = http.createServer(async (req, res) => {
             .concat([...main.matchAll(/https:\/\/[^"'()\s]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"'()\s]*)?/gi)].map((m) => m[0]))
         )].slice(0, 30);
         const dims = await Promise.all(urls.map((x) => imageDims(x)));
-        const images = urls.map((x, i) => ({
-          url: x.slice(0, 140), w: dims[i] ? dims[i].w : null, h: dims[i] ? dims[i].h : null,
-          ok: !!(dims[i] && dims[i].w >= MIN),
-          measured: !!dims[i],
-        }));
+        const heroes = heroImageUrls(main);
+        const images = urls.map((x, i) => {
+          const isHero = heroes.has(x);
+          const need = isHero ? Math.max(MIN, HERO_MIN_WIDTH) : MIN;
+          return {
+            url: x.slice(0, 140), w: dims[i] ? dims[i].w : null, h: dims[i] ? dims[i].h : null,
+            role: isHero ? "hero" : "inline", need,
+            ok: !!(dims[i] && dims[i].w >= need),
+            measured: !!dims[i],
+          };
+        });
         const measured = images.filter((x) => x.measured);
         pages.push({
           path: p2, total: images.length,
@@ -4892,9 +5125,9 @@ const server = http.createServer(async (req, res) => {
         .filter((j) => j.type === "build" && j.composed && j.payload && j.payload.answers && j.businessName === site.businessName)
         .sort(newest)[0];
       const src = buildForSlug
-        ? { answers: buildForSlug.payload.answers, composed: buildForSlug.composed, referenceWebsite: buildForSlug.payload.referenceWebsite, existingWebsite: buildForSlug.payload.existingWebsite, businessId: buildForSlug.businessId }
+        ? { answers: buildForSlug.payload.answers, composed: buildForSlug.composed, referenceWebsite: buildForSlug.payload.referenceWebsite, existingWebsite: buildForSlug.payload.existingWebsite, businessId: buildForSlug.businessId, authoritative: true }
         : enrichForSlug
-          ? { answers: enrichForSlug.payload.answers, composed: enrichForSlug.payload.composed, referenceWebsite: enrichForSlug.payload.referenceWebsite, existingWebsite: enrichForSlug.payload.existingWebsite, businessId: enrichForSlug.businessId }
+          ? { answers: enrichForSlug.payload.answers, composed: enrichForSlug.payload.composed, referenceWebsite: enrichForSlug.payload.referenceWebsite, existingWebsite: enrichForSlug.payload.existingWebsite, businessId: enrichForSlug.businessId, authoritative: true }
           : buildByName
             ? { answers: buildByName.payload.answers, composed: buildByName.composed, referenceWebsite: buildByName.payload.referenceWebsite, existingWebsite: buildByName.payload.existingWebsite, businessId: buildByName.businessId }
             : null;
@@ -4907,7 +5140,7 @@ const server = http.createServer(async (req, res) => {
         // fall back to the answers' current-site field so content grounding isn't
         // silently skipped when the source build's payload lacks existingWebsite
         existingWebsite: src.existingWebsite || (src.answers || {}).existing_website || (src.answers || {}).current_website || "",
-        headerOnly: !!body0.headerOnly,
+        headerOnly: !!body0.headerOnly, brandAuthoritative: !!src.authoritative,
       });
       return json(res, 202, { jobId: job.draftId, status: job.status, monitor: "/jobs" });
     }
@@ -5009,6 +5242,20 @@ const server = http.createServer(async (req, res) => {
         catch (e) { console.warn("compose: site analysis failed:", e.message.slice(0, 120)); }
       }
 
+      // 1b) The source site's REAL type + palette, read from its markup. A
+      // screenshot can't reveal font names, so without this the brief only ever
+      // described a "style" and generation fell back to Playfair/Inter.
+      // Fonts come from the EXISTING site — that's the brand the client already
+      // has, and what "matching their fonts" means. The reference site still
+      // drives the overall design language (palette, vibe, layout) as before.
+      let siteBrand = null, fontsFrom = null;
+      if (existUrl) { siteBrand = await readSiteBrand(existUrl); fontsFrom = existUrl; }
+      if (!siteBrand || !siteBrand.fonts.length) {
+        const alt = siteUrl && siteUrl !== existUrl ? await readSiteBrand(siteUrl) : null;
+        if (alt && alt.fonts.length) { siteBrand = alt; fontsFrom = siteUrl; }
+      }
+      if (siteBrand) console.log(`compose: real fonts on ${fontsFrom}: ${siteBrand.fonts.slice(0, 4).join(", ") || "none"}`);
+
       // 2) Full CRO report (per-discipline issues, not just top recs).
       let cro = null; try { cro = JSON.parse(fs.readFileSync(path.join(GEN, ".cro-existing.json"), "utf8")); } catch (e) {}
 
@@ -5036,6 +5283,9 @@ const server = http.createServer(async (req, res) => {
         `${isRef ? "REFERENCE / INSPIRATION SITE the client loves" : "EXISTING SITE"} BRAND THEME (extracted from ${siteUrl}) — ${isRef ? "the new site must feel like the same design family (emulate this):" : "keep the brand's DNA but elevate it:"}`,
         `- Colors: primary ${analysis.primaryColor}, secondary ${analysis.secondaryColor}, accent ${analysis.accentColor}, background ${analysis.backgroundColor}.`,
         `- Vibe: ${analysis.vibe}. Headings: ${analysis.headingFontStyle}. Body: ${analysis.bodyFontStyle}.`,
+        siteBrand && siteBrand.fonts.length
+          ? `- ACTUAL font families that site declares (read from its markup — authoritative; a screenshot cannot show these): ${siteBrand.fonts.slice(0, 4).join(", ")}. Its real palette: ${siteBrand.palette.slice(0, 4).join(", ")}.`
+          : "",
         `- Layout style: ${analysis.layoutStyle}. Imagery style: ${analysis.imageryStyle}.`,
         `- Mood: ${(analysis.mood || []).join(", ")}. Signature elements: ${(analysis.signatureElements || []).join("; ")}.`,
         `REFINE these colors into a clean, WCAG-accessible, premium palette (keep the brand feel, fix contrast/harmony).`,
@@ -5053,6 +5303,9 @@ const server = http.createServer(async (req, res) => {
         `\n== ${themeBlock}`,
         `\n== ${croBlock}`,
         `\n== IMAGERY DIRECTION (REQUIRED) ==\nSpecify a cohesive, HIGH-QUALITY photographic art direction: editorial, photorealistic medical-aesthetic photography — real clinic interiors, close-up treatment/skin/results shots, warm authentic provider & patient portraits. Describe subjects, lighting (soft natural / golden), color grade, and composition so every section has intentional, premium imagery. NO low-resolution, cartoonish, or generic clip-art stock. Images must reinforce trust and the luxury feel.`,
+        siteBrand && siteBrand.fonts.length
+          ? `\n== TYPOGRAPHY RULE ==\nThat site really uses: ${siteBrand.fonts.slice(0, 4).join(", ")}. Set "headingFont" and "bodyFont" to those EXACT families (heading = the display/serif one, body = the clean sans one) so the new site stays typographically continuous with the brand. Substitute only if a family isn't on Google Fonts — then pick the closest Google equivalent with the same character.`
+          : "",
         `\n== OUTPUT ==\nReturn ONLY minified JSON with these keys:`,
         `{"primary":"#hex","secondary":"#hex","accent":"#hex","headingFont":"a Google serif display font name","bodyFont":"a clean Google sans font name","imageryDirection":"2-3 sentences of concrete photographic art direction","brief":"a DETAILED, multi-paragraph art-direction + build brief (250-400 words) written as concrete design directives: overall look & feel, layout sophistication and section rhythm, typographic system, color usage, component styling, the specific imagery to use per section, and the exact CRO fixes this new site must implement based on the audit above. Be specific, not vague."}`,
       ].join("\n");
@@ -5063,6 +5316,19 @@ const server = http.createServer(async (req, res) => {
         if (obj.imageryDirection && obj.brief && !obj.brief.includes(obj.imageryDirection.slice(0, 30))) {
           obj.brief += `\n\nIMAGERY: ${obj.imageryDirection}`;
         }
+        // A guarantee, not a hope: if the model still invented fonts, use the real
+        // ones. Recorded so a run's typography can be explained afterwards.
+        if (siteBrand && siteBrand.fonts.length) {
+          obj.fontSource = "site";
+          const wantH = siteBrand.headingFont, wantB = siteBrand.bodyFont;
+          if (wantH && String(obj.headingFont || "").toLowerCase() !== wantH.toLowerCase()) {
+            obj.headingFontModelPick = obj.headingFont; obj.headingFont = wantH; obj.fontSource = "site (model overridden)";
+          }
+          if (wantB && String(obj.bodyFont || "").toLowerCase() !== wantB.toLowerCase()) {
+            obj.bodyFontModelPick = obj.bodyFont; obj.bodyFont = wantB; obj.fontSource = "site (model overridden)";
+          }
+          obj.siteFonts = siteBrand.fonts.slice(0, 4);
+        } else { obj.fontSource = "model"; }
         obj.usedAnalysis = !!analysis; obj.usedCro = !!cro;
         return json(res, 200, obj);
       } catch (e) { return json(res, 502, { error: "compose failed: " + e.message }); }
@@ -5135,7 +5401,8 @@ const server = http.createServer(async (req, res) => {
       const built = await buildStitchSite(pages.map(pg => ({ key: pg.key.replace(/[^a-z0-9_-]/gi, ""), prompt: pg.prompt + "\n\n" + designTokensBlock(theme) + STITCH_IMG_CLAUSE })), theme || {}, deviceType);
       const out = await Promise.all(built.results.map(async r => {
         if (!r.html) return { pageKey: r.key, engine: "stitch", error: r.error || "no HTML" };
-        let html = sharpenStitchImages(r.html);
+        let html = enforceBrandFonts(r.html, theme);  // pin the composed brand type
+        html = sharpenStitchImages(html);
         html = await fixImages(html);                // replace broken/expiring image URLs with stable photos
         html = await qcStitchImages(html);          // swap any text-baked images for clean photos
         html = seoEnhance(html, r.key);
