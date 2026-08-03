@@ -2301,6 +2301,43 @@ function prettyName(slug) {
 }
 // Collapse a PR's statusCheckRollup (mix of CheckRun + StatusContext) into one
 // CI verdict: failing > pending > passing > none (no checks configured/ran).
+// Does this repo have any GitHub Actions workflows at all? A brand-new client repo often
+// doesn't (prodteam1.gogroth.com shipped with only dependabot.yml), and then no PR check will
+// ever appear. Cached because it changes about never, and every CI poll would otherwise pay
+// for the lookup.
+const WORKFLOW_CACHE = new Map();   // repo -> boolean
+async function repoHasWorkflows(repo) {
+  if (WORKFLOW_CACHE.has(repo)) return WORKFLOW_CACHE.get(repo);
+  const r = await sh(`gh api repos/${repo}/contents/.github/workflows --jq ".[].name"`);
+  // 404 (no such path) => no workflows. Any other failure is inconclusive, so assume there
+  // ARE workflows: waiting is safe, merging an ungated PR on a bad guess is not.
+  const has = r.code ? !/not found|404/i.test((r.stderr || "") + (r.stdout || "")) : !!(r.stdout || "").trim();
+  WORKFLOW_CACHE.set(repo, has);
+  return has;
+}
+
+// Reasons a CI watch can stop before its checks ever go green. Both were invisible to the
+// old loop, which only ever looked at check results: it would burn all ~40 minutes and then
+// report a misleading "CI watch timed out".
+const NO_CI_GRACE_POLLS = 12;   // ~2 min at a 10s poll — ample for Actions to register a queued run
+async function ciEarlyExit(job, stepIdx, siteId, st, i) {
+  if (st.merged) {
+    job.mergedExternally = true;
+    jobStep(job, stepIdx, "done", "Merged on GitHub (outside the tool)");
+    return true;
+  }
+  // Only after the grace period, and only when the repo genuinely has no workflows —
+  // never merge ungated just because a check was slow to appear.
+  if (st.noChecks && st.hasWorkflows === false && i >= NO_CI_GRACE_POLLS) {
+    await awaitApprovalIfNeeded(job, siteId, stepIdx);
+    if (!job.mergedExternally) await localApi("/api/pr-merge", { prUrl: job.prUrl });
+    job.mergedWithoutCi = true;
+    jobStep(job, stepIdx, "done", "Merged — this repo has no CI workflows, so there was nothing to gate on");
+    return true;
+  }
+  return false;
+}
+
 function ciRollup(rollup) {
   if (!Array.isArray(rollup) || !rollup.length) return "none";
   let pending = false, failing = false, passing = false;
@@ -3288,6 +3325,7 @@ async function runJob(job) {
       catch (e) { await sleep(10000); continue; }
       const summary = (st.checks || []).map((c) => `${c.name}:${c.status}`).join(" ");
       jobStep(job, 5, "running", summary || "CI starting…");
+      if (await ciEarlyExit(job, 5, "g99-" + slug, st, i)) { merged = true; break; }
       if (st.allPass) {
         await awaitApprovalIfNeeded(job, "g99-" + slug, 5);
         await localApi("/api/pr-merge", { prUrl: job.prUrl });
@@ -4014,6 +4052,7 @@ async function runEditJob(job) {
     for (let i = 0; i < 240 && !merged; i++) {
       let st; try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); } catch (e) { await sleep(10000); continue; }
       jobStep(job, 5, "running", (st.checks || []).map(c => `${c.name}:${c.status}`).join(" ") || "CI starting…");
+      if (await ciEarlyExit(job, 5, P.siteId, st, i)) { merged = true; break; }
       if (st.allPass) { await awaitApprovalIfNeeded(job, P.siteId, 5); if (!job.mergedExternally) await localApi("/api/pr-merge", { prUrl: job.prUrl }); merged = true; jobStep(job, 5, "done", job.mergedExternally ? "Merged on GitHub" : `Merged${fixes ? ` after ${fixes} fix(es)` : ""}`); break; }
       if (st.anyFail) {
         if (fixes >= 3) throw new Error("CI still failing after 3 auto-fix attempts — " + job.prUrl);
@@ -4150,6 +4189,7 @@ async function runRestoreJob(job) {
     for (let i = 0; i < 240 && !merged; i++) {
       let st; try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); } catch (e) { await sleep(10000); continue; }
       jobStep(job, 3, "running", (st.checks || []).map(c => `${c.name}:${c.status}`).join(" ") || "CI starting…");
+      if (await ciEarlyExit(job, 3, P.siteId, st, i)) { merged = true; break; }
       if (st.allPass) { await awaitApprovalIfNeeded(job, P.siteId, 3); if (!job.mergedExternally) await localApi("/api/pr-merge", { prUrl: job.prUrl }); merged = true; jobStep(job, 3, "done", job.mergedExternally ? "Merged on GitHub" : "Merged"); break; }
       if (st.anyFail) throw new Error("CI failed on the restore — review it by hand: " + job.prUrl);
       await sleep(10000);
@@ -5215,6 +5255,7 @@ async function runEnrichJob(job) {
     for (let i = 0; i < 240 && !merged; i++) {
       let st; try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); } catch (e) { await sleep(10000); continue; }
       jobStep(job, 4, "running", (st.checks || []).map((c) => `${c.name}:${c.status}`).join(" ") || "CI starting…");
+      if (await ciEarlyExit(job, 4, P.siteId, st, i)) { merged = true; break; }
       if (st.allPass) { await awaitApprovalIfNeeded(job, P.siteId, 4); await localApi("/api/pr-merge", { prUrl: job.prUrl }); merged = true; jobStep(job, 4, "done", `Merged${fixes ? ` after ${fixes} fix(es)` : ""}`); break; }
       if (st.anyFail) {
         if (fixes >= 3) throw new Error("CI still failing after 3 auto-fix attempts — " + job.prUrl);
@@ -6274,6 +6315,7 @@ async function runSeoJob(job) {
     for (let i = 0; i < 240 && !merged; i++) {
       let st; try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); } catch (e) { await sleep(10000); continue; }
       jobStep(job, 9, "running", (st.checks || []).map((c) => `${c.name}:${c.status}`).join(" ") || "CI starting…");
+      if (await ciEarlyExit(job, 9, P.siteId, st, i)) { merged = true; break; }
       if (st.allPass) { await awaitApprovalIfNeeded(job, P.siteId, 9); if (!job.mergedExternally) await localApi("/api/pr-merge", { prUrl: job.prUrl }); merged = true; jobStep(job, 9, "done", `Merged${fixes ? ` after ${fixes} fix(es)` : ""}`); break; }
       if (st.anyFail) {
         if (fixes >= 3) throw new Error("CI still failing after 3 auto-fix attempts — " + job.prUrl);
@@ -7698,8 +7740,21 @@ const server = http.createServer(async (req, res) => {
         if (!cur || rank(b.status) > rank(cur.status)) byName[b.name] = b;
       }
       const list = Object.values(byName);
+      // "No checks" is ambiguous on its own: CI may not have registered yet, or the repo may
+      // have no workflows at all. Report the PR's own state and whether the repo even has
+      // workflows, so a watcher can tell those apart instead of polling for 40 minutes.
+      const repo = repoFromPrUrl(prUrl);
+      const pv = await sh(`gh pr view ${prNum} --repo ${repo} --json state,mergedAt`);
+      let prState = "", merged = false;
+      try {
+        const v = JSON.parse(pv.stdout || "{}");
+        prState = v.state || "";
+        merged = prState === "MERGED" || !!v.mergedAt;
+      } catch (e) { /* leave unknown — the watcher just keeps waiting */ }
       return json(res, 200, {
-        prNum, checks: list,
+        prNum, checks: list, prState, merged,
+        hasWorkflows: await repoHasWorkflows(repo),
+        noChecks: list.length === 0,
         anyFail: list.some(b => b.status === "fail"),
         anyPending: list.some(b => b.status === "pending"),
         allPass: list.length > 0 && list.every(b => b.status === "pass"),
