@@ -1834,6 +1834,18 @@ const JOB_STEPS = [
   "Service pages + brand guide",
 ];
 const ENRICH_STEP_IDX = JOB_STEPS.length - 1;
+
+// Stable machine ids, positionally paired with JOB_STEPS. Consumers (G99 product-service, which
+// turns these into SERVICE_PAGES_CREATED) must key off these, never off the labels: two labels
+// contain the word "pages" ("Generate pages (Stitch)" builds the site, "Service pages + brand
+// guide" builds the service pages), so label matching silently picks the wrong one. Labels are
+// display text and may be reworded; these keys are the contract.
+const JOB_STEP_KEYS = [
+  "cro_audit_before", "compose_prompt", "generate_pages", "assemble_site",
+  "wp_theme_pr", "ci_automerge", "theme_activation_watch", "cro_audit_after",
+  "service_pages",
+];
+const SERVICE_PAGES_STEP_KEY = JOB_STEP_KEYS[ENRICH_STEP_IDX];
 const JOBS = new Map();     // draftId -> job record
 const JOB_QUEUE = [];       // draftIds waiting (single concurrency — Stitch/Gemini quotas)
 let JOB_RUNNING = false;
@@ -2309,9 +2321,12 @@ function newJob(payload) {
     liveUrl: payload.betaSiteUrl || LIVE_URL,
     businessName: payload.businessName || (payload.answers || {}).business_name || "Client",
     status: "queued", currentStep: 0,
-    steps: JOB_STEPS.map((label) => ({ label, status: "pending", detail: "" })),
+    steps: JOB_STEPS.map((label, i) => ({ key: JOB_STEP_KEYS[i], label, status: "pending", detail: "" })),
     payload, prUrl: null, branch: null, siteUrl: null,
     before: null, after: null, delta: null, reportUrl: null, error: null,
+    // Set once, when the service-pages step finishes. Reported to G99 so it can record
+    // SERVICE_PAGES_CREATED without inferring anything from step labels or ordering.
+    servicePagesCreatedAt: null,
     cost: { gemini: 0, stitch: 0 }, cancelRequested: false, awaitingApproval: false,
     createdAt: new Date().toISOString(), startedAt: null, finishedAt: null,
   };
@@ -2385,7 +2400,9 @@ function jobStatusSnapshot(job) {
     status: job.status,                        // queued | running | done | error | cancelled
     currentStep: job.currentStep,
     totalSteps: (job.steps || []).length,
-    steps: (job.steps || []).map((s) => ({ label: s.label, status: s.status, detail: s.detail })),
+    steps: (job.steps || []).map((s) => ({ key: s.key || null, label: s.label, status: s.status, detail: s.detail })),
+    // Explicit, unambiguous signal for G99's SERVICE_PAGES_CREATED. Null until that step is done.
+    servicePagesCreatedAt: job.servicePagesCreatedAt || null,
     error: job.error || null,
     // The published WordPress site (shared host) — this is the real "live site" once the theme is live.
     liveUrl: job.liveUrl || LIVE_URL || null,
@@ -4262,7 +4279,16 @@ function mirrorToParent(job, status, detail) {
   parent.steps[ENRICH_STEP_IDX].status = status;
   parent.steps[ENRICH_STEP_IDX].detail = String(detail || "").slice(0, 240);
   parent.enrichJobId = job.draftId;
+  // Stamp once — the enrich run can report "done" more than once (retries, manual re-runs) and
+  // the first completion is the honest timestamp.
+  if (status === "done" && !parent.servicePagesCreatedAt) {
+    parent.servicePagesCreatedAt = new Date().toISOString();
+  }
   saveJobs();
+  // The enrich run is a SEPARATE job, so nothing in its lifecycle goes through jobStep() on the
+  // parent — which is where postStatus() normally fires. Without this call the parent's final step
+  // changed only in local state and G99 never learned the service pages were created.
+  postStatus(parent);
 }
 function enqueueEnrichJob(payload) {
   const job = newEnrichJob(payload);
