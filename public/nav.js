@@ -322,9 +322,11 @@
   const path = location.pathname;
   const NAV = [
     { href: "/", label: "Overview", icon: "home", exact: true },
+    { href: "/clients", label: "Clients", icon: "sites" },
     { href: "/sites", label: "Sites", icon: "sites" },
     { href: "/dashboard", label: "Build a site", icon: "plus" },
     { href: "/jobs", label: "Activity", icon: "activity" },
+    { href: "/coverage", label: "Page coverage", icon: "panel" },
   ];
   // /site?id=… is a child of Sites; /job?id=… is a child of Activity.
   const CHILD = { "/site": "/sites", "/job": "/jobs" };

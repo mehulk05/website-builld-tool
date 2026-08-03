@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Growth99 · Clients</title>
+<link rel="stylesheet" href="/theme.css?v=10">
+<style>
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 30px 34px 90px; display: flex; flex-direction: column; gap: 18px; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 10px; }
+  .tile { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 15px 17px; box-shadow: var(--shadow-sm); }
+  .tile b { display: block; font-size: 26px; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; }
+  .tile span { display: block; font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 700; margin-top: 6px; }
+  .tile.good b { color: var(--good); }
+  .tile.warn b { color: var(--warn-strong); }
+  .tile.bad b { color: var(--bad); }
+  .tile.accent b { color: var(--accent); }
+
+  .store { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--muted); }
+  .store .dot { width: 7px; height: 7px; border-radius: 99px; background: var(--good); }
+  .store.degraded .dot { background: var(--warn); }
+
+  .card-t { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow-sm); overflow: hidden; }
+  .tablewrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 700; padding: 10px 15px; background: var(--surface-2); white-space: nowrap; }
+  td { padding: 11px 15px; border-top: 1px solid var(--line-2); vertical-align: middle; }
+  tr:hover td { background: var(--surface-2); }
+  td.client b { display: block; font-weight: 700; }
+  td.client small { color: var(--muted); font-size: 11px; font-family: var(--mono); }
+  td.mono { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); }
+  td.nowrap { white-space: nowrap; }
+
+  .pgbar { width: 108px; height: 7px; border-radius: 99px; background: var(--line-2); overflow: hidden; }
+  .pgbar i { display: block; height: 100%; background: var(--good); }
+  .pgtxt { font-size: 11.5px; color: var(--ink-2); font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 4px; }
+  .pgnone { color: var(--muted); font-size: 11.5px; }
+
+  .acts { display: flex; gap: 6px; justify-content: flex-end; }
+  .acts a { font-size: 11.5px; padding: 5px 10px; border-radius: 8px; border: 1px solid var(--line); color: var(--ink-2); text-decoration: none; font-weight: 600; white-space: nowrap; }
+  .acts a:hover { background: var(--surface-2); border-color: var(--line); color: var(--ink); }
+  .acts a.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+  .live { display: inline-flex; align-items: center; gap: 5px; }
+  .live .pulse { width: 6px; height: 6px; border-radius: 99px; background: var(--accent); animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .3 } }
+
+  .empty { color: var(--muted); text-align: center; padding: 46px 0; font-size: 13px; }
+  .foot { font-size: 11.5px; color: var(--muted); }
+</style>
+</head>
+<body data-title="Clients">
+<main class="wrap" id="wrap">
+  <p class="empty"><span class="spin"></span>Reading the client pool…</p>
+</main>
+<div class="toast" id="toast"></div>
+<script src="/nav.js"></script>
+<script src="/clients.js"></script>
+</body>
+</html>
