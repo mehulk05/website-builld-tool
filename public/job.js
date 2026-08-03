@@ -145,7 +145,115 @@ function actions(j) {
   return b.join("");
 }
 
-const TYPE_LABEL = { edit: "Edit", enrich: "Enrich", restore: "Restore", build: "Build" };
+const TYPE_LABEL = { edit: "Edit", enrich: "Enrich", restore: "Restore", build: "Build", seo: "SEO" };
+
+// ---- SEO run detail ----------------------------------------------------------
+// What the run decided, page by page, plus the two things it deliberately did
+// not change on its own: URLs it renamed (with the redirect behind them) and
+// content it judged off-topic.
+function seoCards(j) {
+  if (j.type !== "seo") return "";
+  const out = [];
+
+  // A dry run's whole output is on disk, so the paths are the result.
+  if (j.payload && j.payload.dryRun) {
+    out.push(`<div class="card pad"><div class="card-h"><h2>Dry run</h2><span class="right" style="font-size:12px;color:var(--muted)">nothing reached GitHub</span></div>
+      <div class="wo-note" style="margin-top:4px">Every step ran and the result was written to disk — no branch, no pull request.</div>
+      ${j.previewDir ? `<div class="seorow"><div class="seohd"><span class="seokw">Preview folder</span></div><div class="seot"><code>${esc(j.previewDir)}</code></div></div>` : ""}
+      ${j.reportPath ? `<div class="seorow"><div class="seohd"><span class="seokw">Report</span></div><div class="seot"><code>${esc(j.reportPath)}</code></div></div>` : ""}
+    </div>`);
+  }
+  const chk = j.seoCheck;
+  const rowFor = (slug) => (chk && chk.rows.find((r) => r.slug === slug)) || null;
+
+  if (j.seoPages && j.seoPages.length) {
+    out.push(`<div class="card pad">
+      <div class="card-h"><h2>Every page</h2>${chk ? `<span class="right" style="font-size:12px;color:var(--muted)">${chk.pass} of ${chk.total} checks pass</span>` : ""}</div>
+      <div class="seolist">${j.seoPages.map((p) => {
+        const r = rowFor(p.slug);
+        const fails = r ? r.checks.filter((c) => !c.ok) : [];
+        return `<div class="seorow">
+          <div class="seohd">
+            <span class="seoslug">/${esc(p.slug === "home" ? "" : p.slug + "/")}</span>
+            ${r ? `<span class="pill ${fails.length ? "warn" : "good"}">${r.pass}/${r.total}</span>` : ""}
+            <span class="seokw">${esc(p.primaryKeyword || "")}</span>
+          </div>
+          <div class="seot">${esc(p.metaTitle)} <i>${p.metaTitle.length}</i></div>
+          <div class="seod">${esc(p.metaDescription)} <i>${p.metaDescription.length}</i></div>
+          ${fails.length ? `<div class="seofail">${fails.map((c) => `${esc(c.k)} — ${esc(c.got)}`).join(" · ")}</div>` : ""}
+        </div>`;
+      }).join("")}</div>
+    </div>`);
+  }
+
+  if (j.seoRenames && j.seoRenames.length) {
+    out.push(`<div class="card pad"><div class="card-h"><h2>URLs renamed</h2><span class="right" style="font-size:12px;color:var(--muted)">301 redirects shipped alongside</span></div>
+      <div class="seolist">${j.seoRenames.map((r) => `<div class="seorow"><div class="seohd"><span class="seoslug"><s>/${esc(r.from)}/</s> → /${esc(r.to)}/</span></div><div class="seod">${esc(r.why)}</div></div>`).join("")}</div></div>`);
+  }
+
+  const links = (j.seoLinks && j.seoLinks.added) || [];
+  const broken = (j.seoLinks && j.seoLinks.broken) || [];
+  if (links.length || broken.length) {
+    out.push(`<div class="card pad"><div class="card-h"><h2>Internal links</h2></div>
+      ${links.length ? `<div class="seolist">${links.map((p) => `<div class="seorow"><div class="seohd"><span class="seoslug">/${esc(p.slug)}/</span></div><div class="seod">${p.links.map((l) => `“${esc(l.anchor)}” → <code>${esc(l.to)}</code>`).join(" · ")}</div></div>`).join("")}</div>` : ""}
+      ${broken.length ? `<div class="wo-note"><b>Broken links found:</b> ${broken.map((p) => `/${esc(p.slug)}/ → ${p.broken.map((b) => esc(b.href)).join(", ")}`).join(" · ")}</div>` : ""}
+    </div>`);
+  }
+
+  if (j.contentAudit && j.contentAudit.length) {
+    const sorted = [...j.contentAudit].sort((a, b) => (a.onTopicPercent ?? 101) - (b.onTopicPercent ?? 101));
+    out.push(`<div class="card pad">
+      <div class="card-h"><h2>Content audit</h2><span class="right" style="font-size:12px;color:var(--muted)">reported, not rewritten</span></div>
+      <div class="seolist">${sorted.map((a) => {
+        const pct = a.onTopicPercent;
+        const tone = pct == null ? "" : pct >= 75 ? "good" : pct >= 60 ? "warn" : "bad";
+        return `<div class="seorow">
+          <div class="seohd">
+            <span class="seoslug">/${esc(a.slug === "home" ? "" : a.slug + "/")}</span>
+            <span class="pill ${tone}">${pct == null ? "—" : pct + "% on topic"}</span>
+            <span class="seokw">${a.words} words</span>
+          </div>
+          <div class="seod">${esc(a.verdict)}</div>
+          ${a.missing.length ? `<ul class="seomiss">${a.missing.map((m) => `<li>${esc(m)}</li>`).join("")}</ul>` : ""}
+        </div>`;
+      }).join("")}</div>
+    </div>`);
+  }
+  return out.join("\n");
+}
+
+// Build jobs carry the target on the job record (from the HubSpot deal); edit and
+// enrich jobs carry it on the payload. Read both so the value is never blank.
+const jobRepo = (j) => j.repo || (j.payload && (j.payload.githubRepo || j.payload.betaSiteRepo)) || null;
+const jobBeta = (j) => j.liveUrl || (j.payload && j.payload.betaSiteUrl) || null;
+
+// Who this run is for, and where it builds to — the information the onboarding
+// form brought in. Sits at the top so a run is identifiable at a glance.
+function clientCard(j) {
+  const repo = jobRepo(j), beta = jobBeta(j);
+  const ex = j.payload && j.payload.existingWebsite;
+  const ref = j.payload && j.payload.referenceWebsite;
+  const when = j.receivedAt || j.createdAt;
+  const row = (k, v, href) => v
+    ? `<div class="kv"><span class="k">${esc(k)}</span>${href
+        ? `<a class="v" href="${esc(href)}" target="_blank" rel="noopener">${esc(v)}</a>`
+        : `<span class="v">${esc(v)}</span>`}</div>`
+    : "";
+  const body = [
+    row("Client", j.businessName),
+    row("Beta site", beta, beta),
+    row("Repository", repo, repo ? "https://github.com/" + repo : null),
+    row("Existing site", ex, ex),
+    row("Reference site", ref, ref),
+    row("Form received", when ? new Date(when).toLocaleString() + " · " + relTime(when) : null),
+    row("Draft", j.draftId),
+  ].filter(Boolean).join("");
+  if (!body) return "";
+  return `<div class="card pad">
+    <div class="card-h"><h2>Client &amp; build target</h2>${j.source ? `<span class="right pill">${esc(j.source)}</span>` : ""}</div>
+    ${body}
+  </div>`;
+}
 
 // Build jobs carry the target on the job record (from the HubSpot deal); edit and
 // enrich jobs carry it on the payload. Read both so the value is never blank.
@@ -251,7 +359,7 @@ function render() {
       <span class="ava lg" style="width:42px;height:42px;border-radius:11px;font-size:15px;background:${avatarColor(j.businessName)}">${esc(initials(j.businessName))}</span>
       <div style="min-width:0;flex:1">
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-          <h1>${esc(j.editSummary || (isEdit ? "Website edit" : isEnrich ? "Service pages + brand guide" : "Build " + j.businessName))}</h1>
+          <h1>${esc(j.editSummary || (isEdit ? "Website edit" : isEnrich ? "Service pages + brand guide" : j.type === "seo" ? "SEO — " + j.businessName : "Build " + j.businessName))}</h1>
           <span class="pill ${st.cls}">${esc(st.label)}</span>
         </div>
         <div class="meta">${TYPE_LABEL[j.type] || "Build"} · ${esc(j.businessName)} · started ${esc(relTime(j.startedAt || j.createdAt))} · ${c.gemini || 0} AI planning · ${c.stitch || 0} generation calls · ${esc(jobCost(j))} est.</div>
@@ -268,6 +376,8 @@ function render() {
     ${scoresCard(j)}
 
     ${isEnrich && j.servicePages ? enrichDetailCard(j) : ""}
+
+    ${seoCards(j)}
 
     ${isEdit && j.payload && j.payload.prompt ? `<div class="card pad"><div class="card-h"><h2>The request</h2></div><p class="req">${esc(j.payload.prompt)}</p>${workOrder(j)}</div>` : ""}
 

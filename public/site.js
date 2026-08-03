@@ -353,6 +353,7 @@ function render() {
       <div class="acts">
         <button class="btn" id="reauditTop"${AUDITING ? " disabled" : ""}>${svg("chart", 15)}${AUDIT ? "Re-audit" : "Run CRO audit"}</button>
         <button class="btn" id="enrichBtn">${svg("spark", 15)}Add service pages</button>
+        <button class="btn" id="seoBtn" title="Shift-click for a dry run — writes the result to a preview folder, no pull request">${svg("search", 15)}Perform SEO</button>
         <button class="btn" id="imgBtn"${IMG_RUNNING ? " disabled" : ""}>${svg("panel", 15)}${IMG_RUNNING ? "Checking images…" : "Check images"}</button>
         <a class="btn" href="/coverage?siteId=${encodeURIComponent(SITE.siteId)}">${svg("sites", 15)}Page coverage</a>
         <button class="btn" id="editWith">${svg("code", 15)}Edit with…</button>
@@ -454,6 +455,23 @@ function wire() {
       toast("Enrichment started — opening Activity…");
       setTimeout(() => { location.href = "/job?id=" + encodeURIComponent(d.jobId); }, 800);
     } catch (e) { eb.disabled = false; toast("Could not start: " + (e.message || "failed")); }
+  };
+  const sb = $("seoBtn");
+  // Shift-click is a dry run: everything happens except the branch, the push
+  // and the pull request. Useful while the engine is being tuned, since a real
+  // run costs a PR and a CI cycle each time.
+  if (sb) sb.onclick = async (ev) => {
+    const dryRun = ev.shiftKey;
+    const msg = dryRun
+      ? `Dry run the SEO pass over every page of "${SITE.businessName}"?\n\nEverything is worked out and written to a preview folder — no branch, no pull request, nothing reaches GitHub.`
+      : `Run the full SEO pass over every page of "${SITE.businessName}"?\n\nKeywords, titles, descriptions, canonicals, social cards, headings, image alt text, internal links and schema — plus a content audit. One PR, merged when the build is green.`;
+    if (!confirm(msg)) return;
+    sb.disabled = true;
+    try {
+      const d = await postJSON("/api/seo-run", { siteId: SITE.siteId, dryRun });
+      toast(d.dedupe ? "An SEO run is already going — opening it…" : `SEO ${dryRun ? "dry run" : "run"} started — opening Activity…`);
+      setTimeout(() => { location.href = "/job?id=" + encodeURIComponent(d.jobId); }, 800);
+    } catch (e) { sb.disabled = false; toast("Could not start: " + (e.message || "failed")); }
   };
   const ib = $("imgBtn");
   if (ib) ib.onclick = async () => {
