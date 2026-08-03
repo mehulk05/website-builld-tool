@@ -355,6 +355,7 @@ function render() {
         <button class="btn" id="enrichBtn">${svg("spark", 15)}Add service pages</button>
         <button class="btn" id="seoBtn" title="Shift-click for a dry run — writes the result to a preview folder, no pull request">${svg("search", 15)}Perform SEO</button>
         <button class="btn" id="imgBtn"${IMG_RUNNING ? " disabled" : ""}>${svg("panel", 15)}${IMG_RUNNING ? "Checking images…" : "Check images"}</button>
+        <a class="btn" href="/coverage?siteId=${encodeURIComponent(SITE.siteId)}">${svg("sites", 15)}Page coverage</a>
         <button class="btn" id="editWith">${svg("code", 15)}Edit with…</button>
         <a class="btn primary" href="/edit?site=${encodeURIComponent(SITE.siteId)}">${svg("edit", 15)}Edit this site</a>
       </div>
