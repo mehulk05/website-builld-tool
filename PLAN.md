@@ -1,3 +1,60 @@
+# Plan: Full-site replica via a batched page queue  (started 2026-07-30)
+
+Goal: rebuild a client's ENTIRE site (100–150 pages) as a beta site, end-to-end, without human
+intervention — by turning the page inventory into a durable **page queue** and working through it in
+small batches that each open their own PR. No single job ever holds more than a batch in memory.
+
+## The two questions answered
+
+**Where to start:** the **page queue**, not a database. The queue is the durable state (what's built /
+what's pending) AND the unit of batching. A DB is infrastructure that can be swapped in later without
+changing this model; the queue is the model.
+
+**The pain that drove this (Mehul, 2026-07-31):** "jab new deployment karta hu to existing job ka data
+chala jata hai — mere paas koi pool nahi hai jahan dekh saku kitne client onboard hue, unke kitne pages
+bane." Render's disk is ephemeral, so `jobs.json` dies on every deploy. Note the platform ALREADY keeps a
+durable record — Postgres `website_build`, one row per draft, fed by our own status callbacks and listed by
+`GET /api/admin/onboarding/drafts`. What was missing was (a) page counts and (b) any view of it inside this
+tool. Hence the NocoDB pool: external, free, already authenticated, and readable outside the tool.
+
+**Do we need a DB now:** no. The queue lives in `.g99/site.json` inside the theme repo — durable,
+versioned, and **updated in the same PR that adds the pages**, so the queue can never drift from what is
+actually deployed. Mirror a per-site summary row into **NocoDB** (already wired: `NOCODB_TOKEN`) for the
+cross-client table + history view, for free. Graduate to Postgres when >~20 live sites or when
+cross-client queries/trends are needed (note: Render free Postgres expires after 90 days).
+
+## Why 150 pages currently can't work, and the fix
+
+| Constraint | Fix |
+|---|---|
+| Holding 150 pages of HTML in one job = memory blowout | Batch of 5–8 pages per job; write + commit + exit |
+| One Stitch generation per page ≈ 1–3 min → hours, and real cost | **Not every page needs Stitch.** One Stitch *template per section*, then Gemini clones for the long tail (22 location pages are near-identical) |
+| Render: idle sleep, request timeouts, single job concurrency | Each batch is a short job; the queue survives restarts because it's in the repo |
+| A human clicking "build" 25 times | Batch auto-chains: on success, if pending remain, enqueue the next batch (capped + backoff) |
+
+Ordering so value lands first: core → revenue treatments → remaining treatments → proof/offers →
+locations → long tail.
+
+| # | Task | Files / area | Status | Notes |
+|---|------|--------------|--------|-------|
+| 1 | Page-plan model + manifest | server.js — `buildPagePlan()`, `betaSlugFor()`, `nextBatch()`, `readManifest`/`writeManifest` (`.g99/site.json`) | ✅ done | per-page rows `{path,title,section,slug,status,priority,engine,attempts,sourcePaths}`; `SECTION_BUILD` priority+engine map; exposed via `/api/site-inventory`. VERIFIED on ruma.com's real 405-URL sitemap: 247 in-scope URLs → **83 rows, 72 pending, 12 batches**. Caught a bug: `betaSlugFor` stripped `-near-provo-utah` and collapsed all 22 location pages into 2 rows — now skipped for the locations section |
+| 2 | Manifest as brand + plan source of truth | server.js — `updateManifest`, `mergePageRows`, `resolveBrand`; enrich + push-wordpress write it | ✅ done | Two halves, because nothing was writing the manifest before — read alone would never have fired. **Write:** build seeds it (brand read back out of the generated theme, core pages), enrich merges its treatment rows in; both land in the same PR as the pages, via the existing `git add -A "<themePath>"`. **Read:** `resolveBrand` precedence = build-authoritative → manifest → theme scrape → inherited. `mergePageRows` keys on slug so a 6-page job can't look like it deleted the other 77. VERIFIED: 17/17 unit assertions (create, merge-preserves-core, rebuild-in-place, all 4 precedence levels) + repo `.gitignore` checked — no dotfolder rule, so `.g99/site.json` really does commit |
+| 3 | Coverage table becomes the control surface | public/coverage.* , server.js `/api/build-pages`, `estimateBuild`, `PLAN_CACHE`, `titleFromSlug` | ✅ done | Table now renders the PAGE PLAN (one row = one unit of work), not raw URLs. Checkbox per row, per-section select-all, "select all pending", sticky action bar, per-row Build/Rebuild. `/api/build-pages` is two-phase: quote without `confirm`, and validates slugs against the SERVER's plan (`PLAN_CACHE`, 15-min TTL) so the browser can't name arbitrary pages. Built rows locked. VERIFIED in browser: 72 checkboxes / 11 locked / 8 sections; section select-all → 18 selected; quote = 1 Stitch + 17 clones, 3 batches, ~21m, ~$0.03; all-pending → 72 pages, 12 batches, large-selection warning; server rejects built-without-rebuild (400), unknown slug (400), empty (400); confirm returns the honest 501 until task 4. No console errors. Also fixed: page titles came from THEIR titles ("Botox In Lehi Ut", and a consolidated row named "Vitamin IV Therapy…" landing on `/hormone-therapy`) — now `titleFromSlug` names our page after our slug | **Multi-select is the primitive** (Mehul, 2026-08-03): checkbox per row, select-all per section, "select all pending", sticky action bar with count → **Build pages**. Per-row Build too. Built rows locked — Rebuild is an explicit action, never the default. "Build next batch" survives as a preset (= select next N) |
+| 4 | Batched page-builder job (`pages` type) | server.js — `runPagesJob()` | ⏳ pending | takes N pending rows → generate → write → PR → CI → merge → update manifest → exit. Never holds >batch in memory |
+| 5 | Auto-chaining | server.js — tail of `runPagesJob` | ⏳ pending | if pending>0 and batch succeeded → enqueue next batch; stop on 2 consecutive failures; cap batches/run. **Also splits an oversized selection**: 40 selected pages → 7 chained batches from one click, so a big selection can't recreate the memory blowout batching exists to prevent |
+| 6 | Section templates + clone engine | server.js — reuse `generateServiceTemplate`/`cloneServicePage` | ⏳ pending | 1 Stitch template per section, Gemini clones the rest; per-row `engine` records which was used |
+| 7 | NocoDB client pool (cross-client history) | server.js pool block, public/clients.* , /api/pool | ✅ done | **The redeploy-data-loss fix.** NocoDB table `beta_site_builds` (id `meeshvyt8q9x412`), one row per CLIENT keyed by repo (not per job — that turned 4 sites into 24 rows). Coalesced bulk flush (NocoDB 429s on per-row writes), retry on throttle, boot backfill from jobs.json, live in-memory overlay that never blanks stored fields. New `/clients` page + nav entry. VERIFIED: 24 jobs → 6 clients; restart = 24 updates / 0 inserts (no dupes); **jobs.json deleted → all rows still listed** |
+| 8 | AI page classifier (quality, not capability) | server.js — `classifyPage` → Gemini, cached | ⏳ pending | fixes the judgement calls (portfolio CPT = service pages, Traptox ≈ Neurotoxins). Batch ~80 URLs/call, cache on sitemap hash, current rules as fallback |
+| 9 | Inventory as a build step | server.js `runJob` step 2 | ⏳ pending | "Scan the current website" populates the plan on first build; fail-soft |
+| 10 | E2E: ruma-scale replica | full local | ⏳ pending | drive a 100+ page site to ~100% coverage through auto-chained batches |
+| 11 | Pre-flight estimate | public/coverage.js, server.js `estimateBuild` | ✅ done (shipped with 3) | before firing: Stitch-vs-clone split, rough minutes and $ for the selection. No hard cap — 20+ rows warns and asks to confirm, never blocks. Guards against 22 location pages accidentally going through Stitch |
+
+Open decisions: (a) auto-expand the page set or propose-then-confirm — recommend **propose** for the
+first run, auto after; (b) location pages in scope? — recommend yes, they're the biggest unbuilt block,
+but generate via clone to control cost.
+
+---
+
 # Plan: Edit an existing deployed site (AI code-edit → PR → merge)  (started 2026-07-23)
 
 Goal: From the tool, pick an already-deployed site, describe a change in a prompt (free-text, AI-expanded, or a predefined template), and have the tool pull the current theme code, apply the edit with AI (plan-then-apply), open a PR, watch the build, auto-merge on green, and report done. No DB — the site→repo mapping lives in a repo-derived registry.

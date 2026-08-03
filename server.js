@@ -1867,6 +1867,415 @@ function loadJobs() {
 }
 loadJobs();
 
+// ---------------------------------------------------------------- Page inventory
+// "What pages does the client already have, and which have we rebuilt?" A sitemap
+// dump alone is useless here — on a real medspa site ~85% of the URLs are blog
+// posts. So keep WHICH child sitemap each URL came from (page / post / product):
+// that, plus the path, is what separates real pages from content and commerce.
+const SECTIONS = [
+  { key: "core", label: "Core pages", scope: "required",
+    test: (p) => p === "/" || /^\/(about|about-us|team|our-team|staff|providers|contact|contact-us|services|treatments|menu)\/?$/.test(p) },
+  // Must be a real location landing page ("medical spa near X"), not merely a URL
+  // that happens to end in a state code — that matched 200+ blog posts.
+  { key: "locations", label: "Location / local SEO", scope: "recommended",
+    test: (p) => /(medical|med)[- ]?spa[a-z-]*-(near|in)-[a-z-]+/.test(p) || /^\/our-[a-z-]+-location\/?$/.test(p) },
+  // Forms and care sheets are tested BEFORE treatments: a "hormone health quiz" is
+  // a lead form, not a service page, and must not be counted as one to rebuild.
+  { key: "forms", label: "Forms & quizzes", scope: "optional",
+    test: (p) => /(quiz|form|inquiry|consult|appointment|booking|book-)/.test(p) },
+  { key: "care", label: "Pre / post care", scope: "optional",
+    test: (p) => /(pre-and-post|pre-post|aftercare|post-care|instruction)/.test(p) },
+  { key: "treatments", label: "Treatment / service pages", scope: "required",
+    test: (p) => /(botox|dysport|filler|sculptra|microneedl|laser|peel|facial|inject|infusion|iv-|hormone|hrt|weight-loss|prp|prf|thread|skincare|hydrafacial|coolsculpt|kybella|bbl|moxi|morpheus|miradry|thermoclear|red-light|tox|lash|brow|wax|hair-removal|skin-tightening|body-contour)/.test(p) },
+  { key: "proof", label: "Proof & trust", scope: "recommended",
+    test: (p) => /(review|testimonial|before-and-after|before-after|gallery|results|partner)/.test(p) },
+  { key: "offers", label: "Offers, memberships & financing", scope: "recommended",
+    test: (p) => /(special|offer|promo|vip|membership|payment-plan|financ|gift|package|bank)/.test(p) },
+  { key: "shop", label: "Store & products", scope: "out-of-scope",
+    test: (p, src) => src === "product" || /^\/(shop|store|product|cart|checkout|my-account)/.test(p) },
+  { key: "blog", label: "Blog & articles", scope: "out-of-scope",
+    test: (p, src) => src === "post" || /^\/(blog|blogs|news|article)/.test(p) },
+  { key: "legal", label: "Legal & policy", scope: "out-of-scope",
+    test: (p) => /(privacy|terms|policy|policies|accessibility|hipaa|disclaimer|sitemap)/.test(p) },
+  { key: "careers", label: "Careers", scope: "out-of-scope",
+    test: (p) => /(career|job|employment|hiring)/.test(p) },
+];
+function classifyPage(pathname, source) {
+  // The sitemap a URL came from is authoritative about WHAT it is, so content type
+  // wins before any path guess. Without this, blog posts whose titles mention a
+  // treatment or a town were being counted as treatment/location pages to build.
+  if (source === "post") return SECTIONS.find((s) => s.key === "blog");
+  if (source === "product" || source === "product_cat") return SECTIONS.find((s) => s.key === "shop");
+  // Only genuinely-media sitemaps are skipped outright. NOT "portfolio": sites
+  // commonly keep their real service pages in a portfolio custom post type
+  // (ruma's /services/botox-in-lehi-ut/ lives there), so those must fall through
+  // to path classification instead of being written off as media.
+  if (source === "video" || source === "attachment" || source === "image") {
+    return { key: "media", label: "Video & media items", scope: "out-of-scope" };
+  }
+  for (const s of SECTIONS) {
+    if (s.test(pathname, source)) return s;
+  }
+  return { key: "other", label: "Other pages", scope: "review" };
+}
+const titleFromPath = (p) => p === "/" ? "Home"
+  : decodeURIComponent(p).replace(/^\/|\/$/g, "").split("/").pop()
+      .replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+
+// Read every page a site publishes. Sitemap first (authoritative + cheap); if the
+// site has none, fall back to the links its own homepage exposes.
+async function crawlSiteInventory(siteUrl) {
+  const origin = (() => { try { return new URL(siteUrl).origin; } catch (e) { return null; } })();
+  if (!origin) throw new Error("bad url");
+  const get = async (u) => {
+    try {
+      const r = await fetch(u, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 G99Bot" } });
+      return r.ok ? await r.text() : "";
+    } catch (e) { return ""; }
+  };
+  const locsOf = (xml) => (xml.match(/<loc>([^<]+)<\/loc>/g) || []).map((m) => m.replace(/<\/?loc>/g, "").trim());
+  const pages = new Map();                     // path -> { path, source }
+  const add = (u, source) => {
+    try {
+      const x = new URL(u);
+      if (x.origin !== origin) return;
+      const p = x.pathname.replace(/\/{2,}/g, "/");
+      if (/\.(xml|jpg|jpeg|png|webp|pdf|css|js|svg|gif)$/i.test(p)) return;
+      if (!pages.has(p)) pages.set(p, { path: p, source: source || "page" });
+    } catch (e) { /* skip */ }
+  };
+  let sitemaps = [];
+  for (const cand of ["/sitemap.xml", "/wp-sitemap.xml", "/sitemap_index.xml"]) {
+    const xml = await get(origin + cand);
+    if (!xml) continue;
+    const locs = locsOf(xml);
+    const children = locs.filter((l) => /\.xml$/i.test(l));
+    if (children.length) { sitemaps = children.slice(0, 20); }
+    else if (locs.length) { sitemaps = [origin + cand]; }
+    if (sitemaps.length) break;
+  }
+  for (const sm of sitemaps) {
+    // the child sitemap's own name is the best source signal WordPress gives us
+    // Take the LAST word before "-sitemap": names are often prefixed by the theme
+    // ("astra-portfolio-sitemap.xml"), and requiring a leading slash made 195
+    // portfolio items look like ordinary pages — i.e. pages we owed a rebuild.
+    const source = (sm.match(/([a-z_]+)-sitemap/i) || [, "page"])[1].toLowerCase();
+    for (const u of locsOf(await get(sm))) add(u, source);
+  }
+  let discoveredVia = sitemaps.length ? "sitemap" : "homepage links";
+  if (!pages.size) {                            // no sitemap → read the nav
+    const html = await get(origin + "/");
+    for (const m of html.matchAll(/href="([^"#?]+)"/g)) add(new URL(m[1], origin).href, "page");
+    discoveredVia = "homepage links";
+  }
+  const list = [...pages.values()].map((x) => {
+    const sec = classifyPage(x.path, x.source);
+    return { ...x, section: sec.key, sectionLabel: sec.label, scope: sec.scope, title: titleFromPath(x.path) };
+  });
+  return { origin, discoveredVia, sitemaps: sitemaps.length, total: list.length, pages: list };
+}
+
+// Match what exists against what we've built. Deliberately conservative: a page
+// counts as built only on a real slug/keyword correspondence, so the table never
+// overstates coverage.
+// ---------------------------------------------------------------- Page queue
+// A full-site replica can't be one job: 150 pages won't fit in memory, would run
+// for hours, and any crash would lose everything. So the inventory becomes a
+// durable QUEUE of page rows, and jobs work through it in small batches.
+//
+// The queue lives in the theme repo (`.g99/site.json`) and is updated in the SAME
+// pull request that adds the pages, so it can never disagree with what is actually
+// deployed — and it survives Render's ephemeral disk, unlike in-memory job state.
+const MANIFEST_PATH = ".g99/site.json";
+const BATCH_SIZE = 6;              // pages per job — keeps memory and run time bounded
+
+// Cheapest engine that still looks right: flagship pages get their own Stitch
+// generation; near-identical long-tail pages are cloned from their section's
+// template (22 location pages do not need 22 Stitch runs).
+const SECTION_BUILD = {
+  core:       { priority: 1, engine: "stitch" },
+  treatments: { priority: 2, engine: "stitch-then-clone" },
+  proof:      { priority: 3, engine: "clone" },
+  offers:     { priority: 4, engine: "clone" },
+  locations:  { priority: 5, engine: "clone" },
+  care:       { priority: 6, engine: "clone" },
+  forms:      { priority: 7, engine: "clone" },
+  other:      { priority: 8, engine: "clone" },
+};
+// A page we intend to build gets a slug on OUR site — their URL shape is theirs.
+function betaSlugFor(page) {
+  if (page.path === "/") return "";
+  const parts = page.path.replace(/^\/|\/$/g, "").split("/");
+  let s = slugify(parts[parts.length - 1] || parts[0] || "");
+  // Strip the local-SEO tail so /botox-in-lehi-ut/ becomes /botox/ — but NEVER for a
+  // location page, where the town is the page's whole identity. Collapsing those
+  // turned 22 distinct town pages into one slug and silently dropped the work.
+  if (page.section !== "locations") s = s.replace(/-(in|near)-[a-z0-9-]+$/, "");
+  return s || slugify(page.title || "page");
+}
+// Turn a coverage report into an ordered, de-duplicated work queue. Rows already
+// satisfied (built/covered) are recorded as done rather than dropped, so the table
+// can show the whole picture and progress is auditable.
+function buildPagePlan(coverage, opts = {}) {
+  const rows = [];
+  const seenSlug = new Set();
+  for (const sec of coverage.sections || []) {
+    for (const r of sec.rows) {
+      if (r.status === "not-planned" || r.status === "new") continue;
+      const cfg = SECTION_BUILD[r.section] || SECTION_BUILD.other;
+      const slug = r.builtAs ? r.builtAs.replace(/^\/|\/$/g, "") : betaSlugFor(r);
+      const key = slug || "home";
+      const already = r.status === "built" || r.status === "covered";
+      if (seenSlug.has(key)) {
+        // several of their URLs collapse onto one of our pages — record the extra
+        // source but don't queue the work twice
+        const owner = rows.find((x) => (x.slug || "home") === key);
+        if (owner) (owner.sourcePaths = owner.sourcePaths || []).push(r.path);
+        continue;
+      }
+      seenSlug.add(key);
+      rows.push({
+        // Name OUR page after OUR slug, not after their title. Their titles carry local-SEO
+        // noise ("Botox In Lehi Ut") and, where many URLs consolidate, the winning title can
+        // describe a different treatment than the page it lands on — this becomes the
+        // WordPress page title, so it has to be the clean name.
+        slug, title: titleFromSlug(slug), sourceTitle: r.title,
+        section: r.section, sectionLabel: r.sectionLabel,
+        sourcePaths: [r.path], scope: r.scope,
+        priority: cfg.priority, engine: cfg.engine,
+        status: already ? "built" : "pending",
+        builtAt: already ? (opts.builtAt || null) : null,
+        prUrl: null, attempts: 0, error: null,
+      });
+    }
+  }
+  rows.sort((a, b) => a.priority - b.priority || a.slug.localeCompare(b.slug));
+  return rows;
+}
+// A readable page name from a slug: "laser-hair-removal" -> "Laser Hair Removal". Short
+// words stay lowercase the way a human would write a title, and known initialisms are
+// upper-cased ("iv-therapy" -> "IV Therapy", not "Iv Therapy").
+const TITLE_MINOR = new Set(["and", "or", "the", "a", "an", "of", "for", "in", "on", "to", "with"]);
+const TITLE_UPPER = new Set(["iv", "prp", "co2", "led", "hifu", "emsculpt", "rf", "ipl", "cbd", "hrt", "faq"]);
+function titleFromSlug(slug) {
+  if (!slug) return "Home";
+  const words = String(slug).split("-").filter(Boolean);
+  return words.map((w, i) => {
+    if (TITLE_UPPER.has(w)) return w.toUpperCase();
+    // Trailing two-letter token on a location slug is a state code: "…cedar-hills-ut" -> UT.
+    if (w.length === 2 && i === words.length - 1 && i > 0) return w.toUpperCase();
+    if (i > 0 && TITLE_MINOR.has(w)) return w;
+    return w.charAt(0).toUpperCase() + w.slice(1);
+  }).join(" ") || "Home";
+}
+
+const planTotals = (rows) => ({
+  total: rows.length,
+  built: rows.filter((r) => r.status === "built").length,
+  pending: rows.filter((r) => r.status === "pending").length,
+  building: rows.filter((r) => r.status === "building" || r.status === "queued").length,
+  failed: rows.filter((r) => r.status === "failed").length,
+  skipped: rows.filter((r) => r.status === "skipped").length,
+});
+// The next batch to work on: highest priority first, skipping anything already
+// done, in flight, or that has burned its retry budget.
+const nextBatch = (rows, size = BATCH_SIZE) =>
+  rows.filter((r) => r.status === "pending" && (r.attempts || 0) < 3).slice(0, size);
+
+// Pre-flight estimate for a selection. Per-call prices match the job cost meter in nav.js
+// ($0.001 Gemini / $0.01 Stitch) so one selection can't be quoted at a different rate than
+// it later reports. The point is to catch "22 location pages accidentally routed through
+// Stitch" BEFORE spending it, so the Stitch/clone split is the headline number.
+const COST_PER_STITCH = 0.01, COST_PER_CLONE = 0.001;
+const SECS_PER_STITCH = 90, SECS_PER_CLONE = 25, SECS_PER_BATCH_OVERHEAD = 240;  // clone+PR+CI
+function estimateBuild(rows, size = BATCH_SIZE) {
+  let stitch = 0, clones = 0;
+  const bySection = new Map();
+  for (const r of rows) {
+    if (!bySection.has(r.section)) bySection.set(r.section, []);
+    bySection.get(r.section).push(r);
+  }
+  for (const [, list] of bySection) {
+    const engine = list[0].engine || "clone";
+    if (engine === "stitch") stitch += list.length;                       // every page its own generation
+    else if (engine === "stitch-then-clone") { stitch += 1; clones += list.length - 1; }  // one template, rest cloned
+    else clones += list.length;
+  }
+  const batches = Math.max(1, Math.ceil(rows.length / size));
+  const seconds = stitch * SECS_PER_STITCH + clones * SECS_PER_CLONE + batches * SECS_PER_BATCH_OVERHEAD;
+  return {
+    pages: rows.length, stitch, clones, batches,
+    minutes: Math.round(seconds / 60),
+    usd: Number((stitch * COST_PER_STITCH + clones * COST_PER_CLONE).toFixed(3)),
+  };
+}
+
+// The plan the coverage page last showed, so a build request validates against a
+// server-derived plan instead of trusting slugs posted by the browser — and without
+// paying for a second full crawl between "show me" and "build these".
+const PLAN_CACHE = new Map();   // site origin -> { plan, at }
+const PLAN_TTL_MS = 15 * 60 * 1000;
+function cachePlan(origin, plan) { PLAN_CACHE.set(origin, { plan, at: Date.now() }); }
+function cachedPlan(origin) {
+  const hit = PLAN_CACHE.get(origin);
+  return hit && Date.now() - hit.at < PLAN_TTL_MS ? hit.plan : null;
+}
+
+// Merge freshly-built rows into the manifest's existing page list, keyed by slug. Rows the
+// caller didn't mention are preserved untouched — a job that builds 6 pages must not look
+// like it deleted the other 77.
+function mergePageRows(manifest, rows) {
+  const out = new Map((manifest && manifest.pages ? manifest.pages : []).map((r) => [r.slug, r]));
+  for (const r of rows) out.set(r.slug, { ...(out.get(r.slug) || {}), ...r });
+  return [...out.values()];
+}
+
+function emptyManifest(themeSlug, businessName) {
+  return {
+    version: 1, themeSlug: themeSlug || null, businessName: businessName || null,
+    brand: null, existingWebsite: null, liveUrl: null,
+    inventory: null, pages: [], runs: [],
+    updatedAt: new Date().toISOString(),
+  };
+}
+function readManifest(themeDir) {
+  try {
+    const p = path.join(themeDir, MANIFEST_PATH);
+    if (!fs.existsSync(p)) return null;
+    const m = JSON.parse(fs.readFileSync(p, "utf8"));
+    return m && typeof m === "object" ? m : null;
+  } catch (e) { return null; }
+}
+function writeManifest(themeDir, manifest) {
+  const p = path.join(themeDir, MANIFEST_PATH);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  manifest.updatedAt = new Date().toISOString();
+  fs.writeFileSync(p, JSON.stringify(manifest, null, 2));
+  return MANIFEST_PATH;
+}
+
+// Read-modify-write in one call, creating the manifest if this is the theme's first job.
+// Every job that touches the theme calls this before staging, so the manifest ships inside
+// the same PR as the pages it describes — that's what stops the queue from drifting away
+// from what is actually deployed.
+function updateManifest(themeDir, themeSlug, businessName, patch) {
+  const m = readManifest(themeDir) || emptyManifest(themeSlug, businessName);
+  Object.assign(m, patch);
+  if (patch.run) {
+    m.runs = [...(m.runs || []), patch.run].slice(-40);   // keep the tail, not the whole history
+    delete m.run;
+  }
+  return writeManifest(themeDir, m);
+}
+
+// Which brand a job should honour, in precedence order. The manifest sits at the top because
+// it was written by the job that owns this theme AND is committed alongside it — the two
+// properties the other sources each lack (job memory is authoritative but volatile; the
+// theme's own CSS is durable but only tells us what got rendered, not what was intended).
+function resolveBrand(themeDir, composed, fromBuild) {
+  if (fromBuild) return { brand: composed, from: "build (authoritative)" };
+  const m = readManifest(themeDir);
+  if (m && m.brand && m.brand.headingFont) {
+    return { brand: { ...composed, ...m.brand }, from: "manifest" };
+  }
+  const themeBrand = readThemeBrand(themeDir);
+  if (themeBrand) {
+    return {
+      brand: {
+        ...composed,
+        headingFont: themeBrand.headingFont || composed.headingFont,
+        bodyFont: themeBrand.bodyFont || composed.bodyFont,
+        primary: themeBrand.primary || composed.primary,
+        secondary: themeBrand.secondary || composed.secondary,
+        accent: themeBrand.accent || composed.accent,
+      },
+      from: "theme",
+      themeBrand,
+    };
+  }
+  return { brand: composed, from: "inherited" };
+}
+
+function buildCoverage(inventory, builtPages) {
+  const built = (builtPages || []).map((b) => ({
+    ...b, tokens: String(b.slug || b.path || "").toLowerCase().replace(/^\/|\/$/g, "").split(/[-/]/).filter((t) => t.length > 2),
+  }));
+  const CORE_ALIAS = { "/": ["home", "front"], "/about-us/": ["about"], "/about/": ["about"], "/team/": ["team", "about"],
+    "/contact-us/": ["contact"], "/contact/": ["contact"], "/services/": ["services", "treatments"], "/treatments/": ["services", "treatments"] };
+  const matchFor = (page) => {
+    // the home page has no slug to tokenise, so match it structurally
+    if (page.path === "/" ) {
+      const home = built.find((b) => b.path === "/" || b.slug === "" || b.slug === "home");
+      return home ? { built: home, overlap: 9 } : null;
+    }
+    const alias = CORE_ALIAS[page.path] || [];
+    const ptok = page.path.toLowerCase().replace(/^\/|\/$/g, "").split(/[-/]/).filter((t) => t.length > 2).concat(alias);
+    // Generic words shared by half the site can't establish a match on their own.
+    const WEAK = new Set(["medical", "spa", "medspa", "near", "the", "and", "for", "with", "your",
+      "clinic", "aesthetic", "aesthetics", "treatment", "treatments", "services", "service", "utah", "lehi"]);
+    let best = null;
+    for (const b of built) {
+      const overlap = b.tokens.filter((t) => ptok.includes(t));
+      const strongTokens = overlap.filter((t) => !WEAK.has(t));
+      // an alias hit (home/about/contact/services) is decisive; otherwise the match
+      // must rest on a DISTINCTIVE token, not on shared boilerplate
+      const aliasHit = overlap.some((t) => alias.includes(t));
+      const strong = aliasHit || strongTokens.length >= 1;
+      if (strong && (!best || strongTokens.length > best.overlap)) best = { built: b, overlap: strongTokens.length };
+    }
+    return best;
+  };
+  // Distinguish a real 1:1 rebuild from topic consolidation. Our single /botox/ page
+  // legitimately covers eight of their botox URLs — but calling all eight "built"
+  // overstates the work done, so the best match per built page is "built" and the
+  // rest are "covered" (consolidated into it).
+  const scored = inventory.pages.map((p) => {
+    const m = (p.scope === "out-of-scope") ? null : matchFor(p);
+    return { page: p, match: m, target: m ? (m.built.slug ? "/" + m.built.slug + "/" : m.built.path) : null };
+  });
+  const bestFor = new Map();                     // built target -> strongest score
+  for (const s of scored) {
+    if (!s.target) continue;
+    const cur = bestFor.get(s.target);
+    if (!cur || s.match.overlap > cur.overlap) bestFor.set(s.target, { overlap: s.match.overlap, path: s.page.path });
+  }
+  const consolidated = {};
+  for (const s of scored) { if (s.target) consolidated[s.target] = (consolidated[s.target] || 0) + 1; }
+  const rows = scored.map(({ page: p, target }) => {
+    let status;
+    if (p.scope === "out-of-scope") status = "not-planned";
+    else if (!target) status = "pending";
+    else status = (bestFor.get(target) || {}).path === p.path ? "built" : "covered";
+    return {
+      ...p, status, builtAs: target,
+      consolidatedWith: status === "covered" ? (consolidated[target] - 1) : null,
+    };
+  });
+  // pages we built that the old site never had — genuinely new value
+  const matchedSlugs = new Set(rows.filter((r) => r.builtAs).map((r) => r.builtAs));
+  const extras = built
+    .map((b) => (b.slug ? "/" + b.slug + "/" : b.path))
+    .filter((s) => !matchedSlugs.has(s))
+    .map((s) => ({ path: s, title: titleFromPath(s), status: "new", section: "new", sectionLabel: "New on the beta site", scope: "added" }));
+  const bySection = {};
+  for (const r of rows.concat(extras)) {
+    (bySection[r.sectionLabel] = bySection[r.sectionLabel] || { label: r.sectionLabel, scope: r.scope, rows: [] }).rows.push(r);
+  }
+  const inScope = rows.filter((r) => r.scope !== "out-of-scope");
+  return {
+    sections: Object.values(bySection).sort((a, b) => b.rows.length - a.rows.length),
+    totals: {
+      existing: rows.length,
+      inScope: inScope.length,
+      built: inScope.filter((r) => r.status === "built").length,
+      covered: inScope.filter((r) => r.status === "covered").length,
+      pending: inScope.filter((r) => r.status === "pending").length,
+      notPlanned: rows.length - inScope.length,
+      newPages: extras.length,
+    },
+  };
+}
+
 // ---------------------------------------------------------------- Site registry
 // No DB: the repo is the source of truth. syncSiteRegistry() derives the list of
 // editable sites from the theme dirs on main + each slug's latest merged PR, and
@@ -2353,6 +2762,7 @@ function jobStep(job, i, status, detail) {
   if (detail != null) job.steps[i].detail = String(detail).slice(0, 240);
   saveJobs();
   postStatus(job);   // report each step transition to G99 (fail-soft)
+  mirrorPool(job);   // and to the durable client pool (survives redeploys)
 }
 // Slack (or any incoming-webhook) notification — fail-soft, off when unset.
 function notify(text) {
@@ -2420,6 +2830,216 @@ function postStatus(job, attempt = 0) {
       }
     });
 }
+// ---- Durable client pool (NocoDB) --------------------------------------------
+// The problem this solves: our job state lives in memory + jobs.json, which sits on Render's
+// ephemeral disk — every redeploy wipes it, so there was no answer to "which clients have we
+// onboarded, and how many pages does each have?". NocoDB is external, free, already authenticated,
+// and readable outside this tool, so it is the pool. One row per client site, keyed by draft id,
+// upserted as the job progresses. Fail-soft: the pool is a record of work, never a gate on it.
+const NOCODB_BUILDS_TABLE = process.env.NOCODB_BUILDS_TABLE || "meeshvyt8q9x412";
+const POOL_TYPES = new Set(["build", "enrich", "pages"]);   // edit/restore jobs aren't a client site
+
+async function ncRecords(method, body, query = "") {
+  if (!NOCODB_TOKEN) throw new Error("NOCODB_TOKEN not set");
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 15000);
+  let r;
+  try {
+    r = await fetch(`${NOCODB_BASE}/api/v2/tables/${NOCODB_BUILDS_TABLE}/records${query}`, {
+      method, signal: ctl.signal,
+      headers: { "xc-token": NOCODB_TOKEN, "accept": "application/json", "content-type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } finally { clearTimeout(timer); }
+  if (!r.ok) throw new Error(`NocoDB ${r.status}: ${(await r.text()).slice(0, 160)}`);
+  return r.json();
+}
+
+// Page progress comes from whichever source the job has: a live page plan (batched
+// builds), else the manifest totals it last wrote. Absent on older jobs — send nulls
+// rather than zeros so "not measured yet" reads differently from "nothing built".
+function poolPageCounts(job) {
+  const t = job.planTotals || (job.manifest && job.manifest.planTotals) || null;
+  return {
+    "Existing pages": job.existingPageCount != null ? job.existingPageCount : null,
+    "Pages planned": t ? t.total : null,
+    "Pages built": t ? t.built : null,
+    "Pages pending": t ? t.pending : null,
+    "Coverage pct": t && t.total ? Math.round((t.built / t.total) * 100) : null,
+  };
+}
+
+// The pool is a list of CLIENTS, not of jobs: a client's site gets rebuilt and enriched many
+// times, and one row per run turned four real sites into twenty-four rows. The repo is the
+// client's identity (HubSpot hands out one repo per client), with the beta URL and finally the
+// draft id as fallbacks so a row is never lost for want of a key.
+// Build jobs carry the target on the job; enrich/pages jobs carry it in the payload. Resolve
+// both here, or every enrich run becomes its own "client" and the row shows a blank repo.
+function poolTarget(job) {
+  const P = job.payload || {};
+  return {
+    repo: normalizeRepo(job.repo || P.githubRepo || P.betaSiteRepo || P.repo) || null,
+    url: job.liveUrl || P.betaSiteUrl || P.liveUrl || null,
+  };
+}
+function poolSiteKey(job) {
+  const { repo, url } = poolTarget(job);
+  if (repo) return repo;
+  const host = String(url || "").replace(/^https?:\/\//, "").replace(/\/$/, "");
+  return host || `draft:${job.draftId}`;
+}
+
+function poolRow(job) {
+  const target = poolTarget(job);
+  return {
+    "Site key": poolSiteKey(job),
+    // Identity of the latest job on this site. Text, not numeric: manual and test runs use
+    // slug ids, and a numeric-only key silently dropped those rows.
+    "Draft key": String(job.draftId),
+    "Draft id": Number.isFinite(Number(job.draftId)) ? Number(job.draftId) : null,
+    Client: job.businessName || "Client",
+    "Beta site": target.url,
+    Repo: target.repo,
+    Theme: (job.payload && job.payload.themeSlug) || job.themeSlug || null,
+    Status: job.status,
+    Step: `${job.currentStep + 1}/${(job.steps || []).length}`,
+    ...poolPageCounts(job),
+    "Last PR": job.prUrl || null,
+    "Received at": job.receivedAt || job.createdAt || null,
+    "Finished at": job.finishedAt || null,
+    "Job link": `${G99_TOOL_PUBLIC_URL}/job?id=${encodeURIComponent(job.draftId)}`,
+    Error: job.error ? String(job.error).slice(0, 240) : null,
+  };
+}
+
+// NocoDB throttles hard (a per-row GET+PATCH pass over 24 jobs was enough to earn a wall of
+// 429s), so writes are coalesced instead of immediate: jobs mark themselves dirty, and one
+// flush turns the whole batch into at most one bulk PATCH plus one bulk POST. Row ids are
+// cached from a single read, which removes the per-row lookup entirely.
+const POOL_DIRTY = new Map();          // site key -> latest job for that site
+const POOL_IDS = new Map();            // site key -> NocoDB row Id
+const POOL_BUILDS = new Map();         // site key -> runs counted so far
+const POOL_LAST = new Map();           // site key -> last job id written (to count new runs)
+let POOL_IDS_LOADED = false;
+let POOL_FLUSH_TIMER = null;
+let POOL_FLUSHING = false;
+
+function mirrorPool(job) {
+  if (!NOCODB_TOKEN || !job || !POOL_TYPES.has(job.type) || !job.draftId) return;
+  POOL_DIRTY.set(poolSiteKey(job), job);
+  const terminal = ["done", "error", "cancelled"].includes(job.status);
+  if (terminal) return void schedulePoolFlush(0);
+  schedulePoolFlush(4000);
+}
+
+function schedulePoolFlush(delay) {
+  if (POOL_FLUSH_TIMER) return;
+  POOL_FLUSH_TIMER = setTimeout(() => {
+    POOL_FLUSH_TIMER = null;
+    poolFlush().catch((e) => console.error("pool flush failed:", e.message));
+  }, delay);
+}
+
+// Retry the 429s rather than dropping the row — losing a terminal write is exactly the
+// data loss this pool exists to prevent.
+async function ncRetry(method, body, query = "", tries = 4) {
+  for (let i = 0; i < tries; i++) {
+    try { return await ncRecords(method, body, query); }
+    catch (e) {
+      const throttled = /\b429\b/.test(e.message);
+      if (!throttled || i === tries - 1) throw e;
+      await sleep(1500 * (i + 1));
+    }
+  }
+}
+
+async function poolLoadIds() {
+  const d = await ncRetry("GET", null, "?limit=1000&fields=Id,Site%20key,Draft%20key,Builds");
+  POOL_IDS.clear();
+  POOL_BUILDS.clear();
+  POOL_LAST.clear();
+  for (const r of d.list || []) {
+    const key = String(r["Site key"] || "");
+    if (!key) continue;
+    POOL_IDS.set(key, r.Id);
+    POOL_BUILDS.set(key, Number(r.Builds) || 0);
+    if (r["Draft key"]) POOL_LAST.set(key, String(r["Draft key"]));
+  }
+  POOL_IDS_LOADED = true;
+}
+
+async function poolFlush() {
+  if (POOL_FLUSHING || !POOL_DIRTY.size) return;
+  POOL_FLUSHING = true;
+  const batch = [...POOL_DIRTY.entries()];
+  POOL_DIRTY.clear();
+  try {
+    if (!POOL_IDS_LOADED) await poolLoadIds();
+    const updates = [];
+    const inserts = [];
+    for (const [key, job] of batch) {
+      const row = poolRow(job);
+      // Count a run only when the job id changes, so the repeated status writes of one
+      // build don't inflate the number.
+      if (POOL_LAST.get(key) !== row["Draft key"]) {
+        POOL_BUILDS.set(key, (POOL_BUILDS.get(key) || 0) + 1);
+        POOL_LAST.set(key, row["Draft key"]);
+      }
+      row.Builds = POOL_BUILDS.get(key) || 1;
+      const id = POOL_IDS.get(key);
+      if (id) updates.push({ Id: id, ...row });
+      else inserts.push(row);
+    }
+    if (updates.length) await ncRetry("PATCH", updates);
+    if (inserts.length) {
+      const created = await ncRetry("POST", inserts);
+      // Record the new ids so the next flush updates these rows instead of duplicating them.
+      (Array.isArray(created) ? created : []).forEach((r, i) => {
+        if (r && r.Id && inserts[i]) POOL_IDS.set(String(inserts[i]["Site key"]), r.Id);
+      });
+    }
+    console.log(`pool: flushed ${updates.length} update(s), ${inserts.length} insert(s)`);
+  } catch (e) {
+    // Put the batch back so the next flush retries it rather than silently losing history.
+    for (const [key, job] of batch) if (!POOL_DIRTY.has(key)) POOL_DIRTY.set(key, job);
+    console.error("pool flush error:", e.message);
+    schedulePoolFlush(20000);
+  } finally {
+    POOL_FLUSHING = false;
+    if (POOL_DIRTY.size) schedulePoolFlush(5000);
+  }
+}
+
+async function poolList() {
+  const d = await ncRetry("GET", null, "?limit=500&sort=-Id");
+  return (d.list || []).map((r) => ({
+    siteKey: r["Site key"], builds: r.Builds || 1,
+    draftId: r["Draft key"] || r["Draft id"], client: r.Client, betaSite: r["Beta site"], repo: r.Repo,
+    theme: r.Theme, status: r.Status, step: r.Step,
+    existingPages: r["Existing pages"], pagesPlanned: r["Pages planned"],
+    pagesBuilt: r["Pages built"], pagesPending: r["Pages pending"], coveragePct: r["Coverage pct"],
+    prUrl: r["Last PR"], receivedAt: r["Received at"], finishedAt: r["Finished at"],
+    jobLink: r["Job link"], error: r.Error,
+  }));
+}
+
+// One-time backfill on boot: whatever jobs.json still holds gets pushed into the pool, so
+// the history we already have isn't lost the next time this disk is wiped. It rides the same
+// coalesced flush, so 60 jobs cost one bulk write, not 60 round-trips.
+function backfillPool() {
+  if (!NOCODB_TOKEN) return;
+  const jobs = [...JOBS.values()]
+    .filter((j) => POOL_TYPES.has(j.type) && j.draftId)
+    .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")));
+  if (!jobs.length) return;
+  // Keyed by site so the newest run wins — the pool holds one row per client, and the
+  // Builds counter picks up each distinct run as it goes past.
+  for (const job of jobs) POOL_DIRTY.set(poolSiteKey(job), job);
+  console.log(`pool: backfilling ${jobs.length} job(s) → ${POOL_DIRTY.size} client(s)`);
+  schedulePoolFlush(1000);
+}
+setTimeout(backfillPool, 2000);
+
 function siteRequiresApproval(siteId) {
   return !!readApprovals()[siteId];
 }
@@ -2526,6 +3146,7 @@ function enqueueJob(payload) {
   JOBS.set(id, job);
   JOB_QUEUE.push(id); saveJobs();
   postStatus(job);   // "queued" — G99 records that the build was accepted
+  mirrorPool(job);   // and the pool gets the client row the moment the form arrives
   processJobQueue();
   return { job, dedupe: false };
 }
@@ -2559,6 +3180,7 @@ async function runJob(job) {
   job.status = "running";
   job.startedAt = new Date().toISOString(); COST_SINK = job.cost;
   postStatus(job);   // "running"
+  mirrorPool(job);
   const P = job.payload;
   try {
     // Fresh start: clear the previous client's cached scan/CRO so this job never
@@ -2591,11 +3213,16 @@ async function runJob(job) {
     }
 
     // 2 — compose the brand + build brief
-    jobStep(job, 1, "running", "Scanning site + composing brand system…");
-    const composed = await localApi("/api/compose-brand", {});
+    jobStep(job, 1, "running", (job.payload || {}).brand
+      ? "Applying the brand you confirmed…" : "Scanning site + composing brand system…");
+    // Pass THIS job's confirmed brand rather than letting compose read onboarding.json: that file holds
+    // only the most recent submission, so a job that waited in the queue would otherwise compose against
+    // a different client's brand.
+    const composed = await localApi("/api/compose-brand", { brand: (job.payload || {}).brand || null });
     const theme = { displayName: A.business_name, primary: composed.primary, secondary: composed.secondary, accent: composed.accent, headingFont: composed.headingFont, bodyFont: composed.bodyFont };
     job.composed = { primary: composed.primary, secondary: composed.secondary, accent: composed.accent, headingFont: composed.headingFont, bodyFont: composed.bodyFont, brief: composed.brief || "" };
-    jobStep(job, 1, "done", `Palette ${composed.primary}/${composed.accent} · ${composed.headingFont}`);
+    jobStep(job, 1, "done", `Palette ${composed.primary}/${composed.accent} · ${composed.headingFont}`
+      + (composed.brandSource ? " · client-confirmed" : ""));
 
     // 3 — generate all pages with Stitch
     jobStep(job, 2, "running", "Generating 4 pages…");
@@ -2722,6 +3349,7 @@ async function runJob(job) {
   } finally {
     job.finishedAt = new Date().toISOString(); saveJobs(); COST_SINK = null;
     postStatus(job);   // terminal: done | error | cancelled (+ siteUrl/prUrl/scores)
+    mirrorPool(job);   // flushed immediately — this is the row that must survive a redeploy
   }
 }
 
@@ -3423,6 +4051,7 @@ async function runEditJob(job) {
   } finally {
     job.finishedAt = new Date().toISOString(); saveJobs(); COST_SINK = null;
     postStatus(job);   // terminal: done | error | cancelled (+ siteUrl/prUrl/scores)
+    mirrorPool(job);   // flushed immediately — this is the row that must survive a redeploy
   }
 }
 // Snapshot restore: put the theme tree back exactly as it was at one commit and
@@ -4511,6 +5140,33 @@ async function runEnrichJob(job) {
     const title = P.headerOnly
       ? `Fix ${P.businessName}: scope the Treatments dropdown to its own nav item`
       : `Enrich ${P.businessName}: service pages + brand guide`;
+    // Record what this run produced INSIDE the theme, so it is committed by the same
+    // `git add` below. The manifest is how the next job knows this theme's brand and which
+    // pages already exist — without it, every run re-guesses and the guesses go stale.
+    try {
+      updateManifest(themeAbs, P.themeSlug, P.businessName, {
+        brand: {
+          headingFont: composed.headingFont, bodyFont: composed.bodyFont,
+          primary: composed.primary, secondary: composed.secondary, accent: composed.accent,
+        },
+        existingWebsite: P.referenceWebsite || null,
+        liveUrl: job.liveUrl || null,
+        pages: mergePageRows(readManifest(themeAbs), services.map((s) => {
+          // job.serviceDetail is where svcStatus() records which engine actually produced
+          // each page — a Stitch page and a Gemini clone are not interchangeable when we
+          // later decide what needs regenerating.
+          const d = (job.serviceDetail || []).find((x) => x.slug === s.slug) || {};
+          return {
+            slug: s.slug, title: s.name, section: "treatments",
+            status: d.status === "error" ? "failed" : "built",
+            engine: d.engine === "gemini" ? "clone" : "stitch",
+            builtAt: new Date().toISOString(), prUrl: null,
+          };
+        })),
+        run: { type: "enrich", at: new Date().toISOString(), pages: services.length, jobId: job.draftId },
+      });
+    } catch (e) { log_srv("manifest write skipped: " + e.message); }
+
     await run(`git checkout -b "${branch}"`, tmp);
     await run(`git add -A "${P.themePath}" "${P.muPath}"`, tmp);
     r = await run(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "${title.replace(/"/g, "'")}"`, tmp);
@@ -5755,6 +6411,10 @@ const server = http.createServer(async (req, res) => {
       const betaSiteUrl = pick("betaSiteUrl", "beta_site_url", "betaUrl", "beta_url", "siteUrl", "site_url");
       const betaSiteRepoRaw = pick("betaSiteRepo", "beta_site_repo", "githubRepo", "github_repo", "repoUrl", "repo_url", "repo");
       const betaSiteRepo = normalizeRepo(betaSiteRepoRaw);
+      // The brand the CLIENT confirmed on step 10 of the onboarding form — their existing site's real
+      // colours and type, which they said yes to. When present it replaces our own derivation: we no
+      // longer have to guess a palette from a screenshot for a client who already told us theirs.
+      const confirmedBrand = (body.brand && typeof body.brand === "object") ? body.brand : null;
       const receivedAt = new Date().toISOString();
       // Persist it as the current onboarding response, so "Build a site" shows
       // the client who actually submitted rather than whatever was there before.
@@ -5765,6 +6425,7 @@ const server = http.createServer(async (req, res) => {
           betaSiteUrl, betaSiteRepo,
           referenceWebsite: body.referenceWebsite || mapped.referenceWebsite || "",
           existingWebsite: body.existingWebsite || mapped.existingWebsite || "",
+          confirmedBrand,
           answers: mapped.answers,
         }, null, 2));
       } catch (e) { console.warn("could not persist onboarding.json:", e.message); }
@@ -5774,8 +6435,10 @@ const server = http.createServer(async (req, res) => {
         referenceWebsite: body.referenceWebsite || mapped.referenceWebsite,
         // the build target from the deal — without these the job used env defaults
         betaSiteUrl, betaSiteRepo, receivedAt, source: "onboarding form",
+        brand: confirmedBrand,
       });
-      console.log(`webhook: ${job.businessName} · repo ${job.repo} · beta ${job.liveUrl}${betaSiteUrl || betaSiteRepo ? "" : " (deal properties missing — using this deployment's defaults)"}`);
+      console.log(`webhook: ${job.businessName} · repo ${job.repo} · beta ${job.liveUrl}${betaSiteUrl || betaSiteRepo ? "" : " (deal properties missing — using this deployment's defaults)"}`
+        + (confirmedBrand ? ` · client-confirmed brand ${confirmedBrand.primaryColor || "?"}/${confirmedBrand.accentColor || "?"} ${confirmedBrand.headingFont || "?"}` : " · no confirmed brand (will derive)"));
       res.writeHead(202, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ accepted: true, dedupe, draftId: job.draftId, status: job.status, monitor: "/jobs" }));
     }
@@ -6049,6 +6712,175 @@ const server = http.createServer(async (req, res) => {
 
     // Real websites from NocoDB (name / domain / repo). ?refresh=1 bypasses the
     // 60s cache. Approval flags are merged in from the local store.
+    // Page-coverage report: every page the client's current site publishes, grouped
+    // by section, matched against what the beta site has. ?demo=1 uses ruma.com with
+    // a SIMULATED built set so the report can be reviewed without running a build.
+    if (p === "/api/site-inventory") {
+        const siteIdParam = u.searchParams.get("siteId") || "";
+        const demo = u.searchParams.get("demo") === "1" && !siteIdParam;
+        let siteUrl = u.searchParams.get("url") || "";
+        let built = [];
+        let builtSource = "";
+        if (demo || (!siteUrl && !siteIdParam)) {
+          siteUrl = siteUrl || "https://ruma.com";
+          // What a finished beta build produces today: 4 base pages + a services hub,
+          // up to 10 revenue-first treatment pages, and the brand guide.
+          built = [
+            { slug: "", path: "/" }, { slug: "services" }, { slug: "about" }, { slug: "contact" },
+            { slug: "brand-guide" },
+            { slug: "botox" }, { slug: "dermal-fillers" }, { slug: "sculptra" },
+            { slug: "microneedling" }, { slug: "laser-hair-removal" },
+            { slug: "medical-weight-loss" }, { slug: "hormone-therapy" },
+          ];
+          builtSource = "simulated (no build run)";
+        } else {
+          // Real mode. A siteId resolves BOTH sides from this site's own runs: the
+          // client's current website (from the build payload) and the pages actually
+          // built (from its newest enrich run).
+          const siteId = u.searchParams.get("siteId") || "";
+          const runs = [...JOBS.values()].sort((a, b) =>
+            (b.finishedAt || b.createdAt || "").localeCompare(a.finishedAt || a.createdAt || ""));
+          const mine = siteId ? runs.filter((j) => j.payload && j.payload.siteId === siteId) : runs;
+          const e = mine.find((j) => j.type === "enrich" && j.servicePages);
+          if (!siteUrl) {
+            const b = runs.find((j) => j.payload && j.payload.existingWebsite
+              && (!siteId || j.payload.siteId === siteId || (e && j.businessName === e.businessName)));
+            siteUrl = (b && b.payload.existingWebsite) || "";
+          }
+          if (!siteUrl) return json(res, 400, { error: "No current-website URL known for this site — pass ?url=… or run a build first." });
+          built = [{ slug: "", path: "/" }, { slug: "services" }, { slug: "about" }, { slug: "contact" }, { slug: "brand-guide" }]
+            .concat(((e && e.servicePages) || []).map((s) => ({ slug: s.slug })));
+          builtSource = e ? `from run ${e.draftId} (${e.servicePages.length} service pages)` : "base pages only (no enrich run yet)";
+        }
+        try {
+          const inv = await crawlSiteInventory(siteUrl);
+          const cov = buildCoverage(inv, built);
+          // The queue the batched builder will work through, derived from the same
+          // coverage pass so the table and the worker can never disagree.
+          const plan = buildPagePlan(cov);
+          cachePlan(inv.origin, plan);
+          return json(res, 200, {
+            site: inv.origin, discoveredVia: inv.discoveredVia, sitemaps: inv.sitemaps,
+            builtSource, builtCount: built.length, ...cov,
+            plan, planTotals: planTotals(plan), batchSize: BATCH_SIZE,
+            nextBatch: nextBatch(plan).map((r) => r.slug || "home"),
+            checkedAt: new Date().toISOString(),
+          });
+        } catch (e) { return json(res, 502, { error: e.message }); }
+    }
+    // Build a chosen set of pages. Two-phase on purpose: without `confirm` this only
+    // validates and quotes, so the UI can show the Stitch/clone split and the spend before
+    // anything is generated. Slugs are checked against the server's own plan — a browser
+    // must not be able to name arbitrary pages to build.
+    if (p === "/api/build-pages" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req) || "{}");
+      const want = [...new Set((body.slugs || []).map((s) => String(s)))];
+      if (!want.length) return json(res, 400, { error: "no pages selected" });
+
+      let plan = body.site ? cachedPlan(body.site) : null;
+      if (!plan) {
+        // Cache expired (or a fresh tab) — re-derive rather than trust the client's rows.
+        if (!body.site) return json(res, 400, { error: "missing site — reload the coverage page" });
+        try {
+          const inv = await crawlSiteInventory(body.site);
+          plan = buildPagePlan(buildCoverage(inv, body.built || []));
+          cachePlan(inv.origin, plan);
+        } catch (e) { return json(res, 502, { error: "could not re-read the site: " + e.message }); }
+      }
+
+      const byKey = new Map(plan.map((r) => [r.slug || "home", r]));
+      const rows = [], unknown = [], alreadyBuilt = [];
+      for (const key of want) {
+        const row = byKey.get(key);
+        if (!row) { unknown.push(key); continue; }
+        if (row.status === "built" && !body.rebuild) { alreadyBuilt.push(key); continue; }
+        rows.push(row);
+      }
+      if (!rows.length) {
+        return json(res, 400, {
+          error: alreadyBuilt.length ? "every selected page is already built — use Rebuild to regenerate"
+            : "none of the selected pages are in the plan",
+          unknown, alreadyBuilt,
+        });
+      }
+
+      const estimate = estimateBuild(rows);
+      const batches = [];
+      for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+        batches.push(rows.slice(i, i + BATCH_SIZE).map((r) => r.slug || "home"));
+      }
+      const quote = {
+        site: body.site, estimate, batches, batchSize: BATCH_SIZE,
+        pages: rows.map((r) => ({
+          slug: r.slug || "home", title: r.title, section: r.sectionLabel || r.section,
+          engine: r.engine, status: r.status, sources: (r.sourcePaths || []).length,
+        })),
+        unknown, alreadyBuilt,
+      };
+      if (!body.confirm) return json(res, 200, { ...quote, queued: false });
+
+      // Task 4 owns the worker. Refusing loudly beats enqueueing a job type nothing can run.
+      return json(res, 501, {
+        ...quote, queued: false,
+        error: "The batched page builder isn't wired up yet — the selection and quote above are what it will receive.",
+      });
+    }
+
+    if (p === "/clients" || p === "/clients.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "clients.html")));
+    if (p === "/clients.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "clients.js")));
+    if (p === "/coverage" || p === "/coverage.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "coverage.html")));
+    if (p === "/coverage.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "coverage.js")));
+
+    // The durable client pool: every onboarding that reached this tool, with its page
+    // progress. Read from NocoDB (survives redeploys), then overlaid with any job still
+    // live in memory so an in-flight build shows its true current step, not the last
+    // coalesced write.
+    if (p === "/api/pool") {
+      let rows = [];
+      let poolError = null;
+      try { rows = await poolList(); } catch (e) { poolError = e.message; }
+      const bySite = new Map(rows.map((r) => [String(r.siteKey), r]));
+      // In-memory jobs are newer than the last coalesced write, so they win — but only the
+      // most recent job per site, since the row represents the client, not the run.
+      const newest = new Map();
+      for (const job of JOBS.values()) {
+        if (!POOL_TYPES.has(job.type) || !job.draftId) continue;
+        const key = poolSiteKey(job);
+        const at = job.receivedAt || job.createdAt || "";
+        const cur = newest.get(key);
+        if (!cur || String(at) >= String(cur.receivedAt || cur.createdAt || "")) newest.set(key, job);
+      }
+      for (const [key, job] of newest) {
+        const live = poolRow(job);
+        const mapped = {
+          siteKey: key, draftId: live["Draft key"], client: live.Client, betaSite: live["Beta site"],
+          repo: live.Repo, theme: live.Theme, status: live.Status, step: live.Step,
+          existingPages: live["Existing pages"], pagesPlanned: live["Pages planned"],
+          pagesBuilt: live["Pages built"], pagesPending: live["Pages pending"],
+          coveragePct: live["Coverage pct"], prUrl: live["Last PR"], receivedAt: live["Received at"],
+          finishedAt: live["Finished at"], jobLink: live["Job link"], error: live.Error, live: true,
+        };
+        const prev = bySite.get(key);
+        if (!prev) { bySite.set(key, mapped); continue; }
+        // Merge only the fields the live job actually knows. An enrich job carries no repo of
+        // its own, and blindly spreading its nulls would blank out details the stored row has.
+        const merged = { ...prev };
+        for (const [k, v] of Object.entries(mapped)) if (v != null) merged[k] = v;
+        bySite.set(key, merged);
+      }
+      const all = [...bySite.values()].sort((a, b) =>
+        String(b.receivedAt || "").localeCompare(String(a.receivedAt || "")));
+      const totals = {
+        clients: all.length,
+        done: all.filter((r) => r.status === "done").length,
+        running: all.filter((r) => ["running", "queued"].includes(r.status)).length,
+        failed: all.filter((r) => r.status === "error").length,
+        pagesBuilt: all.reduce((n, r) => n + (r.pagesBuilt || 0), 0),
+        pagesPending: all.reduce((n, r) => n + (r.pagesPending || 0), 0),
+      };
+      return json(res, 200, { rows: all, totals, poolError, storedIn: poolError ? "memory only" : "NocoDB" });
+    }
+
     if (p === "/api/sites") {
       try {
         const sites = await getWebsites(u.searchParams.get("refresh") === "1");
@@ -6361,6 +7193,12 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req) || "{}");
       const onb = JSON.parse(fs.readFileSync(path.join(DIR, "onboarding.json"), "utf8"));
       const a = onb.answers;
+      // A brand the client explicitly CONFIRMED beats anything we can infer. G99 detects their existing
+      // site's palette and type, shows it on step 10, and the client says yes — so there is nothing left
+      // to guess. Only the fields they confirmed are pinned; the brief/imagery are still composed below,
+      // and a client who chose "use a different reference site" sends no brand at all, which falls
+      // straight through to the original derivation path.
+      const confirmed = body.brand || onb.confirmedBrand || null;
       // Design language comes from the REFERENCE site the client loves
       // (site_love_1_url); the existing site is only the CRO/what-to-fix source.
       const refUrl = onb.referenceWebsite || a.site_love_1_url || "";
@@ -6464,6 +7302,28 @@ const server = http.createServer(async (req, res) => {
           obj.siteFonts = siteBrand.fonts.slice(0, 4);
         } else { obj.fontSource = "model"; }
         obj.usedAnalysis = !!analysis; obj.usedCro = !!cro;
+        // Last word goes to the client. Everything above is inference — a screenshot read, a font scan,
+        // a model's taste — and all of it is overridden by tokens the client looked at and approved.
+        // Applied per-field so a partial confirmation (say colours but no readable fonts) still keeps
+        // the composed value for whatever they didn't confirm.
+        if (confirmed) {
+          const pin = (dst, src) => { if (confirmed[src]) { obj[dst + "ModelPick"] = obj[dst]; obj[dst] = confirmed[src]; } };
+          pin("primary", "primaryColor");
+          pin("secondary", "secondaryColor");
+          pin("accent", "accentColor");
+          pin("headingFont", "headingFont");
+          pin("bodyFont", "bodyFont");
+          obj.brandSource = confirmed.source || "existing-site-confirmed";
+          obj.brandSourceUrl = confirmed.sourceUrl || onb.existingWebsite || "";
+          if (confirmed.headingFont || confirmed.bodyFont) obj.fontSource = "client-confirmed";
+          // State it in the brief too: the brief is what reaches Stitch as prose, and a palette stated
+          // only in JSON has been ignored by the model before.
+          obj.brief = (obj.brief || "") + `\n\nBRAND (CLIENT-CONFIRMED — use these EXACT values, do not substitute):`
+            + ` primary ${obj.primary}, secondary ${obj.secondary}, accent ${obj.accent};`
+            + ` headings ${obj.headingFont}, body ${obj.bodyFont}.`
+            + ` These were read from the client's existing site (${obj.brandSourceUrl}) and confirmed by the client.`;
+          console.log(`compose: client-confirmed brand pinned — ${obj.primary}/${obj.accent} · ${obj.headingFont}/${obj.bodyFont}`);
+        }
         return json(res, 200, obj);
       } catch (e) { return json(res, 502, { error: "compose failed: " + e.message }); }
     }
@@ -6744,6 +7604,29 @@ const server = http.createServer(async (req, res) => {
           if (/^g99-activate-.*\.php$/.test(f) && f !== muFile) fs.unlinkSync(path.join(tmp, muRel, f));
         }
         fs.writeFileSync(path.join(tmp, muRel, muFile), wpActivatorPlugin(slug, a.business_name, built.buildId));
+        // Seed the manifest from the theme we just wrote. Brand is read back out of the
+        // generated files rather than threaded through the build routes, so it records what
+        // the site actually renders — the discrepancy that produced a brand guide documenting
+        // a palette the site never used.
+        try {
+          const tb = readThemeBrand(dest) || {};
+          updateManifest(dest, slug, a.business_name, {
+            brand: {
+              headingFont: tb.headingFont || null, bodyFont: tb.bodyFont || null,
+              primary: tb.primary || null, secondary: tb.secondary || null, accent: tb.accent || null,
+            },
+            existingWebsite: a.existing_website || a.site_love_1_url || null,
+            pages: mergePageRows(readManifest(dest), built.files
+              .filter((f) => /^(front-page|page-[a-z0-9-]+)\.php$/.test(f))
+              .map((f) => ({
+                slug: f === "front-page.php" ? "" : f.replace(/^page-|\.php$/g, ""),
+                title: f === "front-page.php" ? "Home" : f.replace(/^page-|\.php$/g, "").replace(/-/g, " "),
+                section: "core", status: "built", engine: "stitch",
+                builtAt: new Date().toISOString(),
+              }))),
+            run: { type: "build", at: new Date().toISOString(), buildId: built.buildId },
+          });
+        } catch (e) { console.error("manifest seed skipped:", e.message); }
         await run(`git checkout -b "${branch}"`, tmp);
         await run(`git add -A "${rel}" "${muRel}"`, tmp);
         r = await run(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "Add ${a.business_name} beta theme + auto-activator (Growth99 generated)"`, tmp);
