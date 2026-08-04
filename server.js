@@ -333,6 +333,52 @@ async function generate(prompt, deviceType) {
   return { projectId: pid, screenId: fallback.id, html: "", screenshotUrl: fallback.scr?.screenshot?.downloadUrl || "" };
 }
 
+// -------------------------------------------- Mockup screenshots of the NEW site
+// G99's "Mockup Creation" task wants a visual of the finished beta site: Home, one service page,
+// About and Contact. Captured with microlink (no API key, same service analyzeExistingSite uses)
+// and returned as base64 data URIs rather than links — microlink's own URLs expire, and this
+// server's disk is wiped on every redeploy, so a stored link would 404 within days. Inlining makes
+// the image durable wherever it finally lands.
+const MOCKUP_MAX_BYTES = 1_500_000;   // ~1.5MB/page; 4 pages stays comfortably postable
+
+async function captureMockup(label, url) {
+  try {
+    const api = `https://api.microlink.io/?url=${encodeURIComponent(url)}&screenshot=true&meta=false`;
+    const meta = await (await fetch(api)).json();
+    const shotUrl = meta?.data?.screenshot?.url;
+    if (!shotUrl) return { label, url, error: "no screenshot returned" };
+    const buf = Buffer.from(await (await fetch(shotUrl)).arrayBuffer());
+    if (buf.length > MOCKUP_MAX_BYTES) {
+      // Don't silently ship something that will be rejected downstream — say so instead.
+      return { label, url, error: `screenshot too large (${Math.round(buf.length / 1024)}KB)` };
+    }
+    return { label, url, dataUri: `data:image/png;base64,${buf.toString("base64")}` };
+  } catch (e) {
+    // Never fail the build for a mockup: the site is already live at this point.
+    return { label, url, error: String(e.message || e).slice(0, 160) };
+  }
+}
+
+/**
+ * Captures the four review pages. Service slug comes from the generated pages so it is always a
+ * real URL; About/Contact are conventional WordPress paths and may legitimately not exist, in which
+ * case the entry carries an `error` and the others still go through.
+ */
+async function captureMockups(baseUrl, services) {
+  if (!baseUrl) return [];
+  const root = String(baseUrl).replace(/\/+$/, "");
+  const firstService = (services || []).find((s) => s && s.slug);
+  const targets = [
+    { label: "Home", url: `${root}/` },
+    ...(firstService ? [{ label: `Service — ${firstService.name}`, url: `${root}/${firstService.slug}/` }] : []),
+    { label: "About", url: `${root}/about/` },
+    { label: "Contact", url: `${root}/contact/` },
+  ];
+  const out = [];
+  for (const t of targets) out.push(await captureMockup(t.label, t.url));   // serial: microlink is rate-limited
+  return out;
+}
+
 // -------------------------------------------- Analyze existing site (screenshot -> Gemini vision)
 // Captures the existing/reference site with microlink (no key), then asks Gemini
 // vision to extract its design language so we can generate a new site that
@@ -2905,6 +2951,31 @@ function jobStatusSnapshot(job) {
     steps: (job.steps || []).map((s) => ({ key: s.key || null, label: s.label, status: s.status, detail: s.detail })),
     // Explicit, unambiguous signal for G99's SERVICE_PAGES_CREATED. Null until that step is done.
     servicePagesCreatedAt: job.servicePagesCreatedAt || null,
+    // What was actually written on each service page, and the review screenshots. Sent on the
+    // callback rather than left here to be fetched: this server keeps nothing across a redeploy,
+    // so completion is the only moment the data is guaranteed to still exist.
+    //
+    // serviceDetail FIRST, not servicePages: servicePages is selectServices() output and carries
+    // only {name, slug}. The engine, the existing-site page each one was grounded in, and the brief
+    // are recorded on serviceDetail by svcStatus() as generation progresses. Reading servicePages
+    // yields four permanent nulls. Fall back to it only so a run that never reached brief
+    // composition still reports which pages were planned.
+    servicePages: (job.serviceDetail && job.serviceDetail.length
+      ? job.serviceDetail
+      : job.servicePages || []
+    ).map((p) => ({
+      name: p.name || null,
+      slug: p.slug || null,
+      status: p.status || null,
+      engine: p.engine || null,
+      sourceUrl: p.sourceUrl || null,
+      // Full stored brief (serviceDetail already caps at 3000). It lands in a downloadable .txt on
+      // the TED task, so truncating here would throw away the thing that file exists to carry.
+      brief: p.brief ? String(p.brief) : null,
+    })),
+    mockups: (job.mockups || []).map((m) => ({
+      label: m.label, url: m.url, dataUri: m.dataUri || null, error: m.error || null,
+    })),
     error: job.error || null,
     // The published WordPress site (shared host) — this is the real "live site" once the theme is live.
     liveUrl: job.liveUrl || LIVE_URL || null,
@@ -5008,6 +5079,15 @@ function mirrorToParent(job, status, detail) {
   if (status === "done" && !parent.servicePagesCreatedAt) {
     parent.servicePagesCreatedAt = new Date().toISOString();
   }
+  // Carry the artifacts across. postStatus() below snapshots the PARENT, but the per-page detail and
+  // the screenshots were both recorded on the enrich job — without this copy the callback ships two
+  // empty arrays and the whole thing silently produces nothing. Only on a real completion, and only
+  // when there is something to copy, so a failed retry cannot blank out a good earlier result.
+  if (status === "done") {
+    if (job.serviceDetail && job.serviceDetail.length) parent.serviceDetail = job.serviceDetail;
+    else if (job.servicePages && job.servicePages.length) parent.servicePages = job.servicePages;
+    if (job.mockups && job.mockups.length) parent.mockups = job.mockups;
+  }
   saveJobs();
   // The enrich run is a SEPARATE job, so nothing in its lifecycle goes through jobStep() on the
   // parent — which is where postStatus() normally fires. Without this call the parent's final step
@@ -5328,6 +5408,17 @@ async function runEnrichJob(job) {
     jobStep(job, 5, "running", "Updating site registry…");
     try { await syncSiteRegistry(); } catch (e) { /* non-fatal */ }
     jobStep(job, 5, "done", "Done — service pages + brand guide live on deploy");
+
+    // Capture the review mockups BEFORE mirrorToParent, because that call is what pushes the
+    // status callback to G99 — capturing after it would mean the images miss the very payload
+    // that carries them, and this server keeps nothing across a redeploy to send later.
+    try {
+      job.mockups = await captureMockups(job.liveUrl || P.betaSiteUrl || LIVE_URL, services);
+      saveJobs();
+    } catch (e) {
+      job.mockups = [];   // never block completion on a screenshot
+    }
+
     job.status = "done";
     mirrorToParent(job, "done", `${services.length} service page(s) + brand guide merged`);
     notify(`✨ Enriched *${job.businessName}*: ${services.length} service pages + brand guide · ${job.prUrl || ""}`);
