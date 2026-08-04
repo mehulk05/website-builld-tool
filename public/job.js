@@ -2,7 +2,7 @@
 // up top, engineer detail behind a disclosure, real actions against the runner.
 "use strict";
 
-const { esc, avatarColor, initials, croColor, relTime, toast, getJSON, postJSON,
+const { esc, avatarColor, initials, croColor, relTime, toast, getJSON, postJSON, emitHops,
         ensureAuth, svg, jobState, jobCost } = window.G99;
 
 const $ = (id) => document.getElementById(id);
@@ -311,6 +311,58 @@ function enrichDetailCard(j) {
   return `<div class="card pad">${head}${body}
     <div class="meta" style="margin-top:12px">${j.servicePages.length} service page(s) under a Treatments dropdown, a services hub, and a public /brand-guide page${plan.refCount ? ` · reference site has ${plan.refCount} service pages` : ""}${srcLine ? `<br>${srcLine}` : ""}</div></div>`;
 }
+
+// Did this run's outcome actually leave the building? Two hops, each with its own dot,
+// timestamp and — when it broke — the error verbatim, so "the site is live but the TED
+// ticket is still open" can be diagnosed here instead of by reading Render logs that a
+// redeploy has already thrown away.
+function emissionCard(j) {
+  // Enrich/edit runs report through the parent build's callback; say so and link there
+  // rather than showing an empty audit that reads as "nothing was sent".
+  if (j.type !== "build") {
+    const pid = j.payload && j.payload.parentDraftId;
+    if (!pid) return "";
+    return `<div class="emit note">Status for this run is reported to Growth99 on
+      <a href="/job?id=${encodeURIComponent(pid)}">the build run it belongs to</a>.</div>`;
+  }
+  const a = emitHops(j);
+  if (!a) return "";
+  const rows = a.hops.map((h) => {
+    const bits = [
+      h.at ? `<span class="et" title="${esc(h.at)}">${esc(relTime(h.at))}</span>` : "",
+      h.httpStatus ? `<span class="ec">HTTP ${h.httpStatus}</span>` : "",
+      h.attempts > 1 ? `<span class="ec">${h.attempts} attempts</span>` : "",
+      h.events.length ? `<span class="ec" title="Ledger events written">${esc(h.events.join(", "))}</span>` : "",
+    ].filter(Boolean).join("");
+    return `<div class="erow ${h.state}">
+      <span class="dot ${h.ui.cls}"></span>
+      <div class="eb">
+        <span class="en">${esc(h.name)}<span class="pill ${h.ui.pill} sm">${esc(h.ui.label)}</span></span>
+        <span class="ew">${esc(h.why)}</span>
+        ${bits ? `<span class="em">${bits}</span>` : ""}
+        ${h.error ? `<span class="ee">${esc(h.error)}</span>` : ""}
+      </div>
+    </div>`;
+  }).join("");
+  // The tail matters when a build flaps: one 502 followed by a success is a different
+  // story from four 502s, and only the per-attempt list tells them apart.
+  const hist = a.history.length > 1
+    ? `<details class="ehist"><summary>${a.history.length} callback attempt(s)</summary>
+        <div class="ehl">${a.history.slice().reverse().map((x) => `<div class="ehr ${x.error ? "bad" : "ok"}">
+          <span class="eht" title="${esc(x.at)}">${esc(relTime(x.at))}</span>
+          <span class="ehs">${esc(x.status || "?")}${x.step != null ? " · step " + x.step : ""}</span>
+          <span class="ehv">${x.error ? esc(x.error) : (x.events && x.events.length ? esc(x.events.join(", ")) : (x.httpStatus ? "HTTP " + x.httpStatus + " · no new event" : "sent"))}</span>
+        </div>`).join("")}</div></details>`
+    : "";
+  // Only offered when something broke: a resend on a healthy job is a no-op that invites doubt
+  // about whether the green ticks meant anything.
+  const resend = a.failed
+    ? `<button class="btn sm" data-act="resend" style="margin-top:10px">${svg("refresh", 14)}Resend event</button>`
+    : "";
+  return `<div class="emit${a.failed ? " has-error" : ""}">
+    <div class="eh">Event delivery</div>${rows}${hist}${resend}</div>`;
+}
+
 function render() {
   const j = JOB;
   const st = jobState(j);
@@ -351,6 +403,7 @@ function render() {
     <div class="card pad">
       <div class="card-h"><h2>Progress</h2>${j.prUrl ? `<a class="right linkbtn" href="${esc(j.prUrl)}" target="_blank" rel="noopener">Pull request${svg("ext", 13)}</a>` : ""}</div>
       <div style="padding-top:10px">${stepper(j)}</div>
+      ${emissionCard(j)}
       ${j.editPlan && j.editPlan.length ? `<div class="filebox"><div class="fhead">${j.editPlan.length} file${j.editPlan.length > 1 ? "s" : ""} changed</div>${j.editPlan.map((f) => `<div class="frow"><span class="fop ${esc((f.op || "edit").toLowerCase())}">${esc(f.op || "edit")}</span><span class="fpath">${esc(f.path)}</span></div>`).join("")}</div>` : ""}
       ${(j.siteUrl || j.reportUrl || j.enrichJobId || (j.payload && j.payload.parentDraftId)) ? `<div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:14px;align-items:center">
         ${j.siteUrl ? `<a class="linkbtn" href="${esc(j.siteUrl)}" target="_blank" rel="noopener">Assembled site${svg("ext", 13)}</a>` : ""}
@@ -394,6 +447,12 @@ async function act(kind, btn) {
       details: { Site: JOB.businessName, Run: JOB.draftId },
       confirmLabel: "Cancel run", tone: "danger",
     },
+    resend: {
+      title: "Resend this event?",
+      body: "Posts this run's final status to Growth99 again. The receiver is idempotent, so nothing is duplicated — it only fills in the event that never arrived.",
+      details: { Site: JOB.businessName, Run: JOB.draftId },
+      confirmLabel: "Resend",
+    },
     retry: {
       title: "Run this again?",
       body: JOB.type === "build"
@@ -410,6 +469,7 @@ async function act(kind, btn) {
     approve: ["/api/job-approve", "Approved — merging…"],
     cancel: ["/api/job-cancel", "Cancelling…"],
     retry: ["/api/job-retry", "Retrying — new run started…"],
+    resend: ["/api/job-emit-resend", "Resending — watch the delivery panel…"],
   }[kind];
   btn.disabled = true;
   try {

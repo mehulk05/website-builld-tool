@@ -3090,10 +3090,65 @@ function jobStatusSnapshot(job) {
   };
 }
 
+// ---- Emission audit ----------------------------------------------------------
+// Why this exists: the callback to G99 was fire-and-forget and recorded NOTHING on the job. When a
+// TED task did not close, there was no way from this tool to tell whether the event had left here
+// at all, been rejected, or been accepted and ignored downstream — the only evidence was a console
+// line on an ephemeral Render dyno. Two hops get their own status, because they fail separately:
+//
+//   productService — did our HTTP POST reach g99-product-service and get accepted?
+//   ted            — did that callback WRITE a ledger event? TED polls the ledger, so a callback
+//                    that writes no event (repeated step transition, row already terminal) is a
+//                    perfectly successful POST that TED will never see. product-service echoes the
+//                    event types it wrote, which is what lets us tell those two apart.
+//
+// "ted: ok" therefore means "the event TED reads exists", not "TED processed it" — TED pulls and
+// acks nothing back, so that is the strongest claim this side can honestly make.
+function emitAudit(job) {
+  if (!job.emit) {
+    job.emit = {
+      productService: { state: "pending", at: null, attempts: 0, httpStatus: null, error: null },
+      ted: { state: "pending", at: null, events: [], error: null },
+      history: [],
+    };
+  }
+  return job.emit;
+}
+
+function noteEmit(job, patch) {
+  const a = emitAudit(job);
+  if (patch.productService) Object.assign(a.productService, patch.productService);
+  if (patch.ted) Object.assign(a.ted, patch.ted);
+  // Keep a short tail so a flapping build can be diagnosed after the fact. Newest last, capped —
+  // a 9-step build calls back a dozen times and the whole job object is serialized into jobs.json.
+  if (patch.entry) {
+    a.history.push(patch.entry);
+    if (a.history.length > 12) a.history.splice(0, a.history.length - 12);
+  }
+  saveJobs();
+  return a;
+}
+
 function postStatus(job, attempt = 0) {
   // Only real client builds are tracked in G99 (edit jobs key off an internal jobId, not a draft).
-  if (!G99_STATUS_URL || !job || job.type !== "build") return;
-  const body = JSON.stringify(jobStatusSnapshot(job));
+  if (!job || job.type !== "build") return;
+  if (!G99_STATUS_URL) {
+    // Distinct from "pending": nothing is coming, because this deployment has no callback URL.
+    // Without this the UI would show a grey dot forever and read as "still working on it".
+    noteEmit(job, {
+      productService: { state: "disabled", error: "G99_STATUS_CALLBACK_URL not set" },
+      ted: { state: "disabled", error: "no callback configured" },
+    });
+    return;
+  }
+  const snapshot = jobStatusSnapshot(job);
+  const body = JSON.stringify(snapshot);
+  // Counts every delivery attempt, retries included — "4 attempts" has to mean four POSTs went
+  // out, or the number is worse than no number when someone is judging whether to resend.
+  const a0 = emitAudit(job);
+  a0.productService.attempts += 1;
+  if (attempt === 0) a0.productService.state = "sending";
+  saveJobs();
   fetch(G99_STATUS_URL, {
     method: "POST",
     // Declare the charset explicitly. The briefs and mockup labels carry em-dashes and curly
@@ -3107,14 +3162,77 @@ function postStatus(job, attempt = 0) {
     },
     body,
   })
-    .then((r) => {
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    .then(async (r) => {
+      const text = await r.text().catch(() => "");
+      if (!r.ok) {
+        const err = new Error(`HTTP ${r.status}${text ? " " + text.slice(0, 200) : ""}`);
+        err.httpStatus = r.status;
+        throw err;
+      }
+      // Older product-service builds answer {"status":"ok"} with no event list. Absent is not the
+      // same as empty: report "unknown" rather than claiming nothing reached the ledger.
+      let parsed = null;
+      try { parsed = text ? JSON.parse(text) : null; } catch { /* not JSON — treat as legacy */ }
+      const events = parsed && Array.isArray(parsed.events) ? parsed.events : null;
+      const applied = parsed && typeof parsed.applied === "boolean" ? parsed.applied : null;
+      const at = new Date().toISOString();
+
+      const ps = { state: applied === false ? "error" : "ok", at, httpStatus: r.status, error: null };
+      if (applied === false) {
+        ps.error = (parsed && parsed.message) || "product-service could not apply the callback";
+      }
+
+      const a = emitAudit(job);
+      const ted = {};
+      if (applied === false) {
+        ted.state = "error";
+        ted.error = ps.error;
+      } else if (events === null) {
+        // Legacy response shape — we genuinely cannot tell. Never downgrade a known success.
+        if (a.ted.state !== "ok") {
+          ted.state = "unknown";
+          ted.error = "product-service did not report which events it wrote";
+        }
+      } else if (events.length) {
+        ted.state = "ok";
+        ted.at = at;
+        ted.error = null;
+        ted.events = [...new Set([...(a.ted.events || []), ...events])];
+      }
+      // applied=true with an empty event list means "accepted, nothing new to read". Leave whatever
+      // earlier callbacks established — a later duplicate must not undo a written event.
+      noteEmit(job, {
+        productService: ps,
+        ted,
+        entry: {
+          at, status: snapshot.status, step: snapshot.currentStep,
+          httpStatus: r.status, events: events || null, error: null,
+        },
+      });
     })
     .catch((e) => {
-      if (attempt < G99_RETRY_DELAYS_MS.length) {
+      const at = new Date().toISOString();
+      const message = e.message || String(e);
+      const retrying = attempt < G99_RETRY_DELAYS_MS.length;
+      noteEmit(job, {
+        productService: {
+          state: retrying ? "retrying" : "error",
+          at,
+          httpStatus: e.httpStatus || null,
+          error: message,
+        },
+        // The ledger write cannot have happened if the POST never landed. Only claim failure while
+        // no earlier callback succeeded — one failed step transition does not erase a written event.
+        ted: emitAudit(job).ted.state === "ok" ? {} : { state: retrying ? "pending" : "error", error: message },
+        entry: {
+          at, status: snapshot.status, step: snapshot.currentStep,
+          httpStatus: e.httpStatus || null, events: null, error: message,
+        },
+      });
+      if (retrying) {
         setTimeout(() => postStatus(job, attempt + 1), G99_RETRY_DELAYS_MS[attempt]);
       } else {
-        console.error(`g99 status callback failed for ${job.draftId} after retries:`, e.message);
+        console.error(`g99 status callback failed for ${job.draftId} after retries:`, message);
       }
     });
 }
@@ -6897,6 +7015,19 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/job" ) {
       const j = JOBS.get(u.searchParams.get("id"));
       return j ? json(res, 200, j) : json(res, 404, { error: "job not found" });
+    }
+
+    // Re-send this job's status to G99. The audit above can now show a failed callback; without
+    // this there is nothing to do about one — the build has finished, so no further step transition
+    // will ever fire another attempt, and the event TED needs would stay missing forever.
+    // Same snapshot, same idempotent receiver, so pressing it twice is harmless.
+    if (p === "/api/job-emit-resend" && req.method === "POST") {
+      const { id } = JSON.parse(await readBody(req) || "{}");
+      const j = JOBS.get(id);
+      if (!j) return json(res, 404, { error: "job not found" });
+      if (j.type !== "build") return json(res, 400, { error: "only build jobs report status to G99" });
+      postStatus(j);   // fire-and-forget; poll /api/job to watch job.emit settle
+      return json(res, 202, { ok: true, emit: j.emit || null });
     }
 
     // Cancel a job (queued → dropped; running → stops at the next step boundary).

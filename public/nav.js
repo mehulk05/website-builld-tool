@@ -267,6 +267,60 @@
   const svg = (name, size, sw) =>
     `<svg style="width:${size || 15}px;height:${size || 15}px;flex:none" fill="none" stroke="currentColor" stroke-width="${sw || 2}" viewBox="0 0 24 24">${IC[name] || ""}</svg>`;
 
+  // --------------------------------------------------- cross-system emission
+  // A build here is only half the job: g99-product-service records it, and the TED
+  // dashboard closes its tasks from what product-service wrote. Both hops used to be
+  // invisible from this tool, so "the site built but the ticket never closed" had no
+  // evidence anywhere. server.js now records the outcome of every callback on
+  // job.emit; this turns it into something a screen can paint.
+  //
+  // States, deliberately distinct: pending (not attempted yet) / sending / retrying /
+  // ok / error / unknown (product-service answered without saying what it wrote —
+  // an older deployment) / disabled (no callback URL configured here at all).
+  const EMIT_UI = {
+    ok:       { cls: "done",    pill: "good", label: "Delivered" },
+    sending:  { cls: "running", pill: "",     label: "Sending\u2026" },
+    retrying: { cls: "running", pill: "warn", label: "Retrying\u2026" },
+    // Grey (the bare .dot) is deliberate for pending/disabled: nothing has gone wrong,
+    // it just has not happened. Amber is reserved for states that need a human to look.
+    pending:  { cls: "",        pill: "",     label: "Pending" },
+    unknown:  { cls: "queued",  pill: "warn", label: "Unconfirmed" },
+    error:    { cls: "error",   pill: "bad",  label: "Failed" },
+    disabled: { cls: "",        pill: "",     label: "Not configured" },
+  };
+  function emitHops(j) {
+    // Only build jobs call back. An enrich/edit run reports through its parent build,
+    // so claiming a state of its own would be a lie; callers show a pointer instead.
+    if (!j || j.type !== "build") return null;
+    const e = j.emit || {
+      productService: { state: "pending", at: null, attempts: 0, httpStatus: null, error: null },
+      ted: { state: "pending", at: null, events: [], error: null },
+      history: [],
+    };
+    const hop = (key, name, why, d) => ({
+      key, name, why,
+      state: d.state || "pending",
+      ui: EMIT_UI[d.state] || EMIT_UI.pending,
+      at: d.at || null,
+      error: d.error || null,
+      httpStatus: d.httpStatus != null ? d.httpStatus : null,
+      attempts: d.attempts || 0,
+      events: d.events || [],
+    });
+    return {
+      hops: [
+        hop("productService", "Growth99 product service",
+            "Build status posted to the onboarding webhook", e.productService || {}),
+        // Worth stating plainly: TED polls the ledger and acks nothing back, so the
+        // honest claim is "the event TED reads exists", never "TED processed it".
+        hop("ted", "TED dashboard",
+            "Ledger event written for TED to pick up on its next poll", e.ted || {}),
+      ],
+      history: e.history || [],
+      failed: [e.productService, e.ted].some((x) => x && x.state === "error"),
+    };
+  }
+
   // ------------------------------------------------------------ job mapping
   // Both build and edit jobs carry a `steps[]` of {label,status,detail}; every
   // screen that shows a run derives its pill / bar / caption from these three.
@@ -314,6 +368,7 @@
     esc, avatarColor, initials, host, thumbBg, croColor, croInk, deltaInk, relTime, toast,
     ensureAuth, getJSON, postJSON, IC, svg, confirm: confirmAction,
     jobProgress, jobState, jobCost, jobStepLabel, isActiveJob, siteJobs, siteStatus,
+    emitHops,
   };
 
   // ------------------------------------------------------------ shell chrome

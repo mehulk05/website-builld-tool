@@ -3,7 +3,8 @@
 "use strict";
 
 const { esc, avatarColor, initials, relTime, getJSON, postJSON, toast, ensureAuth,
-        jobState, jobProgress, jobCost, jobStepLabel, isActiveJob, confirm: confirmAction } = window.G99;
+        jobState, jobProgress, jobCost, jobStepLabel, isActiveJob, emitHops,
+        confirm: confirmAction } = window.G99;
 
 const $ = (id) => document.getElementById(id);
 
@@ -38,6 +39,15 @@ function match(j) {
   return j.type === FILTER;
 }
 
+
+// A build can finish perfectly and still fail to tell anyone. Surface that on the row —
+// otherwise the only way to find it is to open all thirty runs one at a time.
+function emitBadge(j) {
+  const a = emitHops(j);
+  if (!a || !a.failed) return "";
+  return `<span class="pill bad" style="margin-right:8px" title="A status callback failed \u2014 open the run for the error">Event not delivered</span>`;
+}
+
 function activeRow(j) {
   const st = jobState(j);
   const pct = jobProgress(j);
@@ -52,6 +62,7 @@ function activeRow(j) {
       ${needsYou(j) ? `<span class="btn warn sm">Review &amp; approve</span>` : ""}
       ${(j.status === "running" || j.status === "queued") && !j.cancelRequested ? `<button class="btn danger sm" data-cancel="${esc(j.draftId)}" data-name="${esc(j.businessName)}">Stop</button>` : ""}
       ${j.cancelRequested && j.status === "running" ? `<span class="pill bad">Stopping…</span>` : ""}
+      ${emitBadge(j)}
       <span class="pill ${st.cls}">${esc(st.label)}</span>
     </div>
     <div class="mt">
@@ -72,6 +83,7 @@ function doneRow(j) {
       <div class="sub trunc">${esc(j.businessName)} · ${esc(sub)} · ${esc(relTime(j.finishedAt || j.createdAt))}</div>
       ${clientMeta(j)}
     </div>
+    ${emitBadge(j)}
     ${j.delta != null ? `<span class="pill ${j.delta >= 0 ? "good" : "bad"}" style="margin-right:8px">CRO ${j.delta >= 0 ? "+" : ""}${j.delta}</span>` : ""}
     <span class="pill ${st.cls}">${esc(st.label)}</span>
   </a>`;

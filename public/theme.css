@@ -297,3 +297,31 @@ input::placeholder, textarea::placeholder { color: var(--muted); }
 .top h1 { font-size: 22px; }
 .tchip { display: inline-grid; place-items: center; width: 30px; height: 30px; border-radius: 9px; background: var(--line-2); border: 1px solid var(--line); color: var(--ink-2); flex: none; }
 .tchip svg { width: 15px; height: 15px; }
+
+/* ---- cross-system event delivery (job pipeline) --------------------------- */
+/* Sits under the step list on a build run: did this outcome reach product-service,
+   and did it land on the ledger TED reads. Styled as a quiet sub-panel — it is
+   audit, not progress, and must not compete with the pipeline above it. */
+.emit { margin-top: 16px; padding: 12px 14px; background: var(--surface-2, rgba(0,0,0,.02)); border: 1px solid var(--line-2); }
+.emit.has-error { border-color: var(--bad); }
+.emit.note { font-size: 12.5px; color: var(--muted); }
+.emit .eh { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; font-weight: 700; color: var(--ink-3); margin-bottom: 10px; }
+.erow { display: grid; grid-template-columns: 12px 1fr; column-gap: 10px; align-items: start; padding: 7px 0; }
+.erow + .erow { border-top: 1px dashed var(--line-2); }
+.erow .dot { margin-top: 5px; }
+.erow .eb { min-width: 0; }
+.erow .en { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 650; color: var(--ink); }
+.erow.pending .en, .erow.disabled .en { color: var(--muted); }
+.erow .pill.sm { font-size: 10px; padding: 1px 7px; }
+.erow .ew { display: block; font-size: 12px; color: var(--muted); margin-top: 2px; }
+.erow .em { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 4px; font-size: 11.5px; color: var(--ink-3); }
+.erow .em .et { font-weight: 650; color: var(--ink-2, var(--ink-3)); }
+.erow .ee { display: block; margin-top: 5px; font-size: 11.5px; font-family: var(--mono, ui-monospace, monospace);
+            color: var(--bad-ink); background: var(--bad-soft); padding: 5px 7px; overflow-wrap: anywhere; }
+.ehist { margin-top: 10px; }
+.ehist summary { font-size: 11.5px; color: var(--muted); cursor: pointer; font-weight: 600; }
+.ehl { margin-top: 7px; display: grid; gap: 3px; }
+.ehr { display: grid; grid-template-columns: 74px 108px 1fr; gap: 8px; font-size: 11.5px; color: var(--ink-3);
+       overflow-wrap: anywhere; }
+.ehr.bad .ehv { color: var(--bad-ink); }
+.ehr .eht { font-weight: 650; }
