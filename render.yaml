@@ -33,6 +33,10 @@ services:
         value: "9078"        # "Implement beta site revisions"
       - key: TED_AUTH_HEADER
         value: bearer        # or x-api-key, if Bearer 401s for personal tokens
+      - key: TED_SHOT_DELAY_MS
+        value: "60000"       # wait for the deploy to land before screenshotting
+      - key: TED_SCREENSHOTS
+        value: "on"          # off = outcome comments without the image
       # Where build progress is reported back to Growth99 (dev). The G99 admin dashboard reads this
       # persisted status, so without it a build's outcome is never recorded on the platform side.
       # NOTE: this is the API-GATEWAY path. The gateway maps /publicv2/** -> public-api /api/public/v2/**;

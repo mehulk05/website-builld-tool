@@ -52,6 +52,16 @@ const TED_REVISIONS_TASK_ID = process.env.TED_REVISIONS_TASK_ID || "9078";
 // The API docs cover Bearer JWTs from Google sign-in but never say how a
 // personal API token is presented. If Bearer 401s, flip this to x-api-key.
 const TED_AUTH_HEADER = (process.env.TED_AUTH_HEADER || "bearer").toLowerCase();
+// How long to wait after a merge before screenshotting the live site. There is
+// no way to detect the deploy landing — the page returns different markup on
+// every request, so a before/after comparison reports "changed" immediately.
+const TED_SHOT_DELAY_MS = Number(process.env.TED_SHOT_DELAY_MS || 60000);
+const TED_SCREENSHOTS = (process.env.TED_SCREENSHOTS || "on").toLowerCase() !== "off";
+// TED stores a comment image inline as base64 in the comment's own text, so an
+// oversized capture is a text-length problem: ~1.5MB inlined returns a 500.
+// jpeg/q40/900px lands around 90KB, well under whatever the real ceiling is.
+const TED_SHOT_PARAMS = "&type=jpeg&quality=40&viewport.width=900";
+const TED_SHOT_MAX_BYTES = 400 * 1024;
 if (!API_KEY) console.warn("⚠ STITCH_API_KEY not set — Stitch generation will fail. Add it to .env or the platform env vars.");
 if (!NOCODB_TOKEN) console.warn("⚠ NOCODB_TOKEN not set — the All Sites / Edit Sites website list will be empty until it's added to .env.");
 if (!GEMINI_KEYS.length) console.warn("⚠ GEMINI_KEYS not set — all AI features (CRO, prompt, bind, QC) will fail.");
@@ -1804,18 +1814,26 @@ async function seoReportHtml(brand, a, dirName) {
 // MasterDesignAgent). Works on a live URL (adds a screenshot for vision) or on
 // raw HTML (beta site, not hosted). Same rubric both ways → fair before/after.
 const CRO_WEIGHTS = { vision: 0.2, ux: 0.3, cro: 0.35, content: 0.15 };
-async function croScreenshot(url) {
+// Shared by the CRO audit (which wants base64 for Gemini vision) and the TED
+// outcome comment (which wants the raw bytes to upload). `extra` appends
+// microlink params — the audit takes the default full-size PNG, TED needs a far
+// smaller JPEG because its comments store the image inline as base64 text.
+async function microlinkShot(url, extra = "", timeoutMs = 15000) {
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), 15000);   // don't let microlink hang the audit
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);   // don't let microlink hang the caller
   try {
-    const api = `https://api.microlink.io/?url=${encodeURIComponent(url)}&screenshot=true&meta=false&embed=screenshot.url`;
+    const api = `https://api.microlink.io/?url=${encodeURIComponent(url)}&screenshot=true&meta=false&embed=screenshot.url${extra}`;
     const r = await fetch(api, { signal: ctl.signal }); if (!r.ok) return null;
     const ct = r.headers.get("content-type") || "";
     if (!ct.startsWith("image")) return null;            // error/redirect, not an image
     const buf = Buffer.from(await r.arrayBuffer());
-    return buf.length > 1000 ? buf.toString("base64") : null;
+    return buf.length > 1000 ? { buf, contentType: ct } : null;
   } catch (e) { return null; }
   finally { clearTimeout(timer); }
+}
+async function croScreenshot(url) {
+  const shot = await microlinkShot(url);
+  return shot ? shot.buf.toString("base64") : null;
 }
 async function croAudit(src) {
   let html = src.html || "", shotB64 = null, label = src.label || src.url || "page";
@@ -2997,14 +3015,28 @@ function tedRequestComment({ site, addr, subject, instruction, jobId }) {
 // contract as notify() and postStatus(): never awaited, never throws, and a
 // TED outage can only cost us the comment — the edit job and the reply to the
 // requester have already happened by the time this runs.
-function tedComment(text, attempt = 0) {
+// `image` is optional {buf, contentType}. With one, the comment goes as
+// multipart/form-data under the field name `files` — TED ignores `file` and
+// `attachments` silently — and Content-Type is deliberately left unset so fetch
+// can add the multipart boundary.
+function tedComment(text, image = null, attempt = 0) {
   if (!TED_API_TOKEN || !text) return;
-  const headers = { "Content-Type": "application/json" };
+  const headers = {};
   if (TED_AUTH_HEADER === "x-api-key") headers["X-Api-Key"] = TED_API_TOKEN;
   else headers["Authorization"] = "Bearer " + TED_API_TOKEN;
-  fetch(`${TED_BASE}/api/tasks/${TED_REVISIONS_TASK_ID}/comments`, {
-    method: "POST", headers, body: JSON.stringify({ text }),
-  })
+
+  let body;
+  if (image) {
+    const ext = /png/i.test(image.contentType) ? "png" : "jpg";
+    body = new FormData();
+    body.append("text", text);
+    body.append("files", new Blob([image.buf], { type: image.contentType }), `studio-change.${ext}`);
+  } else {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify({ text });
+  }
+
+  fetch(`${TED_BASE}/api/tasks/${TED_REVISIONS_TASK_ID}/comments`, { method: "POST", headers, body })
     .then((r) => {
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       // TED serves its Angular shell for any /api route it does not register —
@@ -3013,15 +3045,58 @@ function tedComment(text, attempt = 0) {
       if (/html/i.test(r.headers.get("content-type") || "")) throw new Error("endpoint not deployed (got the TED web app, not the API)");
     })
     .catch((e) => {
+      // Losing the screenshot must never cost us the message: an upload that
+      // fails is retried once as text, which is the part that actually matters.
+      if (image) {
+        console.error(`TED screenshot upload failed (${e.message}) — posting the comment without it`);
+        return tedComment(text, null, attempt);
+      }
       // A dead token, a wrong header or a missing route are all settled facts —
       // retrying three more times would only delay the log line that says so.
       const fatal = /HTTP 40[13]|not deployed/.test(e.message);
       if (!fatal && attempt < G99_RETRY_DELAYS_MS.length) {
-        setTimeout(() => tedComment(text, attempt + 1), G99_RETRY_DELAYS_MS[attempt]);
+        setTimeout(() => tedComment(text, null, attempt + 1), G99_RETRY_DELAYS_MS[attempt]);
       } else {
         console.error(`TED comment on task ${TED_REVISIONS_TASK_ID} failed:`, e.message);
       }
     });
+}
+
+// The other half of the loop: the request comment says what was asked for, this
+// says how it ended. Both carry the same job id so they read as a pair.
+function tedOutcomeComment(job, outcome) {
+  const P = (job && job.payload) || {};
+  const head = outcome.ok
+    ? `Change is live — ${P.businessName || "site"}`
+    : `Change could not be completed — ${P.businessName || "site"}`;
+  return [
+    head,
+    `Studio job: ${job.draftId}`,
+    outcome.ok && P.liveUrl ? P.liveUrl : "",
+    "",
+    outcome.detail,
+  ].filter((l, i) => l !== "" || i === 3).join("\n");
+}
+
+// Fired after a job finishes, never awaited by it. The wait exists because the
+// deploy lands a moment after the merge and a screenshot taken immediately would
+// show the old page — worse than no screenshot at all.
+function tedPostOutcome(job, outcome) {
+  const P = (job && job.payload) || {};
+  // Only requests that arrived by email were announced to TED in the first
+  // place, so only those get an outcome. Same guard queueEmailReply() uses.
+  if (!TED_API_TOKEN || P.source !== "email") return;
+  const text = tedOutcomeComment(job, outcome);
+  if (!outcome.ok || !TED_SCREENSHOTS || !P.liveUrl) return tedComment(text);
+  setTimeout(async () => {
+    let image = null;
+    try {
+      const shot = await microlinkShot(P.liveUrl, TED_SHOT_PARAMS, 25000);
+      if (shot && shot.buf.length <= TED_SHOT_MAX_BYTES) image = shot;
+      else if (shot) console.warn(`TED screenshot ${(shot.buf.length / 1024).toFixed(0)}KB exceeds the inline limit — posting without it`);
+    } catch (e) { /* text still goes out below */ }
+    tedComment(text, image);
+  }, TED_SHOT_DELAY_MS);
 }
 
 // ---- G99 status callback ------------------------------------------------------
@@ -4431,6 +4506,9 @@ async function runEditJob(job) {
       "The change is live now " + String.fromCharCode(8212) + " " + (job.editSummary || "your requested update").trim(),
       P.liveUrl ? "\n" + P.liveUrl : "",
     ].join("\n").trim());
+    // Same news to TED, with a screenshot of the updated page. Detached: it
+    // waits for the deploy to land, and the job is finished by then.
+    tedPostOutcome(job, { ok: true, detail: (job.editSummary || "Your requested update.").trim() });
     // Anything skipped has to be said out loud — otherwise "done" reads as "all
     // of it done". Two ways an item can be missing: too vague to attempt, or
     // attempted and not found in the diff afterwards.
@@ -4454,6 +4532,9 @@ async function runEditJob(job) {
         "",
         "Nothing was changed on the live site. A developer will need to take a look.",
       ].join("\n"));
+      // A request logged in TED with no outcome reads as still in progress, so
+      // failures are reported there too. No screenshot — nothing changed.
+      tedPostOutcome(job, { ok: false, detail: String(e.message).slice(0, 300) + "\n\nNothing was changed on the live site." });
       notify(`❌ Edit failed for *${job.businessName}*: ${e.message}`);
     }
   } finally {
