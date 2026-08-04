@@ -47,6 +47,7 @@ it *would* do without touching a repo.
 | `TED_AUTH_HEADER` | `bearer` (default) or `x-api-key`. |
 | `TED_SHOT_DELAY_MS` | Wait before screenshotting the live site. Default `60000`. |
 | `TED_SCREENSHOTS` | `on` (default) / `off` — keeps the outcome comment, drops the image. |
+| `MICROLINK_API_KEY` | Screenshot quota. **Unset, the limit is 25/day per calling IP** — fine locally, spent by other tenants on a shared host. |
 
 ## How an email becomes a change
 
@@ -97,6 +98,13 @@ TED stores a comment image *inline as base64 in the comment's own text* rather
 than as an attachment, so size is a text-length problem: around 1.5MB inlined
 returns a 500. Captures are jpeg/q40/900px, roughly 90KB. An upload that fails
 still posts the comment without the image.
+
+**A comment that arrives with no picture is not a bug in TED.** The capture is
+the fragile step: without `MICROLINK_API_KEY` the quota is 25 per day counted
+against whichever IP is calling, so it works every time from a laptop and fails
+on a shared host whose allowance other tenants have already spent. Every failure
+now names itself in the log — `screenshot of … failed: HTTP 429 (microlink daily
+quota spent for this IP)` — and the comment still goes out without the image.
 
 The task id is hard-coded for now. `GET /api/tasks/all?client=<name>` takes a
 client filter, so resolving the right task per website is the obvious next step.

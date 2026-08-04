@@ -62,6 +62,11 @@ const TED_SCREENSHOTS = (process.env.TED_SCREENSHOTS || "on").toLowerCase() !== 
 // jpeg/q40/900px lands around 90KB, well under whatever the real ceiling is.
 const TED_SHOT_PARAMS = "&type=jpeg&quality=40&viewport.width=900";
 const TED_SHOT_MAX_BYTES = 400 * 1024;
+// Optional, but effectively required once deployed: microlink's free quota is
+// 25/day counted per calling IP, and a shared host's IP is spent by other
+// tenants long before we get to it. Unset works fine locally and fails on
+// Render for reasons no log used to explain. Also used by the CRO audit.
+const MICROLINK_API_KEY = process.env.MICROLINK_API_KEY || "";
 if (!API_KEY) console.warn("⚠ STITCH_API_KEY not set — Stitch generation will fail. Add it to .env or the platform env vars.");
 if (!NOCODB_TOKEN) console.warn("⚠ NOCODB_TOKEN not set — the All Sites / Edit Sites website list will be empty until it's added to .env.");
 if (!GEMINI_KEYS.length) console.warn("⚠ GEMINI_KEYS not set — all AI features (CRO, prompt, bind, QC) will fail.");
@@ -1823,12 +1828,28 @@ async function microlinkShot(url, extra = "", timeoutMs = 15000) {
   const timer = setTimeout(() => ctl.abort(), timeoutMs);   // don't let microlink hang the caller
   try {
     const api = `https://api.microlink.io/?url=${encodeURIComponent(url)}&screenshot=true&meta=false&embed=screenshot.url${extra}`;
-    const r = await fetch(api, { signal: ctl.signal }); if (!r.ok) return null;
+    // Without a key the quota is 25/day and counted against the *caller's IP* —
+    // which on a shared host is spent by strangers, so captures fail there while
+    // working perfectly from a laptop. A key moves the quota to the account.
+    const headers = MICROLINK_API_KEY ? { "x-api-key": MICROLINK_API_KEY } : {};
+    const r = await fetch(api, { signal: ctl.signal, headers });
+    const left = r.headers.get("x-rate-limit-remaining");
+    if (!r.ok) {
+      // Every one of these used to return null silently, which is why a missing
+      // screenshot was impossible to explain from the logs.
+      console.warn(`screenshot of ${url} failed: HTTP ${r.status}${r.status === 429 ? " (microlink daily quota spent for this IP)" : ""}${left != null ? ` · ${left} left` : ""}`);
+      return null;
+    }
     const ct = r.headers.get("content-type") || "";
-    if (!ct.startsWith("image")) return null;            // error/redirect, not an image
+    if (!ct.startsWith("image")) { console.warn(`screenshot of ${url} failed: got ${ct || "no content-type"}, not an image`); return null; }
     const buf = Buffer.from(await r.arrayBuffer());
-    return buf.length > 1000 ? { buf, contentType: ct } : null;
-  } catch (e) { return null; }
+    if (buf.length <= 1000) { console.warn(`screenshot of ${url} failed: ${buf.length} bytes is not a real image`); return null; }
+    if (left != null && Number(left) <= 3) console.warn(`microlink quota nearly spent: ${left} screenshot(s) left today`);
+    return { buf, contentType: ct };
+  } catch (e) {
+    console.warn(`screenshot of ${url} failed: ${e.name === "AbortError" ? `no response in ${timeoutMs}ms` : e.message}`);
+    return null;
+  }
   finally { clearTimeout(timer); }
 }
 async function croScreenshot(url) {
@@ -3094,7 +3115,10 @@ function tedPostOutcome(job, outcome) {
       const shot = await microlinkShot(P.liveUrl, TED_SHOT_PARAMS, 25000);
       if (shot && shot.buf.length <= TED_SHOT_MAX_BYTES) image = shot;
       else if (shot) console.warn(`TED screenshot ${(shot.buf.length / 1024).toFixed(0)}KB exceeds the inline limit — posting without it`);
-    } catch (e) { /* text still goes out below */ }
+    } catch (e) { console.warn("TED screenshot failed:", e.message); }
+    // Say so explicitly. The comment still goes out either way, and a picture
+    // that is merely absent looks identical to one that was never wanted.
+    if (!image) console.warn(`TED outcome for ${job.draftId} posting without a screenshot${MICROLINK_API_KEY ? "" : " — MICROLINK_API_KEY is unset, so the quota is this host's shared IP"}`);
     tedComment(text, image);
   }, TED_SHOT_DELAY_MS);
 }
