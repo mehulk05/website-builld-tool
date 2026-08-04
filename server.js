@@ -42,6 +42,16 @@ const GEMINI_KEYS = (process.env.GEMINI_KEYS || "").split(",").map(s => s.trim()
 const NOCODB_BASE = (process.env.NOCODB_BASE || "https://app.nocodb.com").replace(/\/$/, "");
 const NOCODB_TOKEN = process.env.NOCODB_TOKEN || "";
 const NOCODB_TABLE = process.env.NOCODB_TABLE || "mp8nfno2six11yi";
+// TED — where an inbound email request is logged for the delivery team. Off
+// until TED_API_TOKEN is set, so nothing changes for a deployment without one.
+const TED_BASE = (process.env.TED_BASE || "https://ted.growth99.com").replace(/\/$/, "");
+const TED_API_TOKEN = process.env.TED_API_TOKEN || "";
+// The one task every email request is filed against, until we look the right
+// task up per client. Env-overridable so moving it is not a code change.
+const TED_REVISIONS_TASK_ID = process.env.TED_REVISIONS_TASK_ID || "9078";
+// The API docs cover Bearer JWTs from Google sign-in but never say how a
+// personal API token is presented. If Bearer 401s, flip this to x-api-key.
+const TED_AUTH_HEADER = (process.env.TED_AUTH_HEADER || "bearer").toLowerCase();
 if (!API_KEY) console.warn("⚠ STITCH_API_KEY not set — Stitch generation will fail. Add it to .env or the platform env vars.");
 if (!NOCODB_TOKEN) console.warn("⚠ NOCODB_TOKEN not set — the All Sites / Edit Sites website list will be empty until it's added to .env.");
 if (!GEMINI_KEYS.length) console.warn("⚠ GEMINI_KEYS not set — all AI features (CRO, prompt, bind, QC) will fail.");
@@ -2359,6 +2369,51 @@ function notify(text) {
   const url = process.env.SLACK_WEBHOOK_URL || "";
   if (!url) return;
   fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) }).catch(() => {});
+}
+
+// What the team reads in TED. The request itself is the point, but a comment
+// with no provenance is unactionable — who asked, for which site, and which
+// Studio run to look at when they want the diff.
+function tedRequestComment({ site, addr, subject, instruction, jobId }) {
+  return [
+    `Website change request — ${site.businessName}`,
+    `From: ${addr}`,
+    `Subject: ${subject || "(none)"}`,
+    `Studio job: ${jobId} · queued, held for approval before merge`,
+    "",
+    instruction,
+  ].join("\n");
+}
+
+// Comment on the TED task that tracks beta site revisions. Same fail-soft
+// contract as notify() and postStatus(): never awaited, never throws, and a
+// TED outage can only cost us the comment — the edit job and the reply to the
+// requester have already happened by the time this runs.
+function tedComment(text, attempt = 0) {
+  if (!TED_API_TOKEN || !text) return;
+  const headers = { "Content-Type": "application/json" };
+  if (TED_AUTH_HEADER === "x-api-key") headers["X-Api-Key"] = TED_API_TOKEN;
+  else headers["Authorization"] = "Bearer " + TED_API_TOKEN;
+  fetch(`${TED_BASE}/api/tasks/${TED_REVISIONS_TASK_ID}/comments`, {
+    method: "POST", headers, body: JSON.stringify({ text }),
+  })
+    .then((r) => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      // TED serves its Angular shell for any /api route it does not register —
+      // index.html with a 200, not a 404. Without this check a missing endpoint
+      // looks like a successful post and the comment is silently dropped.
+      if (/html/i.test(r.headers.get("content-type") || "")) throw new Error("endpoint not deployed (got the TED web app, not the API)");
+    })
+    .catch((e) => {
+      // A dead token, a wrong header or a missing route are all settled facts —
+      // retrying three more times would only delay the log line that says so.
+      const fatal = /HTTP 40[13]|not deployed/.test(e.message);
+      if (!fatal && attempt < G99_RETRY_DELAYS_MS.length) {
+        setTimeout(() => tedComment(text, attempt + 1), G99_RETRY_DELAYS_MS[attempt]);
+      } else {
+        console.error(`TED comment on task ${TED_REVISIONS_TASK_ID} failed:`, e.message);
+      }
+    });
 }
 
 // ---- G99 status callback ------------------------------------------------------
@@ -4759,6 +4814,9 @@ const server = http.createServer(async (req, res) => {
       });
       logEmailRequest({ from, subject, messageId: body.messageId || null, status: "queued", siteId: site.siteId, matchedBy: hit.how, instruction, jobId: job.draftId });
       notify(`📧 Email request from ${addr} → *${site.businessName}*: ${instruction.slice(0, 140)} (needs your approval before merge)`);
+      // File it in TED for the delivery team. Only accepted requests reach this
+      // line — every decline returned above, and so did the dry run.
+      tedComment(tedRequestComment({ site, addr, subject, instruction, jobId: job.draftId }));
       // Echoing the parsed instruction back is the cheapest guard against a
       // misread: the sender sees what will actually be done before it ships.
       // The first of only two messages the requester ever gets. Deliberately
