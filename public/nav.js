@@ -321,6 +321,62 @@
     };
   }
 
+  // Which ledger events a given pipeline step is responsible for producing. Declared, not guessed:
+  // this is what lets the UI show "expected but never emitted" — the state that explains an open TED
+  // task — rather than only showing what did happen.
+  //
+  // service_pages is the enrich run: it writes the service-page content AND captures the mockups,
+  // so both events belong to that step. WEBSITE_BUILD_COMPLETED is emitted when the job finishes,
+  // which is the same moment, but it is listed against the job rather than a step (stepFor = null)
+  // so a build that ends early still shows it as missing in the right place.
+  const STEP_EVENTS = {
+    service_pages: ["SERVICE_PAGES_CREATED", "MOCKUPS_CAPTURED"],
+  };
+  const EVENT_LABEL = {
+    WEBSITE_BUILD_TRIGGERED: "Build accepted",
+    WEBSITE_BUILD_QUEUED: "Build queued",
+    WEBSITE_BUILD_RUNNING: "Build running",
+    WEBSITE_BUILD_COMPLETED: "Build completed",
+    WEBSITE_BUILD_FAILED: "Build failed",
+    WEBSITE_BUILD_CANCELLED: "Build cancelled",
+    SERVICE_PAGES_CREATED: "Content created",
+    MOCKUPS_CAPTURED: "Mockups captured",
+  };
+  // TED closes these tasks off these events. Naming the task makes the panel answer the question
+  // people actually arrive with ("mockup ka ticket band kyun nahi hua").
+  const EVENT_TASK = {
+    SERVICE_PAGES_CREATED: "content.create",
+    MOCKUPS_CAPTURED: "mockup.create",
+    WEBSITE_BUILD_COMPLETED: "beta_site.develop",
+    WEBSITE_BUILD_FAILED: "beta_site.develop",
+  };
+
+  /**
+   * Events to show against one pipeline step: those actually emitted while the job was on it, plus
+   * any this step owes that never arrived.
+   *
+   * A step that is still pending owes nothing yet — showing "missing" there would cry wolf on every
+   * running build. Only a finished step can be missing an event.
+   */
+  function stepEmissions(job, stepIndex, stepKey, stepStatus) {
+    if (!job || job.type !== "build") return [];
+    const log = (job.emit && job.emit.eventLog) || {};
+    const out = [];
+    for (const [type, rec] of Object.entries(log)) {
+      if (rec && rec.step === stepIndex) {
+        out.push({ type, label: EVENT_LABEL[type] || type, task: EVENT_TASK[type] || null,
+                   at: rec.at, state: "ok" });
+      }
+    }
+    for (const type of STEP_EVENTS[stepKey] || []) {
+      if (!log[type] && stepStatus === "done") {
+        out.push({ type, label: EVENT_LABEL[type] || type, task: EVENT_TASK[type] || null,
+                   at: null, state: "missing" });
+      }
+    }
+    return out;
+  }
+
   // ------------------------------------------------------------ job mapping
   // Both build and edit jobs carry a `steps[]` of {label,status,detail}; every
   // screen that shows a run derives its pill / bar / caption from these three.
@@ -368,7 +424,7 @@
     esc, avatarColor, initials, host, thumbBg, croColor, croInk, deltaInk, relTime, toast,
     ensureAuth, getJSON, postJSON, IC, svg, confirm: confirmAction,
     jobProgress, jobState, jobCost, jobStepLabel, isActiveJob, siteJobs, siteStatus,
-    emitHops,
+    emitHops, stepEmissions,
   };
 
   // ------------------------------------------------------------ shell chrome

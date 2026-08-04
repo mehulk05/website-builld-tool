@@ -325,3 +325,15 @@ input::placeholder, textarea::placeholder { color: var(--muted); }
        overflow-wrap: anywhere; }
 .ehr.bad .ehv { color: var(--bad-ink); }
 .ehr .eht { font-weight: 650; }
+
+/* ---- per-step event emission (inside the pipeline) ------------------------ */
+/* Deliberately quieter than the step label above it: this is evidence attached to the step, not
+   another headline competing with it. */
+.sev { margin-top: 7px; display: grid; gap: 3px; }
+.sev-row { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; font-size: 11.5px; color: var(--ink-3); }
+.sev-row .dot { flex: none; }
+.sev-row .sev-n { font-weight: 650; color: var(--ink); }
+.sev-row .sev-t { font-size: 10.5px; color: var(--muted); background: var(--line-2); padding: 0 5px; }
+.sev-row .sev-k { font-size: 10.5px; color: var(--accent); background: var(--accent-soft); padding: 0 5px; }
+.sev-row .sev-w { margin-left: auto; color: var(--muted); }
+.sev-row.missing .sev-n, .sev-row.missing .sev-w { color: var(--bad-ink); }

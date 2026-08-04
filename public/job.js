@@ -3,6 +3,7 @@
 "use strict";
 
 const { esc, avatarColor, initials, croColor, relTime, toast, getJSON, postJSON, emitHops,
+        stepEmissions,
         ensureAuth, svg, jobState, jobCost } = window.G99;
 
 const $ = (id) => document.getElementById(id);
@@ -49,6 +50,22 @@ function pageRows(j, live) {
     return `<div class="pg ${status}"><span class="dot ${dot}"></span><span class="pgn">${esc(label)}</span><span class="pgs">${esc(right)}</span></div>`;
   }).join("")}</div></div>`;
 }
+// One line per event this step put on the ledger — with the time, and the TED task it closes.
+// Rendered on the step itself because "kaunsa event kab nikla" is a question about a step, and a
+// list at the bottom of the page cannot answer it.
+function stepEvents(j, i, s) {
+  const evs = stepEmissions(j, i, s.key, s.status);
+  if (!evs.length) return "";
+  return `<div class="sev">${evs.map((e) => `
+    <div class="sev-row ${e.state}">
+      <span class="dot ${e.state === "ok" ? "done" : "error"}"></span>
+      <span class="sev-n">${esc(e.label)}</span>
+      <code class="sev-t">${esc(e.type)}</code>
+      ${e.task ? `<span class="sev-k" title="TED task closed by this event">${esc(e.task)}</span>` : ""}
+      <span class="sev-w">${e.at ? esc(relTime(e.at)) : "never emitted"}</span>
+    </div>`).join("")}</div>`;
+}
+
 function stepper(j) {
   const ic = { done: svg("check", 13, 3), running: `<span class="spin" style="margin:0;border-color:var(--accent);border-top-color:transparent"></span>`, error: svg("close", 13, 3), pending: "" };
   const isBuild = j.type !== "edit" && j.type !== "enrich" && j.type !== "restore";
@@ -56,6 +73,7 @@ function stepper(j) {
     let extra = "";
     if (isBuild && i === 1 && s.status !== "pending") extra = brandBlock(j);
     if (isBuild && i === 2 && s.status !== "pending") extra = pageRows(j, s.status === "running");
+    extra += stepEvents(j, i, s);
     return `
     <div class="jstep ${s.status}">
       <span class="ic">${ic[s.status] || ""}</span>

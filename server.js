@@ -2026,6 +2026,9 @@ function loadJobs() {
       // list forever, behind a button that couldn't do anything. Clearing it
       // here also heals records written before this was fixed.
       if (j.status !== "running" && j.status !== "queued") j.awaitingApproval = false;
+      // Jobs that ran before eventLog existed still have their callback history; derive the
+      // per-step event view from it so old runs are not blank.
+      backfillEventLog(j);
       JOBS.set(j.draftId, j);
     }
     // Write the healed records straight back, so the file doesn't keep the bad
@@ -3109,10 +3112,30 @@ function emitAudit(job) {
     job.emit = {
       productService: { state: "pending", at: null, attempts: 0, httpStatus: null, error: null },
       ted: { state: "pending", at: null, events: [], error: null },
+      // type -> { at, step, status }: when each ledger event was FIRST written, and which pipeline
+      // step the job was on at the time. First write wins — a later duplicate callback must not
+      // move the timestamp, or "when did content creation emit" answers with the wrong moment.
+      eventLog: {},
       history: [],
     };
   }
+  if (!job.emit.eventLog) job.emit.eventLog = {};   // jobs recorded before this existed
   return job.emit;
+}
+
+// Rebuild eventLog from the callback history for jobs that ran before it existed. The history
+// already carries {at, step, events} per attempt, so the per-step view works retroactively instead
+// of being blank until the next build — which would be exactly when nobody needs it.
+// First occurrence wins, matching how the live path records it.
+function backfillEventLog(job) {
+  if (!job || !job.emit || !Array.isArray(job.emit.history)) return;
+  const log = job.emit.eventLog || (job.emit.eventLog = {});
+  for (const h of job.emit.history) {
+    if (!h || !Array.isArray(h.events)) continue;
+    for (const type of h.events) {
+      if (!log[type]) log[type] = { at: h.at, step: h.step, status: h.status };
+    }
+  }
 }
 
 function noteEmit(job, patch) {
@@ -3198,6 +3221,11 @@ function postStatus(job, attempt = 0) {
         ted.at = at;
         ted.error = null;
         ted.events = [...new Set([...(a.ted.events || []), ...events])];
+        for (const type of events) {
+          if (!a.eventLog[type]) {
+            a.eventLog[type] = { at, step: snapshot.currentStep, status: snapshot.status };
+          }
+        }
       }
       // applied=true with an empty event list means "accepted, nothing new to read". Leave whatever
       // earlier callbacks established — a later duplicate must not undo a written event.
