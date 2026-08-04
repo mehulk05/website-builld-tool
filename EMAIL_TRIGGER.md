@@ -45,6 +45,8 @@ it *would* do without touching a repo.
 | `TED_BASE` | Default `https://ted.growth99.com`. |
 | `TED_REVISIONS_TASK_ID` | Task the requests are filed against. Default `9078`. |
 | `TED_AUTH_HEADER` | `bearer` (default) or `x-api-key`. |
+| `TED_SHOT_DELAY_MS` | Wait before screenshotting the live site. Default `60000`. |
+| `TED_SCREENSHOTS` | `on` (default) / `off` — keeps the outcome comment, drops the image. |
 
 ## How an email becomes a change
 
@@ -81,6 +83,20 @@ reaches TED, so the task does not fill up with noise. Posting is fail-soft and
 happens after the job is queued and the acknowledgement is written: TED being
 down or misconfigured costs the comment and nothing else. Failures are a
 `console.error`, never a 5xx to the mailbox.
+
+When the job finishes, the same task gets a second comment saying how it ended —
+live, or failed and why — carrying the same Studio job id so the two read as a
+pair. A successful one attaches a screenshot of the page above the fold.
+
+That capture is detached and runs a minute after the merge (`TED_SHOT_DELAY_MS`).
+The delay is not tuning: the deploy lands slightly after the merge, and there is
+no way to detect it, because the live page returns different markup on every
+request — a before/after comparison reports "changed" the first time it looks.
+
+TED stores a comment image *inline as base64 in the comment's own text* rather
+than as an attachment, so size is a text-length problem: around 1.5MB inlined
+returns a 500. Captures are jpeg/q40/900px, roughly 90KB. An upload that fails
+still posts the comment without the image.
 
 The task id is hard-coded for now. `GET /api/tasks/all?client=<name>` takes a
 client filter, so resolving the right task per website is the obvious next step.
