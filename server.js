@@ -335,24 +335,94 @@ async function generate(prompt, deviceType) {
 
 // -------------------------------------------- Mockup screenshots of the NEW site
 // G99's "Mockup Creation" task wants a visual of the finished beta site: Home, one service page,
-// About and Contact. Captured with microlink (no API key, same service analyzeExistingSite uses)
-// and returned as base64 data URIs rather than links — microlink's own URLs expire, and this
-// server's disk is wiped on every redeploy, so a stored link would 404 within days. Inlining makes
-// the image durable wherever it finally lands.
-const MOCKUP_MAX_BYTES = 1_500_000;   // ~1.5MB/page; 4 pages stays comfortably postable
+// About and Contact. Returned as base64 data URIs rather than links, for two reasons: this server's
+// disk is wiped on every redeploy, and a screenshot SERVICE url re-renders the page on each request —
+// so months later it would show today's site, not the one that was reviewed. Inlining freezes the
+// evidence at the moment the task closed.
+//
+// thum.io, not microlink. microlink's keyless tier failed all four targets on the first real run:
+// ETIMEOUT after 28s on two, an HTML error page (Cloudflare) on the others, and it rate-limits by IP.
+// thum.io needs no key, answers in ~4s, and returned a full-quality image for all four.
+// Captured via Google PageSpeed Insights, which runs Lighthouse and returns
+// `fullPageScreenshot` — the whole page rendered at a 1350px desktop viewport, as WebP.
+//
+// Why PSI and not a screenshot service. Three were tried against a real beta site and all failed:
+//   * thum.io `width/N`  -> an N x N SQUARE viewport crop. On a site whose hero is `min-h-[90vh]`
+//                           that is hero-only, so all four review shots looked like one image.
+//   * thum.io `fullpage` -> sets the viewport height to the document height, so `90vh` resolves
+//                           against the whole page and the hero swallows ~90% of it. Raising the
+//                           crop does not help: the ratio is fixed (verified at 2400 and 3600).
+//   * microlink keyless  -> ETIMEOUT at 28s, rate-limits by IP, and silently ignores
+//                           `screenshot.fullPage` / `screenshot.type` (paid features).
+// PSI is free (25k/day with a key), answers in ~13s, and returns ~60KB of WebP instead of ~2MB of
+// PNG — which matters because these are inlined into a task comment.
+//
+// KNOWN LIMITATION: Lighthouse also expands the viewport to capture the full page, so a `90vh` hero
+// still renders taller than a visitor would see. Every hosted API shares this; only a headless
+// Chrome using captureBeyondViewport gets the proportions right. The trade accepted here is an
+// exaggerated hero in exchange for seeing every section, at 1/30th the bytes.
+const PSI_ENDPOINT = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed";
+const PSI_API_KEY = process.env.PSI_API_KEY || "";
+// Per image, RAW bytes. A PSI WebP is ~60KB, so this is a generous sanity bound rather than a
+// real constraint — the 1.5MB ceiling it replaces was the sole reason Home failed on the first run.
+const MOCKUP_MAX_BYTES = 3_000_000;
+
+/**
+ * Retries per page. Two independent transient failures make this mandatory rather than defensive:
+ *   * PSI itself is flaky under repeated calls — "Lighthouse returned error: Something went wrong"
+ *     hit 3 of 4 pages in one sweep, and the same URLs succeeded moments earlier.
+ *   * the page may not have finished deploying, so the pre-flight legitimately sees a 404 for a
+ *     service page that appears a few seconds later.
+ * Backoff is generous because both causes resolve on the order of seconds, not milliseconds.
+ */
+const MOCKUP_RETRY_DELAYS_MS = [4000, 10000, 20000];
 
 async function captureMockup(label, url) {
+  let last = null;
+  for (let attempt = 0; attempt <= MOCKUP_RETRY_DELAYS_MS.length; attempt++) {
+    if (attempt) await sleep(MOCKUP_RETRY_DELAYS_MS[attempt - 1]);
+    last = await captureMockupOnce(label, url);
+    if (last.dataUri) return last;
+    // A missing key is configuration, not weather — retrying cannot fix it.
+    if (last.error && last.error.includes("PSI_API_KEY")) return last;
+  }
+  return last;
+}
+
+async function captureMockupOnce(label, url) {
+  if (!PSI_API_KEY) return { label, url, error: "PSI_API_KEY not configured" };
   try {
-    const api = `https://api.microlink.io/?url=${encodeURIComponent(url)}&screenshot=true&meta=false`;
-    const meta = await (await fetch(api)).json();
-    const shotUrl = meta?.data?.screenshot?.url;
-    if (!shotUrl) return { label, url, error: "no screenshot returned" };
-    const buf = Buffer.from(await (await fetch(shotUrl)).arrayBuffer());
-    if (buf.length > MOCKUP_MAX_BYTES) {
-      // Don't silently ship something that will be rejected downstream — say so instead.
-      return { label, url, error: `screenshot too large (${Math.round(buf.length / 1024)}KB)` };
+    // Pre-flight the PAGE itself. A WordPress 404 is a styled page that screenshots perfectly, so
+    // without this a service page that hadn't finished deploying would be attached as if it were
+    // real evidence — worse than reporting nothing, because it looks convincing.
+    const page = await fetch(url, { redirect: "follow" });
+    if (!page.ok) return { label, url, error: `page returned HTTP ${page.status}` };
+
+    const api = `${PSI_ENDPOINT}?url=${encodeURIComponent(url)}&key=${PSI_API_KEY}`
+      + `&strategy=desktop&category=performance`;
+    const res = await fetch(api);
+    // Check the type before touching the body: parsing an HTML error page as JSON is how the first
+    // run lost two captures to a useless "Unexpected token '<'".
+    const ctype = (res.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+    if (!ctype.includes("json")) {
+      return { label, url, error: `PSI returned ${ctype || "no content-type"} (HTTP ${res.status})` };
     }
-    return { label, url, dataUri: `data:image/png;base64,${buf.toString("base64")}` };
+    const body = await res.json();
+    if (body.error) {
+      return { label, url, error: `PSI: ${String(body.error.message || "").slice(0, 120)}` };
+    }
+    const shot = body?.lighthouseResult?.fullPageScreenshot?.screenshot;
+    const dataUri = shot?.data;
+    if (!dataUri || !dataUri.startsWith("data:image/")) {
+      return { label, url, error: "PSI returned no fullPageScreenshot" };
+    }
+    // PSI hands back a ready-made data URI, so there is nothing to re-encode.
+    const approxBytes = Math.floor((dataUri.length - dataUri.indexOf(",") - 1) * 3 / 4);
+    if (approxBytes > MOCKUP_MAX_BYTES) {
+      // Don't silently ship something that will be rejected downstream — say so instead.
+      return { label, url, error: `screenshot too large (${Math.round(approxBytes / 1024)}KB)` };
+    }
+    return { label, url, dataUri, width: shot.width || null, height: shot.height || null };
   } catch (e) {
     // Never fail the build for a mockup: the site is already live at this point.
     return { label, url, error: String(e.message || e).slice(0, 160) };
@@ -1329,6 +1399,36 @@ function readThemeBrand(themeDir) {
 // Stitch bakes its OWN font links into the page chrome and ignores the brand we
 // asked for — the real reason a generated site's type doesn't match. So state the
 // brand explicitly on every page instead of hoping the model complied.
+/**
+ * Replaces viewport-height section heights with fixed pixel heights.
+ *
+ * <p>Stitch emits full-bleed heroes as `min-h-[90vh]` / `h-screen`. Those look correct in a browser,
+ * but they make EVERY full-page screenshot tool useless: thum.io, microlink and Lighthouse/PSI all
+ * capture by expanding the viewport to the document height, so `90vh` then resolves against the whole
+ * page and the hero swallows ~90% of the image. Verified across all three, and raising the crop does
+ * not help — the ratio is fixed.
+ *
+ * <p>A fixed px height renders the same for a visitor on a typical laptop (90vh of a 800px viewport
+ * is ~720px) while making mockup captures readable, and it is kinder to short screens, where a 90vh
+ * hero pushes all content below the fold.
+ *
+ * <p>Deliberately a post-process rather than a prompt instruction: `stylingConstraint()` can only ask,
+ * and the model frequently ignores it. This is deterministic. Idempotent — px values are left alone.
+ */
+const VH_TO_PX = 8;   // 1vh ≈ 8px, i.e. an 800px-tall reference viewport
+
+function clampViewportHeights(html) {
+  if (!html) return html;
+  return String(html)
+    // Tailwind: h-screen / min-h-screen  (also the dvh/svh/lvh variants)
+    .replace(/\b(min-h|h)-screen\b/g, "$1-[720px]")
+    .replace(/\b(min-h|h)-\[(\d{1,3})(?:d|s|l)?vh\]/g,
+      (_m, p, v) => `${p}-[${Math.max(320, Math.round(Math.min(Number(v), 100) * VH_TO_PX))}px]`)
+    // Plain CSS inside <style> blocks
+    .replace(/(\b(?:min-height|height)\s*:\s*)(\d{1,3})(?:d|s|l)?vh\b/gi,
+      (_m, p, v) => `${p}${Math.max(320, Math.round(Math.min(Number(v), 100) * VH_TO_PX))}px`);
+}
+
 function enforceBrandFonts(html, composed) {
   const c = composed || {};
   const h = c.headingFont, b = c.bodyFont;
@@ -2996,7 +3096,15 @@ function postStatus(job, attempt = 0) {
   const body = JSON.stringify(jobStatusSnapshot(job));
   fetch(G99_STATUS_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Webhook-Secret": G99_STATUS_SECRET },
+    // Declare the charset explicitly. The briefs and mockup labels carry em-dashes and curly
+    // apostrophes, and RFC 8259 only makes UTF-8 the default for bare application/json — a receiver
+    // or proxy that falls back to ISO-8859-1 would double-encode every one of them. Spring happens
+    // to default to UTF-8 today, so this is hardening against a silent, hard-to-spot corruption
+    // rather than a fix for an observed one.
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "X-Webhook-Secret": G99_STATUS_SECRET,
+    },
     body,
   })
     .then((r) => {
@@ -4578,7 +4686,7 @@ async function generateServiceTemplate(svc, A, composed, ref, city, brief) {
 // Shared post-processing for Gemini-generated service pages: same image pipeline
 // as the Stitch path, so a fallback page is never blurrier than a Stitch one.
 async function polishServiceHtml(html, composed) {
-  let h = enforceBrandFonts(html, composed);
+  let h = clampViewportHeights(enforceBrandFonts(html, composed));
   h = sharpenStitchImages(h);
   h = await fixImages(h);
   const qc = await qcImageResolution(h);
@@ -5235,7 +5343,9 @@ async function runEnrichJob(job) {
         // the URL asks for full resolution, and enrich skipped the sharpener.
         job.imageReport = job.imageReport || {};
         for (const r of okStitch) {
-          let h = enforceBrandFonts(r.html, composed); // Stitch ignores our fonts — state them
+          // clampViewportHeights: Stitch's `min-h-[90vh]` hero makes every full-page screenshot
+          // tool render the hero at ~90% of the image — see the function's comment.
+          let h = clampViewportHeights(enforceBrandFonts(r.html, composed)); // Stitch ignores our fonts
           h = sharpenStitchImages(h);                 // 512px thumb -> native 1600px
           h = await fixImages(h);                     // drop broken/expiring URLs
           h = await qcStitchImages(h);                // swap text-baked images
@@ -5331,6 +5441,11 @@ async function runEnrichJob(job) {
       jobStep(job, 3, "done", `Dry run — wrote ${changed.length} file(s) to ${themeAbs}`);
       jobStep(job, 4, "done", "skipped (dry run)");
       jobStep(job, 5, "done", "skipped (dry run)");
+      // Returning here also skips captureMockups and mirrorToParent below. That is correct — a dry
+      // run never deploys, so there is no live page to screenshot and nothing G99 should be told
+      // about — but it is worth stating, because it means a dry run cannot be used to exercise the
+      // mockup path, and the skip is otherwise invisible.
+      job.mockups = [];
       job.status = "done";
       notify(`✨ [dry run] Enrich preview for *${job.businessName}*: ${services.length} service pages + brand guide`);
       return;
@@ -7279,10 +7394,20 @@ const server = http.createServer(async (req, res) => {
         const job = enqueueEnrichJob({
           jobId: (isDry ? "enrich-dry-" : "enrich-") + Date.now(), dryRun: isDry,
           siteId: body0.siteId || themeSlug, businessName: body0.businessName || answers.business_name || "Site",
-          githubRepo: WP_REPO, themeSlug, themePath: "web/app/themes/" + themeSlug,
+          // githubRepo overridable: WP_REPO is a single shared default, so without this an ops re-run
+          // of ONE client's enrichment opens a PR on whatever site WP_REPO happens to point at —
+          // a different client's repo. Naming the repo keeps a re-run on its own site.
+          githubRepo: body0.githubRepo || WP_REPO,
+          themeSlug, themePath: "web/app/themes/" + themeSlug,
           muPath: "web/app/mu-plugins/g99-activate-" + themeSlug.replace(/^g99-/, "") + ".php",
           answers, composed, referenceWebsite: body0.referenceWebsite || "",
           existingWebsite: body0.existingWebsite || "",
+          // Needed to screenshot the right site: captureMockups reads job.liveUrl first, and
+          // without it the run falls back to the LIVE_URL env default.
+          liveUrl: body0.liveUrl || "",
+          // Opt in to mirroring the outcome back to a parent build (and therefore to G99/TED).
+          // Absent by default, so an ops re-run stays local unless it explicitly asks to report.
+          parentDraftId: body0.parentDraftId || null,
         });
         return json(res, 202, { jobId: job.draftId, dryRun: isDry, monitor: "/jobs" });
       }
@@ -7612,7 +7737,7 @@ const server = http.createServer(async (req, res) => {
       const built = await buildStitchSite(pages.map(pg => ({ key: pg.key.replace(/[^a-z0-9_-]/gi, ""), prompt: pg.prompt + "\n\n" + designTokensBlock(theme) + STITCH_IMG_CLAUSE })), theme || {}, deviceType);
       const out = await Promise.all(built.results.map(async r => {
         if (!r.html) return { pageKey: r.key, engine: "stitch", error: r.error || "no HTML" };
-        let html = enforceBrandFonts(r.html, theme);  // pin the composed brand type
+        let html = clampViewportHeights(enforceBrandFonts(r.html, theme));  // pin brand type; bound vh heroes
         html = sharpenStitchImages(html);
         html = await fixImages(html);                // replace broken/expiring image URLs with stable photos
         html = await qcStitchImages(html);          // swap any text-baked images for clean photos
