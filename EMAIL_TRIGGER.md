@@ -47,7 +47,7 @@ it *would* do without touching a repo.
 | `TED_AUTH_HEADER` | `bearer` (default) or `x-api-key`. |
 | `TED_SHOT_DELAY_MS` | Wait before screenshotting the live site. Default `60000`. |
 | `TED_SCREENSHOTS` | `on` (default) / `off` — keeps the outcome comment, drops the image. |
-| `MICROLINK_API_KEY` | Screenshot quota. **Unset, the limit is 25/day per calling IP** — fine locally, spent by other tenants on a shared host. |
+| `MICROLINK_API_KEY` | Optional, paid. Lifts microlink's 25/day-per-IP cap. Unset, captures fall back to keyless WordPress mShots. |
 
 ## How an email becomes a change
 
@@ -100,11 +100,18 @@ returns a 500. Captures are jpeg/q40/900px, roughly 90KB. An upload that fails
 still posts the comment without the image.
 
 **A comment that arrives with no picture is not a bug in TED.** The capture is
-the fragile step: without `MICROLINK_API_KEY` the quota is 25 per day counted
-against whichever IP is calling, so it works every time from a laptop and fails
-on a shared host whose allowance other tenants have already spent. Every failure
-now names itself in the log — `screenshot of … failed: HTTP 429 (microlink daily
-quota spent for this IP)` — and the comment still goes out without the image.
+the fragile step, and it has two providers. microlink goes first, but its
+keyless tier allows 25 a day counted against whichever IP is calling — so it
+works every time from a laptop and is usually spent on a shared host by other
+tenants. When it fails, WordPress mShots takes over: no key, no quota, but it
+renders asynchronously, answering with a small "loading" image until the real
+capture is ready, so it is polled a few times before giving up.
+
+`MICROLINK_API_KEY` is optional and paid. It only moves microlink's quota off
+the shared IP; mShots covers the free case. Every failure names itself in the
+log — `HTTP 429 (microlink daily quota spent for this IP)`, `falling back to
+mShots`, `still rendering after 4 attempts` — and the comment goes out without
+the image rather than not at all.
 
 The task id is hard-coded for now. `GET /api/tasks/all?client=<name>` takes a
 client filter, so resolving the right task per website is the obvious next step.

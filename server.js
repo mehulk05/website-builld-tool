@@ -1852,8 +1852,44 @@ async function microlinkShot(url, extra = "", timeoutMs = 15000) {
   }
   finally { clearTimeout(timer); }
 }
+// WordPress mShots — the fallback when microlink's daily allowance is gone.
+// Needs no key and has no per-IP quota, which is exactly what a shared host
+// wants. The trade is that it renders asynchronously: it answers immediately
+// with a small "loading" graphic and only serves the real capture once it is
+// ready, so a short body means "not finished", not "failed".
+const MSHOTS_PLACEHOLDER_MAX_BYTES = 15 * 1024;
+async function mshotsShot(url, width = 900, tries = 4, gapMs = 6000, timeoutMs = 20000) {
+  const api = `https://s.wordpress.com/mshots/v1/${encodeURIComponent(url)}?w=${width}`;
+  for (let i = 0; i < tries; i++) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      const r = await fetch(api, { signal: ctl.signal });
+      const ct = (r.headers.get("content-type") || "").split(";")[0];
+      if (r.ok && ct.startsWith("image")) {
+        const buf = Buffer.from(await r.arrayBuffer());
+        if (buf.length > MSHOTS_PLACEHOLDER_MAX_BYTES) return { buf, contentType: ct };
+      }
+    } catch (e) { /* still rendering, or a blip — try again */ }
+    finally { clearTimeout(timer); }
+    if (i < tries - 1) await sleep(gapMs);
+  }
+  console.warn(`mShots screenshot of ${url} was still rendering after ${tries} attempts`);
+  return null;
+}
+
+// One capture, two providers. microlink first — better quality and it honours
+// width/format — then mShots when its quota is spent, which on a shared IP is
+// most of the time.
+async function siteScreenshot(url, { extra = "", width = 900, timeoutMs = 15000 } = {}) {
+  const shot = await microlinkShot(url, extra, timeoutMs);
+  if (shot) return shot;
+  console.warn(`falling back to mShots for ${url}`);
+  return mshotsShot(url, width);
+}
+
 async function croScreenshot(url) {
-  const shot = await microlinkShot(url);
+  const shot = await siteScreenshot(url, { width: 1280 });
   return shot ? shot.buf.toString("base64") : null;
 }
 async function croAudit(src) {
@@ -3112,13 +3148,13 @@ function tedPostOutcome(job, outcome) {
   setTimeout(async () => {
     let image = null;
     try {
-      const shot = await microlinkShot(P.liveUrl, TED_SHOT_PARAMS, 25000);
+      const shot = await siteScreenshot(P.liveUrl, { extra: TED_SHOT_PARAMS, width: 900, timeoutMs: 25000 });
       if (shot && shot.buf.length <= TED_SHOT_MAX_BYTES) image = shot;
       else if (shot) console.warn(`TED screenshot ${(shot.buf.length / 1024).toFixed(0)}KB exceeds the inline limit — posting without it`);
     } catch (e) { console.warn("TED screenshot failed:", e.message); }
     // Say so explicitly. The comment still goes out either way, and a picture
     // that is merely absent looks identical to one that was never wanted.
-    if (!image) console.warn(`TED outcome for ${job.draftId} posting without a screenshot${MICROLINK_API_KEY ? "" : " — MICROLINK_API_KEY is unset, so the quota is this host's shared IP"}`);
+    if (!image) console.warn(`TED outcome for ${job.draftId} posting without a screenshot — both microlink and mShots came back empty`);
     tedComment(text, image);
   }, TED_SHOT_DELAY_MS);
 }
