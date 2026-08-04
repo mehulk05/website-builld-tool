@@ -59,8 +59,10 @@ const TED_SHOT_DELAY_MS = Number(process.env.TED_SHOT_DELAY_MS || 60000);
 const TED_SCREENSHOTS = (process.env.TED_SCREENSHOTS || "on").toLowerCase() !== "off";
 // TED stores a comment image inline as base64 in the comment's own text, so an
 // oversized capture is a text-length problem: ~1.5MB inlined returns a 500.
-// jpeg/q40/900px lands around 90KB, well under whatever the real ceiling is.
-const TED_SHOT_PARAMS = "&type=jpeg&quality=40&viewport.width=900";
+// jpeg/q40/1400px lands around 110KB (~150KB inlined) on both providers — wide
+// enough to read a hero at a glance, nowhere near the ceiling.
+const TED_SHOT_WIDTH = Number(process.env.TED_SHOT_WIDTH || 1400);
+const TED_SHOT_PARAMS = `&type=jpeg&quality=40&viewport.width=${TED_SHOT_WIDTH}`;
 const TED_SHOT_MAX_BYTES = 400 * 1024;
 // Optional, but effectively required once deployed: microlink's free quota is
 // 25/day counted per calling IP, and a shared host's IP is spent by other
@@ -3148,7 +3150,7 @@ function tedPostOutcome(job, outcome) {
   setTimeout(async () => {
     let image = null;
     try {
-      const shot = await siteScreenshot(P.liveUrl, { extra: TED_SHOT_PARAMS, width: 900, timeoutMs: 25000 });
+      const shot = await siteScreenshot(P.liveUrl, { extra: TED_SHOT_PARAMS, width: TED_SHOT_WIDTH, timeoutMs: 25000 });
       if (shot && shot.buf.length <= TED_SHOT_MAX_BYTES) image = shot;
       else if (shot) console.warn(`TED screenshot ${(shot.buf.length / 1024).toFixed(0)}KB exceeds the inline limit — posting without it`);
     } catch (e) { console.warn("TED screenshot failed:", e.message); }

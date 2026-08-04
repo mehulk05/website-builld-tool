@@ -47,6 +47,7 @@ it *would* do without touching a repo.
 | `TED_AUTH_HEADER` | `bearer` (default) or `x-api-key`. |
 | `TED_SHOT_DELAY_MS` | Wait before screenshotting the live site. Default `60000`. |
 | `TED_SCREENSHOTS` | `on` (default) / `off` — keeps the outcome comment, drops the image. |
+| `TED_SHOT_WIDTH` | Capture width. Default `1400` (~110KB, ~150KB inlined). |
 | `MICROLINK_API_KEY` | Optional, paid. Lifts microlink's 25/day-per-IP cap. Unset, captures fall back to keyless WordPress mShots. |
 
 ## How an email becomes a change
@@ -96,8 +97,9 @@ request — a before/after comparison reports "changed" the first time it looks.
 
 TED stores a comment image *inline as base64 in the comment's own text* rather
 than as an attachment, so size is a text-length problem: around 1.5MB inlined
-returns a 500. Captures are jpeg/q40/900px, roughly 90KB. An upload that fails
-still posts the comment without the image.
+returns a 500. Captures are jpeg/q40 at `TED_SHOT_WIDTH` (1400px), roughly
+110KB from either provider. An upload that fails still posts the comment
+without the image.
 
 **A comment that arrives with no picture is not a bug in TED.** The capture is
 the fragile step, and it has two providers. microlink goes first, but its
