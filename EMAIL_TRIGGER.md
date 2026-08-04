@@ -8,6 +8,7 @@ inbox* is a separate job — pick one of the transports below.
 
 ```
 inbox ──(transport)──> POST /api/webhook/email-change ──> match site ──> edit job ──> PR ──> you approve ──> live
+                                                                    └──> comment on the TED task
 ```
 
 ## The endpoint
@@ -40,6 +41,10 @@ it *would* do without touching a repo.
 | --- | --- |
 | `EMAIL_WEBHOOK_SECRET` | Shared secret for this endpoint. Falls back to `WEBHOOK_SECRET`. Without one set, the endpoint returns 401 to everybody. |
 | `EMAIL_ALLOWED_SENDERS` | Comma-separated addresses or domains. Default `growth99.com`. |
+| `TED_API_TOKEN` | READ_WRITE personal API token. **Unset turns TED logging off** and changes nothing else. |
+| `TED_BASE` | Default `https://ted.growth99.com`. |
+| `TED_REVISIONS_TASK_ID` | Task the requests are filed against. Default `9078`. |
+| `TED_AUTH_HEADER` | `bearer` (default) or `x-api-key`. |
 
 ## How an email becomes a change
 
@@ -63,6 +68,22 @@ it *would* do without touching a repo.
 Everything the mailbox sends, matched or not, is logged to `email-requests.json`
 and readable at `GET /api/email-requests` — the first place to look when someone
 says "I emailed that and nothing happened".
+
+## TED
+
+A request that gets as far as an edit job is also filed in TED as a comment on
+the beta site revisions task (`TED_REVISIONS_TASK_ID`, currently `9078`), so the
+delivery team sees it where they already work. The comment carries the parsed
+instruction plus who asked, which site, and the Studio job id.
+
+Only accepted requests are posted — a decline, a dry run, or automated mail never
+reaches TED, so the task does not fill up with noise. Posting is fail-soft and
+happens after the job is queued and the acknowledgement is written: TED being
+down or misconfigured costs the comment and nothing else. Failures are a
+`console.error`, never a 5xx to the mailbox.
+
+The task id is hard-coded for now. `GET /api/tasks/all?client=<name>` takes a
+client filter, so resolving the right task per website is the obvious next step.
 
 ## Transport A — Gmail + Apps Script (recommended to start)
 
