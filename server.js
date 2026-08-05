@@ -2530,6 +2530,28 @@ function selectPrChecks(rows, requireAllChecks = false) {
   }
   return Object.values(byName);
 }
+function selectAutofixCheck(rows) {
+  const failed = (Array.isArray(rows) ? rows : []).filter((cols) =>
+    String(cols[1] || "").trim() === "fail"
+  );
+  return failed.find((cols) => /^build/i.test(String(cols[0] || "").trim())) || failed[0] || null;
+}
+function autofixFallbackPhpFiles(log, tree, changedFiles) {
+  const treeSet = new Set(Array.isArray(tree) ? tree.filter(Boolean) : []);
+  const changedPhp = [...new Set((Array.isArray(changedFiles) ? changedFiles : [])
+    .map((file) => String(file || "").trim())
+    .filter((file) => file.endsWith(".php") && treeSet.has(file)))];
+  const themeRoots = [...new Set(changedPhp.map((file) => {
+    const match = file.match(/^(web\/app\/themes\/[^/]+)\//);
+    return match ? match[1] : "";
+  }).filter(Boolean))];
+  const inferred = [];
+  if (/<title>|grep[^\n]*title|title[^\n]*home\.html/i.test(String(log || ""))) {
+    for (const root of themeRoots) inferred.push(`${root}/header.php`);
+  }
+  const grounded = [...new Set(inferred)].filter((file) => treeSet.has(file));
+  return (grounded.length ? grounded : changedPhp).slice(0, 3);
+}
 function ciRollup(rollup) {
   if (!Array.isArray(rollup) || !rollup.length) return "none";
   let pending = false, failing = false, passing = false;
@@ -9045,10 +9067,11 @@ const server = http.createServer(async (req, res) => {
       if (!prNum) return json(res, 400, { error: "prUrl with /pull/<n> required" });
       const branch = (await sh(`gh pr view ${prNum} --repo ${repoFromPrUrl(prUrl)} --json headRefName --jq .headRefName`)).stdout.trim();
       if (!branch) return json(res, 500, { error: "could not resolve PR branch" });
-      // find a failing build check and its run id
+      // Prefer a failing build check, then handle any other failing required check.
       const checks = (await sh(`gh pr checks ${prNum} --repo ${repoFromPrUrl(prUrl)}`)).stdout.split("\n").map(l => l.split("\t"));
-      const failing = checks.find(c => /^build/i.test((c[0] || "").trim()) && (c[1] || "").trim() === "fail");
-      if (!failing) return json(res, 200, { fixed: [], message: "no failing build check found" });
+      const failing = selectAutofixCheck(checks);
+      if (!failing) return json(res, 200, { fixed: [], message: "no failing CI check found" });
+      const checkName = String(failing[0] || "CI").trim();
       const runId = ((failing[3] || "").match(/\/runs\/(\d+)/) || [])[1];
       // Detect the "Actions can't run" case (org billing / spending limit / disabled)
       // — Gemini can't fix that; surface it clearly instead of hunting a file.
@@ -9061,7 +9084,11 @@ const server = http.createServer(async (req, res) => {
       const raw = [...new Set([...log.matchAll(/[⨯x]\s+(\S+?\.php)|((?:web|config)\/[\w\/.-]+?\.php)/g)].map(m => (m[1] || m[2])).filter(Boolean))];
       // resolve truncated paths against the branch tree
       const tree = (await sh(`gh api repos/${repoFromPrUrl(prUrl)}/git/trees/${branch}?recursive=1 --jq ".tree[].path"`)).stdout.split("\n");
-      const files = [...new Set(raw.map(f => tree.find(t => t === f) || tree.find(t => t.startsWith(f.replace(/…$/, ""))) || null).filter(Boolean))].slice(0, 3);
+      let files = [...new Set(raw.map(f => tree.find(t => t === f) || tree.find(t => t.startsWith(f.replace(/…$/, ""))) || null).filter(Boolean))].slice(0, 3);
+      if (!files.length) {
+        const changedFiles = (await sh(`gh pr diff ${prNum} --repo ${repoFromPrUrl(prUrl)} --name-only`)).stdout.split("\n");
+        files = autofixFallbackPhpFiles(log, tree, changedFiles);
+      }
       if (!files.length) return json(res, 200, { fixed: [], message: "could not identify offending file from log", log: log.slice(-1500) });
       const fixed = [];
       for (const f of files) {
@@ -9069,7 +9096,8 @@ const server = http.createServer(async (req, res) => {
         if (!meta.content) continue;
         const content = Buffer.from(meta.content, "base64").toString("utf8");
         const prompt = [
-          `This PHP file failed the repo's CI (Laravel Pint, PER preset code style). Fix ONLY what is needed to pass — do not change behavior, structure, or content.`,
+          `This PHP file is a likely cause of the failed GitHub Actions check "${checkName}". Fix ONLY what is needed for that check to pass; preserve unrelated behavior, structure, styling, and content.`,
+          `For code-style failures, make formatting-only changes. For integration or installation failures, make the smallest behavior correction supported by the log.`,
           `CI failure log (tail):\n${log.slice(-3000)}`,
           `File: ${f}\n----- FILE CONTENT START -----\n${content}\n----- FILE CONTENT END -----`,
           `Return ONLY the complete corrected file content. No markdown fences, no commentary.`,
@@ -9079,7 +9107,7 @@ const server = http.createServer(async (req, res) => {
         if (!fixedContent.trim().startsWith("<?php") && content.trim().startsWith("<?php")) continue; // sanity: don't commit garbage
         if (fixedContent.trim() === content.trim()) continue; // nothing changed
         const b64 = Buffer.from(fixedContent, "utf8").toString("base64");
-        const put = await sh(`gh api -X PUT "repos/${repoFromPrUrl(prUrl)}/contents/${f}" -f message="Auto-fix CI build failure (Gemini)" -f content="${b64}" -f sha="${meta.sha}" -f branch="${branch}"`);
+        const put = await sh(`gh api -X PUT "repos/${repoFromPrUrl(prUrl)}/contents/${f}" -f message="Auto-fix CI failure (Gemini)" -f content="${b64}" -f sha="${meta.sha}" -f branch="${branch}"`);
         if (!put.code) fixed.push(f);
       }
       return json(res, 200, { fixed, branch, message: fixed.length ? `committed fix to ${fixed.join(", ")}` : "Gemini produced no usable fix", log: fixed.length ? undefined : log.slice(-1500) });
@@ -9169,5 +9197,5 @@ if (require.main === module) {
 module.exports = {
   seoEnhance, audit, sharpenStitchImages, injectCanonicalNav, qcStitchImages, fixImages,
   JOBS, postStatus, jobStatusSnapshot, saveJobs, loadJobs, emitAudit,
-  safeArtifactName, mobilePageUrl, isSafeArtifactSegment, browserlessScreenshotRequest, browserlessLayoutRequest, captureMobileLayout, issueSupportedByLayout, selectPrChecks, preReleaseMarkerUrl, screenshotBuffersEqual, issueSupportedBySource, safeResponsivePlanFiles, verifyResponsiveDiff, repairResponsiveFile, readMuPages,
+  safeArtifactName, mobilePageUrl, isSafeArtifactSegment, browserlessScreenshotRequest, browserlessLayoutRequest, captureMobileLayout, issueSupportedByLayout, selectPrChecks, selectAutofixCheck, autofixFallbackPhpFiles, preReleaseMarkerUrl, screenshotBuffersEqual, issueSupportedBySource, safeResponsivePlanFiles, verifyResponsiveDiff, repairResponsiveFile, readMuPages,
 };
