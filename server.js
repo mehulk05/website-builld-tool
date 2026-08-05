@@ -8136,6 +8136,32 @@ function findingsPageSpeed(runs) {
 function prFinding(task, severity, page, message, extra) {
   return { task, severity, page: page || "", message: String(message).slice(0, 300), ...(extra || {}) };
 }
+
+// What actually happened to a finding, decided AFTER the fixes run rather than
+// guessed at detection time. The old `fix` flag was a prediction — "this is the
+// kind of thing we can fix" — and it never updated when a fix declined, so the
+// report claimed credit for work it had not done.
+//
+//   done     — fixed in this run, or already correct
+//   pending  — we can fix this, but could not here (a needed input was missing)
+//   decision — only a human can say what the right answer is
+//   not-here — a real problem this repo cannot reach (remote images)
+const OUTCOME = { DONE: "done", PENDING: "pending", DECISION: "decision", NOT_HERE: "not-here" };
+const OUTCOME_LABEL = { done: "Done", pending: "Pending", decision: "Decision", "not-here": "Not here" };
+// Findings whose subject lives outside the repository. Renaming or recompressing
+// these means touching the media library, which no pull request can do.
+const NOT_HERE_TASKS = new Set(["image-naming", "image-format", "image-weight"]);
+// Tasks phase 2 owns. Anything here starts as pending and is upgraded to done
+// only when the corresponding fix reports that it changed a file.
+const FIXABLE_TASKS = new Set(["favicon", "clickable-contact", "business-name"]);
+function resolveFindingOutcomes(findings, fixedTasks) {
+  for (const f of findings) {
+    if (NOT_HERE_TASKS.has(f.task)) { f.outcome = OUTCOME.NOT_HERE; continue; }
+    if (FIXABLE_TASKS.has(f.task)) { f.outcome = fixedTasks.has(f.task) ? OUTCOME.DONE : OUTCOME.PENDING; continue; }
+    f.outcome = OUTCOME.DECISION;
+  }
+  return findings;
+}
 const PHONE_RE = /(?:\+?1[\s.\-])?\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}/g;
 const EMAIL_RE = /[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}/gi;
 const digits = (s) => String(s || "").replace(/\D/g, "");
@@ -8352,6 +8378,53 @@ function appendToFunctions(themeAbs, marker, php) {
   if (!cur || cur.includes(marker)) return false;
   fs.writeFileSync(abs, cur.replace(/\s*$/, "\n") + "\n" + php.trim() + "\n");
   return true;
+}
+// Replace text inside the rendered content only — never inside a tag, an
+// attribute, a URL or a PHP block. A blind string replace would rewrite class
+// names, image filenames and canonical URLs along with the visible copy.
+function replaceInTextNodes(src, from, to) {
+  const parts = String(src || "").split(/(<[^>]+>)/);
+  let hits = 0;
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (part.startsWith("<") || part.includes("<?") || !part.trim()) continue;
+    if (!part.includes(from)) continue;
+    hits += part.split(from).length - 1;
+    parts[i] = part.split(from).join(to);
+  }
+  return { out: parts.join(""), hits };
+}
+// The one name finding that is not a judgement call. NocoDB is the agreed
+// trading name; when the theme still carries the name it was built under, the
+// correct value is known and swapping it is mechanical. Name *variants* — a page
+// saying "Brew" where the record says "Brew Aesthetics" — stay a decision,
+// because shortening a name on purpose is a normal thing for copy to do.
+function fixBusinessName(themeAbs, pages, businessName, siteName, themePath) {
+  const correct = String(businessName || "").trim();
+  const wrong = String(siteName || "").trim();
+  if (!correct || !wrong) return { changed: [], note: "no name to compare against", skipped: true };
+  if (wrong.toLowerCase() === correct.toLowerCase()) return { changed: [], note: `"${correct}" already used throughout` };
+  // Guard against a garbage read: only swap a name that actually looks like one
+  // and is not merely a substring difference in casing or spacing.
+  if (wrong.length < 3 || wrong.length > 80) return { changed: [], note: `"${wrong.slice(0, 40)}" does not look like a business name`, skipped: true };
+  const changed = [];
+  let total = 0;
+  for (const pg of pages) {
+    const abs = path.join(themeAbs, pg.file);
+    const php = readIf(abs);
+    if (!php || !php.includes(wrong)) continue;
+    const { out, hits } = replaceInTextNodes(php, wrong, correct);
+    if (hits) { fs.writeFileSync(abs, out); changed.push(themePath + "/" + pg.file); total += hits; }
+  }
+  for (const shared of ["header.php", "footer.php"]) {
+    const abs = path.join(themeAbs, shared);
+    const php = readIf(abs);
+    if (!php || !php.includes(wrong)) continue;
+    const { out, hits } = replaceInTextNodes(php, wrong, correct);
+    if (hits) { fs.writeFileSync(abs, out); changed.push(themePath + "/" + shared); total += hits; }
+  }
+  if (!total) return { changed: [], note: `"${wrong}" appears only in code or URLs — left alone` };
+  return { changed: [...new Set(changed)], note: `"${wrong}" → "${correct}" in ${total} place(s)` };
 }
 function fixFavicon(themeAbs, pages, themePath, siteHost) {
   const logo = themeLogoUrl(pages, siteHost);
@@ -8607,10 +8680,23 @@ function collapseFindings(list, perTaskLimit = 3) {
 function performPrReportHtml(job) {
   const e = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const tasks = job.prTasks || [];
-  const findings = job.prFindings || [];
+  // Resolved here rather than only at write time, so rendering a stored run —
+  // a re-render, a replay from the JSON sibling — still labels every row.
+  const findings = resolveFindingOutcomes(job.prFindings || [], new Set(job.prFixedTasks || []));
   const bySeverity = (s) => findings.filter((f) => f.severity === s).length;
+  const byOutcome = (o) => findings.filter((f) => f.outcome === o).length;
   const chip = { pass: "#1f9d6b", fixed: "#2a68d8", fail: "#c0392b", skipped: "#8a8fa3" };
   const sevChip = { high: "#c0392b", medium: "#d98324", low: "#6b6f82" };
+  // Four states, four colours. "Decision" is deliberately the loud one: it is
+  // the only column value that is asking the reader to do something.
+  const outChip = {
+    done: { bg: "#e6f6ef", fg: "#1f7a55" }, pending: { bg: "#e8f0fe", fg: "#2a68d8" },
+    decision: { bg: "#fdf0e3", fg: "#a65a12" }, "not-here": { bg: "#f2f3f7", fg: "#6b6f82" },
+  };
+  // Work that is already correct belongs in the report too. A check that passed
+  // or was skipped leaves no finding behind, so it would otherwise vanish — and
+  // a report that only ever lists problems reads as if nothing was fixed.
+  const settled = (job.prTasks || []).filter((t) => t.status === "pass" || t.status === "fixed" || t.status === "skipped");
   const group = new Map();
   for (const f of findings) { if (!group.has(f.task)) group.set(f.task, []); group.get(f.task).push(f); }
   // The report keeps far more detail than the PR body, but a single check that
@@ -8627,7 +8713,7 @@ function performPrReportHtml(job) {
         <td style="padding:8px 12px;color:#6b6f82"><code>${e(f.page || "—")}</code></td>
         <td style="padding:8px 12px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${sevChip[f.severity] || "#6b6f82"};margin-right:7px"></span>${e(f.message)}</td>
         <td style="padding:8px 12px;color:#6b6f82">${e(f.expected || "—")}</td>
-        <td style="padding:8px 12px;text-align:center"><span style="font-size:11px;padding:3px 8px;border-radius:20px;background:${f.fix === "auto" ? "#e8f0fe" : "#f2f3f7"};color:${f.fix === "auto" ? "#2a68d8" : "#6b6f82"}">${e(f.fix === "auto" ? "fixed" : f.fix === "none" ? "n/a" : "proposed")}</span></td>
+        <td style="padding:8px 12px;text-align:center"><span style="font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;background:${(outChip[f.outcome] || outChip["not-here"]).bg};color:${(outChip[f.outcome] || outChip["not-here"]).fg}">${e(OUTCOME_LABEL[f.outcome] || "Decision")}</span></td>
       </tr>`).join("")}
       ${hidden > 0 ? `<tr style="border-top:1px solid #eef0f6"><td colspan="4" style="padding:9px 12px;color:#8a8fa3;font-style:italic">…and ${hidden} more of the same kind (full list in the JSON alongside this report)</td></tr>` : ""}
     </table>`;
@@ -8642,7 +8728,7 @@ function performPrReportHtml(job) {
     ${job.liveSite && job.liveSite.url ? ` · live site <a href="${e(job.liveSite.url)}" style="color:#2a68d8">${e(job.liveSite.url)}</a>` : ""}
   </p>
   <div style="display:flex;gap:12px;flex-wrap:wrap;margin:0 0 28px">
-    ${[["High", bySeverity("high"), "#c0392b"], ["Medium", bySeverity("medium"), "#d98324"], ["Low", bySeverity("low"), "#6b6f82"], ["Auto-fixed", (job.prChanged || []).length + " file(s)", "#2a68d8"]]
+    ${[["Done", byOutcome("done"), "#1f7a55"], ["Needs a decision", byOutcome("decision"), "#a65a12"], ["Pending", byOutcome("pending"), "#2a68d8"], ["Outside this repo", byOutcome("not-here"), "#6b6f82"]]
       .map(([l, v, c]) => `<div style="flex:1;min-width:150px;background:#fff;border:1px solid #e6e8f0;border-radius:12px;padding:16px">
         <div style="font-size:26px;font-weight:800;color:${c}">${e(v)}</div><div style="color:#6b6f82;font-size:12px">${e(l)}</div></div>`).join("")}
   </div>
@@ -8669,6 +8755,13 @@ function performPrReportHtml(job) {
       <td style="padding:9px 12px;text-align:center"><span style="font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;color:#fff;background:${chip[t.status] || "#8a8fa3"}">${e(t.status)}</span></td>
       <td style="padding:9px 12px;color:#555">${e(t.detail || "")}</td></tr>`).join("")}
   </table>
+  ${settled.length ? `<h2 style="font-size:16px;margin:34px 0 10px">Already handled <span style="color:#8a8fa3;font-weight:400;font-size:13px">· ${settled.length}</span></h2>
+  <table style="width:100%;border-collapse:collapse;font-size:13px;background:#fff;border:1px solid #e6e8f0;border-radius:10px;overflow:hidden">
+    ${settled.map((t) => `<tr style="border-top:1px solid #eef0f6">
+      <td style="padding:9px 12px;font-weight:600;width:210px">${e(t.label)}</td>
+      <td style="padding:9px 12px;text-align:center;width:86px"><span style="font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;background:${outChip.done.bg};color:${outChip.done.fg}">Done</span></td>
+      <td style="padding:9px 12px;color:#555">${e(t.status === "fixed" ? "fixed in this run — " + (t.detail || "") : t.detail || "")}</td></tr>`).join("")}
+  </table>` : ""}
   ${findings.length ? `<h2 style="font-size:16px;margin:34px 0 0">Findings</h2>${[...group.entries()].map(([k, v]) => section(k, v)).join("")}` : `<p style="margin-top:30px;color:#1f9d6b;font-weight:600">No findings — every check passed.</p>`}
   ${(job.prChanged || []).length ? `<h2 style="font-size:16px;margin:34px 0 8px">Files changed</h2>
     <ul style="font-size:13px;color:#444">${job.prChanged.map((f) => `<li><code>${e(f)}</code></li>`).join("")}</ul>` : ""}
@@ -8696,11 +8789,28 @@ function performPrPrBody(job, reportUrl) {
     ...(job.prTasks || []).map((t) => `| ${t.label} | ${t.status} | ${String(t.detail || "").replace(/\|/g, "\\|").slice(0, 110)} |`),
     "",
   ];
-  const proposed = collapseFindings(f.filter((x) => x.fix === "proposed"), 3);
-  if (proposed.length) {
+  // What we fixed comes first. A PR that lists only outstanding problems reads
+  // as if it changed nothing, which is the opposite of what it is for.
+  const fixedTasks = (job.prTasks || []).filter((t) => t.status === "fixed");
+  if (fixedTasks.length) {
+    L.push("### Fixed in this PR", "",
+      ...fixedTasks.map((t) => `- **${t.label}** — ${String(t.detail || "").replace(/\|/g, "\\|")}`), "");
+  }
+  const line = (x) => x.rollup ? `- ${x.message}` : `- \`${x.page || "site"}\` — ${x.message.replace(/\|/g, "\\|")}`;
+  const decisions = collapseFindings(f.filter((x) => x.outcome === OUTCOME.DECISION), 3);
+  if (decisions.length) {
     L.push("### Needs a human decision", "",
-      "These were detected but not auto-fixed — the correct value is a judgement call:", "",
-      ...proposed.map((x) => x.rollup ? `- ${x.message}` : `- \`${x.page || "site"}\` — ${x.message.replace(/\|/g, "\\|")}`), "");
+      "Detected, but only a person can say what the right answer is:", "", ...decisions.map(line), "");
+  }
+  const outside = collapseFindings(f.filter((x) => x.outcome === OUTCOME.NOT_HERE), 2);
+  if (outside.length) {
+    L.push("### Outside this repository", "",
+      "Real problems, but the files live in the media library — no pull request can reach them:", "", ...outside.map(line), "");
+  }
+  const pending = collapseFindings(f.filter((x) => x.outcome === OUTCOME.PENDING), 2);
+  if (pending.length) {
+    L.push("### Fixable, but not this run", "",
+      "We own these — an input was missing:", "", ...pending.map(line), "");
   }
   if (reportUrl) L.push(`Full report: ${reportUrl}`, "");
   return L.join("\n");
@@ -8840,22 +8950,31 @@ async function runPerformPrJob(job) {
     // ---- phase 2 -------------------------------------------------------------
     jobStep(job, 6, "running", "Applying the fixes whose answer is computable...");
     const applied = [];
-    const record = (label, result) => {
+    // Which audit each fix answers, so a finding can be told what became of it.
+    const fixedTasks = new Set();
+    const record = (label, result, answers) => {
       applied.push({ label, ...result });
       job.prChanged.push(...(result.changed || []));
+      if (answers && (result.changed || []).length) fixedTasks.add(answers);
       const t = job.prTasks.find((x) => x.label === label);
       if (t) { t.status = (result.changed || []).length ? "fixed" : (result.skipped ? "skipped" : t.status); t.detail = result.note || t.detail; }
       else task(label, (result.changed || []).length ? "fixed" : "skipped", result.note);
       jobStep(job, 6, "running", label + " — " + result.note);
     };
-    record("Favicon", fixFavicon(themeAbs, pages, P.themePath, siteHost));
+    record("Business name", fixBusinessName(themeAbs, pages, P.businessName, facts.name, P.themePath), "business-name");
+    record("Favicon", fixFavicon(themeAbs, pages, P.themePath, siteHost), "favicon");
     record("Social sharing image", fixSocialImage(themeAbs, pages, P.themePath, siteHost));
     record("Custom 404", fix404(themeAbs, P.themePath, brand));
     record("Call Now", fixCallNow(themeAbs, P.themePath, facts.phone, brand));
     record("BLVD button ID", fixBlvd(themeAbs, pages, P.themePath));
     record("Blog sidebar widget", fixBlogSidebar(themeAbs));
     record("Blog link colour", fixBlogLinkColor(themeAbs, P.themePath, brand));
-    record("Clickable contact", fixClickable(themeAbs, pages, P.themePath));
+    record("Clickable contact", fixClickable(themeAbs, pages, P.themePath), "clickable-contact");
+    // Now — and only now — each finding learns what actually happened to it.
+    // Kept on the job so the phase-4 findings (links, PageSpeed) get resolved
+    // the same way when the report is written.
+    job.prFixedTasks = [...fixedTasks];
+    resolveFindingOutcomes(job.prFindings, fixedTasks);
     job.prChanged = [...new Set(job.prChanged)];
     job.editPlan = job.prChanged.map((p2) => ({ path: p2, op: "modify" }));
     jobStep(job, 6, "done", job.prChanged.length ? `${job.prChanged.length} file(s) changed` : "nothing to change");
@@ -10639,6 +10758,7 @@ module.exports = {
   findingsBusinessName, findingsContact, findingsClickable, findingsCta, findingsFavicon,
   fetchLiveSitemap, sitemapLocs, urlSlug, findingsMissingPages, resolveLiveSite,
   splitLocationSlug, findingsUrlStructure, pageSpeedRun, findingsPageSpeed, psiReportUrl, collapseFindings,
+  OUTCOME, OUTCOME_LABEL, resolveFindingOutcomes, replaceInTextNodes, fixBusinessName,
   imageSources, findingsImages, readSeoPages, synthMuSource, pageText,
   fixFavicon, fixSocialImage, fix404, fixCallNow, fixBlvd, fixBlogLinkColor, fixClickable,
   performPrReportHtml, performPrPrBody, performPrMarkerUrl, PERFORM_PR_STEPS,
