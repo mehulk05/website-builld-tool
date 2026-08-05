@@ -4019,7 +4019,66 @@ const THEME_CONVENTIONS = `This is a classic WordPress (Roots Bedrock) theme at 
 - All PHP must pass Laravel Pint (PER preset): blank line after <?php in pure-PHP files; a named function's opening brace on its own line; one statement per line.`;
 
 function stripFence(t) { return String(t || "").replace(/^```(?:json|php|html)?\s*\n?/i, "").replace(/\n?```\s*$/i, "").trim(); }
-
+function firstAiJsonValue(raw) {
+  const text = stripFence(raw);
+  const objectAt = text.indexOf("{");
+  const arrayAt = text.indexOf("[");
+  const starts = [objectAt, arrayAt].filter((at) => at >= 0);
+  if (!starts.length) return "";
+  const start = Math.min(...starts), stack = [];
+  let inString = false, escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const char = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') { inString = true; continue; }
+    if (char === "{" || char === "[") stack.push(char);
+    else if (char === "}" || char === "]") {
+      stack.pop();
+      if (!stack.length) return text.slice(start, i + 1);
+    }
+  }
+  return text.slice(start);
+}
+function closeAiJsonContainers(value) {
+  const stack = [];
+  let inString = false, escaped = false;
+  for (const char of value) {
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === "{" || char === "[") stack.push(char);
+    else if (char === "}" || char === "]") stack.pop();
+  }
+  let repaired = value;
+  if (inString) repaired += '"';
+  while (stack.length) repaired += stack.pop() === "{" ? "}" : "]";
+  return repaired;
+}
+function parseAiJson(raw, fallback) {
+  const value = firstAiJsonValue(raw) || "{}";
+  const commonRepair = value
+    .replace(/}\s*{/g, "},{")
+    .replace(/]\s*\[/g, "],[")
+    .replace(/(["}\]])\s+(?=["{\[])/g, "$1,")
+    .replace(/(["}\]])\s+(?="(?:[^"\\]|\\.)*"\s*:)/g, "$1,")
+    .replace(/,\s*([}\]])/g, "$1");
+  const candidates = [...new Set([value, commonRepair, closeAiJsonContainers(commonRepair)])];
+  let parseError;
+  for (const candidate of candidates) {
+    try { return JSON.parse(candidate); } catch (error) { parseError = error; }
+  }
+  if (arguments.length > 1) return typeof fallback === "function" ? fallback(parseError) : fallback;
+  throw parseError;
+}
 // ---- 1. The work order ------------------------------------------------------
 // A change request arrives as prose. An email especially: background, three
 // separate asks buried in one paragraph, a constraint, and a sign-off. The
@@ -4227,7 +4286,7 @@ async function editPlan(manifest, req, ai) {
     `\nReturn ONLY minified JSON: {"summary":"one line of what you'll change","files":[{"path":"web/app/…","op":"create|modify|delete","instruction":"precise instruction for THIS file"}]}`,
   ].filter(Boolean).join("\n");
   const raw = await aiCall([{ text: p }], { ...(ai || {}), temperature: 0.2, maxOutputTokens: 3000, timeoutMs: 60000, json: true });
-  return JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
+  return parseAiJson(raw, { summary: "Use deterministic responsive fallback plan", files: [] });
 }
 async function editFileContent(op, path_, instruction, currentContent, planContext, ai, req) {
   const p = [
@@ -7088,6 +7147,25 @@ function screenshotBuffersEqual(before, after) {
 function mobileArtifactDiskPath(capture) {
   return path.join(GEN, "pre-release", ...String(capture && capture.screenshot || "").split("/").slice(2).map(decodeURIComponent));
 }
+function reusablePreReleaseAudit(sourceJob, pages, payload) {
+  if (!sourceJob || sourceJob.type !== "pre-release" || sourceJob.status !== "error" || sourceJob.currentStep < 4 || !Array.isArray(sourceJob.mobileBefore)) return null;
+  const capturedTimes = sourceJob.mobileBefore.map((row) => Date.parse(row && row.capturedAt || "")).filter(Number.isFinite);
+  if (!capturedTimes.length || Date.now() - Math.max(...capturedTimes) > 4 * 60 * 60 * 1000) return null;
+  const sourcePayload = sourceJob.payload || {};
+  for (const key of ["siteId", "themePath", "liveUrl"]) {
+    if (String(sourcePayload[key] || "") !== String(payload && payload[key] || "")) return null;
+  }
+  if (sourceJob.mobileBefore.length !== pages.length) return null;
+  const bySlug = new Map(sourceJob.mobileBefore.map((row) => [String(row.slug || ""), row]));
+  const reusable = [];
+  for (const page of pages) {
+    const row = bySlug.get(String(page.slug || ""));
+    if (!row || row.file !== page.file || row.url !== page.url || row.error || !Array.isArray(row.issues) || typeof row.pass !== "boolean") return null;
+    if (!row.screenshot || !fs.existsSync(mobileArtifactDiskPath(row))) return null;
+    reusable.push(JSON.parse(JSON.stringify(row)));
+  }
+  return reusable;
+}
 function mobileScreenshotsEqual(before, after) {
   try {
     return screenshotBuffersEqual(fs.readFileSync(mobileArtifactDiskPath(before)), fs.readFileSync(mobileArtifactDiskPath(after)));
@@ -7202,8 +7280,8 @@ async function inspectMobileScreenshot(capture, sourceContext = "") {
     'Return ONLY minified JSON: {"pass":true|false,"issues":[{"kind":"short stable id","severity":"high|medium|low","description":"specific visible defect","evidence":"what and where in screenshot","fixHint":"precise CSS/layout direction"}]}.',
   ].join("\n");
   const raw = await geminiCall([{ text: prompt }, { inline_data: { mime_type: mime, data: fs.readFileSync(diskPath).toString("base64") } }],
-    { temperature: 0.1, maxOutputTokens: 1800, timeoutMs: 60000 });
-  const d = JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
+    { temperature: 0.1, maxOutputTokens: 1800, timeoutMs: 60000, json: true });
+  const d = parseAiJson(raw);
   const reported = (Array.isArray(d.issues) ? d.issues : []).slice(0, 12).map((x) => ({
     source: "vision", kind: String(x.kind || "layout"), severity: ["high", "medium", "low"].includes(x.severity) ? x.severity : "medium",
     description: String(x.description || "Mobile layout issue").slice(0, 220), evidence: String(x.evidence || "").slice(0, 240),
@@ -7246,7 +7324,7 @@ async function verifyResponsiveDiff(rows, diff, onlyIds = null) {
     "", 'Return ONLY minified JSON: {"results":[{"id":"slug:number","done":true|false,"lines":[1],"reason":"specific short reason"}]}',
   ].join("\n");
   const raw = await geminiCall([{ text: prompt }], { temperature: 0.1, maxOutputTokens: 3000, timeoutMs: 60000, json: true });
-  const data = JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
+  const data = parseAiJson(raw, { results: [] });
   const results = Array.isArray(data.results) ? data.results : [];
   const top = Math.min(changes.length, CHANGE_CAP);
   const missed = [];
@@ -7397,26 +7475,34 @@ async function runPreReleaseJob(job) {
     const sourceByFile = new Map(pages.map((page) => [page.file, mobileSourceContext(themeAbs, page.file)]));
     jobStep(job, 1, "done", `${pages.length} page(s) registered in backend`);
 
-    const before = [];
-    for (let i = 0; i < pages.length; i++) {
-      jobStep(job, 2, "running", `${pages[i].title} (${i + 1}/${pages.length})`);
-      const cap = await captureMobilePage(job.draftId, "before", pages[i]);
-      before.push(cap);
-      job.mobileBefore = before;
-      saveJobs();
-    }
-    const captureErrors = before.filter((x) => x.error);
-    if (captureErrors.length) throw new Error(`mobile screenshot failed for ${captureErrors.length}/${pages.length} page(s): ${captureErrors.map((x) => x.title).join(", ")}`);
-    jobStep(job, 2, "done", `${before.length} full-page mobile screenshot(s) captured`);
+    let audited = reusablePreReleaseAudit(JOBS.get(P.resumeFrom), pages, P);
+    if (audited) {
+      job.mobileBefore = audited;
+      job.reusedAuditFrom = P.resumeFrom;
+      jobStep(job, 2, "done", `${audited.length} existing mobile screenshot(s) reused`);
+      jobStep(job, 3, "done", `${audited.reduce((count, row) => count + row.issues.length, 0)} existing issue(s) reused — no new AI audit calls`);
+    } else {
+      const before = [];
+      for (let i = 0; i < pages.length; i++) {
+        jobStep(job, 2, "running", `${pages[i].title} (${i + 1}/${pages.length})`);
+        const cap = await captureMobilePage(job.draftId, "before", pages[i]);
+        before.push(cap);
+        job.mobileBefore = before;
+        saveJobs();
+      }
+      const captureErrors = before.filter((x) => x.error);
+      if (captureErrors.length) throw new Error(`mobile screenshot failed for ${captureErrors.length}/${pages.length} page(s): ${captureErrors.map((x) => x.title).join(", ")}`);
+      jobStep(job, 2, "done", `${before.length} full-page mobile screenshot(s) captured`);
 
-    const audited = [];
-    for (let i = 0; i < before.length; i++) {
-      jobStep(job, 3, "running", `${before[i].title} (${i + 1}/${before.length})`);
-      audited.push(await inspectMobileScreenshot(before[i], sourceByFile.get(before[i].file) || ""));
-      job.mobileBefore = audited.concat(before.slice(i + 1));
-      saveJobs();
+      audited = [];
+      for (let i = 0; i < before.length; i++) {
+        jobStep(job, 3, "running", `${before[i].title} (${i + 1}/${before.length})`);
+        audited.push(await inspectMobileScreenshot(before[i], sourceByFile.get(before[i].file) || ""));
+        job.mobileBefore = audited.concat(before.slice(i + 1));
+        saveJobs();
+      }
+      job.mobileBefore = audited;
     }
-    job.mobileBefore = audited;
     const failing = audited.filter((x) => !x.pass);
     const issueCount = failing.reduce((n, x) => n + x.issues.length, 0);
     jobStep(job, 3, "done", issueCount ? `${issueCount} issue(s) across ${failing.length}/${audited.length} page(s)` : `all ${audited.length} page(s) pass`);
@@ -7896,7 +7982,7 @@ const server = http.createServer(async (req, res) => {
       const nj = j.type === "edit" ? enqueueEditJob({ ...j.payload, jobId: "edit-" + Date.now() })
         : j.type === "restore" ? enqueueRestoreJob({ ...j.payload, jobId: "restore-" + Date.now() })
         : j.type === "seo" ? enqueueSeoJob({ ...j.payload, jobId: "seo-" + Date.now() })
-        : j.type === "pre-release" ? enqueuePreReleaseJob({ ...j.payload, jobId: "pre-release-" + Date.now() })
+        : j.type === "pre-release" ? enqueuePreReleaseJob({ ...j.payload, resumeFrom: j.draftId, jobId: "pre-release-" + Date.now() })
         : enqueueJob(j.payload).job;
       return json(res, 202, { ok: true, jobId: nj.draftId });
     }
@@ -9197,5 +9283,5 @@ if (require.main === module) {
 module.exports = {
   seoEnhance, audit, sharpenStitchImages, injectCanonicalNav, qcStitchImages, fixImages,
   JOBS, postStatus, jobStatusSnapshot, saveJobs, loadJobs, emitAudit,
-  safeArtifactName, mobilePageUrl, isSafeArtifactSegment, browserlessScreenshotRequest, browserlessLayoutRequest, captureMobileLayout, issueSupportedByLayout, selectPrChecks, selectAutofixCheck, autofixFallbackPhpFiles, preReleaseMarkerUrl, screenshotBuffersEqual, issueSupportedBySource, safeResponsivePlanFiles, verifyResponsiveDiff, repairResponsiveFile, readMuPages,
+  safeArtifactName, mobilePageUrl, isSafeArtifactSegment, browserlessScreenshotRequest, browserlessLayoutRequest, captureMobileLayout, issueSupportedByLayout, selectPrChecks, selectAutofixCheck, autofixFallbackPhpFiles, parseAiJson, reusablePreReleaseAudit, preReleaseMarkerUrl, screenshotBuffersEqual, issueSupportedBySource, safeResponsivePlanFiles, verifyResponsiveDiff, repairResponsiveFile, readMuPages,
 };
