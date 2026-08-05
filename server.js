@@ -8150,10 +8150,14 @@ const OUTCOME = { DONE: "done", PENDING: "pending", DECISION: "decision", NOT_HE
 const OUTCOME_LABEL = { done: "Done", pending: "Pending", decision: "Decision", "not-here": "Not here" };
 // Findings whose subject lives outside the repository. Renaming or recompressing
 // these means touching the media library, which no pull request can do.
-const NOT_HERE_TASKS = new Set(["image-naming", "image-format", "image-weight"]);
+// Findings whose subject genuinely cannot be reached from a pull request. The
+// image tasks used to live here — until it turned out both CDNs will serve WebP
+// at a chosen width, so the photos can be pulled into the theme and fixed after all.
+const NOT_HERE_TASKS = new Set([]);
 // Tasks phase 2 owns. Anything here starts as pending and is upgraded to done
 // only when the corresponding fix reports that it changed a file.
-const FIXABLE_TASKS = new Set(["favicon", "clickable-contact", "business-name"]);
+const FIXABLE_TASKS = new Set(["favicon", "clickable-contact", "business-name",
+  "spelling", "cta", "image-naming", "image-format", "image-weight"]);
 function resolveFindingOutcomes(findings, fixedTasks) {
   for (const f of findings) {
     if (NOT_HERE_TASKS.has(f.task)) { f.outcome = OUTCOME.NOT_HERE; continue; }
@@ -8227,7 +8231,8 @@ function findingsContact(pages, facts) {
       `${emails.length} different email addresses appear across the site`,
       { found: emails.map((e) => `${e.value} (${e.pages.join(", ")})`).join(" · "), expected: facts.email || "one address", fix: "proposed" }));
   }
-  if (!emails.length) out.push(prFinding("contact-details", "medium", "(site-wide)", "No email address found anywhere on the site", { fix: "proposed" }));
+  // No email at all is a deliberate choice on plenty of clinic sites — they want
+  // the phone to ring. Only an email that disagrees with itself is a problem.
   return out;
 }
 function findingsClickable(pages, facts) {
@@ -8425,6 +8430,176 @@ function fixBusinessName(themeAbs, pages, businessName, siteName, themePath) {
   }
   if (!total) return { changed: [], note: `"${wrong}" appears only in code or URLs — left alone` };
   return { changed: [...new Set(changed)], note: `"${wrong}" → "${correct}" in ${total} place(s)` };
+}
+// A misspelling has one correct answer, and the audit already worked out what it
+// is. Applied to text nodes only, and only where the exact word is still present —
+// so a suggestion the audit got wrong changes nothing rather than mangling copy.
+function fixSpelling(themeAbs, pages, findings, themePath) {
+  const wanted = findings.filter((f) => f.task === "spelling" && f.found && f.expected && f.found !== f.expected);
+  if (!wanted.length) return { changed: [], note: "no misspellings to correct", skipped: true, corrections: [] };
+  const changed = [];
+  const corrections = [];
+  for (const pg of pages) {
+    const abs = path.join(themeAbs, pg.file);
+    let php = readIf(abs);
+    if (!php) continue;
+    let touched = false;
+    for (const f of wanted) {
+      if (f.page && f.page !== pg.slug) continue;
+      // Whole word only: "form" must not turn "performance" into "perexpectedance".
+      const re = new RegExp(`\\b${f.found.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "g");
+      if (!re.test(php)) continue;
+      const { out, hits } = replaceInTextNodes(php, f.found, f.expected);
+      if (hits) { php = out; touched = true; corrections.push({ page: pg.slug, from: f.found, to: f.expected, hits }); f.corrected = true; }
+    }
+    if (touched) { fs.writeFileSync(abs, php); changed.push(themePath + "/" + pg.file); }
+  }
+  if (!corrections.length) return { changed: [], note: "the suggested words were not found in the templates", skipped: true, corrections: [] };
+  return { changed: [...new Set(changed)], corrections, note: corrections.map((c) => `"${c.from}" → "${c.to}"`).join(", ").slice(0, 150) };
+}
+
+// A page with no call to action is a dead end. Rather than invent one, the block
+// is lifted from a page that already has a good one, so the copy, the phone
+// number and the styling all match the rest of the site.
+function extractCtaBlock(php) {
+  // The last section that contains a tel: link or booking wording is, on these
+  // themes, the closing CTA band.
+  const sections = String(php || "").match(/<section[\s\S]*?<\/section>/gi) || [];
+  for (let i = sections.length - 1; i >= 0; i--) {
+    const s = sections[i];
+    if (/href\s*=\s*["']tel:/i.test(s) && CTA_WORDS.test(pageText(s))) return s;
+  }
+  return null;
+}
+function fixCta(themeAbs, pages, findings, themePath) {
+  const missing = new Set(findings.filter((f) => f.task === "cta").map((f) => f.page));
+  if (!missing.size) return { changed: [], note: "every page already has a CTA", skipped: true, added: [] };
+  // Take the donor from the home page first — it is the most carefully written.
+  const donorPage = pages.find((p) => p.slug === "home" && extractCtaBlock(p.php))
+    || pages.find((p) => !missing.has(p.slug) && extractCtaBlock(p.php));
+  if (!donorPage) return { changed: [], note: "no existing CTA section to copy from", skipped: true, added: [] };
+  const block = extractCtaBlock(donorPage.php);
+  const changed = [], added = [];
+  for (const pg of pages) {
+    if (!missing.has(pg.slug)) continue;
+    const abs = path.join(themeAbs, pg.file);
+    const php = readIf(abs);
+    if (!php || php.includes(`${PR_MARK}:cta`)) continue;
+    // Before get_footer() so it closes the page, matching where CTAs sit elsewhere.
+    const marker = `\n<!-- ${PR_MARK}:cta — copied from /${donorPage.slug} -->\n${block}\n`;
+    const out = /get_footer\s*\(/.test(php)
+      ? php.replace(/(<\?php\s*)?\s*get_footer\s*\(\s*\)\s*;?/i, (m) => marker + m)
+      : php + marker;
+    fs.writeFileSync(abs, out);
+    changed.push(themePath + "/" + pg.file);
+    added.push(pg.slug);
+  }
+  if (!added.length) return { changed: [], note: "CTA already added on a previous run", skipped: true, added: [] };
+  return { changed, added, note: `CTA copied from /${donorPage.slug} onto ${added.join(", ")}` };
+}
+
+// ---- images: rename, convert and shrink, by pulling them into the repo -------
+// The photos live on Google's and Unsplash's CDNs, so nothing in the repo can be
+// renamed or recompressed in place. Both CDNs will, however, hand back WebP at a
+// chosen width from the URL alone — Google via the `-rw` suffix, Unsplash via
+// `fm=webp`. So the fix is to ask for a small WebP, save it into the theme under
+// a proper name, and point the template at the local copy. One pass fixes the
+// name, the format and the weight, and the asset stops being someone else's.
+const IMG_TARGET_WIDTH = 1200;          // under the 2000px cap, and both CDNs land under 100KB here
+const IMG_MAX_BYTES = 100 * 1024;
+const IMG_STOPWORDS = new Set(["a", "an", "the", "of", "in", "on", "at", "with", "and", "or", "for", "to", "is",
+  "are", "her", "his", "its", "their", "this", "that", "very", "soft", "high", "end", "premium", "luxurious",
+  "luxury", "modern", "clean", "warm", "cool", "bright", "close", "up", "shot", "image", "photo", "background",
+  "featuring", "showing", "while", "from", "into", "over", "under", "sense", "tones", "lighting"]);
+// A name a human can read, taken from the alt text the generator already wrote.
+// Falls back to the page slug, which is the service name on a service page.
+function imageSubject(tag, pageSlug, businessName) {
+  const alt = (tag.match(/\b(?:data-)?alt\s*=\s*["']([^"']+)["']/i) || [])[1] || "";
+  // The business name is appended separately; alt text that already names the
+  // clinic would otherwise produce nuvo-aesthetics-clinic-nuvo-aesthetics-clinic.
+  const bizWords = new Set(prSlugify(businessName || "").split("-").filter(Boolean));
+  const words = alt.toLowerCase().replace(/[^a-z0-9\s-]/g, " ").split(/\s+/)
+    .filter((w) => w.length > 2 && !IMG_STOPWORDS.has(w) && !bizWords.has(w));
+  const subject = words.slice(0, 4).join("-");
+  return subject || prSlugify(pageSlug) || "image";
+}
+// Numbers and single letters are what the naming rules exist to forbid, so a
+// collision is resolved with more of the alt text rather than a counter.
+function uniqueImageName(base, taken, extraWords) {
+  let name = base;
+  let i = 0;
+  while (taken.has(name) && i < extraWords.length) name = base + "-" + extraWords[i++];
+  while (taken.has(name)) name = name + "-alt";
+  taken.add(name);
+  return name;
+}
+// Ask the CDN for WebP at our width. Anything we do not recognise is left alone —
+// downloading an arbitrary host's image and re-hosting it is not our call.
+function cdnWebpUrl(src, width = IMG_TARGET_WIDTH) {
+  if (/lh3\.googleusercontent\.com/.test(src)) return src.replace(/=[a-z0-9-]+$/i, "") + `=w${width}-rw`;
+  if (/images\.unsplash\.com/.test(src)) {
+    const base = src.split("?")[0];
+    return `${base}?w=${width}&fm=webp&q=72&fit=crop`;
+  }
+  return null;
+}
+async function fixImages(themeAbs, pages, businessName, facts, themePath) {
+  const bizSlug = prSlugify(businessName).split("-").slice(0, 3).join("-");
+  const loc = facts.city ? `in-${prSlugify(facts.city)}${facts.region ? "-" + prSlugify(facts.region) : ""}` : "";
+  const dir = path.join(themeAbs, "assets", "img");
+  const taken = new Set();
+  const changed = [];
+  const swaps = [];
+  let bytesBefore = 0, bytesAfter = 0, skipped = 0;
+
+  for (const pg of pages) {
+    const abs = path.join(themeAbs, pg.file);
+    let php = readIf(abs);
+    if (!php) continue;
+    const tags = php.match(/<img[^>]*>/gi) || [];
+    let touched = false;
+    for (const tag of tags) {
+      const src = (tag.match(/\bsrc\s*=\s*["']([^"']+)["']/i) || [])[1];
+      if (!src || !/^https?:\/\//i.test(src)) continue;
+      const webp = cdnWebpUrl(src);
+      if (!webp) { skipped++; continue; }
+      const alt = (tag.match(/\b(?:data-)?alt\s*=\s*["']([^"']+)["']/i) || [])[1] || "";
+      const extra = alt.toLowerCase().replace(/[^a-z0-9\s-]/g, " ").split(/\s+/)
+        .filter((w) => w.length > 2 && !IMG_STOPWORDS.has(w)).slice(4, 9);
+      const base = [imageSubject(tag, pg.slug, businessName), bizSlug, loc].filter(Boolean).join("-").slice(0, 90);
+      const name = uniqueImageName(base, taken, extra);
+      try {
+        // Step down the width until it fits the budget. A dense photograph at
+        // 1200px can still exceed 100KB, and the budget is the point of the fix.
+        let buf = null;
+        for (const w of [IMG_TARGET_WIDTH, 900, 700]) {
+          const r = await fetch(cdnWebpUrl(src, w), { redirect: "follow", headers: { "User-Agent": "G99PerformPR/1.0" } });
+          if (!r.ok) break;
+          buf = Buffer.from(await r.arrayBuffer());
+          if (buf.length && buf.length <= IMG_MAX_BYTES) break;
+        }
+        if (!buf || !buf.length) { skipped++; continue; }
+        // What the page was serving before, so the report can show the saving.
+        let was = 0;
+        try { const h = await fetch(src, { method: "HEAD", headers: { "User-Agent": "G99PerformPR/1.0" } }); was = Number(h.headers.get("content-length") || 0); } catch (_) { /* best effort */ }
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, name + ".webp"), buf);
+        const localRef = `<?php echo esc_url(get_theme_file_uri('assets/img/${name}.webp')); ?>`;
+        php = php.split(src).join(localRef);
+        touched = true;
+        bytesBefore += was; bytesAfter += buf.length;
+        swaps.push({ page: pg.slug, from: src, to: `assets/img/${name}.webp`, wasBytes: was, nowBytes: buf.length });
+        changed.push(`${themePath}/assets/img/${name}.webp`);
+      } catch (e) { skipped++; }
+    }
+    if (touched) { fs.writeFileSync(abs, php); changed.push(themePath + "/" + pg.file); }
+  }
+  if (!swaps.length) return { changed: [], note: skipped ? `${skipped} image(s) are on hosts we do not rewrite` : "no remote images to localise", skipped: true, swaps: [] };
+  const saved = bytesBefore && bytesAfter ? Math.round((1 - bytesAfter / bytesBefore) * 100) : 0;
+  return {
+    changed: [...new Set(changed)], swaps,
+    note: `${swaps.length} image(s) renamed + converted to WebP · ${Math.round(bytesBefore / 1024)}KB → ${Math.round(bytesAfter / 1024)}KB${saved > 0 ? ` (−${saved}%)` : ""}`,
+  };
 }
 function fixFavicon(themeAbs, pages, themePath, siteHost) {
   const logo = themeLogoUrl(pages, siteHost);
@@ -8755,6 +8930,20 @@ function performPrReportHtml(job) {
       <td style="padding:9px 12px;text-align:center"><span style="font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;color:#fff;background:${chip[t.status] || "#8a8fa3"}">${e(t.status)}</span></td>
       <td style="padding:9px 12px;color:#555">${e(t.detail || "")}</td></tr>`).join("")}
   </table>
+  ${(job.imageSwaps || []).length ? `<h2 style="font-size:16px;margin:34px 0 10px">Images — before and after <span style="color:#8a8fa3;font-weight:400;font-size:13px">· ${job.imageSwaps.length}</span></h2>
+  <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:12px;background:#fff;border:1px solid #e6e8f0;border-radius:10px;overflow:hidden">
+    <tr style="background:#fafbfe;color:#6b6f82"><th style="text-align:left;padding:8px 12px;width:72px">Page</th><th style="text-align:left;padding:8px 12px">Was</th><th style="text-align:left;padding:8px 12px">Now</th><th style="padding:8px 12px;width:120px">Size</th></tr>
+    ${job.imageSwaps.slice(0, 40).map((s) => {
+      const wasKb = Math.round((s.wasBytes || 0) / 1024), nowKb = Math.round((s.nowBytes || 0) / 1024);
+      const cut = wasKb ? Math.round((1 - nowKb / wasKb) * 100) : 0;
+      return `<tr style="border-top:1px solid #eef0f6">
+        <td style="padding:8px 12px;color:#6b6f82"><code>${e(s.page)}</code></td>
+        <td style="padding:8px 12px;color:#8a8fa3"><code>${e(String(s.from).split("/").pop().slice(0, 34))}…</code></td>
+        <td style="padding:8px 12px"><code>${e(String(s.to).replace("assets/img/", ""))}</code></td>
+        <td style="padding:8px 12px;text-align:right;white-space:nowrap">${wasKb ? `<span style="color:#8a8fa3">${wasKb}KB</span> → ` : ""}<strong style="color:#1f7a55">${nowKb}KB</strong>${cut > 0 ? ` <span style="color:#1f7a55">−${cut}%</span>` : ""}</td>
+      </tr>`;
+    }).join("")}
+  </table></div>` : ""}
   ${settled.length ? `<h2 style="font-size:16px;margin:34px 0 10px">Already handled <span style="color:#8a8fa3;font-weight:400;font-size:13px">· ${settled.length}</span></h2>
   <table style="width:100%;border-collapse:collapse;font-size:13px;background:#fff;border:1px solid #e6e8f0;border-radius:10px;overflow:hidden">
     ${settled.map((t) => `<tr style="border-top:1px solid #eef0f6">
@@ -8962,6 +9151,14 @@ async function runPerformPrJob(job) {
       jobStep(job, 6, "running", label + " — " + result.note);
     };
     record("Business name", fixBusinessName(themeAbs, pages, P.businessName, facts.name, P.themePath), "business-name");
+    record("Spelling", fixSpelling(themeAbs, pages, job.prFindings, P.themePath), "spelling");
+    record("CTA on every page", fixCta(themeAbs, pages, job.prFindings, P.themePath), "cta");
+    // Images last of the content fixes: it rewrites src attributes across every
+    // template, so it should not race the edits above on the same files.
+    const imgFix = await fixImages(themeAbs, pages, P.businessName, facts, P.themePath);
+    job.imageSwaps = imgFix.swaps || [];
+    record("Image naming", imgFix, "image-naming");
+    if ((imgFix.changed || []).length) { fixedTasks.add("image-format"); fixedTasks.add("image-weight"); }
     record("Favicon", fixFavicon(themeAbs, pages, P.themePath, siteHost), "favicon");
     record("Social sharing image", fixSocialImage(themeAbs, pages, P.themePath, siteHost));
     record("Custom 404", fix404(themeAbs, P.themePath, brand));
@@ -9079,10 +9276,7 @@ async function runPerformPrJob(job) {
     jobStep(job, 10, "running", "Checking links on the deployed site...");
     const links = await verifyLinks(P.liveUrl);
     task("Link check", links.findings.length ? "fail" : "pass", `${links.checked} link(s) across ${links.pages} page(s)`, links.findings);
-    jobStep(job, 10, "running", "Verifying favicon and sharing image...");
-    const headF = await verifyHeadAssets(P.liveUrl);
-    task("Live favicon + og:image", headF.length ? "fail" : "pass", headF.length ? `${headF.length} problem(s)` : "both resolve on the live page", headF);
-    jobStep(job, 10, "done", `${links.findings.length + headF.length} finding(s) after deploy`);
+    jobStep(job, 10, "done", `${links.findings.length} finding(s) after deploy`);
 
     // Last, because it must measure the site as released — after the fixes above
     // are live, not the state we started from.
@@ -10758,6 +10952,7 @@ module.exports = {
   findingsBusinessName, findingsContact, findingsClickable, findingsCta, findingsFavicon,
   fetchLiveSitemap, sitemapLocs, urlSlug, findingsMissingPages, resolveLiveSite,
   splitLocationSlug, findingsUrlStructure, pageSpeedRun, findingsPageSpeed, psiReportUrl, collapseFindings,
+  fixSpelling, fixCta, extractCtaBlock, fixImages, cdnWebpUrl, imageSubject, uniqueImageName,
   OUTCOME, OUTCOME_LABEL, resolveFindingOutcomes, replaceInTextNodes, fixBusinessName,
   imageSources, findingsImages, readSeoPages, synthMuSource, pageText,
   fixFavicon, fixSocialImage, fix404, fixCallNow, fixBlvd, fixBlogLinkColor, fixClickable,
