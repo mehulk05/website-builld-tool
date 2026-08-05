@@ -8811,15 +8811,18 @@ async function runPerformPrJob(job) {
     task("Business name", nameF.length ? "fail" : "pass", nameF.length ? `${nameF.length} inconsistency(ies)` : `"${P.businessName}" used consistently`, nameF);
     const contactF = findingsContact(pages, facts);
     task("Contact details", contactF.length ? "fail" : "pass", contactF.length ? `${contactF.length} issue(s)` : "phone, email and address agree across the site", contactF);
+    // An audit never reports "fixed" — it has not fixed anything yet. Phase 2
+    // upgrades these to "fixed" only when it actually changes a file, so a fix
+    // that declines to run (no site-owned logo, say) stays honest in the report.
     const clickF = findingsClickable(pages, facts);
-    task("Clickable contact", clickF.length ? "fixed" : "pass", clickF.length ? `${clickF.length} plain-text mention(s) to link` : "already clickable", clickF);
+    task("Clickable contact", clickF.length ? "fail" : "pass", clickF.length ? `${clickF.length} plain-text mention(s) to link` : "already clickable", clickF);
     const ctaF = findingsCta(pages);
     task("CTA on every page", ctaF.length ? "fail" : "pass", ctaF.length ? `${ctaF.length} page(s) without a CTA` : `all ${pages.length} page(s) have a CTA`, ctaF);
     jobStep(job, 3, "done", `${nameF.length + contactF.length + clickF.length + ctaF.length} finding(s)`);
 
     jobStep(job, 4, "running", "Favicon, images, spelling...");
     const favF = findingsFavicon(themeAbs, pages, siteHost);
-    task("Favicon", favF.length ? "fixed" : "pass", favF.length ? "missing — generating" : "already emitted", favF);
+    task("Favicon", favF.length ? "fail" : "pass", favF.length ? "not emitted by the theme" : "already emitted", favF);
     const images = imageSources(pages);
     const imgF = findingsImages(images, P.businessName);
     const weightF = await findingsImageWeight(images);
