@@ -59,9 +59,16 @@ const TED_SHOT_DELAY_MS = Number(process.env.TED_SHOT_DELAY_MS || 60000);
 const TED_SCREENSHOTS = (process.env.TED_SCREENSHOTS || "on").toLowerCase() !== "off";
 // TED stores a comment image inline as base64 in the comment's own text, so an
 // oversized capture is a text-length problem: ~1.5MB inlined returns a 500.
-// jpeg/q40/900px lands around 90KB, well under whatever the real ceiling is.
-const TED_SHOT_PARAMS = "&type=jpeg&quality=40&viewport.width=900";
+// jpeg/q40/1400px lands around 110KB (~150KB inlined) on both providers — wide
+// enough to read a hero at a glance, nowhere near the ceiling.
+const TED_SHOT_WIDTH = Number(process.env.TED_SHOT_WIDTH || 1400);
+const TED_SHOT_PARAMS = `&type=jpeg&quality=40&viewport.width=${TED_SHOT_WIDTH}`;
 const TED_SHOT_MAX_BYTES = 400 * 1024;
+// Optional, but effectively required once deployed: microlink's free quota is
+// 25/day counted per calling IP, and a shared host's IP is spent by other
+// tenants long before we get to it. Unset works fine locally and fails on
+// Render for reasons no log used to explain. Also used by the CRO audit.
+const MICROLINK_API_KEY = process.env.MICROLINK_API_KEY || "";
 if (!API_KEY) console.warn("⚠ STITCH_API_KEY not set — Stitch generation will fail. Add it to .env or the platform env vars.");
 if (!NOCODB_TOKEN) console.warn("⚠ NOCODB_TOKEN not set — the All Sites / Edit Sites website list will be empty until it's added to .env.");
 if (!GEMINI_KEYS.length) console.warn("⚠ GEMINI_KEYS not set — all AI features (CRO, prompt, bind, QC) will fail.");
@@ -820,7 +827,9 @@ function splitPage(html) {
   if (footer) main = main.replace(footer, "");
   return { head: wpRewriteLinks(head), header: wpRewriteLinks(header), footer: wpRewriteLinks(footer), main: wpRewriteLinks(main) };
 }
-async function buildWpTheme(slug, biz) {
+// opts.logoUrl   — the onboarding logo upload; becomes the site favicon
+// opts.businessId — drives the chatbot widget's data-id
+async function buildWpTheme(slug, biz, opts = {}) {
   const siteDir = path.join(GEN, "site");
   if (!fs.existsSync(path.join(siteDir, "index.html"))) throw new Error("Bind the site first (Step 4) — no /site/ bundle found.");
   const themeDir = path.join(GEN, "wp-theme", slug);
@@ -831,6 +840,12 @@ async function buildWpTheme(slug, biz) {
   const home = splitPage(fs.readFileSync(path.join(siteDir, "index.html"), "utf8"));
   const written = [];
   const w = (name, content) => { fs.writeFileSync(path.join(themeDir, name), content); written.push(name); };
+
+  // Fetched before functions.php is written, because the hooks below are only emitted when
+  // there is actually a file to point at.
+  const businessId = opts.businessId || null;
+  const favicon = await writeFaviconFromLogo(themeDir, opts.logoUrl);
+  if (favicon) written.push(`assets/${favicon.file}`);
 
   w("style.css", `/*\nTheme Name: ${biz} (Growth99)\nTheme URI: https://growth99.com\nAuthor: Growth99\nDescription: AI-generated beta theme for ${biz}. Classic theme for Bedrock WordPress.\nVersion: 1.0.0\nLicense: Proprietary\nText Domain: g99-${slug}\n*/\n`);
 
@@ -850,7 +865,30 @@ add_action('after_setup_theme', function () {
 add_action('wp_enqueue_scripts', function () {
     wp_enqueue_style('g99-${slug}', get_stylesheet_uri(), [], '1.0.0');
 });
-
+${favicon ? `
+/**
+ * Favicon from the client's onboarding logo (assets/${favicon.file}).
+ * Printed at priority 1 so it wins over anything a plugin adds later. Skipped when the
+ * WordPress Site Icon is set, so an explicit choice in wp-admin is never overridden.
+ */
+add_action('wp_head', function () {
+    if (function_exists('has_site_icon') && has_site_icon()) {
+        return;
+    }
+    $href = esc_url(get_theme_file_uri('assets/${favicon.file}'));
+    echo '<link rel="icon" type="${favicon.mime}" href="' . $href . '">' . "\\n";
+    echo '<link rel="apple-touch-icon" href="' . $href . '">' . "\\n";
+}, 1);
+` : ""}${businessId ? `
+/**
+ * Growth99 chatbot widget. data-id is the base64-encoded business id (${businessId}).
+ * On wp_footer so the div exists before integration.js runs.
+ */
+add_action('wp_footer', function () {
+    echo '<div id="buisness-id" data-id="${chatbotDataId(businessId)}"></div>' . "\\n";
+    echo '<script id="integration-script" src="https://chatbot.growth99.com/assets/js/integration.js"></script>' . "\\n";
+});
+` : ""}
 /**
  * On activation, auto-create the site's Pages, assign templates, set the static
  * front page, and build the primary menu. Idempotent — safe to re-run.
@@ -1468,6 +1506,56 @@ ${h ? `h1,h2,h3,h4{letter-spacing:-.01em}` : ""}
 // test is the image's INTRINSIC pixel width — not a perceptual blur score. Read it
 // straight from the file header (JPEG SOF / PNG IHDR / WebP VP8) using a ranged
 // fetch, so we download a few KB instead of the whole photo.
+// The client's logo, fetched and written into the theme as the favicon. The onboarding upload
+// is an S3 object with NO file extension, so the type comes from the magic bytes — guessing
+// from the URL would produce a .png that is really a JPEG and browsers would drop it.
+// SVG is detected from the leading markup instead (no magic number).
+function imageExtFromBuffer(b) {
+  if (!b || b.length < 12) return null;
+  if (b[0] === 0x89 && b.slice(1, 4).toString("ascii") === "PNG") return "png";
+  if (b[0] === 0xff && b[1] === 0xd8) return "jpg";
+  if (b.slice(0, 3).toString("ascii") === "GIF") return "gif";
+  if (b.slice(0, 4).toString("ascii") === "RIFF" && b.slice(8, 12).toString("ascii") === "WEBP") return "webp";
+  if (b[0] === 0x00 && b[1] === 0x00 && b[2] === 0x01 && b[3] === 0x00) return "ico";
+  const head = b.slice(0, 400).toString("utf8").trim().toLowerCase();
+  if (head.startsWith("<svg") || (head.startsWith("<?xml") && head.includes("<svg"))) return "svg";
+  return null;
+}
+const FAVICON_MIME = {
+  png: "image/png", jpg: "image/jpeg", gif: "image/gif",
+  webp: "image/webp", ico: "image/x-icon", svg: "image/svg+xml",
+};
+
+// Download the logo and drop it in the theme. Returns {file, mime, w, h} or null — a missing
+// or unreadable logo must never fail a build, it just means no favicon this time.
+async function writeFaviconFromLogo(themeDir, logoUrl) {
+  if (!logoUrl || !/^https?:\/\//i.test(logoUrl)) return null;
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 20000);
+    let r;
+    try { r = await fetch(logoUrl, { signal: ctl.signal, redirect: "follow" }); }
+    finally { clearTimeout(timer); }
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const buf = Buffer.from(await r.arrayBuffer());
+    const ext = imageExtFromBuffer(buf);
+    if (!ext) throw new Error("not a recognisable image (" + buf.length + " bytes)");
+    const dir = path.join(themeDir, "assets");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = `favicon.${ext}`;
+    fs.writeFileSync(path.join(dir, file), buf);
+    const d = ext === "svg" ? null : dimsFromBuffer(buf);
+    return { file, mime: FAVICON_MIME[ext], bytes: buf.length, w: d ? d.w : null, h: d ? d.h : null };
+  } catch (e) {
+    console.error("favicon skipped:", e.message);
+    return null;
+  }
+}
+
+// The chatbot widget's data-id is the business id, base64-encoded — that is all the
+// "encryption" is (MTAxOTM= decodes to 10193), so it is derived here rather than asked for.
+const chatbotDataId = (businessId) => Buffer.from(String(businessId), "utf8").toString("base64");
+
 function dimsFromBuffer(b) {
   if (!b || b.length < 24) return null;
   // PNG: 8-byte signature, then IHDR width/height as big-endian uint32
@@ -1826,16 +1914,68 @@ async function microlinkShot(url, extra = "", timeoutMs = 15000) {
   const timer = setTimeout(() => ctl.abort(), timeoutMs);   // don't let microlink hang the caller
   try {
     const api = `https://api.microlink.io/?url=${encodeURIComponent(url)}&screenshot=true&meta=false&embed=screenshot.url${extra}`;
-    const r = await fetch(api, { signal: ctl.signal }); if (!r.ok) return null;
+    // Without a key the quota is 25/day and counted against the *caller's IP* —
+    // which on a shared host is spent by strangers, so captures fail there while
+    // working perfectly from a laptop. A key moves the quota to the account.
+    const headers = MICROLINK_API_KEY ? { "x-api-key": MICROLINK_API_KEY } : {};
+    const r = await fetch(api, { signal: ctl.signal, headers });
+    const left = r.headers.get("x-rate-limit-remaining");
+    if (!r.ok) {
+      // Every one of these used to return null silently, which is why a missing
+      // screenshot was impossible to explain from the logs.
+      console.warn(`screenshot of ${url} failed: HTTP ${r.status}${r.status === 429 ? " (microlink daily quota spent for this IP)" : ""}${left != null ? ` · ${left} left` : ""}`);
+      return null;
+    }
     const ct = r.headers.get("content-type") || "";
-    if (!ct.startsWith("image")) return null;            // error/redirect, not an image
+    if (!ct.startsWith("image")) { console.warn(`screenshot of ${url} failed: got ${ct || "no content-type"}, not an image`); return null; }
     const buf = Buffer.from(await r.arrayBuffer());
-    return buf.length > 1000 ? { buf, contentType: ct } : null;
-  } catch (e) { return null; }
+    if (buf.length <= 1000) { console.warn(`screenshot of ${url} failed: ${buf.length} bytes is not a real image`); return null; }
+    if (left != null && Number(left) <= 3) console.warn(`microlink quota nearly spent: ${left} screenshot(s) left today`);
+    return { buf, contentType: ct };
+  } catch (e) {
+    console.warn(`screenshot of ${url} failed: ${e.name === "AbortError" ? `no response in ${timeoutMs}ms` : e.message}`);
+    return null;
+  }
   finally { clearTimeout(timer); }
 }
+// WordPress mShots — the fallback when microlink's daily allowance is gone.
+// Needs no key and has no per-IP quota, which is exactly what a shared host
+// wants. The trade is that it renders asynchronously: it answers immediately
+// with a small "loading" graphic and only serves the real capture once it is
+// ready, so a short body means "not finished", not "failed".
+const MSHOTS_PLACEHOLDER_MAX_BYTES = 15 * 1024;
+async function mshotsShot(url, width = 900, tries = 4, gapMs = 6000, timeoutMs = 20000) {
+  const api = `https://s.wordpress.com/mshots/v1/${encodeURIComponent(url)}?w=${width}`;
+  for (let i = 0; i < tries; i++) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      const r = await fetch(api, { signal: ctl.signal });
+      const ct = (r.headers.get("content-type") || "").split(";")[0];
+      if (r.ok && ct.startsWith("image")) {
+        const buf = Buffer.from(await r.arrayBuffer());
+        if (buf.length > MSHOTS_PLACEHOLDER_MAX_BYTES) return { buf, contentType: ct };
+      }
+    } catch (e) { /* still rendering, or a blip — try again */ }
+    finally { clearTimeout(timer); }
+    if (i < tries - 1) await sleep(gapMs);
+  }
+  console.warn(`mShots screenshot of ${url} was still rendering after ${tries} attempts`);
+  return null;
+}
+
+// One capture, two providers. microlink first — better quality and it honours
+// width/format — then mShots when its quota is spent, which on a shared IP is
+// most of the time.
+async function siteScreenshot(url, { extra = "", width = 900, timeoutMs = 15000 } = {}) {
+  const shot = await microlinkShot(url, extra, timeoutMs);
+  if (shot) return shot;
+  console.warn(`falling back to mShots for ${url}`);
+  return mshotsShot(url, width);
+}
+
 async function croScreenshot(url) {
-  const shot = await microlinkShot(url);
+  const shot = await siteScreenshot(url, { width: 1280 });
   return shot ? shot.buf.toString("base64") : null;
 }
 async function croAudit(src) {
@@ -3115,10 +3255,13 @@ function tedPostOutcome(job, outcome) {
   setTimeout(async () => {
     let image = null;
     try {
-      const shot = await microlinkShot(P.liveUrl, TED_SHOT_PARAMS, 25000);
+      const shot = await siteScreenshot(P.liveUrl, { extra: TED_SHOT_PARAMS, width: TED_SHOT_WIDTH, timeoutMs: 25000 });
       if (shot && shot.buf.length <= TED_SHOT_MAX_BYTES) image = shot;
       else if (shot) console.warn(`TED screenshot ${(shot.buf.length / 1024).toFixed(0)}KB exceeds the inline limit — posting without it`);
-    } catch (e) { /* text still goes out below */ }
+    } catch (e) { console.warn("TED screenshot failed:", e.message); }
+    // Say so explicitly. The comment still goes out either way, and a picture
+    // that is merely absent looks identical to one that was never wanted.
+    if (!image) console.warn(`TED outcome for ${job.draftId} posting without a screenshot — both microlink and mShots came back empty`);
     tedComment(text, image);
   }, TED_SHOT_DELAY_MS);
 }
@@ -8971,6 +9114,9 @@ const server = http.createServer(async (req, res) => {
           referenceWebsite: body.referenceWebsite || mapped.referenceWebsite || "",
           existingWebsite: body.existingWebsite || mapped.existingWebsite || "",
           confirmedBrand,
+          // Presigned by product-service: the raw logo_file answer is a private S3 object
+          // that 403s, so this is the only fetchable form of the client's logo.
+          logoUrl: body.logoUrl || null,
           answers: mapped.answers,
         }, null, 2));
       } catch (e) { console.warn("could not persist onboarding.json:", e.message); }
@@ -10169,10 +10315,16 @@ const server = http.createServer(async (req, res) => {
 
     if (p === "/api/export-wordpress" && req.method === "POST") {
       const body = JSON.parse(await readBody(req) || "{}");
-      const a = JSON.parse(fs.readFileSync(path.join(DIR, "onboarding.json"), "utf8")).answers;
+      const onb = JSON.parse(fs.readFileSync(path.join(DIR, "onboarding.json"), "utf8"));
+      const a = onb.answers;
       const slug = (a.business_name || "client").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32);
       await ensureFreshSite(body.theme); // rebind /site/ from newest generation — never ship stale
-      const out = await buildWpTheme(slug, a.business_name);
+      const out = await buildWpTheme(slug, a.business_name, {
+        // Favicon source and chatbot business id: the logo is an answer, the business id
+        // rides at the root of the webhook payload.
+        logoUrl: onb.logoUrl || a.logo_file || a.logo || null,
+        businessId: onb.businessId || null,
+      });
       return json(res, 200, { slug: out.slug, themePath: `web/app/themes/g99-${out.slug}/`, files: out.files });
     }
 
@@ -10180,10 +10332,16 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req) || "{}");
       // Per-client target repo (from the job); falls back to this deployment's default.
       const repo = body.githubRepo || WP_REPO;
-      const a = JSON.parse(fs.readFileSync(path.join(DIR, "onboarding.json"), "utf8")).answers;
+      const onb = JSON.parse(fs.readFileSync(path.join(DIR, "onboarding.json"), "utf8"));
+      const a = onb.answers;
       const slug = (a.business_name || "client").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32);
       if (!body.skipRebind) await ensureFreshSite(body.theme); // rebind /site/ from newest generation — never ship stale (dashboard binds itself and passes skipRebind)
-      const built = await buildWpTheme(slug, a.business_name);
+      const built = await buildWpTheme(slug, a.business_name, {
+        // Favicon source and chatbot business id: the logo is an answer, the business id
+        // rides at the root of the webhook payload.
+        logoUrl: onb.logoUrl || a.logo_file || a.logo || null,
+        businessId: onb.businessId || null,
+      });
       const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");   // YYYYMMDDHHMMSS
       const uniq = Date.now().toString(36).slice(-4);                              // avoid same-second collisions
       let branch = (body.branch || `g99/beta-theme-${slug}-${stamp}-${uniq}`).replace(/[^a-zA-Z0-9._\/\-]/g, "");
@@ -10214,7 +10372,13 @@ const server = http.createServer(async (req, res) => {
         // would leave stale templates from earlier merged builds in the repo).
         fs.rmSync(dest, { recursive: true, force: true });
         fs.mkdirSync(dest, { recursive: true });
-        for (const f of built.files) fs.copyFileSync(path.join(built.themeDir, f), path.join(dest, f));
+        for (const f of built.files) {
+          const to = path.join(dest, f);
+          // Some theme files now live in subdirectories (assets/favicon.*), and a flat copy
+          // would throw ENOENT on the missing parent.
+          fs.mkdirSync(path.dirname(to), { recursive: true });
+          fs.copyFileSync(path.join(built.themeDir, f), to);
+        }
         // Must-use plugin so the deploy auto-activates the theme (no manual click).
         const muRel = "web/app/mu-plugins";
         const muFile = `g99-activate-${slug}.php`;
