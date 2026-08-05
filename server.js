@@ -8024,28 +8024,34 @@ function findingsUrlStructure(pages, facts) {
     const slug = String(p.slug || "").toLowerCase();
     return slug !== "home" && !NON_SERVICE_SLUGS.has(slug) && !/^(blog|post|category|tag)-/.test(slug);
   });
-  if (!services.length) return { findings: out, mode: "none", detail: "no service pages to check" };
+  if (!services.length) return { findings: out, renames: [], mode: "none", detail: "no service pages to check" };
 
   const parsed = services.map((p) => ({ ...splitLocationSlug(p.slug), slug: p.slug, title: p.title }));
   const locations = [...new Set(parsed.map((p) => p.location).filter(Boolean))];
   const city = prSlugify(facts.city);
   const multi = locations.length > 1;
 
+  // Slug changes the fixer can apply. Only ever produced for the single-location
+  // rule: a multi-location site needs pages created, not renamed, and creating
+  // pages is a content decision.
+  const renames = [];
   if (!multi) {
     // Single location: the location belongs in every service URL.
     const expected = city ? `in-${city}${facts.region ? "-" + prSlugify(facts.region) : ""}` : (locations[0] ? "in-" + locations[0] : "");
     for (const p of parsed) {
       if (!p.location) {
+        if (expected) renames.push({ from: p.slug, to: `${p.base}-${expected}` });
         out.push(prFinding("url-structure", "medium", p.slug,
           `Service URL has no location — single-location sites should read /${p.base}-${expected || "in-<city>-<state>"}`,
-          { found: "/" + p.slug, expected: expected ? `/${p.base}-${expected}` : "/<service>-in-<city>-<state>", fix: "proposed" }));
+          { found: "/" + p.slug, expected: expected ? `/${p.base}-${expected}` : "/<service>-in-<city>-<state>", fix: expected ? "auto" : "proposed" }));
       } else if (city && !p.location.includes(city)) {
+        if (expected) renames.push({ from: p.slug, to: `${p.base}-${expected}` });
         out.push(prFinding("url-structure", "high", p.slug,
           `URL says "${p.location}" but the business is in ${facts.city}${facts.region ? ", " + facts.region : ""}`,
-          { found: "/" + p.slug, expected: `/${p.base}-in-${city}`, fix: "proposed" }));
+          { found: "/" + p.slug, expected: `/${p.base}-${expected}`, fix: expected ? "auto" : "proposed" }));
       }
     }
-    return { findings: out, mode: "single", detail: `single location${city ? " (" + facts.city + ")" : ""} · ${services.length} service page(s)` };
+    return { findings: out, renames, mode: "single", detail: `single location${city ? " (" + facts.city + ")" : ""} · ${services.length} service page(s)` };
   }
 
   // Multi-location: every service with location pages also needs one clean page
@@ -8064,7 +8070,7 @@ function findingsUrlStructure(pages, facts) {
         { found: withLoc.map((p) => "/" + p.slug).join(", ").slice(0, 120), expected: `/${base}`, fix: "proposed" }));
     }
   }
-  return { findings: out, mode: "multi", detail: `${locations.length} locations (${locations.slice(0, 4).join(", ")}) · ${services.length} service page(s)` };
+  return { findings: out, renames: [], mode: "multi", detail: `${locations.length} locations (${locations.slice(0, 4).join(", ")}) · ${services.length} service page(s)` };
 }
 
 // ---- PageSpeed (pre-release doc, tab 5) --------------------------------------
@@ -8156,7 +8162,7 @@ const OUTCOME_LABEL = { done: "Done", pending: "Pending", decision: "Decision", 
 const NOT_HERE_TASKS = new Set([]);
 // Tasks phase 2 owns. Anything here starts as pending and is upgraded to done
 // only when the corresponding fix reports that it changed a file.
-const FIXABLE_TASKS = new Set(["favicon", "clickable-contact", "business-name",
+const FIXABLE_TASKS = new Set(["favicon", "clickable-contact", "business-name", "url-structure", "internal-links",
   "spelling", "cta", "image-naming", "image-format", "image-weight"]);
 function resolveFindingOutcomes(findings, fixedTasks) {
   for (const f of findings) {
@@ -8431,6 +8437,157 @@ function fixBusinessName(themeAbs, pages, businessName, siteName, themePath) {
   if (!total) return { changed: [], note: `"${wrong}" appears only in code or URLs — left alone` };
   return { changed: [...new Set(changed)], note: `"${wrong}" → "${correct}" in ${total} place(s)` };
 }
+// ---- redirects ---------------------------------------------------------------
+// Renaming a URL without a redirect throws away every inbound link and every
+// ranking that page had — which is the whole reason the location rule exists.
+// So the redirect map is written first and the slug is changed second; if the
+// map cannot be written, the rename does not happen.
+//
+// The map is cumulative. A page renamed twice over two runs must still be
+// reachable from its original URL, so existing entries are re-pointed at the
+// newest destination rather than replaced.
+const REDIRECT_FILE = "inc/g99-redirects.php";
+function readRedirectMap(themeAbs) {
+  const src = readIf(path.join(themeAbs, REDIRECT_FILE));
+  const map = new Map();
+  for (const m of src.matchAll(/'([^']+)'\s*=>\s*'([^']+)'/g)) map.set(m[1], m[2]);
+  return map;
+}
+function writeRedirectMap(themeAbs, themePath, pairs) {
+  const map = readRedirectMap(themeAbs);
+  for (const [from, to] of pairs) {
+    if (!from || !to || from === to) continue;
+    // Anything already pointing at the old URL must follow it to the new one,
+    // or a two-hop rename leaves the first URL stranded on a 404.
+    for (const [k, v] of map) if (v === from) map.set(k, to);
+    map.set(from, to);
+  }
+  if (!map.size) return { changed: [], entries: 0 };
+  const rows = [...map.entries()].filter(([f, t]) => f !== t)
+    .map(([f, t]) => `    '${f.replace(/'/g, "\\'")}' => '${t.replace(/'/g, "\\'")}',`).join("\n");
+  const php = [
+    "<?php",
+    "",
+    "/**",
+    ` * ${PR_MARK}:redirects — 301s for URLs this site used to serve.`,
+    " *",
+    " * Written by the pre-release run whenever it changes a slug. Runs early on",
+    " * template_redirect so it answers before WordPress decides the request is a 404.",
+    " * Safe to edit by hand; the pre-release run merges into this map rather than",
+    " * overwriting it.",
+    " */",
+    "",
+    "add_action('template_redirect', function () {",
+    "    $map = [",
+    rows,
+    "    ];",
+    "",
+    "    $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);",
+    "    $path = '/' . trim((string) $path, '/');",
+    "",
+    "    if ($path !== '/' ) {",
+    "        $path .= '/';",
+    "    }",
+    "",
+    "    if (isset($map[$path])) {",
+    "        wp_safe_redirect(home_url($map[$path]), 301);",
+    "        exit;",
+    "    }",
+    "}, 1);",
+    "",
+  ].join("\n");
+  fs.mkdirSync(path.join(themeAbs, "inc"), { recursive: true });
+  fs.writeFileSync(path.join(themeAbs, REDIRECT_FILE), php);
+  const changed = [`${themePath}/${REDIRECT_FILE}`];
+  // functions.php must actually load it, or the file is decoration.
+  const fnAbs = path.join(themeAbs, "functions.php");
+  const fn = readIf(fnAbs);
+  if (fn && !fn.includes(REDIRECT_FILE)) {
+    fs.writeFileSync(fnAbs, fn.replace(/^<\?php\s*/, (m) => `${m}\nrequire_once get_template_directory() . '/${REDIRECT_FILE}';\n`));
+    changed.push(themePath + "/functions.php");
+  }
+  return { changed, entries: map.size };
+}
+
+// The slug lives in the mu-plugin's $pages array, which is the authority on which
+// template serves which URL. Templates keep their filenames — only the slug moves.
+function fixUrlStructure(themeAbs, muAbs, muPath, themePath, renames) {
+  if (!renames.length) return { changed: [], note: "every service URL already carries the location", skipped: true, renamed: [] };
+  if (!muAbs || !fs.existsSync(muAbs)) return { changed: [], note: "no mu-plugin found — slugs cannot be changed safely", skipped: true, renamed: [] };
+  let mu = fs.readFileSync(muAbs, "utf8");
+  const applied = [];
+  for (const r of renames) {
+    // Only inside a $pages entry, so a slug that also appears in prose or a
+    // template name is left alone.
+    const re = new RegExp(`(\\['title'\\s*=>\\s*'[^']*'\\s*,\\s*'slug'\\s*=>\\s*')${r.from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(')`, "g");
+    if (!re.test(mu)) continue;
+    mu = mu.replace(re, `$1${r.to}$2`);
+    applied.push(r);
+  }
+  if (!applied.length) return { changed: [], note: "no matching slugs in the mu-plugin page list", skipped: true, renamed: [] };
+  // Redirects first: if this fails, the rename is abandoned rather than shipped
+  // without a way back to the old URL.
+  const red = writeRedirectMap(themeAbs, themePath, applied.map((r) => [`/${r.from}/`, `/${r.to}/`]));
+  if (!red.changed.length) return { changed: [], note: "could not write the redirect map — slugs left alone", skipped: true, renamed: [] };
+  fs.writeFileSync(muAbs, mu);
+  return {
+    changed: [muPath, ...red.changed], renamed: applied,
+    note: `${applied.length} URL(s) given the location, each 301'd from the old path`,
+  };
+}
+
+// Internal links that point at a page this site does not have. Checked against
+// the page list rather than over the network, so it runs before the PR instead
+// of after the deploy — which is the only point at which it can still be fixed.
+function findingsInternalLinks(pages, muPages) {
+  const known = new Set(["", "home", ...muPages.map((p) => String(p.slug || "").toLowerCase())]);
+  const out = [];
+  const seen = new Set();
+  for (const pg of pages) {
+    for (const m of String(pg.php || "").matchAll(/href\s*=\s*["'](\/[^"'#?]*)["']/gi)) {
+      const target = m[1].replace(/^\/+|\/+$/g, "").toLowerCase();
+      if (!target || target.includes("<?") || /\.(php|css|js|xml|txt|jpe?g|png|webp|svg|pdf)$/i.test(target)) continue;
+      const slug = target.split("/").pop();
+      if (known.has(target) || known.has(slug)) continue;
+      const key = pg.slug + "|" + target;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(prFinding("internal-links", "high", pg.slug, `Links to /${target}/, which is not a page on this site`,
+        { found: "/" + target + "/", expected: "an existing page, or a redirect", fix: "auto" }));
+    }
+  }
+  return out;
+}
+// A dead internal link gets a redirect to the closest page we do have. Closeness
+// is measured on shared slug words, and a link with no plausible destination is
+// left for a human rather than pointed somewhere arbitrary.
+function bestRedirectTarget(target, muPages) {
+  const words = new Set(String(target).split(/[^a-z0-9]+/i).filter((w) => w.length > 2));
+  let best = null, bestScore = 0;
+  for (const p of muPages) {
+    const slug = String(p.slug || "").toLowerCase();
+    if (!slug) continue;
+    const hits = [...words].filter((w) => slug.includes(w)).length;
+    if (hits > bestScore) { bestScore = hits; best = slug; }
+  }
+  return bestScore > 0 ? best : null;
+}
+function fixInternalLinks(themeAbs, themePath, findings, muPages) {
+  const dead = findings.filter((f) => f.task === "internal-links" && f.found);
+  if (!dead.length) return { changed: [], note: "every internal link resolves", skipped: true, redirects: [] };
+  const pairs = [], redirects = [];
+  for (const f of dead) {
+    const target = String(f.found).replace(/^\/+|\/+$/g, "");
+    const to = bestRedirectTarget(target, muPages);
+    if (!to) continue;
+    pairs.push([`/${target}/`, `/${to}/`]);
+    redirects.push({ from: "/" + target + "/", to: "/" + to + "/", page: f.page });
+  }
+  if (!pairs.length) return { changed: [], note: `${dead.length} dead link(s) with no plausible destination — left for review`, skipped: true, redirects: [] };
+  const red = writeRedirectMap(themeAbs, themePath, pairs);
+  return { changed: red.changed, redirects, note: `${redirects.length} dead link(s) 301'd to the nearest matching page` };
+}
+
 // A misspelling has one correct answer, and the audit already worked out what it
 // is. Applied to text nodes only, and only where the exact word is still present —
 // so a suggestion the audit got wrong changes nothing rather than mangling copy.
@@ -9056,7 +9213,7 @@ async function runPerformPrJob(job) {
     if (!fs.existsSync(themeAbs)) throw new Error("theme not found: " + P.themePath);
     const muAbs = P.muPath ? path.join(tmp, P.muPath) : "";
     const muSrc = muAbs && fs.existsSync(muAbs) ? fs.readFileSync(muAbs, "utf8") : synthMuSource(themeAbs);
-    const { pages } = readSeoPages(themeAbs, muSrc);
+    const { pages, muPages } = readSeoPages(themeAbs, muSrc);
     if (!pages.length) throw new Error("no registered pages found in the active theme");
     jobStep(job, 0, "done", `${pages.length} page(s) in ${P.themePath}`);
 
@@ -9106,6 +9263,10 @@ async function runPerformPrJob(job) {
     const urls = findingsUrlStructure(pages, facts);
     task("Location + URL structure", urls.findings.length ? "fail" : "pass",
       `${urls.detail}${urls.findings.length ? ` — ${urls.findings.length} issue(s)` : " — all correct"}`, urls.findings);
+    // Checked against the page list rather than over the network, so a dead
+    // internal link can still be fixed in this PR instead of found after deploy.
+    const linkF = findingsInternalLinks(pages, muPages);
+    task("Internal links", linkF.length ? "fail" : "pass", linkF.length ? `${linkF.length} link(s) point at a missing page` : "every internal link resolves", linkF);
     const nameF = findingsBusinessName(pages, P.businessName);
     task("Business name", nameF.length ? "fail" : "pass", nameF.length ? `${nameF.length} inconsistency(ies)` : `"${P.businessName}" used consistently`, nameF);
     const contactF = findingsContact(pages, facts);
@@ -9151,6 +9312,13 @@ async function runPerformPrJob(job) {
       jobStep(job, 6, "running", label + " — " + result.note);
     };
     record("Business name", fixBusinessName(themeAbs, pages, P.businessName, facts.name, P.themePath), "business-name");
+    // Redirect map first, then the rename that depends on it.
+    const urlFix = fixUrlStructure(themeAbs, muAbs, P.muPath, P.themePath, urls.renames || []);
+    job.urlRenames = urlFix.renamed || [];
+    record("Location + URL structure", urlFix, "url-structure");
+    const linkFix = fixInternalLinks(themeAbs, P.themePath, job.prFindings, muPages);
+    job.linkRedirects = linkFix.redirects || [];
+    record("Internal links", linkFix, "internal-links");
     record("Spelling", fixSpelling(themeAbs, pages, job.prFindings, P.themePath), "spelling");
     record("CTA on every page", fixCta(themeAbs, pages, job.prFindings, P.themePath), "cta");
     // Images last of the content fixes: it rewrites src attributes across every
@@ -10953,6 +11121,7 @@ module.exports = {
   fetchLiveSitemap, sitemapLocs, urlSlug, findingsMissingPages, resolveLiveSite,
   splitLocationSlug, findingsUrlStructure, pageSpeedRun, findingsPageSpeed, psiReportUrl, collapseFindings,
   fixSpelling, fixCta, extractCtaBlock, fixImages, cdnWebpUrl, imageSubject, uniqueImageName,
+  writeRedirectMap, readRedirectMap, fixUrlStructure, findingsInternalLinks, bestRedirectTarget, fixInternalLinks,
   OUTCOME, OUTCOME_LABEL, resolveFindingOutcomes, replaceInTextNodes, fixBusinessName,
   imageSources, findingsImages, readSeoPages, synthMuSource, pageText,
   fixFavicon, fixSocialImage, fix404, fixCallNow, fixBlvd, fixBlogLinkColor, fixClickable,
