@@ -373,6 +373,9 @@ async function generate(prompt, deviceType) {
 // exaggerated hero in exchange for seeing every section, at 1/30th the bytes.
 const PSI_ENDPOINT = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed";
 const PSI_API_KEY = process.env.PSI_API_KEY || "";
+const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN || process.env.BROWSERLESS_API_KEY || "";
+const BROWSERLESS_URL = String(process.env.BROWSERLESS_URL || "https://production-sfo.browserless.io").replace(/\/+$/, "");
+const BROWSERLESS_TIMEOUT_MS = Math.max(10000, Number(process.env.BROWSERLESS_TIMEOUT_MS || 60000) || 60000);
 // Per image, RAW bytes. A PSI WebP is ~60KB, so this is a generous sanity bound rather than a
 // real constraint — the 1.5MB ceiling it replaces was the sole reason Home failed on the first run.
 const MOCKUP_MAX_BYTES = 3_000_000;
@@ -1969,7 +1972,7 @@ function audit(html, kw) {
 function send(res, code, type, body) { res.writeHead(code, { "Content-Type": type }); res.end(body); }
 function json(res, code, obj) { send(res, code, "application/json", JSON.stringify(obj)); }
 function readBody(req) { return new Promise(r => { let d = ""; req.on("data", c => d += c); req.on("end", () => r(d)); }); }
-const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".png": "image/png" };
+const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp" };
 
 // ============================================================ JOB RUNNER
 // Server-side pipeline: a webhook (or manual enqueue) runs the whole 7-step
@@ -2515,6 +2518,18 @@ async function ciEarlyExit(job, stepIdx, siteId, st, i) {
   return false;
 }
 
+function selectPrChecks(rows, requireAllChecks = false) {
+  const candidates = (Array.isArray(rows) ? rows : [])
+    .filter((cols) => cols.length >= 2 && (requireAllChecks || /^build/i.test(String(cols[0] || "").trim())))
+    .map((cols) => ({ name: String(cols[0] || "").trim(), status: String(cols[1] || "").trim(), url: String(cols[3] || "").trim() }));
+  const byName = {};
+  for (const check of candidates) {
+    const current = byName[check.name];
+    const rank = (status) => status === "fail" ? 2 : (status === "pending" ? 1 : 0);
+    if (!current || rank(check.status) > rank(current.status)) byName[check.name] = check;
+  }
+  return Object.values(byName);
+}
 function ciRollup(rollup) {
   if (!Array.isArray(rollup) || !rollup.length) return "none";
   let pending = false, failing = false, passing = false;
@@ -3716,7 +3731,7 @@ async function processJobQueue() {
   if (!id) return;
   JOB_RUNNING = true;
   const job = JOBS.get(id);
-  const RUNNER = { edit: runEditJob, restore: runRestoreJob, enrich: runEnrichJob, seo: runSeoJob };
+  const RUNNER = { edit: runEditJob, restore: runRestoreJob, enrich: runEnrichJob, seo: runSeoJob, "pre-release": runPreReleaseJob };
   try { await ((job && RUNNER[job.type] ? RUNNER[job.type] : runJob)(job)); }
   catch (e) { console.error("job runner crashed:", e); }
   finally { JOB_RUNNING = false; processJobQueue(); }
@@ -6933,6 +6948,650 @@ function seoPrBody(job, entries, renames, audit, check, stripped, origin) {
   return L.join("\n");
 }
 
+// ============================================================ PRE-RELEASE ENGINE
+// "Perform PR" is an extensible release gate. Its first task audits every page
+// registered by the active WordPress theme at a mobile viewport, fixes only
+// evidenced responsive defects, uses the normal PR/CI/merge rails, then captures
+// the live result again. Screenshots stay in Studio, outside the client theme.
+const PRE_RELEASE_STEPS = [
+  "Pull latest code", "Inventory every page", "Capture mobile screenshots",
+  "Audit mobile responsiveness", "Fix responsive issues", "Check the changes",
+  "Push + open PR", "CI checks then merge", "Capture post-release proof", "Verify pre-release",
+];
+const MOBILE_CAPTURE_RETRY_MS = [4000, 10000];
+const MOBILE_VIEWPORT = Object.freeze({ width: 390, height: 844, deviceScaleFactor: 1, isMobile: true, hasTouch: true });
+
+function safeArtifactName(value) {
+  return String(value || "page").toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "page";
+}
+function mobilePageUrl(origin, slug) {
+  const root = String(origin || "").replace(/\/+$/, "");
+  return slug === "home" ? root + "/" : root + "/" + String(slug || "").replace(/^\/+|\/+$/g, "") + "/";
+}
+function isSafeArtifactSegment(value) {
+  const s = String(value || "");
+  return s !== "." && s !== ".." && /^[a-z0-9][a-z0-9_.-]*$/i.test(s);
+}
+const BROWSERLESS_LAYOUT_CODE = `export default async ({ page, context }) => {
+  await page.setViewport(context.viewport);
+  const response = await page.goto(context.url, { waitUntil: "networkidle2", timeout: context.timeout });
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  const metrics = await page.evaluate(() => {
+    const vw = window.innerWidth;
+    const visible = (element) => {
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
+    };
+    const label = (element) => {
+      const id = element.id ? "#" + element.id : "";
+      const classes = Array.from(element.classList || []).slice(0, 3).map((name) => "." + name.replace(/[^a-z0-9_-]/gi, "")).join("");
+      return (element.tagName || "element").toLowerCase() + id + classes;
+    };
+    const describe = (element) => {
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return { selector: label(element), text: String(element.innerText || element.textContent || "").trim().replace(/\s+/g, " ").slice(0, 100), left: Math.round(rect.left), right: Math.round(rect.right), top: Math.round(rect.top), bottom: Math.round(rect.bottom), width: Math.round(rect.width), position: style.position, zIndex: style.zIndex };
+    };
+    const all = Array.from(document.body.querySelectorAll("*")).filter(visible);
+    const overflowElements = all.filter((element) => {
+      const rect = element.getBoundingClientRect();
+      return rect.left < -1 || rect.right > vw + 1;
+    }).slice(0, 30).map(describe);
+    const candidates = Array.from(document.querySelectorAll("button,a,[role=button],span,p,h1,h2,h3,h4,input,select,textarea")).filter(visible).slice(0, 160);
+    const overlaps = [];
+    for (let i = 0; i < candidates.length && overlaps.length < 30; i++) {
+      for (let j = i + 1; j < candidates.length && overlaps.length < 30; j++) {
+        const a = candidates[i], b = candidates[j];
+        if (a.contains(b) || b.contains(a)) continue;
+        const ar = a.getBoundingClientRect(), br = b.getBoundingClientRect();
+        const width = Math.max(0, Math.min(ar.right, br.right) - Math.max(ar.left, br.left));
+        const height = Math.max(0, Math.min(ar.bottom, br.bottom) - Math.max(ar.top, br.top));
+        const overlapArea = width * height;
+        const smaller = Math.min(ar.width * ar.height, br.width * br.height);
+        if (smaller > 0 && overlapArea / smaller >= 0.2) overlaps.push({ first: describe(a), second: describe(b), ratio: Math.round(overlapArea / smaller * 100) / 100 });
+      }
+    }
+    return { viewportWidth: vw, documentWidth: document.documentElement.scrollWidth, horizontalOverflow: document.documentElement.scrollWidth > vw + 1, overflowElements, overlaps };
+  });
+  return { data: { httpStatus: response ? response.status() : null, ...metrics }, type: "application/json" };
+};`;
+
+function browserlessLayoutRequest(url) {
+  return { code: BROWSERLESS_LAYOUT_CODE, context: { url, viewport: MOBILE_VIEWPORT, timeout: Math.min(BROWSERLESS_TIMEOUT_MS, 45000) } };
+}
+async function captureMobileLayout(url) {
+  const api = `${BROWSERLESS_URL}/function?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), BROWSERLESS_TIMEOUT_MS);
+  try {
+    const response = await fetch(api, {
+      method: "POST", signal: controller.signal,
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-cache" },
+      body: JSON.stringify(browserlessLayoutRequest(url)),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) return { error: `Browserless function ${response.status}: ${String(body && (body.message || body.error) || "request failed").slice(0, 120)}` };
+    const data = body && body.data && typeof body.data === "object" ? body.data : body;
+    return data && typeof data === "object" ? data : { error: "Browserless function returned invalid layout data" };
+  } catch (error) {
+    return { error: String(error && error.message || error).slice(0, 140) };
+  } finally { clearTimeout(timer); }
+}
+function issueSupportedByLayout(issue, layout) {
+  if (!layout || layout.error) return true;
+  const signal = [issue && issue.kind, issue && issue.description].filter(Boolean).join(" ")
+    .toLowerCase().replace(/[^a-z0-9]+/g, "-");
+  if (signal.includes("horizontal-overflow") || signal.includes("layout-overflow")) return layout.horizontalOverflow !== false;
+  if (signal.includes("overlap") && Array.isArray(layout.overlaps)) return layout.overlaps.length > 0;
+  return true;
+}
+function browserlessScreenshotRequest(url) {
+  return {
+    url,
+    viewport: MOBILE_VIEWPORT,
+    gotoOptions: { waitUntil: "networkidle2", timeout: Math.min(BROWSERLESS_TIMEOUT_MS, 45000) },
+    waitForTimeout: 1500,
+    bestAttempt: true,
+    options: { fullPage: true, captureBeyondViewport: true, type: "jpeg", quality: 82 },
+  };
+}
+function preReleaseMarkerUrl(origin, themeSlug, jobId, probe = Date.now()) {
+  const root = String(origin || "").replace(/\/+$/, "");
+  return `${root}/app/themes/${encodeURIComponent(themeSlug)}/g99-pre-release-marker.txt?release=${encodeURIComponent(jobId)}&probe=${encodeURIComponent(probe)}`;
+}
+function screenshotBuffersEqual(before, after) {
+  return Buffer.isBuffer(before) && Buffer.isBuffer(after) && before.length === after.length && before.equals(after);
+}
+function mobileArtifactDiskPath(capture) {
+  return path.join(GEN, "pre-release", ...String(capture && capture.screenshot || "").split("/").slice(2).map(decodeURIComponent));
+}
+function mobileScreenshotsEqual(before, after) {
+  try {
+    return screenshotBuffersEqual(fs.readFileSync(mobileArtifactDiskPath(before)), fs.readFileSync(mobileArtifactDiskPath(after)));
+  } catch (_) { return false; }
+}
+async function waitForPreReleaseDeployment(liveUrl, themeSlug, jobId) {
+  const timeoutMs = Math.max(30000, Number(process.env.PR_DEPLOY_TIMEOUT_MS || 900000) || 900000);
+  const pollMs = Math.max(2000, Number(process.env.PR_DEPLOY_POLL_MS || 10000) || 10000);
+  const started = Date.now();
+  let last = "not found";
+  while (Date.now() - started < timeoutMs) {
+    try {
+      const response = await fetch(preReleaseMarkerUrl(liveUrl, themeSlug, jobId), {
+        redirect: "follow", cache: "no-store",
+        headers: { "Cache-Control": "no-cache, no-store, max-age=0", "User-Agent": "G99PreReleaseDeployProbe/1.0" },
+      });
+      const value = response.ok ? (await response.text()).trim() : "";
+      if (response.ok && value === jobId) return { deployedAt: new Date().toISOString() };
+      last = response.ok ? `marker contained ${value.slice(0, 60) || "empty content"}` : `HTTP ${response.status}`;
+    } catch (error) { last = String(error && error.message || error).slice(0, 120); }
+    await sleep(pollMs);
+  }
+  throw new Error(`deployment did not expose release marker ${jobId} within ${Math.round(timeoutMs / 60000)} minute(s): ${last}`);
+}
+function writeMobileScreenshot(jobId, phase, slug, bytes, mime) {
+  const types = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" };
+  const ext = types[mime];
+  if (!ext || !Buffer.isBuffer(bytes) || !bytes.length) throw new Error("Browserless returned an invalid screenshot");
+  const rel = [safeArtifactName(jobId), safeArtifactName(phase), safeArtifactName(slug) + "." + ext];
+  const dir = path.join(GEN, "pre-release", rel[0], rel[1]);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, rel[2]), bytes);
+  return "/pr-artifacts/" + rel.map(encodeURIComponent).join("/");
+}
+async function captureMobilePage(jobId, phase, page) {
+  if (!BROWSERLESS_TOKEN) return { ...page, error: "BROWSERLESS_TOKEN is not configured" };
+  let last = null;
+  for (let attempt = 0; attempt <= MOBILE_CAPTURE_RETRY_MS.length; attempt++) {
+    if (attempt) await sleep(MOBILE_CAPTURE_RETRY_MS[attempt - 1]);
+    try {
+      const renderUrl = new URL(page.url);
+      renderUrl.searchParams.set("__g99_pr", `${jobId}-${phase}-${attempt}-${Date.now()}`);
+      const pre = await fetch(renderUrl, { redirect: "follow", cache: "no-store", headers: { "User-Agent": "Mozilla/5.0 G99MobilePreRelease", "Cache-Control": "no-cache, no-store, max-age=0" } });
+      if (!pre.ok) throw new Error(`page returned HTTP ${pre.status}`);
+      const api = `${BROWSERLESS_URL}/screenshot?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), BROWSERLESS_TIMEOUT_MS);
+      let response;
+      try {
+        response = await fetch(api, {
+          method: "POST", signal: controller.signal,
+          headers: { "Content-Type": "application/json", "Cache-Control": "no-cache" },
+          body: JSON.stringify(browserlessScreenshotRequest(renderUrl.toString())),
+        });
+      } finally { clearTimeout(timer); }
+      if (!response.ok) {
+        const detail = (await response.text().catch(() => "")).replace(/\s+/g, " ").slice(0, 140);
+        throw new Error(`Browserless ${response.status}${detail ? `: ${detail}` : ""}`);
+      }
+      const targetStatus = Number(response.headers.get("x-response-code") || 0);
+      if (targetStatus >= 400) throw new Error(`target page returned HTTP ${targetStatus} in Browserless`);
+      const mime = (response.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+      if (!/^image\/(png|jpeg|webp)$/.test(mime)) throw new Error(`Browserless returned ${mime || "no content-type"}`);
+      const bytes = Buffer.from(await response.arrayBuffer());
+      const layout = await captureMobileLayout(renderUrl.toString());
+      return {
+        slug: page.slug, title: page.title, file: page.file, url: page.url,
+        screenshot: writeMobileScreenshot(jobId, phase, page.slug, bytes, mime),
+        width: MOBILE_VIEWPORT.width, height: MOBILE_VIEWPORT.height,
+        provider: "browserless", layout, capturedAt: new Date().toISOString(),
+      };
+    } catch (e) { last = e; }
+  }
+  return { ...page, error: String(last && last.message || "capture failed").slice(0, 200) };
+}function issueQuotedLabels(issue) {
+  const text = [issue && issue.description, issue && issue.evidence].filter(Boolean).join(" ")
+    .replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+  const labels = [];
+  const re = /'([^']{2,80})'|"([^"]{2,80})"/g;
+  let match;
+  while ((match = re.exec(text))) labels.push(String(match[1] || match[2]).trim());
+  return [...new Set(labels.filter(Boolean))];
+}
+function issueSupportedBySource(issue, sourceContext) {
+  if (!sourceContext) return true;
+  const source = String(sourceContext).toLowerCase().replace(/\s+/g, " ");
+  const labels = issueQuotedLabels(issue);
+  return !labels.length || labels.every((label) => source.includes(label.toLowerCase().replace(/\s+/g, " ")));
+}
+function mobileSourceContext(themeAbs, templateFile) {
+  const files = [templateFile, "header.php", "footer.php", "style.css"];
+  return files.map((file) => {
+    const abs = path.join(themeAbs, file);
+    if (!fs.existsSync(abs)) return "";
+    return `\n/* SOURCE ${file} */\n${fs.readFileSync(abs, "utf8")}`;
+  }).join("\n").slice(0, 50000);
+}
+async function inspectMobileScreenshot(capture, sourceContext = "") {
+  const diskPath = mobileArtifactDiskPath(capture);
+  const ext = path.extname(diskPath).toLowerCase();
+  const mime = ext === ".png" ? "image/png" : ext === ".jpg" ? "image/jpeg" : "image/webp";
+  const prompt = [
+    `Act as a strict mobile-responsive QA engineer. Inspect this full-page screenshot rendered by Browserless Chromium at a ${MOBILE_VIEWPORT.width}x${MOBILE_VIEWPORT.height} mobile viewport.`,
+    `Page: ${capture.title} (${capture.url}). Source template: ${capture.file}.`,
+
+    "Report ONLY visible mobile responsiveness defects: horizontal overflow, clipped or cut-off content, overlapping elements, unusable navigation, broken stacking, tiny tap targets or text, or media wider than viewport.",
+    "The relevant rendered source is included below. Every named control or quoted visible label in an issue MUST exist in this source. If it does not, do not report that issue.",
+    "Use the source to identify the exact component and likely CSS cause; do not guess negative margins, absolute positioning, or an adjacent control without source evidence.",
+    "Do not report aesthetics, copy, SEO, desktop concerns, performance, or imagined defects. A long screenshot is normal.",
+    sourceContext ? `RENDERED SOURCE CONTEXT:\n-----\n${sourceContext}\n-----` : "",
+    capture.layout ? `BROWSERLESS DOM GEOMETRY:\n${JSON.stringify(capture.layout)}` : "",
+    'Return ONLY minified JSON: {"pass":true|false,"issues":[{"kind":"short stable id","severity":"high|medium|low","description":"specific visible defect","evidence":"what and where in screenshot","fixHint":"precise CSS/layout direction"}]}.',
+  ].join("\n");
+  const raw = await geminiCall([{ text: prompt }, { inline_data: { mime_type: mime, data: fs.readFileSync(diskPath).toString("base64") } }],
+    { temperature: 0.1, maxOutputTokens: 1800, timeoutMs: 60000 });
+  const d = JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
+  const reported = (Array.isArray(d.issues) ? d.issues : []).slice(0, 12).map((x) => ({
+    source: "vision", kind: String(x.kind || "layout"), severity: ["high", "medium", "low"].includes(x.severity) ? x.severity : "medium",
+    description: String(x.description || "Mobile layout issue").slice(0, 220), evidence: String(x.evidence || "").slice(0, 240),
+    fixHint: String(x.fixHint || "").slice(0, 240),
+  }));
+  const visual = reported.filter((issue) => issueSupportedBySource(issue, sourceContext) && issueSupportedByLayout(issue, capture.layout));
+  const rejectedIssues = reported.filter((issue) => !issueSupportedBySource(issue, sourceContext) || !issueSupportedByLayout(issue, capture.layout));
+  return { ...capture, issues: visual, rejectedIssues, pass: !visual.length };
+}
+function mobileIssueBrief(rows) {
+  return rows.filter((p) => p.issues && p.issues.length).map((p) => [
+    `PAGE ${p.title} - ${p.file} - ${p.url}`,
+    ...p.issues.map((x, i) => `${i + 1}. [${x.severity}] ${x.description}${x.evidence ? ` Evidence: ${x.evidence}` : ""}${x.fixHint ? ` Fix direction: ${x.fixHint}` : ""}`),
+  ].join("\n")).join("\n\n");
+}
+async function verifyResponsiveDiff(rows, diff, onlyIds = null) {
+  let issues = [];
+  for (const page of rows || []) {
+    for (let i = 0; i < (page.issues || []).length; i++) {
+      const issue = page.issues[i];
+      issues.push({
+        id: `${page.slug}:${i + 1}`, page: page.title, file: page.file,
+        description: issue.description, evidence: issue.evidence, fixHint: issue.fixHint,
+      });
+    }
+  }
+  if (onlyIds) issues = issues.filter((issue) => onlyIds.has(issue.id));
+  const changes = diffChanges(diff);
+  if (!issues.length) return { issues: [], missed: [] };
+  if (!changes.length) return { issues, missed: issues.map((issue) => ({ ...issue, reason: "no source lines changed" })) };
+  const prompt = [
+    "Review a proposed WordPress mobile-responsive patch before it is allowed to merge.",
+    "For every reported issue, decide whether the changed source lines DIRECTLY modify the element or shared rule implicated by the evidence.",
+    "A nearby or unrelated responsive change does not count. Example: changing a CTA row does not fix an overlapping feature-card stack elsewhere in the hero.",
+    "Generic overflow-x:hidden does not count when it merely conceals clipped content. The underlying layout must be corrected.",
+    "A shared footer/CSS change may satisfy multiple pages only when its cited lines directly address their same root cause.",
+    "Each done=true verdict must cite at least one real changed-line id. Be strict; uncertainty means done=false.",
+    "", "CHANGED LINES:", "-----", changesText(changes), "-----", "", "ISSUES:",
+    ...issues.map((issue) => `${issue.id} | page=${issue.page} | template=${issue.file} | ${issue.description} | evidence=${issue.evidence || "none"} | requested direction=${issue.fixHint || "none"}`),
+    "", 'Return ONLY minified JSON: {"results":[{"id":"slug:number","done":true|false,"lines":[1],"reason":"specific short reason"}]}',
+  ].join("\n");
+  const raw = await geminiCall([{ text: prompt }], { temperature: 0.1, maxOutputTokens: 3000, timeoutMs: 60000, json: true });
+  const data = JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
+  const results = Array.isArray(data.results) ? data.results : [];
+  const top = Math.min(changes.length, CHANGE_CAP);
+  const missed = [];
+  for (const issue of issues) {
+    const verdict = results.find((result) => result && result.id === issue.id);
+    const cited = (verdict && Array.isArray(verdict.lines) ? verdict.lines : []).map(Number)
+      .filter((line) => Number.isInteger(line) && line >= 1 && line <= top);
+    if (!verdict || verdict.done !== true || !cited.length) {
+      missed.push({ ...issue, reason: String(verdict && verdict.reason || "no grounded diff evidence").slice(0, 220) });
+    }
+  }
+  return { issues, missed };
+}
+async function repairResponsiveFile(rel, current, misses, capture) {
+  const diskPath = mobileArtifactDiskPath(capture);
+  const ext = path.extname(diskPath).toLowerCase();
+  const mime = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : "image/jpeg";
+  const prompt = [
+    `Repair the exact mobile defects in ${rel}. Return the COMPLETE final file content only; no markdown or commentary.`,
+    "You are given the actual failing 390px screenshot and current source. Use BOTH. The earlier text diagnosis may name the wrong CSS cause, so trust the visible evidence and source structure over its guessed fix direction.",
+    "Modify the exact named component, not a nearby CTA or unrelated responsive container. Use the smallest scoped mobile fix. Preserve desktop behavior, copy, branding, and unrelated bytes.",
+    "Do not hide overflow to conceal broken content. Correct sizing, stacking, positioning, contrast, wrapping, or flow at the actual source element.",
+    "", "UNRESOLVED FINDINGS:",
+    ...misses.map((miss, index) => `${index + 1}. ${miss.description}\nEvidence: ${miss.evidence || "none"}\nPrevious reviewer: ${miss.reason || "not grounded"}`),
+    capture.layout ? `\nMEASURED BROWSERLESS DOM GEOMETRY (authoritative for which elements really overflow/overlap):\n${JSON.stringify(capture.layout)}` : "",
+    "", "CURRENT SOURCE:", "-----", current, "-----", "", "Return the complete modified file now.",
+  ].join("\n");
+  return stripFence(await geminiCall([
+    { text: prompt },
+    { inline_data: { mime_type: mime, data: fs.readFileSync(diskPath).toString("base64") } },
+  ], { temperature: 0.1, maxOutputTokens: 16000, timeoutMs: 90000 }));
+}
+function safeResponsivePlanFiles(modelFiles, themePath, failingRows, manifest) {
+  const clean = (value) => String(value || "").replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
+  const theme = clean(themePath);
+  const known = new Set((manifest || []).map((file) => clean(file && file.path)).filter(Boolean));
+  const resolved = [];
+  const seen = new Set();
+  for (const file of Array.isArray(modelFiles) ? modelFiles : []) {
+    if (!file || file.op === "delete") continue;
+    const raw = clean(file.path);
+    const candidates = [raw, `${theme}/${raw}`];
+    const byName = [...known].filter((path_) => path_.endsWith("/" + path.posix.basename(raw)));
+    if (byName.length === 1) candidates.push(byName[0]);
+    const path_ = candidates.find((candidate) => candidate.startsWith(theme + "/") && known.has(candidate));
+    if (!path_ || seen.has(path_)) continue;
+    seen.add(path_);
+    resolved.push({ ...file, path: path_, op: "modify" });
+  }
+  if (resolved.length) return resolved.slice(0, 20);
+
+  const add = (relative, instruction) => {
+    const path_ = `${theme}/${clean(relative)}`;
+    if (!known.has(path_) || seen.has(path_)) return;
+    seen.add(path_);
+    resolved.push({ path: path_, op: "modify", instruction });
+  };
+  for (const page of failingRows || []) {
+    const descriptions = (page.issues || []).map((issue) => issue.description).filter(Boolean);
+    add(page.file, `Fix the measured mobile defects on ${page.title || page.file}: ${descriptions.join(" | ")}`);
+  }
+  const all = (failingRows || []).flatMap((page) => page.issues || [])
+    .map((issue) => `${issue.kind || ""} ${issue.description || ""} ${issue.evidence || ""}`).join(" ").toLowerCase();
+  if (/footer/.test(all)) add("footer.php", "Fix the measured shared mobile footer defects without changing desktop layout.");
+  if (/navigation|navbar|header|site title|mobile menu/.test(all)) add("header.php", "Fix the measured shared mobile header/navigation defects without changing desktop layout.");
+  return resolved.slice(0, 20);
+}
+function scanResponsiveTheme(root, themePath, muPath) {
+  const manifest = [], source = [];
+  for (const relRoot of [themePath, ...(muPath ? [muPath] : [])]) {
+    const absRoot = path.join(root, relRoot);
+    if (!fs.existsSync(absRoot)) continue;
+    const walk = (abs, rel) => {
+      const st = fs.statSync(abs);
+      if (st.isDirectory()) { for (const name of fs.readdirSync(abs)) walk(path.join(abs, name), path.join(rel, name)); return; }
+      const clean = rel.replace(/\\/g, "/");
+      manifest.push({ path: clean, bytes: st.size });
+      if (TEXTUAL.test(rel) && st.size <= 400000) source.push({ rel: clean, content: fs.readFileSync(abs, "utf8") });
+    };
+    walk(absRoot, relRoot);
+  }
+  return { manifest, source };
+}
+function newPreReleaseJob(payload) {
+  return {
+    type: "pre-release", draftId: String(payload.jobId), businessId: null,
+    businessName: payload.businessName || payload.siteId || "Site", status: "queued", currentStep: 0,
+    steps: PRE_RELEASE_STEPS.map((label) => ({ label, status: "pending", detail: "" })), payload,
+    prUrl: null, branch: null, mobileBefore: null, mobileAfter: null, mobileSummary: null,
+    editPlan: null, editSummary: "Pre-release mobile responsiveness", error: null,
+    cost: { gemini: 0, stitch: 0 }, cancelRequested: false, awaitingApproval: false,
+    createdAt: new Date().toISOString(), startedAt: null, finishedAt: null,
+  };
+}
+function enqueuePreReleaseJob(payload) {
+  const job = newPreReleaseJob(payload);
+  JOBS.set(job.draftId, job);
+  JOB_QUEUE.push(job.draftId);
+  saveJobs();
+  processJobQueue();
+  return job;
+}
+function mobilePrBody(job, pages, changed) {
+  const L = [`Pre-release mobile responsiveness pass for **${job.businessName}**.`, "",
+    `Audited **${pages.length} page(s)** at a mobile viewport.`, "",
+    "| Page | Findings before fix |", "|---|---:|"];
+  for (const p of pages) L.push(`| \`/${p.slug === "home" ? "" : p.slug + "/"}\` | ${(p.issues || []).length} |`);
+  L.push("", `Changed ${changed.length} file(s):`, ...changed.map((x) => `- \`${x.path}\``), "",
+    "Post-release screenshots and verification are recorded by the Studio run after deployment.");
+  return L.join("\n");
+}
+
+async function runPreReleaseJob(job) {
+  job.status = "running";
+  job.startedAt = new Date().toISOString();
+  COST_SINK = job.cost;
+  const P = job.payload, repo = P.githubRepo || WP_REPO;
+  const tmp = path.join(os.tmpdir(), "g99pr-" + Date.now());
+  const run = async (cmd, cwd) => sh(cmd, cwd);
+  const runRetry = async (cmd, cwd, n = 3) => {
+    let r;
+    for (let i = 1; i <= n; i++) {
+      r = await run(cmd, cwd);
+      if (!r.code) return r;
+      await sleep(3000 * i);
+    }
+    return r;
+  };
+  try {
+    jobStep(job, 0, "running", "Cloning " + repo);
+    let r = await runRetry(`gh repo clone ${repo} "${tmp}" -- --depth 1`);
+    const cloneUrl = process.env.GH_TOKEN ? `https://x-access-token:${process.env.GH_TOKEN}@github.com/${repo}.git` : `https://github.com/${repo}.git`;
+    if (r.code) r = await runRetry(`git clone --depth 1 "${cloneUrl}" "${tmp}"`);
+    if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
+    if (process.env.GH_TOKEN) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
+    const themeAbs = path.join(tmp, P.themePath);
+    const muAbs = P.muPath ? path.join(tmp, P.muPath) : "";
+    if (!fs.existsSync(themeAbs)) throw new Error("theme not found: " + P.themePath);
+    jobStep(job, 0, "done", "Latest code pulled");
+
+    jobStep(job, 1, "running", "Reading registered page templates...");
+    const muSrc = muAbs && fs.existsSync(muAbs) ? fs.readFileSync(muAbs, "utf8") : synthMuSource(themeAbs);
+    const { pages: sourcePages } = readSeoPages(themeAbs, muSrc);
+    if (!sourcePages.length) throw new Error("no registered pages found in active theme");
+    if (!P.liveUrl) throw new Error("site has no live domain in NocoDB - mobile pages cannot be rendered");
+    const pages = sourcePages.map((p) => ({ slug: p.slug, title: p.title, file: p.file, url: mobilePageUrl(P.liveUrl, p.slug) }));
+    job.mobilePages = pages;
+    const sourceByFile = new Map(pages.map((page) => [page.file, mobileSourceContext(themeAbs, page.file)]));
+    jobStep(job, 1, "done", `${pages.length} page(s) registered in backend`);
+
+    const before = [];
+    for (let i = 0; i < pages.length; i++) {
+      jobStep(job, 2, "running", `${pages[i].title} (${i + 1}/${pages.length})`);
+      const cap = await captureMobilePage(job.draftId, "before", pages[i]);
+      before.push(cap);
+      job.mobileBefore = before;
+      saveJobs();
+    }
+    const captureErrors = before.filter((x) => x.error);
+    if (captureErrors.length) throw new Error(`mobile screenshot failed for ${captureErrors.length}/${pages.length} page(s): ${captureErrors.map((x) => x.title).join(", ")}`);
+    jobStep(job, 2, "done", `${before.length} full-page mobile screenshot(s) captured`);
+
+    const audited = [];
+    for (let i = 0; i < before.length; i++) {
+      jobStep(job, 3, "running", `${before[i].title} (${i + 1}/${before.length})`);
+      audited.push(await inspectMobileScreenshot(before[i], sourceByFile.get(before[i].file) || ""));
+      job.mobileBefore = audited.concat(before.slice(i + 1));
+      saveJobs();
+    }
+    job.mobileBefore = audited;
+    const failing = audited.filter((x) => !x.pass);
+    const issueCount = failing.reduce((n, x) => n + x.issues.length, 0);
+    jobStep(job, 3, "done", issueCount ? `${issueCount} issue(s) across ${failing.length}/${audited.length} page(s)` : `all ${audited.length} page(s) pass`);
+
+    if (!issueCount) {
+      for (const i of [4, 5, 6, 7]) jobStep(job, i, "done", "skipped - no responsive defects found");
+      job.mobileAfter = audited.map((x) => ({ ...x, phase: "before" }));
+      jobStep(job, 8, "done", "Initial screenshots are release proof - no code changed");
+      job.mobileSummary = { pass: true, pages: audited.length, beforeIssues: 0, afterIssues: 0, changedFiles: 0 };
+      jobStep(job, 9, "done", `${audited.length}/${audited.length} pages pass`);
+      job.status = "done";
+      return;
+    }
+
+    jobStep(job, 4, "running", `Planning fixes for ${issueCount} evidenced issue(s)...`);
+    const scan = scanResponsiveTheme(tmp, P.themePath, P.muPath);
+    const issueBrief = mobileIssueBrief(audited);
+    const request = [
+      `Fix ONLY the mobile responsiveness defects observed by the pre-release audit for ${P.businessName}.`,
+      "Preserve desktop appearance, content, branding, URLs, behavior, and unrelated formatting.",
+      "Prefer shared responsive CSS when one root cause affects multiple pages. Use scoped media queries and fluid sizing; do not hide meaningful content to make checks pass.",
+      "Every listed page was rendered from the named template. Do not touch pages without an evidenced issue unless changing a shared rule required by an evidenced issue.",
+      "", issueBrief,
+    ].join("\n");
+    const outline = scan.source.map((f) => ({ rel: f.rel, items: fileOutline(f.content) })).filter((x) => x.items.length);
+    const plan0 = await editPlan(scan.manifest, {
+      prompt: request, businessName: P.businessName, outline: outlineText(outline), evidence: issueBrief,
+    }, { aiModel: "gemini" });
+    job.plannerPaths = (plan0.files || []).map((file) => String(file && file.path || "")).filter(Boolean).slice(0, 30);
+    const plan = {
+      summary: String(plan0.summary || "Fix mobile responsiveness"),
+      files: safeResponsivePlanFiles(plan0.files, P.themePath, failing, scan.manifest),
+    };
+    if (!plan.files.length) throw new Error("no registered failing page templates were found in the active theme");
+    job.editPlan = plan.files.map((f) => ({ path: f.path, op: f.op || "modify" }));
+    job.editSummary = plan.summary;
+    const context = plan.files.map((f) => `${f.op || "modify"} ${f.path}`).join("\n");
+    for (let i = 0; i < plan.files.length; i++) {
+      const f = plan.files[i];
+      const abs = path.join(tmp, f.path);
+      const op = f.op === "create" ? "create" : "modify";
+      jobStep(job, 4, "running", `${path.basename(f.path)} (${i + 1}/${plan.files.length})`);
+      const current = op === "modify" && fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : "";
+      const content = await editFileContent(op, f.path, f.instruction || plan.summary, current, context,
+        { aiModel: "gemini" }, { prompt: request });
+      if (!content || (current.includes("<?php") && !content.includes("<?php"))) throw new Error("AI returned invalid content for " + f.path);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, content);
+    }
+    const markerPath = path.join(themeAbs, "g99-pre-release-marker.txt");
+    fs.writeFileSync(markerPath, job.draftId + "\n");
+    jobStep(job, 4, "done", `${plan.files.length} file(s) proposed`);
+
+    jobStep(job, 5, "running", "Checking diff, syntax, and issue coverage...");
+    const paths = `"${P.themePath}"`;
+    await run(`git add -A -- ${paths}`, tmp);
+    let diff = await run(`git --no-pager diff --cached --stat -- ${paths}`, tmp);
+    if (!String(diff.stdout || "").trim()) throw new Error("responsive fix produced no code changes");
+    let whitespace = await run(`git diff --cached --check -- ${paths}`, tmp);
+    if (whitespace.code) throw new Error("responsive fix failed git diff check: " + String(whitespace.stdout || whitespace.stderr).slice(-200));
+    let patch = await run(`git --no-pager diff --cached -- ${paths}`, tmp);
+    let coverage = await verifyResponsiveDiff(audited, patch.stdout || "");
+    const pagesByFile = new Map(audited.map((page) => [page.file, page]));
+    for (let repairAttempt = 1; coverage.missed.length && repairAttempt <= 3; repairAttempt++) {
+      const targets = coverage.missed;
+      jobStep(job, 5, "running", `Screenshot-guided repair ${repairAttempt}/3 for ${targets.length} finding(s)...`);
+      const missedByFile = new Map();
+      for (const missed of targets) {
+        const list = missedByFile.get(missed.file) || [];
+        list.push(missed);
+        missedByFile.set(missed.file, list);
+      }
+      for (const [file, misses] of missedByFile) {
+        const page = pagesByFile.get(file);
+        const rel = `${P.themePath}/${file}`;
+        const abs = path.join(tmp, rel);
+        if (!page || !fs.existsSync(abs)) continue;
+        const current = fs.readFileSync(abs, "utf8");
+        const repaired = await repairResponsiveFile(rel, current, misses, page);
+        if (!repaired || (current.includes("<?php") && !repaired.includes("<?php"))) throw new Error("AI returned invalid repair content for " + rel);
+        fs.writeFileSync(abs, repaired);
+        if (!job.editPlan.some((item) => item.path === rel)) job.editPlan.push({ path: rel, op: "modify" });
+      }
+      await run(`git add -A -- ${paths}`, tmp);
+      whitespace = await run(`git diff --cached --check -- ${paths}`, tmp);
+      if (whitespace.code) throw new Error("responsive repair failed git diff check: " + String(whitespace.stdout || whitespace.stderr).slice(-200));
+      patch = await run(`git --no-pager diff --cached -- ${paths}`, tmp);
+      const retryIds = new Set(targets.map((missed) => missed.id));
+      const retryCoverage = await verifyResponsiveDiff(audited, patch.stdout || "", retryIds);
+      coverage = { issues: coverage.issues, missed: retryCoverage.missed };
+    }    if (coverage.missed.length) {
+      const failedDir = path.join(GEN, "pre-release", safeArtifactName(job.draftId));
+      fs.mkdirSync(failedDir, { recursive: true });
+      const failedPatchPath = path.join(failedDir, "failed-responsive-patch.diff");
+      fs.writeFileSync(failedPatchPath, String(patch.stdout || ""));
+      job.failedPatch = failedPatchPath;
+      saveJobs();      throw new Error(`responsive patch does not directly address ${coverage.missed.length} finding(s): ${coverage.missed.slice(0, 3).map((miss) => `${miss.page}: ${miss.description}`).join(" | ")}`);
+    }
+    diff = await run(`git --no-pager diff --cached --stat -- ${paths}`, tmp);
+    jobStep(job, 5, "done", `All ${coverage.issues.length} issue(s) grounded in patch - ${String(diff.stdout || "").trim().split("\n").slice(-1)[0]}`);
+    jobStep(job, 6, "running", "Pushing + opening PR...");
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
+    const branch = `g99/pre-release-mobile-${P.themeSlug.replace(/^g99-/, "")}-${stamp}`;
+    const title = `Pre-release ${P.businessName}: mobile responsiveness`;
+    await run(`git checkout -b "${branch}"`, tmp);
+    r = await run(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "${title.replace(/"/g, "'")}"`, tmp);
+    if (r.code) throw new Error("commit failed: " + String(r.stderr || r.stdout).slice(-180));
+    r = await runRetry(`git push -u origin "${branch}"`, tmp);
+    if (r.code) throw new Error("push failed: " + r.stderr.slice(-200));
+    const bodyFile = path.join(os.tmpdir(), `pre-release-pr-${Date.now()}.md`);
+    fs.writeFileSync(bodyFile, mobilePrBody(job, audited, job.editPlan));
+    r = await runRetry(`gh pr create --repo ${repo} --base main --head "${branch}" --title "${title.replace(/"/g, "'")}" --body-file "${bodyFile}"`, tmp);
+    fs.rmSync(bodyFile, { force: true });
+    job.prUrl = (r.stdout.match(/https:\/\/github\.com\/\S+/) || [""])[0];
+    job.branch = branch;
+    if (!job.prUrl) throw new Error("PR create failed: " + r.stderr.slice(-200));
+    jobStep(job, 6, "done", job.prUrl);
+
+    jobStep(job, 7, "running", "Watching CI build checks...");
+    let fixes = 0, merged = false;
+    for (let i = 0; i < 240 && !merged; i++) {
+      let st;
+      try { st = await localApi("/api/pr-status", { prUrl: job.prUrl, requireAllChecks: true }); }
+      catch (e) { await sleep(10000); continue; }
+      jobStep(job, 7, "running", (st.checks || []).map((c) => `${c.name}:${c.status}`).join(" ") || "CI starting...");
+      if (await ciEarlyExit(job, 7, P.siteId, st, i)) { merged = true; break; }
+      if (st.allPass) {
+        await awaitApprovalIfNeeded(job, P.siteId, 7);
+        if (!job.mergedExternally) await localApi("/api/pr-merge", { prUrl: job.prUrl });
+        merged = true;
+        jobStep(job, 7, "done", `Merged${fixes ? ` after ${fixes} fix(es)` : ""}`);
+        break;
+      }
+      if (st.anyFail) {
+        if (fixes >= 3) throw new Error("CI still failing after 3 auto-fix attempts - " + job.prUrl);
+        fixes++;
+        const fix = await localApi("/api/pr-autofix", { prUrl: job.prUrl }, 5 * 60 * 1000);
+        if (fix.billing) throw new Error(fix.message);
+        if (!fix.fixed || !fix.fixed.length) throw new Error("auto-fix could not resolve CI: " + (fix.message || ""));
+        await sleep(20000);
+        continue;
+      }
+      await sleep(10000);
+    }
+    if (!merged) throw new Error("CI watch timed out - " + job.prUrl);
+    jobStep(job, 8, "running", `Waiting for exact release ${job.draftId} to deploy...`);
+    const deployed = await waitForPreReleaseDeployment(P.liveUrl, P.themeSlug, job.draftId);
+    job.deployedAt = deployed.deployedAt;
+    const settleWait = Math.max(0, Number(process.env.PR_DEPLOY_WAIT_MS || 5000) || 5000);
+    if (settleWait) await sleep(settleWait);
+    fs.rmSync(tmp, { recursive: true, force: true });
+    jobStep(job, 8, "running", `Release marker confirmed; capturing ${pages.length} page(s)...`);    const after = [];
+    for (let i = 0; i < pages.length; i++) {
+      jobStep(job, 8, "running", `${pages[i].title} (${i + 1}/${pages.length})`);
+      const cap = await captureMobilePage(job.draftId, "after", pages[i]);
+      if (cap.error) throw new Error(`post-release screenshot failed for ${pages[i].title}: ${cap.error}`);
+      if (!audited[i].pass && mobileScreenshotsEqual(audited[i], cap)) throw new Error(`post-release proof for ${pages[i].title} is pixel-identical to its failing before screenshot`);
+      after.push(cap);
+      job.mobileAfter = after;
+      saveJobs();
+    }
+    jobStep(job, 8, "done", `${after.length} post-release screenshot(s) captured`);
+
+    const verified = [];
+    for (let i = 0; i < after.length; i++) {
+      jobStep(job, 9, "running", `${after[i].title} (${i + 1}/${after.length})`);
+      verified.push(await inspectMobileScreenshot(after[i], sourceByFile.get(after[i].file) || ""));
+      job.mobileAfter = verified.concat(after.slice(i + 1));
+      saveJobs();
+    }
+    job.mobileAfter = verified;
+    const remaining = verified.reduce((n, x) => n + (x.issues || []).length, 0);
+    job.mobileSummary = { pass: remaining === 0, pages: pages.length, beforeIssues: issueCount, afterIssues: remaining, changedFiles: plan.files.length };
+    if (remaining) throw new Error(`post-release mobile verification still found ${remaining} issue(s) - screenshots preserved for review`);
+    jobStep(job, 9, "done", `${pages.length}/${pages.length} pages pass - ${issueCount} issue(s) fixed`);
+    job.status = "done";
+    notify(`Pre-release mobile check passed for *${job.businessName}*: ${pages.length} page(s) - ${issueCount} issue(s) fixed - ${job.prUrl || ""}`);
+  } catch (e) {
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
+    if (e && e.cancelled) job.status = "cancelled";
+    else {
+      job.error = e.message;
+      job.status = "error";
+      if (job.steps[job.currentStep] && job.steps[job.currentStep].status === "running") {
+        job.steps[job.currentStep].status = "error";
+        job.steps[job.currentStep].detail = String(e.message).slice(0, 240);
+      }
+      console.error(`pre-release job ${job.draftId} failed:`, e.message);
+      notify(`Pre-release failed for *${job.businessName}*: ${e.message}`);
+    }
+  } finally {
+    job.finishedAt = new Date().toISOString();
+    saveJobs();
+    COST_SINK = null;
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const u = new URL(req.url, `http://localhost:${PORT}`);
@@ -6962,6 +7621,15 @@ const server = http.createServer(async (req, res) => {
     if (p === "/site.html" || (p === "/site" && u.searchParams.get("id"))) return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "site.html")));
     if (p === "/site.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "site.js")));
     if (p === "/app.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "app.js")));
+    // Mobile pre-release evidence. Strict segment allow-list prevents traversal;
+    // screenshots contain only already-public website renders.
+    if (p.startsWith("/pr-artifacts/")) {
+      const parts = p.slice("/pr-artifacts/".length).split("/").map(decodeURIComponent);
+      if (parts.length !== 3 || parts.some((x) => !isSafeArtifactSegment(x))) return send(res, 404, "text/plain", "not found");
+      const f = path.join(GEN, "pre-release", ...parts);
+      if (!fs.existsSync(f) || !fs.statSync(f).isFile()) return send(res, 404, "text/plain", "not found");
+      return send(res, 200, MIME[path.extname(f).toLowerCase()] || "application/octet-stream", fs.readFileSync(f));
+    }
     if (p === "/styles.css") return send(res, 200, "text/css", fs.readFileSync(path.join(DIR, "public", "styles.css")));
     if (p === "/dashboard" || p === "/dashboard.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "dashboard.html")));
     if (p === "/dashboard.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "dashboard.js")));
@@ -7205,6 +7873,8 @@ const server = http.createServer(async (req, res) => {
       const j = JOBS.get(id); if (!j) return json(res, 404, { error: "job not found" });
       const nj = j.type === "edit" ? enqueueEditJob({ ...j.payload, jobId: "edit-" + Date.now() })
         : j.type === "restore" ? enqueueRestoreJob({ ...j.payload, jobId: "restore-" + Date.now() })
+        : j.type === "seo" ? enqueueSeoJob({ ...j.payload, jobId: "seo-" + Date.now() })
+        : j.type === "pre-release" ? enqueuePreReleaseJob({ ...j.payload, jobId: "pre-release-" + Date.now() })
         : enqueueJob(j.payload).job;
       return json(res, 202, { ok: true, jobId: nj.draftId });
     }
@@ -7524,7 +8194,7 @@ const server = http.createServer(async (req, res) => {
       let prs = []; try { prs = JSON.parse(raw.stdout || "[]"); } catch (e) { prs = []; }
       const re = new RegExp("(^|[/-])" + bare.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "(-|$)");
       const history = prs.filter(pr => re.test(pr.headRefName || ""))
-        .map(pr => ({ number: pr.number, title: pr.title, url: pr.url, state: pr.state, type: (pr.headRefName || "").includes("/edit-") ? "edit" : (pr.headRefName || "").includes("/restore-") ? "restore" : "build", date: pr.mergedAt || pr.createdAt, build: ciRollup(pr.statusCheckRollup) }))
+        .map(pr => ({ number: pr.number, title: pr.title, url: pr.url, state: pr.state, type: (pr.headRefName || "").includes("/pre-release-") ? "pre-release" : (pr.headRefName || "").includes("/edit-") ? "edit" : (pr.headRefName || "").includes("/restore-") ? "restore" : "build", date: pr.mergedAt || pr.createdAt, build: ciRollup(pr.statusCheckRollup) }))
         .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
       return json(res, 200, { siteId, repo: site.githubRepo, themeSlug: target.themeSlug, history });
     }
@@ -7672,6 +8342,30 @@ const server = http.createServer(async (req, res) => {
       return json(res, 202, { jobId: job.draftId, dryRun: !!body0.dryRun, monitor: "/jobs" });
     }
 
+    // Extensible pre-release run. Current task: mobile responsiveness across
+    // every page registered by the active backend theme.
+    if (p === "/api/pre-release-run" && req.method === "POST") {
+      const { siteId } = JSON.parse(await readBody(req) || "{}");
+      if (!BROWSERLESS_TOKEN) return json(res, 409, { error: "BROWSERLESS_TOKEN is not configured - add it to .env and restart the server" });
+      const site = await findWebsite(siteId);
+      if (!site) return json(res, 404, { error: "unknown siteId - refresh the site list" });
+      if (!site.githubRepo) return json(res, 409, { error: site.businessName + " has no repository set in NocoDB" });
+      if (!site.liveUrl) return json(res, 409, { error: site.businessName + " has no Domain set in NocoDB" });
+      let target;
+      try { target = await resolveEditTarget(site); }
+      catch (e) { return json(res, 409, { error: e.message }); }
+      const running = [...JOBS.values()].find((j) => j.type === "pre-release"
+        && (j.status === "queued" || j.status === "running")
+        && j.payload && j.payload.siteId === site.siteId);
+      if (running) return json(res, 202, { jobId: running.draftId, dedupe: true, monitor: "/jobs" });
+      const job = enqueuePreReleaseJob({
+        jobId: "pre-release-" + Date.now(), siteId: site.siteId,
+        businessName: site.businessName, githubRepo: site.githubRepo,
+        themeSlug: target.themeSlug, themePath: target.themePath,
+        muPath: target.muPath, liveUrl: site.liveUrl,
+      });
+      return json(res, 202, { jobId: job.draftId, monitor: "/jobs" });
+    }
     if (p === "/api/enrich-run" && req.method === "POST") {
       const body0 = JSON.parse(await readBody(req) || "{}");
       // Inline mode (ops/test): explicit themeSlug + answers → enqueue directly,
@@ -8289,22 +8983,15 @@ const server = http.createServer(async (req, res) => {
     // PR CI status — BUILD checks only (integration `test` intentionally ignored).
     // The dashboard polls this every 10s after opening a PR.
     if (p === "/api/pr-status" && req.method === "POST") {
-      const { prUrl } = JSON.parse(await readBody(req) || "{}");
+      const { prUrl, requireAllChecks } = JSON.parse(await readBody(req) || "{}");
       const prNum = ((prUrl || "").match(/\/pull\/(\d+)/) || [])[1];
       if (!prNum) return json(res, 400, { error: "prUrl with /pull/<n> required" });
       const r = await sh(`gh pr checks ${prNum} --repo ${repoFromPrUrl(prUrl)}`);
       // output lines: <name>\t<pass|fail|pending|skipping>\t<duration>\t<url>
       const rows = (r.stdout || "").split("\n").map(l => l.split("\t")).filter(c => c.length >= 2);
-      const builds = rows.filter(c => /^build/i.test(c[0].trim()))
-        .map(c => ({ name: c[0].trim(), status: c[1].trim(), url: (c[3] || "").trim() }));
-      // aggregate duplicates (push + pull_request runs share names): fail > pending > pass
-      const byName = {};
-      for (const b of builds) {
-        const cur = byName[b.name];
-        const rank = (s) => s === "fail" ? 2 : (s === "pending" ? 1 : 0);
-        if (!cur || rank(b.status) > rank(cur.status)) byName[b.name] = b;
-      }
-      const list = Object.values(byName);
+      // Most workflows retain the historical build-only gate. Pre-release passes
+      // requireAllChecks=true because visual fixes must not merge while any test fails.
+      const list = selectPrChecks(rows, !!requireAllChecks);
       // "No checks" is ambiguous on its own: CI may not have registered yet, or the repo may
       // have no workflows at all. Report the PR's own state and whether the repo even has
       // workflows, so a watcher can tell those apart instead of polling for 40 minutes.
@@ -8482,4 +9169,5 @@ if (require.main === module) {
 module.exports = {
   seoEnhance, audit, sharpenStitchImages, injectCanonicalNav, qcStitchImages, fixImages,
   JOBS, postStatus, jobStatusSnapshot, saveJobs, loadJobs, emitAudit,
+  safeArtifactName, mobilePageUrl, isSafeArtifactSegment, browserlessScreenshotRequest, browserlessLayoutRequest, captureMobileLayout, issueSupportedByLayout, selectPrChecks, preReleaseMarkerUrl, screenshotBuffersEqual, issueSupportedBySource, safeResponsivePlanFiles, verifyResponsiveDiff, repairResponsiveFile, readMuPages,
 };

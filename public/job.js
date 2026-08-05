@@ -70,7 +70,7 @@ function stepEvents(j, i, s) {
 
 function stepper(j) {
   const ic = { done: svg("check", 13, 3), running: `<span class="spin" style="margin:0;border-color:var(--accent);border-top-color:transparent"></span>`, error: svg("close", 13, 3), pending: "" };
-  const isBuild = j.type !== "edit" && j.type !== "enrich" && j.type !== "restore";
+  const isBuild = j.type === "build";
   return `<div class="steps">${(j.steps || []).map((s, i) => {
     let extra = "";
     if (isBuild && i === 1 && s.status !== "pending") extra = brandBlock(j);
@@ -165,7 +165,7 @@ function actions(j) {
   return b.join("");
 }
 
-const TYPE_LABEL = { edit: "Edit", enrich: "Enrich", restore: "Restore", build: "Build", seo: "SEO" };
+const TYPE_LABEL = { edit: "Edit", enrich: "Enrich", restore: "Restore", build: "Build", seo: "SEO", "pre-release": "Pre-release" };
 
 // ---- SEO run detail ----------------------------------------------------------
 // What the run decided, page by page, plus the two things it deliberately did
@@ -242,10 +242,46 @@ function seoCards(j) {
   return out.join("\n");
 }
 
+
+// ---- Pre-release mobile evidence --------------------------------------------
+function mobileCards(j) {
+  if (j.type !== "pre-release") return "";
+  const before = j.mobileBefore || [];
+  const after = j.mobileAfter || [];
+  if (!before.length && !after.length) return "";
+  const afterBySlug = new Map(after.map((p) => [p.slug, p]));
+  const summary = j.mobileSummary;
+  const issueText = (p) => {
+    if (!p) return "";
+    if (p.error) return `<div class="moberr">${esc(p.error)}</div>`;
+    const issues = p.issues || [];
+    return issues.length
+      ? `<ul class="mobissues">${issues.map((x) => `<li><b>${esc(x.severity || "issue")}</b> ${esc(x.description || x.kind)}${x.evidence ? `<span>${esc(x.evidence)}</span>` : ""}</li>`).join("")}</ul>`
+      : `<span class="pill good">Pass</span>`;
+  };
+  const shot = (p, label) => p && p.screenshot
+    ? `<a class="mobshot" href="${esc(p.screenshot)}" target="_blank" rel="noopener"><span>${label}</span><img src="${esc(p.screenshot)}" alt="${esc(label + " mobile screenshot for " + p.title)}" loading="lazy"></a>`
+    : "";
+  const rows = before.length ? before : after;
+  return `<div class="card pad">
+    <div class="card-h"><h2>Mobile responsiveness</h2>
+      ${summary ? `<span class="right pill ${summary.pass ? "good" : "bad"}">${summary.pass ? "Passed" : "Needs review"} · ${summary.pages} pages</span>` : ""}
+    </div>
+    ${summary ? `<div class="mobsummary"><b>${summary.beforeIssues}</b> issue(s) before · <b>${summary.afterIssues}</b> after · <b>${summary.changedFiles}</b> file(s) changed</div>` : ""}
+    <div class="moblist">${rows.map((p) => {
+      const a = afterBySlug.get(p.slug);
+      return `<section class="mobrow">
+        <div class="mobhd"><a href="${esc(p.url)}" target="_blank" rel="noopener">/${esc(p.slug === "home" ? "" : p.slug + "/")}</a><span>${esc(p.title || p.file)}</span></div>
+        <div class="mobgrid">${shot(p, "Before")}${shot(a, a && a.phase === "before" ? "Release proof" : "After")}</div>
+        ${a && a !== p ? issueText(a) : issueText(p)}
+      </section>`;
+    }).join("")}</div>
+  </div>`;
+}
 // Build jobs carry the target on the job record (from the HubSpot deal); edit and
 // enrich jobs carry it on the payload. Read both so the value is never blank.
 const jobRepo = (j) => j.repo || (j.payload && (j.payload.githubRepo || j.payload.betaSiteRepo)) || null;
-const jobBeta = (j) => j.liveUrl || (j.payload && j.payload.betaSiteUrl) || null;
+const jobBeta = (j) => j.liveUrl || (j.payload && (j.payload.liveUrl || j.payload.betaSiteUrl)) || null;
 
 // Who this run is for, and where it builds to — the information the onboarding
 // form brought in. Sits at the top so a run is identifiable at a glance.
@@ -398,7 +434,7 @@ function render() {
       <span class="ava lg" style="width:42px;height:42px;border-radius:11px;font-size:15px;background:${avatarColor(j.businessName)}">${esc(initials(j.businessName))}</span>
       <div style="min-width:0;flex:1">
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-          <h1>${esc(j.editSummary || (isEdit ? "Website edit" : isEnrich ? "Service pages + brand guide" : j.type === "seo" ? "SEO — " + j.businessName : "Build " + j.businessName))}</h1>
+          <h1>${esc(j.editSummary || (isEdit ? "Website edit" : isEnrich ? "Service pages + brand guide" : j.type === "seo" ? "SEO — " + j.businessName : j.type === "pre-release" ? "Pre-release — " + j.businessName : "Build " + j.businessName))}</h1>
           <span class="pill ${st.cls}">${esc(st.label)}</span>
         </div>
         <div class="meta">${TYPE_LABEL[j.type] || "Build"} · ${esc(j.businessName)} · started ${esc(relTime(j.startedAt || j.createdAt))} · ${c.gemini || 0} AI planning · ${c.stitch || 0} generation calls · ${esc(jobCost(j))} est.</div>
@@ -417,6 +453,7 @@ function render() {
     ${isEnrich && j.servicePages ? enrichDetailCard(j) : ""}
 
     ${seoCards(j)}
+    ${mobileCards(j)}
 
     ${isEdit && j.payload && j.payload.prompt ? `<div class="card pad"><div class="card-h"><h2>The request</h2></div><p class="req">${esc(j.payload.prompt)}</p>${workOrder(j)}</div>` : ""}
 

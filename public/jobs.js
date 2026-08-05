@@ -15,7 +15,7 @@ let shownCount = PAGE;
 // isActiveJob guards against a stale awaitingApproval flag on a run that has
 // already ended — a finished job can't be waiting for you.
 const needsYou = (j) => j.awaitingApproval && !j.approved && isActiveJob(j);
-const title = (j) => j.editSummary || (j.payload && j.payload.prompt) || (j.type === "edit" ? "Website edit" : j.type === "seo" ? "SEO — " + j.businessName : "Build " + j.businessName);
+const title = (j) => j.editSummary || (j.payload && j.payload.prompt) || (j.type === "edit" ? "Website edit" : j.type === "seo" ? "SEO — " + j.businessName : j.type === "pre-release" ? "Pre-release — " + j.businessName : "Build " + j.businessName);
 
 // Client info the onboarding form brought with it: the build target from the
 // HubSpot deal, plus when the submission actually arrived. Shown on every row so
@@ -75,7 +75,7 @@ function activeRow(j) {
 
 function doneRow(j) {
   const st = jobState(j);
-  const sub = j.type === "build" ? "Generated & deployed" : j.type === "enrich" ? "Service pages + brand guide" : j.prUrl ? "Change shipped" : "Run ended";
+  const sub = j.type === "build" ? "Generated & deployed" : j.type === "enrich" ? "Service pages + brand guide" : j.type === "pre-release" ? "Mobile release check" : j.prUrl ? "Change shipped" : "Run ended";
   return `<a class="run compact" href="/job?id=${encodeURIComponent(j.draftId)}">
     <span class="ava" style="background:${avatarColor(j.businessName)}">${esc(initials(j.businessName))}</span>
     <div style="flex:1;min-width:0;margin-left:12px">

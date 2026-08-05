@@ -354,6 +354,7 @@ function render() {
         <button class="btn" id="reauditTop"${AUDITING ? " disabled" : ""}>${svg("chart", 15)}${AUDIT ? "Re-audit" : "Run CRO audit"}</button>
         <button class="btn" id="enrichBtn">${svg("spark", 15)}Add service pages</button>
         <button class="btn" id="seoBtn" title="Shift-click for a dry run — writes the result to a preview folder, no pull request">${svg("search", 15)}Perform SEO</button>
+        <button class="btn" id="preReleaseBtn" title="Run pre-release checks across every registered page">${svg("mobile", 15)}Perform PR</button>
         <button class="btn" id="imgBtn"${IMG_RUNNING ? " disabled" : ""}>${svg("panel", 15)}${IMG_RUNNING ? "Checking images…" : "Check images"}</button>
         <a class="btn" href="/coverage?siteId=${encodeURIComponent(SITE.siteId)}">${svg("sites", 15)}Page coverage</a>
         <button class="btn" id="editWith">${svg("code", 15)}Edit with…</button>
@@ -472,6 +473,19 @@ function wire() {
       toast(d.dedupe ? "An SEO run is already going — opening it…" : `SEO ${dryRun ? "dry run" : "run"} started — opening Activity…`);
       setTimeout(() => { location.href = "/job?id=" + encodeURIComponent(d.jobId); }, 800);
     } catch (e) { sb.disabled = false; toast("Could not start: " + (e.message || "failed")); }
+  };
+  const prb = $("preReleaseBtn");
+  if (prb) prb.onclick = async () => {
+    const msg = `Perform pre-release checks for "${SITE.businessName}"?
+
+Current task: capture and audit every registered page at a mobile viewport, fix evidenced responsive issues, open one PR, follow this site's CI/approval policy, then capture post-release proof.`;
+    if (!confirm(msg)) return;
+    prb.disabled = true;
+    try {
+      const d = await postJSON("/api/pre-release-run", { siteId: SITE.siteId });
+      toast(d.dedupe ? "A pre-release run is already going - opening it..." : "Pre-release run started - opening Activity...");
+      setTimeout(() => { location.href = "/job?id=" + encodeURIComponent(d.jobId); }, 800);
+    } catch (e) { prb.disabled = false; toast("Could not start: " + (e.message || "failed")); }
   };
   const ib = $("imgBtn");
   if (ib) ib.onclick = async () => {
