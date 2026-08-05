@@ -71,7 +71,9 @@ function stepEvents(j, i, s) {
 function stepper(j) {
   const ic = { done: svg("check", 13, 3), running: `<span class="spin" style="margin:0;border-color:var(--accent);border-top-color:transparent"></span>`, error: svg("close", 13, 3), pending: "" };
   const isBuild = j.type === "build";
-  return `<div class="steps">${(j.steps || []).map((s, i) => {
+  const steps = (j.steps || []).map((s, i) => ({ s, i })).filter(({ i }) => !(j.type === "pre-release" && i === 9));
+  return `<div class="steps">${steps.map(({ s, i }) => {
+    const label = j.type === "pre-release" && i === 8 ? "Check fixes on live site" : s.label;
     let extra = "";
     if (isBuild && i === 1 && s.status !== "pending") extra = brandBlock(j);
     if (isBuild && i === 2 && s.status !== "pending") extra = pageRows(j, s.status === "running");
@@ -80,7 +82,7 @@ function stepper(j) {
     <div class="jstep ${s.status}">
       <span class="ic">${ic[s.status] || ""}</span>
       <div class="jb">
-        <span class="lb">${esc(s.label)}</span>
+        <span class="lb">${esc(label)}</span>
         ${s.detail ? `<span class="dt"${s.status === "error" ? ' style="color:var(--bad)"' : ""}>${esc(s.detail)}</span>` : ""}
         ${extra}
       </div>
@@ -265,14 +267,18 @@ function mobileCards(j) {
   const rows = before.length ? before : after;
   return `<div class="card pad">
     <div class="card-h"><h2>Mobile responsiveness</h2>
-      ${summary ? `<span class="right pill ${summary.pass ? "good" : "bad"}">${summary.pass ? "Passed" : "Needs review"} · ${summary.pages} pages</span>` : ""}
+      ${summary ? (summary.verificationDisabled
+        ? `<span class="right pill">After-fix screenshots · ${summary.pages} pages</span>`
+        : `<span class="right pill ${summary.pass ? "good" : "bad"}">${summary.pass ? "Passed" : "Needs review"} · ${summary.pages} pages</span>`) : ""}
     </div>
-    ${summary ? `<div class="mobsummary"><b>${summary.beforeIssues}</b> issue(s) before · <b>${summary.afterIssues}</b> after · <b>${summary.changedFiles}</b> file(s) changed</div>` : ""}
+    ${summary ? (summary.verificationDisabled
+      ? `<div class="mobsummary"><b>${summary.beforeIssues}</b> issue(s) found · after-fix screenshots captured for <b>${summary.pages}</b> affected page(s) · <b>${summary.changedFiles}</b> file(s) changed</div>`
+      : `<div class="mobsummary"><b>${summary.beforeIssues}</b> issue(s) before · <b>${summary.afterIssues}</b> after · <b>${summary.changedFiles}</b> file(s) changed</div>`) : ""}
     <div class="moblist">${rows.map((p) => {
       const a = afterBySlug.get(p.slug);
       return `<section class="mobrow">
         <div class="mobhd"><a href="${esc(p.url)}" target="_blank" rel="noopener">/${esc(p.slug === "home" ? "" : p.slug + "/")}</a><span>${esc(p.title || p.file)}</span></div>
-        <div class="mobgrid">${shot(p, "Before")}${shot(a, a && a.phase === "before" ? "Release proof" : "After")}</div>
+        <div class="mobgrid">${shot(p, "Before")}${shot(a, a && a.phase === "before" ? "Release proof" : "After fix")}</div>
         ${a && a !== p ? issueText(a) : issueText(p)}
       </section>`;
     }).join("")}</div>

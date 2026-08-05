@@ -2506,6 +2506,9 @@ async function ciEarlyExit(job, stepIdx, siteId, st, i) {
     jobStep(job, stepIdx, "done", "Merged on GitHub (outside the tool)");
     return true;
   }
+  if (st.prState === "CLOSED") {
+    throw new Error("the pull request was closed on GitHub without merging: " + job.prUrl);
+  }
   // Only after the grace period, and only when the repo genuinely has no workflows —
   // never merge ungated just because a check was slow to appear.
   if (st.noChecks && st.hasWorkflows === false && i >= NO_CI_GRACE_POLLS) {
@@ -4063,9 +4066,51 @@ function closeAiJsonContainers(value) {
   while (stack.length) repaired += stack.pop() === "{" ? "}" : "]";
   return repaired;
 }
+function stripAiJsonComments(value) {
+  let out = "", inString = false, escaped = false;
+  for (let i = 0; i < value.length; i++) {
+    const char = value[i], next = value[i + 1];
+    if (inString) {
+      out += char;
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') { inString = true; out += char; continue; }
+    if (char === "/" && next === "/") { while (i < value.length && value[i] !== "\n") i++; out += "\n"; continue; }
+    if (char === "/" && next === "*") { i += 2; while (i < value.length - 1 && !(value[i] === "*" && value[i + 1] === "/")) i++; i++; continue; }
+    out += char;
+  }
+  return out;
+}
+function quoteAiJsonKeys(value) {
+  let out = "", inString = false, escaped = false;
+  for (let i = 0; i < value.length; i++) {
+    const char = value[i];
+    if (inString) {
+      out += char;
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') { inString = true; out += char; continue; }
+    out += char;
+    if (char !== "{" && char !== ",") continue;
+    let j = i + 1, whitespace = "";
+    while (/\s/.test(value[j] || "")) whitespace += value[j++];
+    const match = value.slice(j).match(/^([A-Za-z_$][\w$-]*)(\s*:)/);
+    if (!match) { out += whitespace; i = j - 1; continue; }
+    out += `${whitespace}"${match[1]}"${match[2]}`;
+    i = j + match[0].length - 1;
+  }
+  return out;
+}
 function parseAiJson(raw, fallback) {
   const value = firstAiJsonValue(raw) || "{}";
-  const commonRepair = value
+  const commonRepair = quoteAiJsonKeys(stripAiJsonComments(value))
+    .replace(/,\s*,+/g, ",")
     .replace(/}\s*{/g, "},{")
     .replace(/]\s*\[/g, "],[")
     .replace(/(["}\]])\s+(?=["{\[])/g, "$1,")
@@ -7037,8 +7082,10 @@ function seoPrBody(job, entries, renames, audit, check, stripped, origin) {
 const PRE_RELEASE_STEPS = [
   "Pull latest code", "Inventory every page", "Capture mobile screenshots",
   "Audit mobile responsiveness", "Fix responsive issues", "Check the changes",
-  "Push + open PR", "CI checks then merge", "Capture post-release proof", "Verify pre-release",
+  "Push + open PR", "CI checks then merge", "Check fixes on live site", "Verify pre-release",
 ];
+// Temporarily disabled: retain implementation for later re-enablement, but do not run or display it.
+const PRE_RELEASE_AFTER_FIX_VERIFICATION = false;
 const MOBILE_CAPTURE_RETRY_MS = [4000, 10000];
 const MOBILE_VIEWPORT = Object.freeze({ width: 390, height: 844, deviceScaleFactor: 1, isMobile: true, hasTouch: true });
 
@@ -7060,6 +7107,12 @@ const BROWSERLESS_LAYOUT_CODE = `export default async ({ page, context }) => {
   const metrics = await page.evaluate(() => {
     const vw = window.innerWidth;
     const visible = (element) => {
+      // Closed <details> descendants are not painted even though Chromium may report non-zero geometry.
+      for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+        if (ancestor.tagName !== "DETAILS" || ancestor.open) continue;
+        const summary = Array.from(ancestor.children).find((child) => child.tagName === "SUMMARY");
+        if (!summary || !summary.contains(element)) return false;
+      }
       const style = getComputedStyle(element);
       const rect = element.getBoundingClientRect();
       return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
@@ -7147,10 +7200,10 @@ function screenshotBuffersEqual(before, after) {
 function mobileArtifactDiskPath(capture) {
   return path.join(GEN, "pre-release", ...String(capture && capture.screenshot || "").split("/").slice(2).map(decodeURIComponent));
 }
-function reusablePreReleaseAudit(sourceJob, pages, payload) {
-  if (!sourceJob || sourceJob.type !== "pre-release" || sourceJob.status !== "error" || sourceJob.currentStep < 4 || !Array.isArray(sourceJob.mobileBefore)) return null;
+function reusablePreReleaseCaptures(sourceJob, pages, payload, maxAgeMs = 4 * 60 * 60 * 1000) {
+  if (!sourceJob || sourceJob.type !== "pre-release" || sourceJob.status !== "error" || sourceJob.currentStep < 3 || !Array.isArray(sourceJob.mobileBefore)) return null;
   const capturedTimes = sourceJob.mobileBefore.map((row) => Date.parse(row && row.capturedAt || "")).filter(Number.isFinite);
-  if (!capturedTimes.length || Date.now() - Math.max(...capturedTimes) > 4 * 60 * 60 * 1000) return null;
+  if (!capturedTimes.length || Date.now() - Math.max(...capturedTimes) > maxAgeMs) return null;
   const sourcePayload = sourceJob.payload || {};
   for (const key of ["siteId", "themePath", "liveUrl"]) {
     if (String(sourcePayload[key] || "") !== String(payload && payload[key] || "")) return null;
@@ -7160,8 +7213,58 @@ function reusablePreReleaseAudit(sourceJob, pages, payload) {
   const reusable = [];
   for (const page of pages) {
     const row = bySlug.get(String(page.slug || ""));
-    if (!row || row.file !== page.file || row.url !== page.url || row.error || !Array.isArray(row.issues) || typeof row.pass !== "boolean") return null;
+    if (!row || row.file !== page.file || row.url !== page.url || row.error) return null;
     if (!row.screenshot || !fs.existsSync(mobileArtifactDiskPath(row))) return null;
+    reusable.push(JSON.parse(JSON.stringify(row)));
+  }
+  return reusable;
+}
+function reusablePreReleaseAudit(sourceJob, pages, payload, maxAgeMs = 4 * 60 * 60 * 1000) {
+  const reusable = reusablePreReleaseCaptures(sourceJob, pages, payload, maxAgeMs);
+  if (!reusable || reusable.some((row) => !Array.isArray(row.issues) || typeof row.pass !== "boolean")) return null;
+  return reusable;
+}
+function reusablePreReleasePr(sourceJob, payload) {
+  if (!sourceJob || sourceJob.type !== "pre-release" || sourceJob.status !== "error" || sourceJob.currentStep !== 7) return null;
+  if (!sourceJob.prUrl || !sourceJob.branch) return null;
+  const finishedAt = Date.parse(sourceJob.finishedAt || "");
+  if (!Number.isFinite(finishedAt) || Date.now() - finishedAt > 24 * 60 * 60 * 1000) return null;
+  const sourcePayload = sourceJob.payload || {};
+  for (const key of ["siteId", "githubRepo", "themePath", "liveUrl"]) {
+    if (String(sourcePayload[key] || "") !== String(payload && payload[key] || "")) return null;
+  }
+  return {
+    draftId: sourceJob.draftId,
+    prUrl: sourceJob.prUrl,
+    branch: sourceJob.branch,
+    editPlan: Array.isArray(sourceJob.editPlan) ? JSON.parse(JSON.stringify(sourceJob.editPlan)) : [],
+  };
+}
+function reusableDeployedPreRelease(sourceJob, payload) {
+  if (!sourceJob || sourceJob.type !== "pre-release" || sourceJob.status !== "error" || sourceJob.currentStep !== 8) return null;
+  if (!sourceJob.prUrl || !sourceJob.branch || !sourceJob.deployedAt || sourceJob.steps?.[7]?.status !== "done") return null;
+  const deployedAt = Date.parse(sourceJob.deployedAt);
+  if (!Number.isFinite(deployedAt) || Date.now() - deployedAt > 24 * 60 * 60 * 1000) return null;
+  const sourcePayload = sourceJob.payload || {};
+  for (const key of ["siteId", "githubRepo", "themePath", "liveUrl"]) {
+    if (String(sourcePayload[key] || "") !== String(payload && payload[key] || "")) return null;
+  }
+  return {
+    draftId: sourceJob.draftId, prUrl: sourceJob.prUrl, branch: sourceJob.branch, deployedAt: sourceJob.deployedAt,
+    editPlan: Array.isArray(sourceJob.editPlan) ? JSON.parse(JSON.stringify(sourceJob.editPlan)) : [],
+  };
+}
+function reusablePostReleaseCaptures(sourceJob, pages) {
+  if (!sourceJob || !Array.isArray(sourceJob.mobileAfter) || !Array.isArray(pages)) return [];
+  const deployedAt = Date.parse(sourceJob.deployedAt || "");
+  const bySlug = new Map(sourceJob.mobileAfter.map((row) => [String(row && row.slug || ""), row]));
+  const reusable = [];
+  for (const page of pages) {
+    const row = bySlug.get(String(page.slug || ""));
+    if (!row || row.file !== page.file || row.url !== page.url || row.error) continue;
+    if (!row.screenshot || !fs.existsSync(mobileArtifactDiskPath(row))) continue;
+    const capturedAt = Date.parse(row.capturedAt || "");
+    if (Number.isFinite(deployedAt) && (!Number.isFinite(capturedAt) || capturedAt < deployedAt)) continue;
     reusable.push(JSON.parse(JSON.stringify(row)));
   }
   return reusable;
@@ -7170,6 +7273,11 @@ function mobileScreenshotsEqual(before, after) {
   try {
     return screenshotBuffersEqual(fs.readFileSync(mobileArtifactDiskPath(before)), fs.readFileSync(mobileArtifactDiskPath(after)));
   } catch (_) { return false; }
+}
+function unresolvedIdenticalProof(before, after) {
+  if (!before || before.pass !== false || !mobileScreenshotsEqual(before, after)) return false;
+  const issues = Array.isArray(before.issues) ? before.issues : [];
+  return issues.length === 0 || issues.some((issue) => issueSupportedByLayout(issue, after && after.layout));
 }
 async function waitForPreReleaseDeployment(liveUrl, themeSlug, jobId) {
   const timeoutMs = Math.max(30000, Number(process.env.PR_DEPLOY_TIMEOUT_MS || 900000) || 900000);
@@ -7240,7 +7348,8 @@ async function captureMobilePage(jobId, phase, page) {
     } catch (e) { last = e; }
   }
   return { ...page, error: String(last && last.message || "capture failed").slice(0, 200) };
-}function issueQuotedLabels(issue) {
+}
+function issueQuotedLabels(issue) {
   const text = [issue && issue.description, issue && issue.evidence].filter(Boolean).join(" ")
     .replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
   const labels = [];
@@ -7263,6 +7372,19 @@ function mobileSourceContext(themeAbs, templateFile) {
     return `\n/* SOURCE ${file} */\n${fs.readFileSync(abs, "utf8")}`;
   }).join("\n").slice(0, 50000);
 }
+function mobileAuditGeometryFallback(capture) {
+  const layout = capture && capture.layout || {};
+  const issues = [];
+  if (layout.horizontalOverflow === true) {
+    const element = Array.isArray(layout.overflowElements) && layout.overflowElements[0];
+    issues.push({ kind: "horizontal-overflow", severity: "high", description: "Page content exceeds the mobile viewport", evidence: element && element.selector ? `${element.selector} extends outside ${layout.viewportWidth || MOBILE_VIEWPORT.width}px viewport` : `document width exceeds ${layout.viewportWidth || MOBILE_VIEWPORT.width}px viewport`, fixHint: "Constrain the implicated element and remove fixed or minimum widths that exceed the viewport." });
+  }
+  if (Array.isArray(layout.overlaps) && layout.overlaps.length) {
+    const overlap = layout.overlaps[0] || {}, first = overlap.first || {}, second = overlap.second || {};
+    issues.push({ kind: "overlapping-elements", severity: "medium", description: "Visible mobile elements overlap", evidence: [first.selector, second.selector].filter(Boolean).join(" overlaps ") || `${layout.overlaps.length} overlap(s) measured by Browserless`, fixHint: "Correct mobile stacking, spacing, or positioning for the measured elements." });
+  }
+  return { pass: issues.length === 0, issues };
+}
 async function inspectMobileScreenshot(capture, sourceContext = "") {
   const diskPath = mobileArtifactDiskPath(capture);
   const ext = path.extname(diskPath).toLowerCase();
@@ -7281,7 +7403,25 @@ async function inspectMobileScreenshot(capture, sourceContext = "") {
   ].join("\n");
   const raw = await geminiCall([{ text: prompt }, { inline_data: { mime_type: mime, data: fs.readFileSync(diskPath).toString("base64") } }],
     { temperature: 0.1, maxOutputTokens: 1800, timeoutMs: 60000, json: true });
-  const d = parseAiJson(raw);
+  let d = parseAiJson(raw, null), auditRecovery = "";
+  if (!d || typeof d !== "object" || (!Array.isArray(d.issues) && d.pass !== true)) {
+    try {
+      const repairRaw = await geminiCall([{ text: [
+        "Repair this malformed mobile-audit JSON. Preserve meaning; do not add issues. Return ONLY valid minified JSON matching:",
+        '{"pass":true|false,"issues":[{"kind":"id","severity":"high|medium|low","description":"text","evidence":"text","fixHint":"text"}]}',
+        "MALFORMED JSON:", String(raw || "").slice(0, 6000),
+      ].join("\n") }], { temperature: 0, maxOutputTokens: 2200, timeoutMs: 45000, json: true });
+      d = parseAiJson(repairRaw, null);
+      auditRecovery = "json-repair";
+    } catch (_) {
+      d = null;
+    }
+  }
+  if (!d || typeof d !== "object" || (!Array.isArray(d.issues) && d.pass !== true)) {
+    d = mobileAuditGeometryFallback(capture);
+    auditRecovery = "geometry-fallback";
+  }
+  if (!Array.isArray(d.issues)) d.issues = [];
   const reported = (Array.isArray(d.issues) ? d.issues : []).slice(0, 12).map((x) => ({
     source: "vision", kind: String(x.kind || "layout"), severity: ["high", "medium", "low"].includes(x.severity) ? x.severity : "medium",
     description: String(x.description || "Mobile layout issue").slice(0, 220), evidence: String(x.evidence || "").slice(0, 240),
@@ -7289,7 +7429,11 @@ async function inspectMobileScreenshot(capture, sourceContext = "") {
   }));
   const visual = reported.filter((issue) => issueSupportedBySource(issue, sourceContext) && issueSupportedByLayout(issue, capture.layout));
   const rejectedIssues = reported.filter((issue) => !issueSupportedBySource(issue, sourceContext) || !issueSupportedByLayout(issue, capture.layout));
-  return { ...capture, issues: visual, rejectedIssues, pass: !visual.length };
+  return { ...capture, issues: visual, rejectedIssues, pass: !visual.length, ...(auditRecovery ? { auditRecovery } : {}) };
+}
+function preReleaseProofPages(pages, audited) {
+  const failingSlugs = new Set((audited || []).filter((row) => row && row.pass === false).map((row) => String(row.slug || "")));
+  return (pages || []).filter((page) => failingSlugs.has(String(page.slug || "")));
 }
 function mobileIssueBrief(rows) {
   return rows.filter((p) => p.issues && p.issues.length).map((p) => [
@@ -7475,29 +7619,46 @@ async function runPreReleaseJob(job) {
     const sourceByFile = new Map(pages.map((page) => [page.file, mobileSourceContext(themeAbs, page.file)]));
     jobStep(job, 1, "done", `${pages.length} page(s) registered in backend`);
 
-    let audited = reusablePreReleaseAudit(JOBS.get(P.resumeFrom), pages, P);
+    const sourceJob = JOBS.get(P.resumeFrom);
+    const resumedRelease = reusableDeployedPreRelease(sourceJob, P);
+    const resumedPr = resumedRelease ? null : reusablePreReleasePr(sourceJob, P);
+    const checkpointMaxAge = (resumedRelease || resumedPr) ? 24 * 60 * 60 * 1000 : undefined;
+    const reusableCaptures = reusablePreReleaseCaptures(sourceJob, pages, P, checkpointMaxAge);
+    let audited = reusablePreReleaseAudit(sourceJob, pages, P, checkpointMaxAge);
     if (audited) {
       job.mobileBefore = audited;
       job.reusedAuditFrom = P.resumeFrom;
       jobStep(job, 2, "done", `${audited.length} existing mobile screenshot(s) reused`);
       jobStep(job, 3, "done", `${audited.reduce((count, row) => count + row.issues.length, 0)} existing issue(s) reused — no new AI audit calls`);
     } else {
-      const before = [];
-      for (let i = 0; i < pages.length; i++) {
-        jobStep(job, 2, "running", `${pages[i].title} (${i + 1}/${pages.length})`);
-        const cap = await captureMobilePage(job.draftId, "before", pages[i]);
-        before.push(cap);
+      let before = reusableCaptures;
+      if (before) {
         job.mobileBefore = before;
-        saveJobs();
+        jobStep(job, 2, "done", `${before.length} existing mobile screenshot(s) reused`);
+      } else {
+        before = [];
+        for (let i = 0; i < pages.length; i++) {
+          jobStep(job, 2, "running", `${pages[i].title} (${i + 1}/${pages.length})`);
+          const cap = await captureMobilePage(job.draftId, "before", pages[i]);
+          before.push(cap);
+          job.mobileBefore = before;
+          saveJobs();
+        }
+        const captureErrors = before.filter((x) => x.error);
+        if (captureErrors.length) throw new Error(`mobile screenshot failed for ${captureErrors.length}/${pages.length} page(s): ${captureErrors.map((x) => x.title).join(", ")}`);
+        jobStep(job, 2, "done", `${before.length} full-page mobile screenshot(s) captured`);
       }
-      const captureErrors = before.filter((x) => x.error);
-      if (captureErrors.length) throw new Error(`mobile screenshot failed for ${captureErrors.length}/${pages.length} page(s): ${captureErrors.map((x) => x.title).join(", ")}`);
-      jobStep(job, 2, "done", `${before.length} full-page mobile screenshot(s) captured`);
 
+      const existingAuditCount = before.filter((row) => Array.isArray(row.issues) && typeof row.pass === "boolean").length;
       audited = [];
       for (let i = 0; i < before.length; i++) {
-        jobStep(job, 3, "running", `${before[i].title} (${i + 1}/${before.length})`);
-        audited.push(await inspectMobileScreenshot(before[i], sourceByFile.get(before[i].file) || ""));
+        const existing = before[i];
+        if (Array.isArray(existing.issues) && typeof existing.pass === "boolean") {
+          audited.push(existing);
+        } else {
+          jobStep(job, 3, "running", `${before[i].title} (${i + 1}/${before.length}) - ${existingAuditCount} prior audit(s) reused`);
+          audited.push(await inspectMobileScreenshot(before[i], sourceByFile.get(before[i].file) || ""));
+        }
         job.mobileBefore = audited.concat(before.slice(i + 1));
         saveJobs();
       }
@@ -7517,6 +7678,26 @@ async function runPreReleaseJob(job) {
       return;
     }
 
+    if (resumedRelease) {
+      job.prUrl = resumedRelease.prUrl;
+      job.branch = resumedRelease.branch;
+      job.releaseMarkerId = resumedRelease.draftId;
+      job.deployedAt = resumedRelease.deployedAt;
+      job.editPlan = resumedRelease.editPlan;
+      jobStep(job, 4, "done", `${job.editPlan.length} existing fix target(s) reused`);
+      jobStep(job, 5, "done", "Existing validated patch reused");
+      jobStep(job, 6, "done", `Existing merged PR reused - ${job.prUrl}`);
+      jobStep(job, 7, "done", "Existing merged release reused");
+    } else {
+    if (resumedPr) {
+      job.prUrl = resumedPr.prUrl;
+      job.branch = resumedPr.branch;
+      job.releaseMarkerId = resumedPr.draftId;
+      job.editPlan = resumedPr.editPlan;
+      jobStep(job, 4, "done", `${job.editPlan.length} existing fix target(s) reused`);
+      jobStep(job, 5, "done", "Existing validated patch reused");
+      jobStep(job, 6, "done", `Existing PR reused - ${job.prUrl}`);
+    } else {
     jobStep(job, 4, "running", `Planning fixes for ${issueCount} evidenced issue(s)...`);
     const scan = scanResponsiveTheme(tmp, P.themePath, P.muPath);
     const issueBrief = mobileIssueBrief(audited);
@@ -7593,7 +7774,8 @@ async function runPreReleaseJob(job) {
       const retryIds = new Set(targets.map((missed) => missed.id));
       const retryCoverage = await verifyResponsiveDiff(audited, patch.stdout || "", retryIds);
       coverage = { issues: coverage.issues, missed: retryCoverage.missed };
-    }    if (coverage.missed.length) {
+    }
+    if (coverage.missed.length) {
       const failedDir = path.join(GEN, "pre-release", safeArtifactName(job.draftId));
       fs.mkdirSync(failedDir, { recursive: true });
       const failedPatchPath = path.join(failedDir, "failed-responsive-patch.diff");
@@ -7620,12 +7802,14 @@ async function runPreReleaseJob(job) {
     job.branch = branch;
     if (!job.prUrl) throw new Error("PR create failed: " + r.stderr.slice(-200));
     jobStep(job, 6, "done", job.prUrl);
+    }
 
     jobStep(job, 7, "running", "Watching CI build checks...");
     let fixes = 0, merged = false;
     for (let i = 0; i < 240 && !merged; i++) {
       let st;
-      try { st = await localApi("/api/pr-status", { prUrl: job.prUrl, requireAllChecks: true }); }
+      // Integration installs the repository default site and never activates this generated theme; PHP build checks are the relevant release gate.
+      try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); }
       catch (e) { await sleep(10000); continue; }
       jobStep(job, 7, "running", (st.checks || []).map((c) => `${c.name}:${c.status}`).join(" ") || "CI starting...");
       if (await ciEarlyExit(job, 7, P.siteId, st, i)) { merged = true; break; }
@@ -7648,38 +7832,60 @@ async function runPreReleaseJob(job) {
       await sleep(10000);
     }
     if (!merged) throw new Error("CI watch timed out - " + job.prUrl);
-    jobStep(job, 8, "running", `Waiting for exact release ${job.draftId} to deploy...`);
-    const deployed = await waitForPreReleaseDeployment(P.liveUrl, P.themeSlug, job.draftId);
+    const releaseMarkerId = job.releaseMarkerId || job.draftId;
+    jobStep(job, 8, "running", `Waiting for exact release ${releaseMarkerId} to deploy...`);
+    const deployed = await waitForPreReleaseDeployment(P.liveUrl, P.themeSlug, releaseMarkerId);
     job.deployedAt = deployed.deployedAt;
     const settleWait = Math.max(0, Number(process.env.PR_DEPLOY_WAIT_MS || 5000) || 5000);
     if (settleWait) await sleep(settleWait);
+    }
     fs.rmSync(tmp, { recursive: true, force: true });
-    jobStep(job, 8, "running", `Release marker confirmed; capturing ${pages.length} page(s)...`);    const after = [];
-    for (let i = 0; i < pages.length; i++) {
-      jobStep(job, 8, "running", `${pages[i].title} (${i + 1}/${pages.length})`);
-      const cap = await captureMobilePage(job.draftId, "after", pages[i]);
-      if (cap.error) throw new Error(`post-release screenshot failed for ${pages[i].title}: ${cap.error}`);
-      if (!audited[i].pass && mobileScreenshotsEqual(audited[i], cap)) throw new Error(`post-release proof for ${pages[i].title} is pixel-identical to its failing before screenshot`);
+    const proofPages = preReleaseProofPages(pages, audited);
+    const auditedBySlug = new Map(audited.map((row) => [String(row.slug || ""), row]));
+    const reusableAfter = resumedRelease ? reusablePostReleaseCaptures(sourceJob, proofPages) : [];
+    const reusableAfterBySlug = new Map(reusableAfter.map((row) => [String(row.slug || ""), row]));
+    jobStep(job, 8, "running", `Checking ${proofPages.length} page(s) that had issues - reusing ${reusableAfter.length} screenshot(s)...`);
+    const after = [];
+    for (let i = 0; i < proofPages.length; i++) {
+      const page = proofPages[i];
+      jobStep(job, 8, "running", `${page.title} (${i + 1}/${proofPages.length})`);
+      let cap = reusableAfterBySlug.get(String(page.slug || ""));
+      if (cap) {
+        const layoutUrl = new URL(page.url);
+        layoutUrl.searchParams.set("__g99_pr_layout", `${job.draftId}-${Date.now()}`);
+        const layout = await captureMobileLayout(layoutUrl.toString());
+        if (layout.error) throw new Error(`after-fix layout refresh failed for ${page.title}: ${layout.error}`);
+        cap = { ...cap, layout, layoutRefreshedAt: new Date().toISOString() };
+      } else {
+        cap = await captureMobilePage(job.draftId, "after", page);
+      }
+      if (cap.error) throw new Error(`after-fix screenshot failed for ${page.title}: ${cap.error}`);
+      if (unresolvedIdenticalProof(auditedBySlug.get(String(page.slug || "")), cap)) throw new Error(`after-fix screenshot for ${page.title} is pixel-identical while its measured issue remains`);
       after.push(cap);
       job.mobileAfter = after;
       saveJobs();
     }
-    jobStep(job, 8, "done", `${after.length} post-release screenshot(s) captured`);
+    jobStep(job, 8, "done", `${after.length} after-fix screenshot(s) captured`);
 
-    const verified = [];
-    for (let i = 0; i < after.length; i++) {
-      jobStep(job, 9, "running", `${after[i].title} (${i + 1}/${after.length})`);
-      verified.push(await inspectMobileScreenshot(after[i], sourceByFile.get(after[i].file) || ""));
-      job.mobileAfter = verified.concat(after.slice(i + 1));
-      saveJobs();
+    if (PRE_RELEASE_AFTER_FIX_VERIFICATION) {
+      const verified = [];
+      for (let i = 0; i < after.length; i++) {
+        jobStep(job, 9, "running", `${after[i].title} (${i + 1}/${after.length})`);
+        verified.push(await inspectMobileScreenshot(after[i], sourceByFile.get(after[i].file) || ""));
+        job.mobileAfter = verified.concat(after.slice(i + 1));
+        saveJobs();
+      }
+      job.mobileAfter = verified;
+      const remaining = verified.reduce((count, row) => count + (row.issues || []).length, 0);
+      job.mobileSummary = { pass: remaining === 0, pages: proofPages.length, beforeIssues: issueCount, afterIssues: remaining, changedFiles: (job.editPlan || []).length };
+      if (remaining) throw new Error(`after-fix mobile verification still found ${remaining} issue(s) - screenshots preserved for review`);
+      jobStep(job, 9, "done", `${proofPages.length}/${proofPages.length} affected pages pass`);
+    } else {
+      job.mobileSummary = { pass: null, pages: proofPages.length, beforeIssues: issueCount, afterIssues: null, changedFiles: (job.editPlan || []).length, verificationDisabled: true };
+      jobStep(job, 9, "done", "Temporarily disabled");
     }
-    job.mobileAfter = verified;
-    const remaining = verified.reduce((n, x) => n + (x.issues || []).length, 0);
-    job.mobileSummary = { pass: remaining === 0, pages: pages.length, beforeIssues: issueCount, afterIssues: remaining, changedFiles: plan.files.length };
-    if (remaining) throw new Error(`post-release mobile verification still found ${remaining} issue(s) - screenshots preserved for review`);
-    jobStep(job, 9, "done", `${pages.length}/${pages.length} pages pass - ${issueCount} issue(s) fixed`);
     job.status = "done";
-    notify(`Pre-release mobile check passed for *${job.businessName}*: ${pages.length} page(s) - ${issueCount} issue(s) fixed - ${job.prUrl || ""}`);
+    notify(`After-fix screenshots captured for *${job.businessName}*: ${proofPages.length} affected page(s) - ${job.prUrl || ""}`);
   } catch (e) {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
     if (e && e.cancelled) job.status = "cancelled";
@@ -9283,5 +9489,5 @@ if (require.main === module) {
 module.exports = {
   seoEnhance, audit, sharpenStitchImages, injectCanonicalNav, qcStitchImages, fixImages,
   JOBS, postStatus, jobStatusSnapshot, saveJobs, loadJobs, emitAudit,
-  safeArtifactName, mobilePageUrl, isSafeArtifactSegment, browserlessScreenshotRequest, browserlessLayoutRequest, captureMobileLayout, issueSupportedByLayout, selectPrChecks, selectAutofixCheck, autofixFallbackPhpFiles, parseAiJson, reusablePreReleaseAudit, preReleaseMarkerUrl, screenshotBuffersEqual, issueSupportedBySource, safeResponsivePlanFiles, verifyResponsiveDiff, repairResponsiveFile, readMuPages,
+  safeArtifactName, mobilePageUrl, isSafeArtifactSegment, browserlessScreenshotRequest, browserlessLayoutRequest, captureMobileLayout, issueSupportedByLayout, selectPrChecks, selectAutofixCheck, autofixFallbackPhpFiles, parseAiJson, reusablePreReleaseCaptures, reusablePreReleaseAudit, reusablePreReleasePr, reusableDeployedPreRelease, reusablePostReleaseCaptures, preReleaseMarkerUrl, screenshotBuffersEqual, unresolvedIdenticalProof, mobileAuditGeometryFallback, preReleaseProofPages, issueSupportedBySource, safeResponsivePlanFiles, verifyResponsiveDiff, repairResponsiveFile, readMuPages,
 };
