@@ -820,7 +820,9 @@ function splitPage(html) {
   if (footer) main = main.replace(footer, "");
   return { head: wpRewriteLinks(head), header: wpRewriteLinks(header), footer: wpRewriteLinks(footer), main: wpRewriteLinks(main) };
 }
-async function buildWpTheme(slug, biz) {
+// opts.logoUrl   — the onboarding logo upload; becomes the site favicon
+// opts.businessId — drives the chatbot widget's data-id
+async function buildWpTheme(slug, biz, opts = {}) {
   const siteDir = path.join(GEN, "site");
   if (!fs.existsSync(path.join(siteDir, "index.html"))) throw new Error("Bind the site first (Step 4) — no /site/ bundle found.");
   const themeDir = path.join(GEN, "wp-theme", slug);
@@ -831,6 +833,12 @@ async function buildWpTheme(slug, biz) {
   const home = splitPage(fs.readFileSync(path.join(siteDir, "index.html"), "utf8"));
   const written = [];
   const w = (name, content) => { fs.writeFileSync(path.join(themeDir, name), content); written.push(name); };
+
+  // Fetched before functions.php is written, because the hooks below are only emitted when
+  // there is actually a file to point at.
+  const businessId = opts.businessId || null;
+  const favicon = await writeFaviconFromLogo(themeDir, opts.logoUrl);
+  if (favicon) written.push(`assets/${favicon.file}`);
 
   w("style.css", `/*\nTheme Name: ${biz} (Growth99)\nTheme URI: https://growth99.com\nAuthor: Growth99\nDescription: AI-generated beta theme for ${biz}. Classic theme for Bedrock WordPress.\nVersion: 1.0.0\nLicense: Proprietary\nText Domain: g99-${slug}\n*/\n`);
 
@@ -850,7 +858,30 @@ add_action('after_setup_theme', function () {
 add_action('wp_enqueue_scripts', function () {
     wp_enqueue_style('g99-${slug}', get_stylesheet_uri(), [], '1.0.0');
 });
-
+${favicon ? `
+/**
+ * Favicon from the client's onboarding logo (assets/${favicon.file}).
+ * Printed at priority 1 so it wins over anything a plugin adds later. Skipped when the
+ * WordPress Site Icon is set, so an explicit choice in wp-admin is never overridden.
+ */
+add_action('wp_head', function () {
+    if (function_exists('has_site_icon') && has_site_icon()) {
+        return;
+    }
+    $href = esc_url(get_theme_file_uri('assets/${favicon.file}'));
+    echo '<link rel="icon" type="${favicon.mime}" href="' . $href . '">' . "\\n";
+    echo '<link rel="apple-touch-icon" href="' . $href . '">' . "\\n";
+}, 1);
+` : ""}${businessId ? `
+/**
+ * Growth99 chatbot widget. data-id is the base64-encoded business id (${businessId}).
+ * On wp_footer so the div exists before integration.js runs.
+ */
+add_action('wp_footer', function () {
+    echo '<div id="buisness-id" data-id="${chatbotDataId(businessId)}"></div>' . "\\n";
+    echo '<script id="integration-script" src="https://chatbot.growth99.com/assets/js/integration.js"></script>' . "\\n";
+});
+` : ""}
 /**
  * On activation, auto-create the site's Pages, assign templates, set the static
  * front page, and build the primary menu. Idempotent — safe to re-run.
@@ -1468,6 +1499,56 @@ ${h ? `h1,h2,h3,h4{letter-spacing:-.01em}` : ""}
 // test is the image's INTRINSIC pixel width — not a perceptual blur score. Read it
 // straight from the file header (JPEG SOF / PNG IHDR / WebP VP8) using a ranged
 // fetch, so we download a few KB instead of the whole photo.
+// The client's logo, fetched and written into the theme as the favicon. The onboarding upload
+// is an S3 object with NO file extension, so the type comes from the magic bytes — guessing
+// from the URL would produce a .png that is really a JPEG and browsers would drop it.
+// SVG is detected from the leading markup instead (no magic number).
+function imageExtFromBuffer(b) {
+  if (!b || b.length < 12) return null;
+  if (b[0] === 0x89 && b.slice(1, 4).toString("ascii") === "PNG") return "png";
+  if (b[0] === 0xff && b[1] === 0xd8) return "jpg";
+  if (b.slice(0, 3).toString("ascii") === "GIF") return "gif";
+  if (b.slice(0, 4).toString("ascii") === "RIFF" && b.slice(8, 12).toString("ascii") === "WEBP") return "webp";
+  if (b[0] === 0x00 && b[1] === 0x00 && b[2] === 0x01 && b[3] === 0x00) return "ico";
+  const head = b.slice(0, 400).toString("utf8").trim().toLowerCase();
+  if (head.startsWith("<svg") || (head.startsWith("<?xml") && head.includes("<svg"))) return "svg";
+  return null;
+}
+const FAVICON_MIME = {
+  png: "image/png", jpg: "image/jpeg", gif: "image/gif",
+  webp: "image/webp", ico: "image/x-icon", svg: "image/svg+xml",
+};
+
+// Download the logo and drop it in the theme. Returns {file, mime, w, h} or null — a missing
+// or unreadable logo must never fail a build, it just means no favicon this time.
+async function writeFaviconFromLogo(themeDir, logoUrl) {
+  if (!logoUrl || !/^https?:\/\//i.test(logoUrl)) return null;
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 20000);
+    let r;
+    try { r = await fetch(logoUrl, { signal: ctl.signal, redirect: "follow" }); }
+    finally { clearTimeout(timer); }
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const buf = Buffer.from(await r.arrayBuffer());
+    const ext = imageExtFromBuffer(buf);
+    if (!ext) throw new Error("not a recognisable image (" + buf.length + " bytes)");
+    const dir = path.join(themeDir, "assets");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = `favicon.${ext}`;
+    fs.writeFileSync(path.join(dir, file), buf);
+    const d = ext === "svg" ? null : dimsFromBuffer(buf);
+    return { file, mime: FAVICON_MIME[ext], bytes: buf.length, w: d ? d.w : null, h: d ? d.h : null };
+  } catch (e) {
+    console.error("favicon skipped:", e.message);
+    return null;
+  }
+}
+
+// The chatbot widget's data-id is the business id, base64-encoded — that is all the
+// "encryption" is (MTAxOTM= decodes to 10193), so it is derived here rather than asked for.
+const chatbotDataId = (businessId) => Buffer.from(String(businessId), "utf8").toString("base64");
+
 function dimsFromBuffer(b) {
   if (!b || b.length < 24) return null;
   // PNG: 8-byte signature, then IHDR width/height as big-endian uint32
@@ -7701,6 +7782,9 @@ const server = http.createServer(async (req, res) => {
           referenceWebsite: body.referenceWebsite || mapped.referenceWebsite || "",
           existingWebsite: body.existingWebsite || mapped.existingWebsite || "",
           confirmedBrand,
+          // Presigned by product-service: the raw logo_file answer is a private S3 object
+          // that 403s, so this is the only fetchable form of the client's logo.
+          logoUrl: body.logoUrl || null,
           answers: mapped.answers,
         }, null, 2));
       } catch (e) { console.warn("could not persist onboarding.json:", e.message); }
@@ -8873,10 +8957,16 @@ const server = http.createServer(async (req, res) => {
 
     if (p === "/api/export-wordpress" && req.method === "POST") {
       const body = JSON.parse(await readBody(req) || "{}");
-      const a = JSON.parse(fs.readFileSync(path.join(DIR, "onboarding.json"), "utf8")).answers;
+      const onb = JSON.parse(fs.readFileSync(path.join(DIR, "onboarding.json"), "utf8"));
+      const a = onb.answers;
       const slug = (a.business_name || "client").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32);
       await ensureFreshSite(body.theme); // rebind /site/ from newest generation — never ship stale
-      const out = await buildWpTheme(slug, a.business_name);
+      const out = await buildWpTheme(slug, a.business_name, {
+        // Favicon source and chatbot business id: the logo is an answer, the business id
+        // rides at the root of the webhook payload.
+        logoUrl: onb.logoUrl || a.logo_file || a.logo || null,
+        businessId: onb.businessId || null,
+      });
       return json(res, 200, { slug: out.slug, themePath: `web/app/themes/g99-${out.slug}/`, files: out.files });
     }
 
@@ -8884,10 +8974,16 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req) || "{}");
       // Per-client target repo (from the job); falls back to this deployment's default.
       const repo = body.githubRepo || WP_REPO;
-      const a = JSON.parse(fs.readFileSync(path.join(DIR, "onboarding.json"), "utf8")).answers;
+      const onb = JSON.parse(fs.readFileSync(path.join(DIR, "onboarding.json"), "utf8"));
+      const a = onb.answers;
       const slug = (a.business_name || "client").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32);
       if (!body.skipRebind) await ensureFreshSite(body.theme); // rebind /site/ from newest generation — never ship stale (dashboard binds itself and passes skipRebind)
-      const built = await buildWpTheme(slug, a.business_name);
+      const built = await buildWpTheme(slug, a.business_name, {
+        // Favicon source and chatbot business id: the logo is an answer, the business id
+        // rides at the root of the webhook payload.
+        logoUrl: onb.logoUrl || a.logo_file || a.logo || null,
+        businessId: onb.businessId || null,
+      });
       const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");   // YYYYMMDDHHMMSS
       const uniq = Date.now().toString(36).slice(-4);                              // avoid same-second collisions
       let branch = (body.branch || `g99/beta-theme-${slug}-${stamp}-${uniq}`).replace(/[^a-zA-Z0-9._\/\-]/g, "");
@@ -8918,7 +9014,13 @@ const server = http.createServer(async (req, res) => {
         // would leave stale templates from earlier merged builds in the repo).
         fs.rmSync(dest, { recursive: true, force: true });
         fs.mkdirSync(dest, { recursive: true });
-        for (const f of built.files) fs.copyFileSync(path.join(built.themeDir, f), path.join(dest, f));
+        for (const f of built.files) {
+          const to = path.join(dest, f);
+          // Some theme files now live in subdirectories (assets/favicon.*), and a flat copy
+          // would throw ENOENT on the missing parent.
+          fs.mkdirSync(path.dirname(to), { recursive: true });
+          fs.copyFileSync(path.join(built.themeDir, f), to);
+        }
         // Must-use plugin so the deploy auto-activates the theme (no manual click).
         const muRel = "web/app/mu-plugins";
         const muFile = `g99-activate-${slug}.php`;
