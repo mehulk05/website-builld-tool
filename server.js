@@ -2618,11 +2618,17 @@ function parseRepoSlug(url) {
 function mapNocoRow(row) {
   const businessName = nocoField(row, ["Website name", "Website Name", "Name", "Business", "Business Name"]);
   const liveUrl = nocoField(row, ["Domain", "Website URL", "URL", "Site URL", "Live URL"]);
+  // Two different things, and conflating them cost us a wrong live-site guess:
+  // `liveUrl` (Domain) is the BETA we build and deploy to, e.g. prodteam.gogroth.com.
+  // `existingSiteUrl` (Live Site) is the client's CURRENT site, e.g. nuvoaestheticsclinic.com,
+  // which is read for one thing only — its sitemap, to catch pages we have not rebuilt.
+  // It is not derivable from the beta domain: Brew Aesthetics builds on prodteam.gogroth.com.
+  const existingSiteUrl = nocoField(row, ["Live Site", "Live Website", "Existing Site", "Existing Website", "Current Site", "Old Site"]);
   const repoUrl = nocoField(row, ["Repo File Path", "Repository URL", "Repo", "Repository", "GitHub", "Github Repo"]);
   const githubRepo = parseRepoSlug(repoUrl);
   const rowId = row.Id != null ? row.Id : (row.id != null ? row.id : null);
   const siteId = rowId != null ? `noco-${rowId}` : (githubRepo || businessName);
-  return { siteId, rowId, businessName, liveUrl, repoUrl, githubRepo };
+  return { siteId, rowId, businessName, liveUrl, existingSiteUrl, repoUrl, githubRepo };
 }
 async function fetchNocoWebsites() {
   if (!NOCODB_TOKEN) throw new Error("NOCODB_TOKEN not set — add it to .env");
@@ -3731,7 +3737,7 @@ async function processJobQueue() {
   if (!id) return;
   JOB_RUNNING = true;
   const job = JOBS.get(id);
-  const RUNNER = { edit: runEditJob, restore: runRestoreJob, enrich: runEnrichJob, seo: runSeoJob, "pre-release": runPreReleaseJob };
+  const RUNNER = { edit: runEditJob, restore: runRestoreJob, enrich: runEnrichJob, seo: runSeoJob, "pre-release": runPreReleaseJob, "perform-pr": runPerformPrJob };
   try { await ((job && RUNNER[job.type] ? RUNNER[job.type] : runJob)(job)); }
   catch (e) { console.error("job runner crashed:", e); }
   finally { JOB_RUNNING = false; processJobQueue(); }
@@ -7592,6 +7598,1270 @@ async function runPreReleaseJob(job) {
   }
 }
 
+// ============================================================ PERFORM PR ENGINE
+// "Perform PR" is the pre-release gate for everything that is NOT mobile
+// responsiveness — that stays in the older pre-release job until the two are
+// merged deliberately. Four phases: read the repo and the client's current live
+// site, audit what the built site says about itself, apply only the fixes whose
+// correct answer is computable, then verify the merged result on the live
+// domain. Exactly one human touchpoint, by design: the pull request.
+//
+// Findings the job cannot fix deterministically are never guessed at. They are
+// carried into the report as proposals — a wrong auto-fix on a client's phone
+// number is far more expensive than a line in a report someone reads.
+const PERFORM_PR_STEPS = [
+  "Pull latest code",
+  "Read the live site's sitemap",
+  "Read the built site's own facts",
+  "Audit pages, URLs, name + contact",
+  "Audit favicon, images + spelling",
+  "Page audit (AI)",
+  "Apply automatic fixes",
+  "Check the changes",
+  "Push + open PR",
+  "CI checks then merge",
+  "Verify on the live site",
+  "PageSpeed audit",
+  "Publish report",
+];
+
+// ---- phase 0: the client's current live site ---------------------------------
+// Their real site is the beta domain with the Growth99 staging label taken out:
+// brew-aesthetics.gogroth.com -> brew-aesthetics.com. Per product decision the
+// TLD is always .com. Anything we cannot derive is reported, never guessed —
+// crawling a stranger's website because a hostname did not match is worse than
+// running the rest of the audit without a live-site comparison.
+function liveSiteCandidate(betaUrl) {
+  let host = "";
+  try { host = new URL(String(betaUrl || "")).hostname.toLowerCase(); } catch (_) { return ""; }
+  const labels = host.split(".").filter(Boolean);
+  const at = labels.findIndex((l) => /^gogro(w)?th$/.test(l));
+  if (at < 1) return "";
+  return "https://" + labels.slice(0, at).join(".") + ".com";
+}
+// Distinctive words of the business name — "the", "and", "med" match everything.
+function nameTokens(businessName) {
+  return String(businessName || "").toLowerCase().split(/[^a-z0-9]+/)
+    .filter((w) => w.length > 3 && !["the", "and", "for", "with", "clinic", "center", "centre", "studio", "group"].includes(w));
+}
+async function fetchText(url, timeoutMs = 20000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { redirect: "follow", signal: ctrl.signal, headers: { "User-Agent": "G99PerformPR/1.0" } });
+    const type = String(r.headers.get("content-type") || "");
+    // A 200 that is not HTML is not a page. TED taught us this the hard way:
+    // status alone is not evidence that the thing you asked for came back.
+    if (!r.ok || !/text\/html/i.test(type)) return { ok: false, status: r.status, html: "", type };
+    return { ok: true, status: r.status, html: (await r.text()).slice(0, 600000), type };
+  } catch (e) { return { ok: false, status: 0, html: "", error: String(e && e.message || e).slice(0, 140) }; }
+  finally { clearTimeout(timer); }
+}
+// The live site has exactly one job here: hand over its sitemap, so we can tell
+// which of the pages the client publishes today are missing from the new site.
+// Nothing else is read from it. The built site is the authority on the
+// business's own name, phone, email and address — an old site is frequently out
+// of date, and letting it argue with the new one produces noise, not findings.
+//
+// The name check is a safety gate, not a comparison: without it, a parked domain
+// or a squatter on the .com would hand us a sitemap and we would report dozens
+// of "missing" pages that were never the client's.
+// The Live Site column in NocoDB is the answer whenever it is filled in. Deriving
+// it from the beta domain only ever worked by luck: Brew Aesthetics builds on
+// prodteam.gogroth.com but its real site is nuvoaestheticsclinic.com, which no
+// amount of string-stripping will produce. Derivation stays as a fallback for
+// rows where the column is still empty.
+async function resolveLiveSite(betaUrl, businessName, existingSiteUrl) {
+  const declared = String(existingSiteUrl || "").trim();
+  const candidate = declared ? (/^https?:\/\//i.test(declared) ? declared : "https://" + declared.replace(/^\/+/, ""))
+    : liveSiteCandidate(betaUrl);
+  const source = declared ? "NocoDB Live Site" : "derived from the beta domain";
+  if (!candidate) return { ok: false, url: "", source, reason: "no Live Site set in NocoDB, and none could be derived from the beta domain" };
+  const r = await fetchText(candidate);
+  if (!r.ok) return { ok: false, url: candidate, source, reason: r.error ? `unreachable (${r.error})` : `unreachable (HTTP ${r.status})` };
+  // The name gate protects against a parked domain or a squatter handing us a
+  // sitemap — but only when we guessed. A URL a human typed into NocoDB is
+  // trusted: plenty of real clinics trade under a name that never appears
+  // verbatim in their homepage copy.
+  if (!declared) {
+    const tokens = nameTokens(businessName);
+    const text = pageText(r.html).toLowerCase();
+    if (tokens.length && !tokens.some((t) => text.includes(t))) {
+      return { ok: false, url: candidate, source, reason: `resolved but does not mention "${businessName}" — not treated as the client's site. Set the Live Site column in NocoDB to fix this.` };
+    }
+  }
+  return { ok: true, url: candidate, source };
+}
+
+// ---- the client's existing page list, from their sitemap ---------------------
+const SITEMAP_PATHS = ["/sitemap.xml", "/sitemap_index.xml", "/wp-sitemap.xml", "/sitemap-index.xml", "/page-sitemap.xml"];
+async function fetchXml(url, timeoutMs = 20000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { redirect: "follow", signal: ctrl.signal, headers: { "User-Agent": "G99PerformPR/1.0" } });
+    if (!r.ok) return "";
+    const body = (await r.text()).slice(0, 2000000);
+    return /<(urlset|sitemapindex)\b/i.test(body) ? body : "";
+  } catch (_) { return ""; }
+  finally { clearTimeout(timer); }
+}
+const sitemapLocs = (xml) => [...String(xml).matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)].map((m) => m[1]);
+// A sitemap index points at more sitemaps; WordPress and Yoast both ship one.
+// Following it is the difference between finding 5 pages and finding all 60.
+// robots.txt is checked as well as the usual paths, not instead of them: plenty
+// of clinic sites put their sitemap somewhere non-standard and only declare it
+// there. Growth99's own site is an example — nothing at /sitemap.xml, and the
+// real location is a Sitemap: line in robots.txt.
+async function sitemapFromRobots(root) {
+  try {
+    const r = await fetch(root + "/robots.txt", { redirect: "follow", headers: { "User-Agent": "G99PerformPR/1.0" } });
+    if (!r.ok) return [];
+    return [...(await r.text()).matchAll(/^\s*sitemap:\s*(\S+)/gim)].map((m) => m[1]).slice(0, 5);
+  } catch (_) { return []; }
+}
+async function fetchLiveSitemap(origin, maxUrls = 500) {
+  const root = String(origin).replace(/\/+$/, "");
+  const candidates = [...SITEMAP_PATHS.map((p) => root + p), ...(await sitemapFromRobots(root))];
+  for (const candidate of [...new Set(candidates)]) {
+    const xml = await fetchXml(candidate);
+    if (!xml) continue;
+    let urls = sitemapLocs(xml);
+    if (/<sitemapindex\b/i.test(xml)) {
+      const children = urls.slice(0, 25);
+      urls = [];
+      for (const child of children) {
+        if (urls.length >= maxUrls) break;
+        const sub = await fetchXml(child);
+        if (sub) urls.push(...sitemapLocs(sub));
+      }
+    }
+    urls = urls.filter((u) => !/\.(xml|jpe?g|png|webp|gif|svg|pdf)$/i.test(u));
+    if (urls.length) return { ok: true, url: candidate, urls: [...new Set(urls)].slice(0, maxUrls) };
+  }
+  return { ok: false, url: "", urls: [], reason: "no readable sitemap found on the live site (checked the usual paths and robots.txt)" };
+}
+function urlSlug(u) {
+  let pathname = "";
+  try { pathname = new URL(u).pathname; } catch (_) { pathname = String(u); }
+  const parts = pathname.replace(/\/+$/, "").split("/").filter(Boolean);
+  return (parts[parts.length - 1] || "home").toLowerCase();
+}
+// Matching on the last path segment, not the full path, because the new site
+// deliberately restructures URLs (/service/botox-in-evans-ga vs /botox). A page
+// that moved is not a page that is missing.
+function findingsMissingPages(pages, liveUrls) {
+  const built = new Set(pages.map((p) => String(p.slug || "").toLowerCase()));
+  built.add("home");
+  const out = [];
+  for (const u of liveUrls) {
+    const slug = urlSlug(u);
+    if (built.has(slug)) continue;
+    // A restructured slug still counts as present when the built site has a page
+    // whose slug contains it (botox -> botox-in-evans-ga) or vice versa.
+    if ([...built].some((b) => b.includes(slug) || slug.includes(b))) continue;
+    out.push(prFinding("missing-pages", "high", "(live site)", `"${slug}" exists on the live site but not on the new site`, { found: u.slice(0, 120), expected: "a matching page on the beta site", fix: "proposed" }));
+    if (out.length >= 60) break;
+  }
+  return out;
+}
+async function crawlLiveSite(origin, max = 12) {
+  const root = String(origin).replace(/\/+$/, "");
+  let host = "";
+  try { host = new URL(root).hostname; } catch (_) { return []; }
+  const seen = new Set([root + "/"]);
+  const out = [];
+  const queue = [root + "/"];
+  while (queue.length && out.length < max) {
+    const url = queue.shift();
+    const r = await fetchText(url, 15000);
+    if (!r.ok) continue;
+    out.push({ url, html: r.html, text: pageText(r.html) });
+    for (const m of r.html.matchAll(/href\s*=\s*["']([^"'#]+)["']/gi)) {
+      let abs;
+      try { abs = new URL(m[1], url); } catch (_) { continue; }
+      if (abs.hostname !== host || !/^https?:$/.test(abs.protocol)) continue;
+      if (/\.(pdf|jpe?g|png|webp|gif|svg|zip|mp4|css|js)$/i.test(abs.pathname)) continue;
+      const key = abs.origin + abs.pathname.replace(/\/+$/, "") + "/";
+      if (seen.has(key) || seen.size > max * 4) continue;
+      seen.add(key); queue.push(key);
+    }
+  }
+  return out;
+}
+
+// ---- phase 0: what the built site says about itself --------------------------
+// Per product decision only the business name comes from NocoDB. Everything else
+// is read back out of the site we already built, so the audit compares the site
+// against itself and against the client's live site — not against a record that
+// may never have been filled in.
+const SOCIAL_HOSTS = ["facebook.com", "instagram.com", "twitter.com", "x.com", "tiktok.com", "youtube.com", "linkedin.com", "yelp.com", "pinterest.com"];
+function extractSocials(pages) {
+  const found = new Map();
+  for (const pg of pages) {
+    for (const m of String(pg.php || "").matchAll(/href\s*=\s*["'](https?:\/\/[^"']+)["']/gi)) {
+      const url = m[1];
+      const host = SOCIAL_HOSTS.find((h) => url.toLowerCase().includes(h));
+      if (host && !found.has(host)) found.set(host, url);
+    }
+  }
+  return [...found.entries()].map(([host, url]) => ({ host, url }));
+}
+// The brand colour drives the Call Now bar and blog links. Themes state it as a
+// CSS variable when they have one; otherwise the most-used non-neutral hex is a
+// better guess than a hardcoded default that would look wrong on every site.
+function themeBrandColor(themeAbs) {
+  let src = "";
+  for (const f of ["style.css", "header.php", "front-page.php", "functions.php"]) {
+    const abs = path.join(themeAbs, f);
+    if (fs.existsSync(abs)) src += fs.readFileSync(abs, "utf8");
+  }
+  const varHit = src.match(/--(?:brand|primary|accent)[a-z-]*\s*:\s*(#[0-9a-f]{3,8})/i);
+  if (varHit) return varHit[1];
+  const counts = new Map();
+  for (const m of src.matchAll(/#([0-9a-f]{6})\b/gi)) {
+    const hex = "#" + m[1].toLowerCase();
+    const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    if (max - min < 24 || max > 240 || max < 24) continue;   // neutral / near-white / near-black
+    counts.set(hex, (counts.get(hex) || 0) + 1);
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([hex]) => hex)[0] || "";
+}
+// Only an image this site is entitled to use. A generated theme can carry an
+// absolute URL to another client's asset (the sample theme in this repo points at
+// elanaesthetics.com), and pinning that as the favicon or the sharing card would
+// publish one client's logo on another client's site. Relative paths are always
+// safe; absolute ones must match the site's own host.
+function themeLogoUrl(pages, siteHost) {
+  const host = String(siteHost || "").replace(/^www\./, "").toLowerCase();
+  const usable = (src) => {
+    if (!src) return false;
+    if (!/^https?:\/\//i.test(src)) return true;                       // relative / theme-local
+    try { return new URL(src).hostname.replace(/^www\./, "").toLowerCase() === host && !!host; }
+    catch (_) { return false; }
+  };
+  for (const pg of pages) {
+    for (const m of String(pg.php || "").matchAll(/<img[^>]*>/gi)) {
+      if (!/logo/i.test(m[0])) continue;
+      const src = (m[0].match(/src\s*=\s*["']([^"']+)["']/i) || [])[1];
+      if (usable(src)) return src;
+    }
+  }
+  for (const pg of pages) {
+    for (const m of String(pg.php || "").matchAll(/<img[^>]+src\s*=\s*["']([^"']+)["']/gi)) {
+      if (usable(m[1])) return m[1];
+    }
+  }
+  return "";
+}
+function siteHostOf(liveUrl) {
+  try { return new URL(String(liveUrl)).hostname; } catch (_) { return ""; }
+}
+
+// ---- location + URL structure (pre-release doc, tab 17) ----------------------
+// Single location: every service URL carries the location — /botox-cosmetic-in-evans-ga.
+// Multiple locations: one location-free page for the menu (/botox) plus a
+// location page per city for SEO (/botox-in-slc), which stay out of the menu.
+//
+// Which rule applies is not a setting anywhere, so it is inferred: more than one
+// distinct location across the service URLs means multi-location.
+const prSlugify = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+const NON_SERVICE_SLUGS = new Set(["home", "about", "about-us", "contact", "contact-us", "team", "our-team", "blog",
+  "privacy-policy", "privacy", "terms", "gallery", "testimonials", "reviews", "financing", "specials", "offers",
+  "careers", "faq", "faqs", "locations", "shop", "cart", "checkout", "my-account", "branding", "brand-guide",
+  "seo", "seo-report", "sitemap", "search", "thank-you", "book", "booking", "appointment"]);
+function splitLocationSlug(slug) {
+  const m = String(slug || "").match(/^(.+?)-in-(.+)$/);
+  return m ? { base: m[1], location: m[2] } : { base: String(slug || ""), location: "" };
+}
+function findingsUrlStructure(pages, facts) {
+  const out = [];
+  const services = pages.filter((p) => {
+    const slug = String(p.slug || "").toLowerCase();
+    return slug !== "home" && !NON_SERVICE_SLUGS.has(slug) && !/^(blog|post|category|tag)-/.test(slug);
+  });
+  if (!services.length) return { findings: out, mode: "none", detail: "no service pages to check" };
+
+  const parsed = services.map((p) => ({ ...splitLocationSlug(p.slug), slug: p.slug, title: p.title }));
+  const locations = [...new Set(parsed.map((p) => p.location).filter(Boolean))];
+  const city = prSlugify(facts.city);
+  const multi = locations.length > 1;
+
+  if (!multi) {
+    // Single location: the location belongs in every service URL.
+    const expected = city ? `in-${city}${facts.region ? "-" + prSlugify(facts.region) : ""}` : (locations[0] ? "in-" + locations[0] : "");
+    for (const p of parsed) {
+      if (!p.location) {
+        out.push(prFinding("url-structure", "medium", p.slug,
+          `Service URL has no location — single-location sites should read /${p.base}-${expected || "in-<city>-<state>"}`,
+          { found: "/" + p.slug, expected: expected ? `/${p.base}-${expected}` : "/<service>-in-<city>-<state>", fix: "proposed" }));
+      } else if (city && !p.location.includes(city)) {
+        out.push(prFinding("url-structure", "high", p.slug,
+          `URL says "${p.location}" but the business is in ${facts.city}${facts.region ? ", " + facts.region : ""}`,
+          { found: "/" + p.slug, expected: `/${p.base}-in-${city}`, fix: "proposed" }));
+      }
+    }
+    return { findings: out, mode: "single", detail: `single location${city ? " (" + facts.city + ")" : ""} · ${services.length} service page(s)` };
+  }
+
+  // Multi-location: every service with location pages also needs one clean page
+  // for the menu, or the nav has nowhere to point.
+  const byBase = new Map();
+  for (const p of parsed) {
+    if (!byBase.has(p.base)) byBase.set(p.base, []);
+    byBase.get(p.base).push(p);
+  }
+  const bare = new Set(parsed.filter((p) => !p.location).map((p) => p.base));
+  for (const [base, group] of byBase) {
+    const withLoc = group.filter((p) => p.location);
+    if (withLoc.length && !bare.has(base)) {
+      out.push(prFinding("url-structure", "medium", withLoc[0].slug,
+        `"${base}" has ${withLoc.length} location page(s) but no location-free page for the menu`,
+        { found: withLoc.map((p) => "/" + p.slug).join(", ").slice(0, 120), expected: `/${base}`, fix: "proposed" }));
+    }
+  }
+  return { findings: out, mode: "multi", detail: `${locations.length} locations (${locations.slice(0, 4).join(", ")}) · ${services.length} service page(s)` };
+}
+
+// ---- PageSpeed (pre-release doc, tab 5) --------------------------------------
+// The doc's manual steps — open pagespeed.web.dev, run mobile then desktop, note
+// the four scores, list what the developer can fix — done through the API that
+// page is a front end for. The human-readable report URL is kept so the task
+// comment can link to exactly what a person would have screenshotted.
+const PSI_CATEGORIES = ["PERFORMANCE", "ACCESSIBILITY", "BEST_PRACTICES", "SEO"];
+const PSI_DEV_FIXABLE = new Set(["uses-optimized-images", "uses-webp-images", "modern-image-formats", "uses-responsive-images",
+  "offscreen-images", "render-blocking-resources", "unused-css-rules", "unused-javascript", "unminified-css",
+  "unminified-javascript", "efficient-animated-content", "third-party-summary", "server-response-time", "uses-text-compression"]);
+function psiReportUrl(url, strategy) {
+  return `https://pagespeed.web.dev/report?url=${encodeURIComponent(url)}&form_factor=${strategy === "desktop" ? "desktop" : "mobile"}`;
+}
+async function pageSpeedRun(url, strategy) {
+  // Same PSI_API_KEY the screenshot flow already uses. The API also answers
+  // without a key, just harder rate-limited — worth running either way rather
+  // than skipping the check because a key is missing.
+  const key = PSI_API_KEY || "";
+  const api = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=" + encodeURIComponent(url)
+    + "&strategy=" + strategy + PSI_CATEGORIES.map((c) => "&category=" + c).join("") + (key ? "&key=" + encodeURIComponent(key) : "");
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 120000);
+  try {
+    const r = await fetch(api, { signal: ctrl.signal, headers: { "User-Agent": "G99PerformPR/1.0" } });
+    if (!r.ok) {
+      const why = r.status === 429
+        ? (key ? "rate limited by Google — the PSI_API_KEY quota is spent" : "rate limited — set PSI_API_KEY in .env to raise the quota")
+        : `PageSpeed API returned ${r.status}`;
+      return { ok: false, strategy, reason: why, reportUrl: psiReportUrl(url, strategy) };
+    }
+    const d = await r.json();
+    const cats = (d.lighthouseResult || {}).categories || {};
+    const pct = (c) => (cats[c] && typeof cats[c].score === "number") ? Math.round(cats[c].score * 100) : null;
+    const audits = (d.lighthouseResult || {}).audits || {};
+    const opportunities = Object.entries(audits)
+      .filter(([id, a]) => PSI_DEV_FIXABLE.has(id) && a && typeof a.score === "number" && a.score < 0.9 && a.title)
+      .map(([id, a]) => ({ id, title: a.title, saving: Math.round(((a.details || {}).overallSavingsMs || 0)) }))
+      .sort((a, b) => b.saving - a.saving).slice(0, 6);
+    return {
+      ok: true, strategy, reportUrl: psiReportUrl(url, strategy),
+      scores: { performance: pct("performance"), accessibility: pct("accessibility"), bestPractices: pct("best-practices"), seo: pct("seo") },
+      opportunities,
+    };
+  } catch (e) { return { ok: false, strategy, reason: String(e && e.message || e).slice(0, 120), reportUrl: psiReportUrl(url, strategy) }; }
+  finally { clearTimeout(timer); }
+}
+function findingsPageSpeed(runs) {
+  const out = [];
+  for (const run of runs) {
+    if (!run.ok) { out.push(prFinding("pagespeed", "low", `(${run.strategy})`, `PageSpeed did not complete: ${run.reason}`, { fix: "none" })); continue; }
+    for (const [label, value] of Object.entries(run.scores)) {
+      if (value == null) continue;
+      // Mobile is the one Google ranks on, so a weak mobile score matters more.
+      const weight = run.strategy === "mobile" ? 0 : 10;
+      if (value < 50 - weight) out.push(prFinding("pagespeed", "high", `(${run.strategy})`, `${label} score is ${value}`, { found: String(value), expected: "90+", fix: "proposed" }));
+      else if (value < 90 - weight) out.push(prFinding("pagespeed", "medium", `(${run.strategy})`, `${label} score is ${value}`, { found: String(value), expected: "90+", fix: "proposed" }));
+    }
+    for (const op of run.opportunities) {
+      out.push(prFinding("pagespeed", "medium", `(${run.strategy})`, `${op.title}${op.saving ? ` — about ${op.saving} ms` : ""}`, { expected: "developer-fixable", fix: "proposed" }));
+    }
+  }
+  return out;
+}
+
+// ---- findings ----------------------------------------------------------------
+// One shape for every check so the report, the PR body and the job card can all
+// render findings without knowing which audit produced them.
+function prFinding(task, severity, page, message, extra) {
+  return { task, severity, page: page || "", message: String(message).slice(0, 300), ...(extra || {}) };
+}
+const PHONE_RE = /(?:\+?1[\s.\-])?\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}/g;
+const EMAIL_RE = /[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}/gi;
+const digits = (s) => String(s || "").replace(/\D/g, "");
+
+// Walk HTML/PHP as tokens so "is this inside a link already" is answered by the
+// markup rather than by a regex lookbehind that breaks on the first nested tag.
+function textNodesOutsideAnchors(src) {
+  const parts = String(src || "").split(/(<[^>]+>)/);
+  const out = [];
+  let depth = 0, offset = 0;
+  for (const part of parts) {
+    if (part.startsWith("<")) {
+      if (/^<a\b/i.test(part)) depth++;
+      else if (/^<\/a>/i.test(part)) depth = Math.max(0, depth - 1);
+    } else if (depth === 0 && part.trim()) {
+      out.push({ text: part, offset });
+    }
+    offset += part.length;
+  }
+  return out;
+}
+function findingsBusinessName(pages, businessName) {
+  const out = [];
+  const name = String(businessName || "").trim();
+  const lower = name.toLowerCase();
+  for (const pg of pages) {
+    const text = pg.text || "";
+    const stale = text.match(/[a-z0-9-]+\.gogro(w)?th\.com/i);
+    if (stale) out.push(prFinding("business-name", "high", pg.slug, `Staging domain "${stale[0]}" is still printed on the page`, { found: stale[0], expected: name, fix: "proposed" }));
+    // A page that talks about the brand but never spells it the agreed way.
+    const first = (nameTokens(name)[0] || lower.split(/\s+/)[0] || "");
+    if (first && text.toLowerCase().includes(first) && !text.toLowerCase().includes(lower)) {
+      const near = (text.match(new RegExp(`\\b${first}[\\w'’-]*(?:\\s+[A-Z][\\w'’-]+){0,2}`, "i")) || [])[0] || "";
+      out.push(prFinding("business-name", "medium", pg.slug, `Page names the brand as "${near.trim()}" but never as "${name}"`, { found: near.trim(), expected: name, fix: "proposed" }));
+    }
+  }
+  return out;
+}
+function findingsContact(pages, facts) {
+  const out = [];
+  const collect = (re, norm) => {
+    const seen = new Map();
+    for (const pg of pages) {
+      for (const m of (pg.text || "").match(re) || []) {
+        const key = norm(m);
+        if (!key) continue;
+        if (!seen.has(key)) seen.set(key, { value: m.trim(), pages: [] });
+        if (!seen.get(key).pages.includes(pg.slug)) seen.get(key).pages.push(pg.slug);
+      }
+    }
+    return [...seen.values()];
+  };
+  const phones = collect(PHONE_RE, digits);
+  const emails = collect(EMAIL_RE, (s) => s.toLowerCase());
+  if (phones.length > 1) {
+    out.push(prFinding("contact-details", "high", "(site-wide)",
+      `${phones.length} different phone numbers appear across the site`,
+      { found: phones.map((p) => `${p.value} (${p.pages.join(", ")})`).join(" · "), expected: facts.phone || "one number", fix: "proposed" }));
+  }
+  if (!phones.length) out.push(prFinding("contact-details", "high", "(site-wide)", "No phone number found anywhere on the site", { fix: "proposed" }));
+  if (emails.length > 1) {
+    out.push(prFinding("contact-details", "medium", "(site-wide)",
+      `${emails.length} different email addresses appear across the site`,
+      { found: emails.map((e) => `${e.value} (${e.pages.join(", ")})`).join(" · "), expected: facts.email || "one address", fix: "proposed" }));
+  }
+  if (!emails.length) out.push(prFinding("contact-details", "medium", "(site-wide)", "No email address found anywhere on the site", { fix: "proposed" }));
+  return out;
+}
+function findingsClickable(pages, facts) {
+  const out = [];
+  for (const pg of pages) {
+    for (const node of textNodesOutsideAnchors(pg.php)) {
+      for (const m of node.text.match(PHONE_RE) || []) {
+        out.push(prFinding("clickable-contact", "medium", pg.slug, `Phone "${m.trim()}" is plain text — not a tel: link`, { found: m.trim(), fix: "auto" }));
+      }
+      for (const m of node.text.match(EMAIL_RE) || []) {
+        out.push(prFinding("clickable-contact", "medium", pg.slug, `Email "${m.trim()}" is plain text — not a mailto: link`, { found: m.trim(), fix: "auto" }));
+      }
+    }
+  }
+  return out;
+}
+const CTA_WORDS = /(book\s+(now|online|an?\s|your)|schedule\s+(a|your|an)|request\s+(a|an|your)|make\s+an?\s+appointment|get\s+started|contact\s+us|call\s+(us|now|today)|free\s+consult)/i;
+function findingsCta(pages) {
+  const out = [];
+  for (const pg of pages) {
+    const php = String(pg.php || "");
+    const hasTel = /href\s*=\s*["']tel:/i.test(php);
+    const hasBooking = /href\s*=\s*["'][^"']*(book|appointment|schedule|consult|contact)/i.test(php);
+    if (!hasTel && !hasBooking && !CTA_WORDS.test(pg.text || "")) {
+      out.push(prFinding("cta", "high", pg.slug, "No call-to-action found — page has no booking link, tel: link or CTA copy", { fix: "proposed" }));
+    }
+  }
+  return out;
+}
+function findingsFavicon(themeAbs, pages, siteHost) {
+  const src = ["header.php", "functions.php"].map((f) => {
+    const abs = path.join(themeAbs, f);
+    return fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : "";
+  }).join("\n");
+  if (/rel\s*=\s*["'](shortcut\s+)?icon["']/i.test(src) || /add_theme_support\(\s*['"]custom-logo/.test(src) || /site_icon/.test(src)) return [];
+  const logo = themeLogoUrl(pages, siteHost);
+  return [prFinding("favicon", "high", "(site-wide)",
+    logo ? "No favicon link is emitted by the theme" : "No favicon link is emitted by the theme, and no usable site-owned image was found to derive one from",
+    { expected: logo || "a 48×48 icon on the site's own domain", fix: logo ? "auto" : "proposed" })];
+}
+// Images on these builds are remote URLs (Stitch/Unsplash/WP uploads), not files
+// in the repo — a pull request cannot rename or recompress them. Detection is
+// still worth running; the fix is a proposal for whoever owns the media library.
+function imageSources(pages) {
+  const out = [];
+  for (const pg of pages) {
+    for (const m of String(pg.php || "").matchAll(/<img[^>]+src\s*=\s*["']([^"']+)["']/gi)) out.push({ page: pg.slug, src: m[1] });
+    for (const m of String(pg.php || "").matchAll(/background-image\s*:\s*url\(\s*["']?([^"')]+)["']?\s*\)/gi)) out.push({ page: pg.slug, src: m[1] });
+  }
+  return out;
+}
+function findingsImages(images, businessName) {
+  const out = [];
+  const slug = String(businessName || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const seenBad = new Set();
+  for (const img of images) {
+    let file = "";
+    try { file = decodeURIComponent(new URL(img.src, "https://x.invalid").pathname.split("/").pop() || ""); }
+    catch (_) { file = img.src.split("/").pop() || ""; }
+    const bare = file.replace(/\.[a-z0-9]+$/i, "");
+    const ext = (file.match(/\.([a-z0-9]+)$/i) || [])[1] || "";
+    // CDN tokens run to hundreds of characters; the report needs the name, not the blob.
+    const shown = file.length > 48 ? file.slice(0, 45) + "…" : file;
+    const key = img.page + "|" + file;
+    if (seenBad.has(key)) continue;
+    if (/^(photo-)?\d+$/i.test(bare) || /[-_](\d{1,2}|[a-d])$/i.test(bare)) {
+      out.push(prFinding("image-naming", "medium", img.page, `"${shown}" uses a positional or numeric name`, { found: shown, expected: `service-${slug}-in-location.webp`, fix: "proposed" }));
+      seenBad.add(key);
+    } else if (slug && !bare.toLowerCase().includes(slug.split("-")[0])) {
+      out.push(prFinding("image-naming", "low", img.page, `"${shown}" does not carry the business name`, { found: shown, expected: `<subject>-${slug}.webp`, fix: "proposed" }));
+      seenBad.add(key);
+    }
+    if (ext && !/^(webp|svg)$/i.test(ext)) {
+      out.push(prFinding("image-format", "medium", img.page, `"${shown}" is .${ext} — should be .webp`, { found: "." + ext, expected: ".webp", fix: "proposed" }));
+    }
+  }
+  return out;
+}
+// Weight and dimensions need the bytes, so this asks the CDN rather than guessing.
+async function findingsImageWeight(images, limit = 24) {
+  const out = [];
+  const seen = new Set();
+  for (const img of images) {
+    if (out.length >= limit || seen.has(img.src)) continue;
+    seen.add(img.src);
+    if (!/^https?:/i.test(img.src)) continue;
+    try {
+      const r = await fetch(img.src, { method: "HEAD", headers: { "User-Agent": "G99PerformPR/1.0" } });
+      const bytes = Number(r.headers.get("content-length") || 0);
+      if (bytes > 100 * 1024) {
+        out.push(prFinding("image-weight", "medium", img.page, `${img.src.split("/").pop().slice(0, 60)} is ${Math.round(bytes / 1024)} KB — over the 100 KB budget`, { found: Math.round(bytes / 1024) + " KB", expected: "< 100 KB", fix: "proposed" }));
+      }
+    } catch (_) { /* an unreachable asset is the link check's finding, not this one */ }
+  }
+  return out;
+}
+async function findingsSpelling(pages, ai) {
+  const out = [];
+  const batch = pages.slice(0, 14).map((p) => `### ${p.slug}\n${(p.text || "").slice(0, 2200)}`).join("\n\n");
+  if (!batch.trim()) return out;
+  try {
+    const raw = await aiCall([{ text: [
+      "Proofread this medical-spa website copy for genuine spelling mistakes only.",
+      "IGNORE: brand names, people's names, place names, clinical and product terms (Botox, Dysport, Kybella, Sculptra, microneedling, hyaluronic, PRP...), American vs British spelling, and anything that is merely unusual.",
+      "Report a word ONLY if it is unambiguously misspelt. Return an empty array rather than reaching for borderline cases.",
+      "", batch, "",
+      'Return ONLY minified JSON: {"items":[{"page":"slug","word":"","suggestion":"","context":"a few surrounding words"}]}',
+    ].join("\n") }], { ...(ai || {}), temperature: 0, maxOutputTokens: 1200, timeoutMs: 60000, json: true });
+    const parsed = JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
+    for (const it of (parsed.items || []).slice(0, 40)) {
+      if (!it || !it.word) continue;
+      out.push(prFinding("spelling", "low", String(it.page || ""), `"${it.word}" → "${it.suggestion || "?"}"${it.context ? ` (…${String(it.context).slice(0, 80)}…)` : ""}`, { found: it.word, expected: it.suggestion || "", fix: "proposed" }));
+    }
+  } catch (e) { out.push(prFinding("spelling", "low", "", "Spell check did not complete: " + String(e.message).slice(0, 120), { fix: "none" })); }
+  return out;
+}
+async function findingsPageAudit(pages, businessName, ai) {
+  const out = [];
+  const batch = pages.slice(0, 12).map((p) => `### ${p.slug} — ${p.title}\n${(p.text || "").slice(0, 1800)}`).join("\n\n");
+  if (!batch.trim()) return out;
+  try {
+    const raw = await aiCall([{ text: [
+      `Review the copy of this ${businessName} website page by page as a conversion-focused editor.`,
+      "Report only concrete, actionable problems: missing or vague headlines, pages that never say what the service is or who it is for, absent trust signals, thin content, or a page whose purpose is unclear.",
+      "Do not comment on design, colour, layout or images — you cannot see them. Maximum 2 items per page.",
+      "", batch, "",
+      'Return ONLY minified JSON: {"items":[{"page":"slug","severity":"high|medium|low","finding":"","suggestion":""}]}',
+    ].join("\n") }], { ...(ai || {}), temperature: 0.2, maxOutputTokens: 1800, timeoutMs: 75000, json: true });
+    const parsed = JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
+    for (const it of (parsed.items || []).slice(0, 30)) {
+      if (!it || !it.finding) continue;
+      const sev = ["high", "medium", "low"].includes(String(it.severity)) ? String(it.severity) : "low";
+      out.push(prFinding("page-audit", sev, String(it.page || ""), it.finding, { expected: it.suggestion || "", fix: "proposed" }));
+    }
+  } catch (e) { out.push(prFinding("page-audit", "low", "", "Page audit did not complete: " + String(e.message).slice(0, 120), { fix: "none" })); }
+  return out;
+}
+
+// ---- phase 2: the deterministic fixes ----------------------------------------
+// Every fix is idempotent through a marker string. Perform PR is expected to run
+// more than once on the same site, and a second run must not append a second
+// Call Now bar or a second favicon link.
+const PR_MARK = "g99-perform-pr";
+function readIf(abs) { return fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : ""; }
+function appendToFunctions(themeAbs, marker, php) {
+  const abs = path.join(themeAbs, "functions.php");
+  const cur = readIf(abs);
+  if (!cur || cur.includes(marker)) return false;
+  fs.writeFileSync(abs, cur.replace(/\s*$/, "\n") + "\n" + php.trim() + "\n");
+  return true;
+}
+function fixFavicon(themeAbs, pages, themePath, siteHost) {
+  const logo = themeLogoUrl(pages, siteHost);
+  if (!logo) return { changed: [], note: "no site-owned image to derive a favicon from — reported instead" };
+  const marker = `${PR_MARK}:favicon`;
+  const ok = appendToFunctions(themeAbs, marker, [
+    `// ${marker} — the theme emitted no favicon, so search results showed the`,
+    "// hosting default. Printed here rather than hardcoded into header.php so a",
+    "// later Site Identity upload still wins on priority.",
+    "add_action('wp_head', function () {",
+    "    if (function_exists('has_site_icon') && has_site_icon()) {",
+    "        return;",
+    "    }",
+    `    echo '<link rel="icon" href="' . esc_url('${logo.replace(/'/g, "\\'")}') . '">' . "\\n";`,
+    "}, 2);",
+  ].join("\n"));
+  return ok ? { changed: [themePath + "/functions.php"], note: `favicon points at ${logo.slice(0, 80)}` } : { changed: [], note: "favicon link already present" };
+}
+function fixSocialImage(themeAbs, pages, themePath, siteHost) {
+  // The SEO layer already prints og:image per page. Emitting a second one here is
+  // exactly the "two sets of Open Graph tags fighting each other" that the SEO
+  // engine exists to clean up, so when it is installed we leave this alone.
+  if (fs.existsSync(path.join(themeAbs, "inc", "g99-seo.php"))) {
+    return { changed: [], note: "Open Graph is owned by the SEO layer (inc/g99-seo.php) — not duplicated here" };
+  }
+  const image = themeLogoUrl(pages, siteHost);
+  if (!image) return { changed: [], note: "no site-owned image available to use as the sharing card" };
+  const marker = `${PR_MARK}:og-image`;
+  const ok = appendToFunctions(themeAbs, marker, [
+    `// ${marker} — a shared link with no image renders as a grey box. This is a`,
+    "// site-wide fallback only; a per-page card belongs to the SEO layer.",
+    "add_action('wp_head', function () {",
+    `    $img = esc_url('${image.replace(/'/g, "\\'")}');`,
+    "    echo '<meta property=\"og:image\" content=\"' . $img . '\">' . \"\\n\";",
+    "    echo '<meta name=\"twitter:card\" content=\"summary_large_image\">' . \"\\n\";",
+    "    echo '<meta name=\"twitter:image\" content=\"' . $img . '\">' . \"\\n\";",
+    "}, 3);",
+  ].join("\n"));
+  return ok ? { changed: [themePath + "/functions.php"], note: "site-wide og:image fallback added" } : { changed: [], note: "og:image already emitted" };
+}
+function fix404(themeAbs, themePath, brand) {
+  const abs = path.join(themeAbs, "404.php");
+  if (fs.existsSync(abs) && readIf(abs).includes(PR_MARK)) return { changed: [], note: "404 template already in place" };
+  if (fs.existsSync(abs)) return { changed: [], note: "theme already ships its own 404.php — left untouched" };
+  const accent = brand || "#1c1d29";
+  fs.writeFileSync(abs, [
+    "<?php",
+    `/** ${PR_MARK}:404 — branded 404 so a mistyped URL keeps the visitor on the site. */`,
+    "get_header();",
+    "?>",
+    `<main style="max-width:720px;margin:0 auto;padding:96px 24px;text-align:center">`,
+    `  <p style="font-size:14px;letter-spacing:.14em;text-transform:uppercase;color:${accent};margin:0 0 12px">404</p>`,
+    `  <h1 style="font-size:34px;line-height:1.2;margin:0 0 14px">We couldn't find that page</h1>`,
+    `  <p style="font-size:17px;color:#555;margin:0 0 30px">The page may have moved. Let's get you back to <?php echo esc_html(get_bloginfo('name')); ?>.</p>`,
+    `  <p><a href="<?php echo esc_url(home_url('/')); ?>" style="display:inline-block;background:${accent};color:#fff;text-decoration:none;padding:14px 30px;border-radius:8px;font-weight:600">Back to home</a></p>`,
+    "</main>",
+    "<?php",
+    "get_footer();",
+  ].join("\n") + "\n");
+  return { changed: [themePath + "/404.php"], note: "branded 404.php created" };
+}
+function fixCallNow(themeAbs, themePath, phone, brand) {
+  if (!phone) return { changed: [], note: "no phone number on the site to call" };
+  const marker = `${PR_MARK}:call-now`;
+  const accent = brand || "#1c1d29";
+  const tel = "+1" + digits(phone).replace(/^1/, "");
+  const ok = appendToFunctions(themeAbs, marker, [
+    `// ${marker} — sticky call bar on phones. Replaces the Call Now Button plugin;`,
+    "// mobile visitors to a clinic site are overwhelmingly trying to phone it.",
+    "add_action('wp_footer', function () {",
+    "    ?>",
+    `    <a class="g99-call-now" href="tel:${tel}" aria-label="Call ${"<?php echo esc_attr(get_bloginfo('name')); ?>"}">`,
+    "        <svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M6.6 10.8a15.1 15.1 0 0 0 6.6 6.6l2.2-2.2a1 1 0 0 1 1-.2 11.4 11.4 0 0 0 3.6.6 1 1 0 0 1 1 1V20a1 1 0 0 1-1 1A17 17 0 0 1 3 4a1 1 0 0 1 1-1h3.4a1 1 0 0 1 1 1 11.4 11.4 0 0 0 .6 3.6 1 1 0 0 1-.2 1z\"/></svg>",
+    "        <span>Call now</span>",
+    "    </a>",
+    "    <style>",
+    "        .g99-call-now{display:none}",
+    "        @media (max-width:767px){",
+    "            .g99-call-now{display:inline-flex;align-items:center;gap:8px;position:fixed;left:16px;bottom:16px;z-index:9999;",
+    `                background:${accent};color:#fff;text-decoration:none;padding:13px 20px;border-radius:999px;`,
+    "                font:600 15px/1 system-ui,-apple-system,Segoe UI,sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.25)}",
+    "        }",
+    "    </style>",
+    "    <?php",
+    "}, 20);",
+  ].join("\n"));
+  return ok ? { changed: [themePath + "/functions.php"], note: `sticky call bar → ${phone}` } : { changed: [], note: "call bar already present" };
+}
+// Boulevard tracking needs the id on the element that opens the booking flow.
+function fixBlvd(themeAbs, pages, themePath) {
+  const changed = [];
+  let tagged = 0;
+  for (const pg of pages) {
+    const abs = path.join(themeAbs, pg.file);
+    let php = readIf(abs);
+    if (!php) continue;
+    const before = php;
+    php = php.replace(/<a\b[^>]*>/gi, (tag) => {
+      if (!/blvd|boulevard/i.test(tag) || /\bid\s*=/.test(tag)) return tag;
+      tagged++;
+      return tag.replace(/^<a\b/i, '<a id="blvd_booking"');
+    });
+    if (php !== before) { fs.writeFileSync(abs, php); changed.push(themePath + "/" + pg.file); }
+  }
+  if (!tagged) return { changed: [], note: "no Boulevard booking links found — nothing to tag", skipped: true };
+  return { changed, note: `blvd_booking added to ${tagged} button(s)` };
+}
+function fixBlogLinkColor(themeAbs, themePath, brand) {
+  if (!brand) return { changed: [], note: "no brand colour detected", skipped: true };
+  const hasBlog = ["single.php", "archive.php", "page-blog.php"].some((f) => fs.existsSync(path.join(themeAbs, f)));
+  if (!hasBlog) return { changed: [], note: "theme has no blog templates", skipped: true };
+  const abs = path.join(themeAbs, "style.css");
+  const cur = readIf(abs);
+  const marker = `${PR_MARK}:blog-links`;
+  if (!cur || cur.includes(marker)) return { changed: [], note: "blog link colour already set" };
+  fs.writeFileSync(abs, cur.replace(/\s*$/, "\n") + [
+    "", `/* ${marker} — in-content links inherited the theme default, not the brand. */`,
+    ".entry-content a:not(.button):not(.btn),", ".post-content a:not(.button):not(.btn) {",
+    `    color: ${brand};`, "    text-decoration: underline;", "}", "",
+  ].join("\n"));
+  return { changed: [themePath + "/style.css"], note: `blog links set to ${brand}` };
+}
+function fixBlogSidebar(themeAbs) {
+  const hasBlog = ["single.php", "archive.php"].some((f) => fs.existsSync(path.join(themeAbs, f)));
+  if (!hasBlog) return { changed: [], note: "theme has no blog templates — sidebar not applicable", skipped: true };
+  return { changed: [], note: "blog templates exist; sidebar widget is not yet automated", skipped: true };
+}
+function fixClickable(themeAbs, pages, themePath) {
+  const changed = [];
+  let linked = 0;
+  for (const pg of pages) {
+    const abs = path.join(themeAbs, pg.file);
+    const php = readIf(abs);
+    if (!php) continue;
+    const parts = php.split(/(<[^>]+>)/);
+    let depth = 0, touched = false;
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      if (part.startsWith("<")) {
+        if (/^<a\b/i.test(part)) depth++;
+        else if (/^<\/a>/i.test(part)) depth = Math.max(0, depth - 1);
+        continue;
+      }
+      if (depth || !part.trim() || part.includes("<?")) continue;   // never rewrite inside PHP
+      const next = part
+        .replace(PHONE_RE, (m) => { linked++; touched = true; return `<a href="tel:+1${digits(m).replace(/^1/, "")}">${m}</a>`; })
+        .replace(EMAIL_RE, (m) => { linked++; touched = true; return `<a href="mailto:${m.trim()}">${m}</a>`; });
+      parts[i] = next;
+    }
+    if (touched) { fs.writeFileSync(abs, parts.join("")); changed.push(themePath + "/" + pg.file); }
+  }
+  if (!linked) return { changed: [], note: "every phone and email is already a link" };
+  return { changed: [...new Set(changed)], note: `${linked} phone/email mention(s) linked` };
+}
+
+// ---- phase 4: verification on the merged, deployed site ----------------------
+function performPrMarkerUrl(origin, themeSlug, jobId, probe = Date.now()) {
+  const root = String(origin || "").replace(/\/+$/, "");
+  return `${root}/app/themes/${encodeURIComponent(themeSlug)}/g99-perform-pr-marker.txt?release=${encodeURIComponent(jobId)}&probe=${encodeURIComponent(probe)}`;
+}
+async function waitForPerformPrDeployment(liveUrl, themeSlug, jobId) {
+  const timeoutMs = Math.max(30000, Number(process.env.PR_DEPLOY_TIMEOUT_MS || 900000) || 900000);
+  const pollMs = Math.max(2000, Number(process.env.PR_DEPLOY_POLL_MS || 10000) || 10000);
+  const started = Date.now();
+  let last = "not found";
+  while (Date.now() - started < timeoutMs) {
+    try {
+      const r = await fetch(performPrMarkerUrl(liveUrl, themeSlug, jobId), {
+        redirect: "follow", cache: "no-store",
+        headers: { "Cache-Control": "no-cache, no-store, max-age=0", "User-Agent": "G99PerformPRDeployProbe/1.0" },
+      });
+      const value = r.ok ? (await r.text()).trim() : "";
+      if (r.ok && value === jobId) return { deployedAt: new Date().toISOString() };
+      last = r.ok ? `marker contained ${value.slice(0, 60) || "empty content"}` : `HTTP ${r.status}`;
+    } catch (e) { last = String(e && e.message || e).slice(0, 120); }
+    await sleep(pollMs);
+  }
+  throw new Error(`deployment did not expose release marker ${jobId} within ${Math.round(timeoutMs / 60000)} minute(s): ${last}`);
+}
+// Runs after merge because renaming or relinking anything above changes URLs —
+// a link check against pre-merge source would be checking the wrong site.
+async function verifyLinks(origin, max = 120) {
+  const pages = await crawlLiveSite(origin, 12);
+  const links = new Map();
+  for (const pg of pages) {
+    for (const m of pg.html.matchAll(/href\s*=\s*["']([^"'#]+)["']/gi)) {
+      let abs;
+      try { abs = new URL(m[1], pg.url); } catch (_) { continue; }
+      if (!/^https?:$/.test(abs.protocol)) continue;
+      const key = abs.toString();
+      if (!links.has(key)) links.set(key, pg.url);
+      if (links.size >= max) break;
+    }
+  }
+  const broken = [];
+  for (const [url, from] of links) {
+    try {
+      let r = await fetch(url, { method: "HEAD", redirect: "follow", headers: { "User-Agent": "G99PerformPR/1.0" } });
+      if (r.status === 405 || r.status === 501) r = await fetch(url, { method: "GET", redirect: "follow", headers: { "User-Agent": "G99PerformPR/1.0" } });
+      if (r.status >= 400) broken.push(prFinding("link-check", r.status === 404 ? "high" : "medium", from, `${r.status} → ${url.slice(0, 120)}`, { found: String(r.status), fix: "proposed" }));
+    } catch (e) {
+      broken.push(prFinding("link-check", "medium", from, `unreachable → ${url.slice(0, 120)}`, { found: String(e.message).slice(0, 60), fix: "proposed" }));
+    }
+  }
+  return { checked: links.size, pages: pages.length, findings: broken };
+}
+async function verifyHeadAssets(origin) {
+  const out = [];
+  const r = await fetchText(String(origin).replace(/\/+$/, "") + "/");
+  if (!r.ok) return [prFinding("live-verify", "high", "(home)", "Home page did not return HTML after deploy", { fix: "none" })];
+  const icon = (r.html.match(/<link[^>]+rel\s*=\s*["'](?:shortcut )?icon["'][^>]*>/i) || [])[0] || "";
+  const og = (r.html.match(/<meta[^>]+property\s*=\s*["']og:image["'][^>]*>/i) || [])[0] || "";
+  const grab = (tag) => (tag.match(/(?:href|content)\s*=\s*["']([^"']+)["']/i) || [])[1] || "";
+  for (const [label, tag] of [["favicon", icon], ["og:image", og]]) {
+    if (!tag) { out.push(prFinding("live-verify", "high", "(home)", `${label} is still missing on the live page`, { fix: "proposed" })); continue; }
+    const url = grab(tag);
+    try {
+      const a = await fetch(new URL(url, origin).toString(), { method: "HEAD", redirect: "follow" });
+      if (!a.ok) out.push(prFinding("live-verify", "high", "(home)", `${label} points at ${url.slice(0, 90)} which returns ${a.status}`, { fix: "proposed" }));
+    } catch (e) { out.push(prFinding("live-verify", "high", "(home)", `${label} could not be fetched: ${String(e.message).slice(0, 80)}`, { fix: "proposed" })); }
+  }
+  return out;
+}
+
+// One line per distinct problem, not per occurrence. A 17-page run produced 95
+// findings, most of them the same image-naming message with a different filename,
+// which buried the two that actually needed a decision.
+function collapseFindings(list, perTaskLimit = 3) {
+  const byTask = new Map();
+  for (const f of list) {
+    if (!byTask.has(f.task)) byTask.set(f.task, []);
+    byTask.get(f.task).push(f);
+  }
+  const out = [];
+  for (const [taskName, items] of byTask) {
+    out.push(...items.slice(0, perTaskLimit));
+    const rest = items.length - perTaskLimit;
+    if (rest > 0) {
+      const pages = [...new Set(items.slice(perTaskLimit).map((f) => f.page).filter(Boolean))];
+      out.push({
+        task: taskName, severity: "low", page: "",
+        message: `…and ${rest} more ${taskName.replace(/-/g, " ")} finding(s)${pages.length ? ` across ${pages.length} page(s)` : ""} — see the full report`,
+        expected: "", fix: "proposed", rollup: rest,
+      });
+    }
+  }
+  return out;
+}
+
+// ---- the shareable report ----------------------------------------------------
+// Written twice: once when the PR opens, once after live verification. Same URL
+// both times, so a link pasted into TED early does not go stale.
+function performPrReportHtml(job) {
+  const e = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const tasks = job.prTasks || [];
+  const findings = job.prFindings || [];
+  const bySeverity = (s) => findings.filter((f) => f.severity === s).length;
+  const chip = { pass: "#1f9d6b", fixed: "#2a68d8", fail: "#c0392b", skipped: "#8a8fa3" };
+  const sevChip = { high: "#c0392b", medium: "#d98324", low: "#6b6f82" };
+  const group = new Map();
+  for (const f of findings) { if (!group.has(f.task)) group.set(f.task, []); group.get(f.task).push(f); }
+  // The report keeps far more detail than the PR body, but a single check that
+  // fires 70 times still needs a lid on it or the page becomes unreadable.
+  const ROW_CAP = 15;
+  const section = (name, all) => {
+    const rows = all.slice(0, ROW_CAP);
+    const hidden = all.length - rows.length;
+    return `
+    <h3 style="font-size:14px;margin:26px 0 8px;text-transform:capitalize">${e(name.replace(/-/g, " "))} <span style="color:#8a8fa3;font-weight:400">· ${all.length}</span></h3>
+    <table style="width:100%;border-collapse:collapse;font-size:13px;background:#fff;border:1px solid #e6e8f0;border-radius:10px;overflow:hidden">
+      <tr style="background:#fafbfe;color:#6b6f82"><th style="text-align:left;padding:8px 12px;width:110px">Page</th><th style="text-align:left;padding:8px 12px">Finding</th><th style="text-align:left;padding:8px 12px;width:150px">Expected</th><th style="padding:8px 12px;width:78px">Action</th></tr>
+      ${rows.map((f) => `<tr style="border-top:1px solid #eef0f6">
+        <td style="padding:8px 12px;color:#6b6f82"><code>${e(f.page || "—")}</code></td>
+        <td style="padding:8px 12px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${sevChip[f.severity] || "#6b6f82"};margin-right:7px"></span>${e(f.message)}</td>
+        <td style="padding:8px 12px;color:#6b6f82">${e(f.expected || "—")}</td>
+        <td style="padding:8px 12px;text-align:center"><span style="font-size:11px;padding:3px 8px;border-radius:20px;background:${f.fix === "auto" ? "#e8f0fe" : "#f2f3f7"};color:${f.fix === "auto" ? "#2a68d8" : "#6b6f82"}">${e(f.fix === "auto" ? "fixed" : f.fix === "none" ? "n/a" : "proposed")}</span></td>
+      </tr>`).join("")}
+      ${hidden > 0 ? `<tr style="border-top:1px solid #eef0f6"><td colspan="4" style="padding:9px 12px;color:#8a8fa3;font-style:italic">…and ${hidden} more of the same kind (full list in the JSON alongside this report)</td></tr>` : ""}
+    </table>`;
+  };
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pre-release report — ${e(job.businessName)}</title></head>
+<body style="margin:0;font-family:Inter,-apple-system,Segoe UI,sans-serif;background:#f4f5f8;color:#1c1d29">
+<div style="max-width:960px;margin:0 auto;padding:40px 24px 80px">
+  <h1 style="font-size:24px;margin:0 0 6px">Pre-release report — ${e(job.businessName)}</h1>
+  <p style="color:#6b6f82;font-size:13px;margin:0 0 24px">
+    Run ${e(job.draftId)} · ${e(job.finishedAt || job.startedAt || new Date().toISOString())}
+    ${job.prUrl ? ` · <a href="${e(job.prUrl)}" style="color:#2a68d8">pull request</a>` : ""}
+    ${job.liveSite && job.liveSite.url ? ` · live site <a href="${e(job.liveSite.url)}" style="color:#2a68d8">${e(job.liveSite.url)}</a>` : ""}
+  </p>
+  <div style="display:flex;gap:12px;flex-wrap:wrap;margin:0 0 28px">
+    ${[["High", bySeverity("high"), "#c0392b"], ["Medium", bySeverity("medium"), "#d98324"], ["Low", bySeverity("low"), "#6b6f82"], ["Auto-fixed", (job.prChanged || []).length + " file(s)", "#2a68d8"]]
+      .map(([l, v, c]) => `<div style="flex:1;min-width:150px;background:#fff;border:1px solid #e6e8f0;border-radius:12px;padding:16px">
+        <div style="font-size:26px;font-weight:800;color:${c}">${e(v)}</div><div style="color:#6b6f82;font-size:12px">${e(l)}</div></div>`).join("")}
+  </div>
+  ${job.liveSite && !job.liveSite.ok ? `<div style="background:#fff8e6;border:1px solid #f0d9a0;border-radius:10px;padding:14px 16px;font-size:13px;margin-bottom:24px">
+    <strong>Page comparison skipped.</strong> ${e(job.liveSite.reason || "")}${job.liveSite.url ? ` (<code>${e(job.liveSite.url)}</code>)` : ""}.
+    Every other check ran against the beta site as normal.</div>` : ""}
+  ${job.liveSite && job.liveSite.ok && job.liveSite.sitemapUrl ? `<p style="font-size:13px;color:#6b6f82;margin:-8px 0 22px">
+    Compared against <a href="${e(job.liveSite.sitemapUrl)}" style="color:#2a68d8">${e(job.liveSite.sitemapUrl)}</a> — ${e(job.liveSite.pageCount)} page(s) on the client's current site.</p>` : ""}
+  ${(job.pageSpeed || []).some((r) => r && r.ok) ? `<h2 style="font-size:16px;margin:0 0 10px">PageSpeed</h2>
+  <table style="width:100%;border-collapse:collapse;font-size:13px;background:#fff;border:1px solid #e6e8f0;border-radius:10px;overflow:hidden;margin-bottom:28px">
+    <tr style="background:#fafbfe;color:#6b6f82"><th style="text-align:left;padding:9px 12px">Device</th><th style="padding:9px 12px">Performance</th><th style="padding:9px 12px">Accessibility</th><th style="padding:9px 12px">Best practices</th><th style="padding:9px 12px">SEO</th><th style="padding:9px 12px;width:90px">Report</th></tr>
+    ${(job.pageSpeed || []).filter((r) => r && r.ok).map((r) => {
+      const cell = (v) => `<td style="padding:9px 12px;text-align:center;font-weight:700;color:${v == null ? "#8a8fa3" : v >= 90 ? "#1f9d6b" : v >= 50 ? "#d98324" : "#c0392b"}">${v == null ? "—" : v}</td>`;
+      return `<tr style="border-top:1px solid #eef0f6"><td style="padding:9px 12px;text-transform:capitalize;font-weight:600">${e(r.strategy)}</td>
+        ${cell(r.scores.performance)}${cell(r.scores.accessibility)}${cell(r.scores.bestPractices)}${cell(r.scores.seo)}
+        <td style="padding:9px 12px;text-align:center"><a href="${e(r.reportUrl)}" style="color:#2a68d8">open</a></td></tr>`;
+    }).join("")}
+  </table>` : ""}
+  <h2 style="font-size:16px;margin:0 0 10px">Checks</h2>
+  <table style="width:100%;border-collapse:collapse;font-size:13px;background:#fff;border:1px solid #e6e8f0;border-radius:10px;overflow:hidden">
+    <tr style="background:#fafbfe;color:#6b6f82"><th style="text-align:left;padding:9px 12px;width:210px">Check</th><th style="padding:9px 12px;width:86px">Result</th><th style="text-align:left;padding:9px 12px">Detail</th></tr>
+    ${tasks.map((t) => `<tr style="border-top:1px solid #eef0f6">
+      <td style="padding:9px 12px;font-weight:600">${e(t.label)}</td>
+      <td style="padding:9px 12px;text-align:center"><span style="font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;color:#fff;background:${chip[t.status] || "#8a8fa3"}">${e(t.status)}</span></td>
+      <td style="padding:9px 12px;color:#555">${e(t.detail || "")}</td></tr>`).join("")}
+  </table>
+  ${findings.length ? `<h2 style="font-size:16px;margin:34px 0 0">Findings</h2>${[...group.entries()].map(([k, v]) => section(k, v)).join("")}` : `<p style="margin-top:30px;color:#1f9d6b;font-weight:600">No findings — every check passed.</p>`}
+  ${(job.prChanged || []).length ? `<h2 style="font-size:16px;margin:34px 0 8px">Files changed</h2>
+    <ul style="font-size:13px;color:#444">${job.prChanged.map((f) => `<li><code>${e(f)}</code></li>`).join("")}</ul>` : ""}
+  <p style="margin-top:40px;color:#8a8fa3;font-size:12px">Generated by Growth99 Studio · Perform PR</p>
+</div></body></html>`;
+}
+function writePerformPrReport(job) {
+  const dir = path.join(GEN, "reports");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, job.draftId + ".html"), performPrReportHtml(job));
+  fs.writeFileSync(path.join(dir, job.draftId + ".json"), JSON.stringify({
+    draftId: job.draftId, businessName: job.businessName, prUrl: job.prUrl,
+    liveSite: job.liveSite, tasks: job.prTasks, findings: job.prFindings,
+    changed: job.prChanged, finishedAt: job.finishedAt,
+  }, null, 2));
+  return "/reports/" + job.draftId + ".html";
+}
+function performPrPrBody(job, reportUrl) {
+  const f = job.prFindings || [];
+  const count = (s) => f.filter((x) => x.severity === s).length;
+  const L = [
+    `Pre-release pass for **${job.businessName}**.`, "",
+    `**${count("high")} high · ${count("medium")} medium · ${count("low")} low** findings across ${(job.prTasks || []).length} checks.`, "",
+    "| Check | Result | Detail |", "|---|---|---|",
+    ...(job.prTasks || []).map((t) => `| ${t.label} | ${t.status} | ${String(t.detail || "").replace(/\|/g, "\\|").slice(0, 110)} |`),
+    "",
+  ];
+  const proposed = collapseFindings(f.filter((x) => x.fix === "proposed"), 3);
+  if (proposed.length) {
+    L.push("### Needs a human decision", "",
+      "These were detected but not auto-fixed — the correct value is a judgement call:", "",
+      ...proposed.map((x) => x.rollup ? `- ${x.message}` : `- \`${x.page || "site"}\` — ${x.message.replace(/\|/g, "\\|")}`), "");
+  }
+  if (reportUrl) L.push(`Full report: ${reportUrl}`, "");
+  return L.join("\n");
+}
+
+function newPerformPrJob(payload) {
+  return {
+    type: "perform-pr", draftId: String(payload.jobId), businessId: null,
+    businessName: payload.businessName || payload.siteId || "Site", status: "queued", currentStep: 0,
+    steps: PERFORM_PR_STEPS.map((label) => ({ label, status: "pending", detail: "" })), payload,
+    prUrl: null, branch: null, reportUrl: null,
+    liveSite: null, prFacts: null, prTasks: [], prFindings: [], prChanged: [], pageSpeed: null,
+    editPlan: null, editSummary: "Pre-release checks", error: null,
+    cost: { gemini: 0, stitch: 0 }, cancelRequested: false, awaitingApproval: false,
+    createdAt: new Date().toISOString(), startedAt: null, finishedAt: null,
+  };
+}
+function enqueuePerformPrJob(payload) {
+  const job = newPerformPrJob(payload);
+  JOBS.set(job.draftId, job);
+  JOB_QUEUE.push(job.draftId);
+  saveJobs();
+  processJobQueue();
+  return job;
+}
+
+async function runPerformPrJob(job) {
+  job.status = "running";
+  job.startedAt = new Date().toISOString();
+  COST_SINK = job.cost;
+  const P = job.payload, repo = P.githubRepo || WP_REPO;
+  const tmp = path.join(os.tmpdir(), "g99ppr-" + Date.now());
+  const ai = { aiModel: "gemini" };
+  const run = async (cmd, cwd) => sh(cmd, cwd);
+  const runRetry = async (cmd, cwd, n = 3) => {
+    let r;
+    for (let i = 1; i <= n; i++) { r = await run(cmd, cwd); if (!r.code) return r; await sleep(3000 * i); }
+    return r;
+  };
+  const task = (label, status, detail, findings) => {
+    job.prTasks.push({ label, status, detail: String(detail || "").slice(0, 200) });
+    if (findings && findings.length) job.prFindings.push(...findings);
+    saveJobs();
+  };
+  try {
+    // ---- phase 0 -------------------------------------------------------------
+    jobStep(job, 0, "running", "Cloning " + repo);
+    let r = await runRetry(`gh repo clone ${repo} "${tmp}" -- --depth 1`);
+    const cloneUrl = process.env.GH_TOKEN ? `https://x-access-token:${process.env.GH_TOKEN}@github.com/${repo}.git` : `https://github.com/${repo}.git`;
+    if (r.code) r = await runRetry(`git clone --depth 1 "${cloneUrl}" "${tmp}"`);
+    if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
+    if (process.env.GH_TOKEN) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
+    const themeAbs = path.join(tmp, P.themePath);
+    if (!fs.existsSync(themeAbs)) throw new Error("theme not found: " + P.themePath);
+    const muAbs = P.muPath ? path.join(tmp, P.muPath) : "";
+    const muSrc = muAbs && fs.existsSync(muAbs) ? fs.readFileSync(muAbs, "utf8") : synthMuSource(themeAbs);
+    const { pages } = readSeoPages(themeAbs, muSrc);
+    if (!pages.length) throw new Error("no registered pages found in the active theme");
+    jobStep(job, 0, "done", `${pages.length} page(s) in ${P.themePath}`);
+
+    // The live site is read for one thing only: its sitemap, which tells us which
+    // pages the client publishes today. Everything else about the business comes
+    // from the site we built.
+    jobStep(job, 1, "running", P.existingSiteUrl ? `Reading ${P.existingSiteUrl}...` : "Deriving the client's live domain...");
+    const live = await resolveLiveSite(P.liveUrl, P.businessName, P.existingSiteUrl);
+    job.liveSite = { ok: live.ok, url: live.url, source: live.source, reason: live.reason || "" };
+    let liveUrls = [];
+    if (live.ok) {
+      jobStep(job, 1, "running", `Fetching the sitemap from ${live.url}...`);
+      const sitemap = await fetchLiveSitemap(live.url);
+      liveUrls = sitemap.urls || [];
+      job.liveSite.sitemapUrl = sitemap.url || "";
+      job.liveSite.pageCount = liveUrls.length;
+      if (!sitemap.ok) {
+        job.liveSite.ok = false;
+        job.liveSite.reason = sitemap.reason || "no sitemap";
+        jobStep(job, 1, "done", "no sitemap — page comparison skipped");
+      } else {
+        jobStep(job, 1, "done", `${liveUrls.length} page(s) in ${sitemap.url}`);
+      }
+    } else {
+      // Not fatal: every audit that reads the built site still runs. Only the
+      // missing-pages comparison is skipped, and the report says so plainly.
+      jobStep(job, 1, "done", "not compared — " + job.liveSite.reason);
+    }
+
+    jobStep(job, 2, "running", "Reading contact details off the built site...");
+    const facts = await readBusinessFacts(pages, P.businessName, ai);
+    const socials = extractSocials(pages);
+    const brand = themeBrandColor(themeAbs);
+    const siteHost = siteHostOf(P.liveUrl);
+    job.prFacts = { ...facts, name: P.businessName, socials, brand };
+    jobStep(job, 2, "done", [facts.phone, facts.email, socials.length ? socials.length + " social link(s)" : "", brand].filter(Boolean).join(" · ") || "no contact details found");
+
+    // ---- phase 1 -------------------------------------------------------------
+    jobStep(job, 3, "running", "Pages from the live site, business name, contact, CTAs...");
+    if (job.liveSite.ok) {
+      const missingF = findingsMissingPages(pages, liveUrls);
+      task("Pages from the live site", missingF.length ? "fail" : "pass",
+        missingF.length ? `${missingF.length} of ${liveUrls.length} live page(s) have no match` : `all ${liveUrls.length} live page(s) have a match`, missingF);
+    } else {
+      task("Pages from the live site", "skipped", job.liveSite.reason);
+    }
+    const urls = findingsUrlStructure(pages, facts);
+    task("Location + URL structure", urls.findings.length ? "fail" : "pass",
+      `${urls.detail}${urls.findings.length ? ` — ${urls.findings.length} issue(s)` : " — all correct"}`, urls.findings);
+    const nameF = findingsBusinessName(pages, P.businessName);
+    task("Business name", nameF.length ? "fail" : "pass", nameF.length ? `${nameF.length} inconsistency(ies)` : `"${P.businessName}" used consistently`, nameF);
+    const contactF = findingsContact(pages, facts);
+    task("Contact details", contactF.length ? "fail" : "pass", contactF.length ? `${contactF.length} issue(s)` : "phone, email and address agree across the site", contactF);
+    const clickF = findingsClickable(pages, facts);
+    task("Clickable contact", clickF.length ? "fixed" : "pass", clickF.length ? `${clickF.length} plain-text mention(s) to link` : "already clickable", clickF);
+    const ctaF = findingsCta(pages);
+    task("CTA on every page", ctaF.length ? "fail" : "pass", ctaF.length ? `${ctaF.length} page(s) without a CTA` : `all ${pages.length} page(s) have a CTA`, ctaF);
+    jobStep(job, 3, "done", `${nameF.length + contactF.length + clickF.length + ctaF.length} finding(s)`);
+
+    jobStep(job, 4, "running", "Favicon, images, spelling...");
+    const favF = findingsFavicon(themeAbs, pages, siteHost);
+    task("Favicon", favF.length ? "fixed" : "pass", favF.length ? "missing — generating" : "already emitted", favF);
+    const images = imageSources(pages);
+    const imgF = findingsImages(images, P.businessName);
+    const weightF = await findingsImageWeight(images);
+    task("Image naming", imgF.filter((f) => f.task === "image-naming").length ? "fail" : "pass", `${images.length} image(s) inspected`, imgF);
+    task("Image format + weight", weightF.length ? "fail" : "pass", weightF.length ? `${weightF.length} oversized` : "within budget", weightF);
+    const spellF = await findingsSpelling(pages, ai);
+    task("Spelling", spellF.length ? "fail" : "pass", spellF.length ? `${spellF.length} suspected misspelling(s)` : "no misspellings found", spellF);
+    jobStep(job, 4, "done", `${favF.length + imgF.length + weightF.length + spellF.length} finding(s)`);
+
+    jobStep(job, 5, "running", "Reading every page for content problems...");
+    const auditF = await findingsPageAudit(pages, P.businessName, ai);
+    task("Page audit", auditF.length ? "fail" : "pass", auditF.length ? `${auditF.length} suggestion(s)` : "no content problems found", auditF);
+    jobStep(job, 5, "done", `${auditF.length} suggestion(s)`);
+
+    // ---- phase 2 -------------------------------------------------------------
+    jobStep(job, 6, "running", "Applying the fixes whose answer is computable...");
+    const applied = [];
+    const record = (label, result) => {
+      applied.push({ label, ...result });
+      job.prChanged.push(...(result.changed || []));
+      const t = job.prTasks.find((x) => x.label === label);
+      if (t) { t.status = (result.changed || []).length ? "fixed" : (result.skipped ? "skipped" : t.status); t.detail = result.note || t.detail; }
+      else task(label, (result.changed || []).length ? "fixed" : "skipped", result.note);
+      jobStep(job, 6, "running", label + " — " + result.note);
+    };
+    record("Favicon", fixFavicon(themeAbs, pages, P.themePath, siteHost));
+    record("Social sharing image", fixSocialImage(themeAbs, pages, P.themePath, siteHost));
+    record("Custom 404", fix404(themeAbs, P.themePath, brand));
+    record("Call Now", fixCallNow(themeAbs, P.themePath, facts.phone, brand));
+    record("BLVD button ID", fixBlvd(themeAbs, pages, P.themePath));
+    record("Blog sidebar widget", fixBlogSidebar(themeAbs));
+    record("Blog link colour", fixBlogLinkColor(themeAbs, P.themePath, brand));
+    record("Clickable contact", fixClickable(themeAbs, pages, P.themePath));
+    job.prChanged = [...new Set(job.prChanged)];
+    job.editPlan = job.prChanged.map((p2) => ({ path: p2, op: "modify" }));
+    jobStep(job, 6, "done", job.prChanged.length ? `${job.prChanged.length} file(s) changed` : "nothing to change");
+
+    // ---- phase 3 -------------------------------------------------------------
+    jobStep(job, 7, "running", "Checking the diff...");
+    const marker = path.join(themeAbs, "g99-perform-pr-marker.txt");
+    fs.writeFileSync(marker, job.draftId + "\n");
+    const paths = `"${P.themePath}"`;
+    await run(`git add -A -- ${paths}`, tmp);
+    const whitespace = await run(`git diff --cached --check -- ${paths}`, tmp);
+    if (whitespace.code) throw new Error("fixes failed git diff check: " + String(whitespace.stdout || whitespace.stderr).slice(-200));
+    const stat = await run(`git --no-pager diff --cached --stat -- ${paths}`, tmp);
+    jobStep(job, 7, "done", String(stat.stdout || "").trim().split("\n").slice(-1)[0] || "marker only");
+
+    jobStep(job, 8, "running", "Pushing + opening PR...");
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
+    const branch = `g99/perform-pr-${P.themeSlug.replace(/^g99-/, "")}-${stamp}`;
+    const title = `Pre-release ${P.businessName}: automated checks + fixes`;
+    await run(`git checkout -b "${branch}"`, tmp);
+    r = await run(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "${title.replace(/"/g, "'")}"`, tmp);
+    if (r.code) throw new Error("commit failed: " + String(r.stderr || r.stdout).slice(-180));
+    r = await runRetry(`git push -u origin "${branch}"`, tmp);
+    if (r.code) throw new Error("push failed: " + r.stderr.slice(-200));
+    job.branch = branch;
+    // Report first so the PR body can link to it; rewritten again after verification.
+    job.reportUrl = writePerformPrReport(job);
+    const bodyFile = path.join(os.tmpdir(), `perform-pr-${Date.now()}.md`);
+    fs.writeFileSync(bodyFile, performPrPrBody(job, absUrl(job.reportUrl)));
+    r = await runRetry(`gh pr create --repo ${repo} --base main --head "${branch}" --title "${title.replace(/"/g, "'")}" --body-file "${bodyFile}"`, tmp);
+    fs.rmSync(bodyFile, { force: true });
+    job.prUrl = (r.stdout.match(/https:\/\/github\.com\/\S+/) || [""])[0];
+    if (!job.prUrl) throw new Error("PR create failed: " + r.stderr.slice(-200));
+    jobStep(job, 8, "done", job.prUrl);
+
+    jobStep(job, 9, "running", "Watching CI build checks...");
+    let fixes = 0, merged = false;
+    for (let i = 0; i < 240 && !merged; i++) {
+      let st;
+      try { st = await localApi("/api/pr-status", { prUrl: job.prUrl, requireAllChecks: true }); }
+      catch (e) { await sleep(10000); continue; }
+      jobStep(job, 9, "running", (st.checks || []).map((c) => `${c.name}:${c.status}`).join(" ") || "CI starting...");
+      if (await ciEarlyExit(job, 9, P.siteId, st, i)) { merged = true; break; }
+      if (st.allPass) {
+        await awaitApprovalIfNeeded(job, P.siteId, 9);
+        if (!job.mergedExternally) await localApi("/api/pr-merge", { prUrl: job.prUrl });
+        merged = true;
+        jobStep(job, 9, "done", `Merged${fixes ? ` after ${fixes} fix(es)` : ""}`);
+        break;
+      }
+      if (st.anyFail) {
+        // The auto-fixer only repairs build checks. When the red check is
+        // something else — this repo's Integration test has been failing on main
+        // since before Perform PR existed — retrying is pointless and throwing
+        // buries the reason. Stop cleanly, leave the PR open, say which check.
+        const failing = (st.checks || []).filter((c) => c.status === "fail");
+        const repairable = failing.filter((c) => /^build/i.test(c.name));
+        if (!repairable.length) {
+          job.ciBlockedBy = failing.map((c) => c.name).join(", ") || "an unknown check";
+          jobStep(job, 9, "error", `${job.ciBlockedBy} failing — not a build check the auto-fixer can repair. PR left open.`);
+          break;
+        }
+        if (fixes >= 3) throw new Error("CI still failing after 3 auto-fix attempts - " + job.prUrl);
+        fixes++;
+        const fix = await localApi("/api/pr-autofix", { prUrl: job.prUrl }, 5 * 60 * 1000);
+        // Org billing stopped Actions from starting at all. Nothing in this repo
+        // can fix that, and the audit is still worth keeping — so take the same
+        // clean exit as a check the auto-fixer does not own, rather than throwing
+        // away the run's findings.
+        if (fix.billing) {
+          job.ciBlockedBy = "GitHub Actions billing";
+          jobStep(job, 9, "error", fix.message);
+          break;
+        }
+        if (!fix.fixed || !fix.fixed.length) throw new Error("auto-fix could not resolve CI: " + (fix.message || ""));
+        await sleep(20000);
+        continue;
+      }
+      await sleep(10000);
+    }
+    fs.rmSync(tmp, { recursive: true, force: true });
+    // Not merged, but the audit is still the point of the run. Publish what we
+    // found and stop before the live-verification phase, which needs the deploy.
+    if (!merged) {
+      const why = job.ciBlockedBy ? `blocked by ${job.ciBlockedBy}` : "CI watch timed out";
+      for (const i of [10, 11]) jobStep(job, i, "done", `skipped — ${why}, nothing deployed to measure`);
+      jobStep(job, 12, "running", "Writing the report...");
+      job.finishedAt = new Date().toISOString();
+      job.reportUrl = writePerformPrReport(job);
+      jobStep(job, 12, "done", `${job.prFindings.length} finding(s) · ${job.prChanged.length} file(s) changed · PR open`);
+      job.status = "done";
+      job.error = `PR opened but not merged — ${why}. ${job.prUrl}`;
+      notify(`Perform PR audited *${job.businessName}* but did not merge (${why}) — ${absUrl(job.reportUrl)}`);
+      return;
+    }
+
+    // ---- phase 4 -------------------------------------------------------------
+    jobStep(job, 10, "running", `Waiting for release ${job.draftId} to deploy...`);
+    await waitForPerformPrDeployment(P.liveUrl, P.themeSlug, job.draftId);
+    const settle = Math.max(0, Number(process.env.PR_DEPLOY_WAIT_MS || 5000) || 5000);
+    if (settle) await sleep(settle);
+    jobStep(job, 10, "running", "Checking links on the deployed site...");
+    const links = await verifyLinks(P.liveUrl);
+    task("Link check", links.findings.length ? "fail" : "pass", `${links.checked} link(s) across ${links.pages} page(s)`, links.findings);
+    jobStep(job, 10, "running", "Verifying favicon and sharing image...");
+    const headF = await verifyHeadAssets(P.liveUrl);
+    task("Live favicon + og:image", headF.length ? "fail" : "pass", headF.length ? `${headF.length} problem(s)` : "both resolve on the live page", headF);
+    jobStep(job, 10, "done", `${links.findings.length + headF.length} finding(s) after deploy`);
+
+    // Last, because it must measure the site as released — after the fixes above
+    // are live, not the state we started from.
+    jobStep(job, 11, "running", "Running PageSpeed on mobile...");
+    const psiMobile = await pageSpeedRun(P.liveUrl, "mobile");
+    jobStep(job, 11, "running", "Running PageSpeed on desktop...");
+    const psiDesktop = await pageSpeedRun(P.liveUrl, "desktop");
+    job.pageSpeed = [psiMobile, psiDesktop];
+    const psiF = findingsPageSpeed(job.pageSpeed);
+    const scoreLine = (r) => r.ok ? `${r.strategy}: perf ${r.scores.performance ?? "—"} · a11y ${r.scores.accessibility ?? "—"} · best ${r.scores.bestPractices ?? "—"} · seo ${r.scores.seo ?? "—"}` : `${r.strategy}: ${r.reason}`;
+    task("PageSpeed", psiF.some((f) => f.severity === "high") ? "fail" : psiF.length ? "fail" : "pass",
+      [scoreLine(psiMobile), scoreLine(psiDesktop)].join(" | "), psiF);
+    jobStep(job, 11, "done", scoreLine(psiMobile));
+
+    jobStep(job, 12, "running", "Writing the report...");
+    job.finishedAt = new Date().toISOString();
+    job.reportUrl = writePerformPrReport(job);
+    const high = job.prFindings.filter((f) => f.severity === "high").length;
+    jobStep(job, 12, "done", `${job.prFindings.length} finding(s) · ${job.prChanged.length} file(s) changed`);
+    job.status = "done";
+    notify(`Perform PR finished for *${job.businessName}*: ${job.prChanged.length} file(s) fixed, ${job.prFindings.length} finding(s) (${high} high) — ${absUrl(job.reportUrl)}`);
+  } catch (e) {
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
+    if (e && e.cancelled) job.status = "cancelled";
+    else {
+      job.error = e.message;
+      job.status = "error";
+      if (job.steps[job.currentStep] && job.steps[job.currentStep].status === "running") {
+        job.steps[job.currentStep].status = "error";
+        job.steps[job.currentStep].detail = String(e.message).slice(0, 240);
+      }
+      console.error(`perform-pr job ${job.draftId} failed:`, e.message);
+      notify(`Perform PR failed for *${job.businessName}*: ${e.message}`);
+    }
+    // A run that died at step 7 still learned something at steps 3–5. Publishing
+    // the partial report is strictly better than losing the findings.
+    try { if ((job.prTasks || []).length) job.reportUrl = writePerformPrReport(job); } catch (_) {}
+  } finally {
+    job.finishedAt = job.finishedAt || new Date().toISOString();
+    saveJobs();
+    COST_SINK = null;
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const u = new URL(req.url, `http://localhost:${PORT}`);
@@ -7875,6 +9145,7 @@ const server = http.createServer(async (req, res) => {
         : j.type === "restore" ? enqueueRestoreJob({ ...j.payload, jobId: "restore-" + Date.now() })
         : j.type === "seo" ? enqueueSeoJob({ ...j.payload, jobId: "seo-" + Date.now() })
         : j.type === "pre-release" ? enqueuePreReleaseJob({ ...j.payload, jobId: "pre-release-" + Date.now() })
+        : j.type === "perform-pr" ? enqueuePerformPrJob({ ...j.payload, jobId: "perform-pr-" + Date.now() })
         : enqueueJob(j.payload).job;
       return json(res, 202, { ok: true, jobId: nj.draftId });
     }
@@ -8363,6 +9634,31 @@ const server = http.createServer(async (req, res) => {
         businessName: site.businessName, githubRepo: site.githubRepo,
         themeSlug: target.themeSlug, themePath: target.themePath,
         muPath: target.muPath, liveUrl: site.liveUrl,
+      });
+      return json(res, 202, { jobId: job.draftId, monitor: "/jobs" });
+    }
+    // Perform PR — the pre-release gate for everything except mobile
+    // responsiveness (that is /api/pre-release-run until the two are merged).
+    // No Browserless dependency: every check here is HTTP + source reading.
+    if (p === "/api/perform-pr-run" && req.method === "POST") {
+      const { siteId } = JSON.parse(await readBody(req) || "{}");
+      const site = await findWebsite(siteId);
+      if (!site) return json(res, 404, { error: "unknown siteId - refresh the site list" });
+      if (!site.githubRepo) return json(res, 409, { error: site.businessName + " has no repository set in NocoDB" });
+      if (!site.liveUrl) return json(res, 409, { error: site.businessName + " has no Domain set in NocoDB" });
+      let target;
+      try { target = await resolveEditTarget(site); }
+      catch (e) { return json(res, 409, { error: e.message }); }
+      const running = [...JOBS.values()].find((j) => j.type === "perform-pr"
+        && (j.status === "queued" || j.status === "running")
+        && j.payload && j.payload.siteId === site.siteId);
+      if (running) return json(res, 202, { jobId: running.draftId, dedupe: true, monitor: "/jobs" });
+      const job = enqueuePerformPrJob({
+        jobId: "perform-pr-" + Date.now(), siteId: site.siteId,
+        businessName: site.businessName, githubRepo: site.githubRepo,
+        themeSlug: target.themeSlug, themePath: target.themePath,
+        muPath: target.muPath, liveUrl: site.liveUrl,
+        existingSiteUrl: site.existingSiteUrl || "",
       });
       return json(res, 202, { jobId: job.draftId, monitor: "/jobs" });
     }
@@ -9170,4 +10466,13 @@ module.exports = {
   seoEnhance, audit, sharpenStitchImages, injectCanonicalNav, qcStitchImages, fixImages,
   JOBS, postStatus, jobStatusSnapshot, saveJobs, loadJobs, emitAudit,
   safeArtifactName, mobilePageUrl, isSafeArtifactSegment, browserlessScreenshotRequest, browserlessLayoutRequest, captureMobileLayout, issueSupportedByLayout, selectPrChecks, preReleaseMarkerUrl, screenshotBuffersEqual, issueSupportedBySource, safeResponsivePlanFiles, verifyResponsiveDiff, repairResponsiveFile, readMuPages,
+  // Perform PR: the pure halves are exported so the audits and fixes can be
+  // exercised against a real theme without cloning a repo or opening a PR.
+  liveSiteCandidate, nameTokens, textNodesOutsideAnchors, extractSocials, themeBrandColor, themeLogoUrl, siteHostOf,
+  findingsBusinessName, findingsContact, findingsClickable, findingsCta, findingsFavicon,
+  fetchLiveSitemap, sitemapLocs, urlSlug, findingsMissingPages, resolveLiveSite,
+  splitLocationSlug, findingsUrlStructure, pageSpeedRun, findingsPageSpeed, psiReportUrl, collapseFindings,
+  imageSources, findingsImages, readSeoPages, synthMuSource, pageText,
+  fixFavicon, fixSocialImage, fix404, fixCallNow, fixBlvd, fixBlogLinkColor, fixClickable,
+  performPrReportHtml, performPrPrBody, performPrMarkerUrl, PERFORM_PR_STEPS,
 };

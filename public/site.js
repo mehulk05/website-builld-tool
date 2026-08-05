@@ -8,7 +8,10 @@ const { esc, avatarColor, initials, host, thumbBg, croColor, relTime, toast,
 const $ = (id) => document.getElementById(id);
 const ID = new URLSearchParams(location.search).get("id");
 
-let SITE = null, JOBS = [], AUDIT = null, TARGET = { history: [] };
+// TARGET starts as loading, not empty: resolving the theme is an 8s GitHub
+// round-trip, and rendering "unresolved" for those 8 seconds reads as a broken
+// site rather than one that has not answered yet.
+let SITE = null, JOBS = [], AUDIT = null, TARGET = { history: [], loading: true };
 // A CRO audit fetches the page, screenshots it and runs a Gemini pass — tens of
 // seconds. Track it so the UI can show elapsed time instead of a bare spinner.
 let AUDITING = false, auditStarted = 0, auditTick;
@@ -110,13 +113,16 @@ function healthCard() {
 function targetCard() {
   const rows = [
     ["Repository", SITE.githubRepo || "not set", SITE.githubRepo ? "https://github.com/" + SITE.githubRepo : null],
-    ["Live domain", host(SITE.liveUrl) || "not set", SITE.liveUrl || null],
-    ["Theme", TARGET.themeSlug || "unresolved", null],
+    ["Beta domain", host(SITE.liveUrl) || "not set", SITE.liveUrl || null],
+    // The client's CURRENT site — read by Perform PR for its sitemap, to catch
+    // pages the rebuild missed. Not derivable from the beta domain.
+    ["Live site", host(SITE.existingSiteUrl) || "not set", SITE.existingSiteUrl || null],
+    ["Theme", TARGET.themeSlug || (TARGET.loading ? "resolving…" : "unresolved"), null],
     ["Merge policy", SITE.requireApproval ? "Approve before merge" : "Auto-merge on green build", null],
   ];
   return `<div class="card pad" style="padding-bottom:10px">
     <div class="card-h"><h2>Edit target</h2></div>
-    ${TARGET.resolveError ? `<div class="banner" style="margin:8px 0">${svg("warn", 18)}<div><div class="bt">No theme resolved</div><div class="bd">${esc(TARGET.resolveError.slice(0, 220))}</div></div></div>` : ""}
+    ${!TARGET.loading && TARGET.resolveError ? `<div class="banner" style="margin:8px 0">${svg("warn", 18)}<div><div class="bt">No theme resolved</div><div class="bd">${esc(TARGET.resolveError.slice(0, 220))}</div></div></div>` : ""}
     ${rows.map(([k, v, href]) => `
       <div class="kv">
         <span class="k" style="flex:none;width:104px">${esc(k)}</span>
@@ -354,7 +360,8 @@ function render() {
         <button class="btn" id="reauditTop"${AUDITING ? " disabled" : ""}>${svg("chart", 15)}${AUDIT ? "Re-audit" : "Run CRO audit"}</button>
         <button class="btn" id="enrichBtn">${svg("spark", 15)}Add service pages</button>
         <button class="btn" id="seoBtn" title="Shift-click for a dry run — writes the result to a preview folder, no pull request">${svg("search", 15)}Perform SEO</button>
-        <button class="btn" id="preReleaseBtn" title="Run pre-release checks across every registered page">${svg("mobile", 15)}Perform PR</button>
+        <button class="btn" id="preReleaseBtn" title="Mobile responsiveness pass across every registered page">${svg("mobile", 15)}Perform PR</button>
+        <button class="btn" id="performPrBtn" title="Pre-release checks: business name, contact details, CTAs, favicon, images, spelling — auto-fixes what is deterministic, reports the rest">${svg("check", 15)}Perform PR (new)</button>
         <button class="btn" id="imgBtn"${IMG_RUNNING ? " disabled" : ""}>${svg("panel", 15)}${IMG_RUNNING ? "Checking images…" : "Check images"}</button>
         <a class="btn" href="/coverage?siteId=${encodeURIComponent(SITE.siteId)}">${svg("sites", 15)}Page coverage</a>
         <button class="btn" id="editWith">${svg("code", 15)}Edit with…</button>
@@ -487,6 +494,21 @@ Current task: capture and audit every registered page at a mobile viewport, fix 
       setTimeout(() => { location.href = "/job?id=" + encodeURIComponent(d.jobId); }, 800);
     } catch (e) { prb.disabled = false; toast("Could not start: " + (e.message || "failed")); }
   };
+  const ppr = $("performPrBtn");
+  if (ppr) ppr.onclick = async () => {
+    const msg = `Run pre-release checks for "${SITE.businessName}"?
+
+Audits the built site against the client's live site: business name, contact details, clickable phone/email, CTAs, favicon, image naming and weight, spelling, and a page-by-page content audit.
+
+Auto-fixes only what has one correct answer (favicon, 404, Call Now, BLVD button IDs, blog link colour, clickable contact), opens one PR, then verifies links and sharing images on the deployed site. Everything else is reported, not guessed.`;
+    if (!confirm(msg)) return;
+    ppr.disabled = true;
+    try {
+      const d = await postJSON("/api/perform-pr-run", { siteId: SITE.siteId });
+      toast(d.dedupe ? "A pre-release run is already going — opening it…" : "Pre-release run started — opening Activity…");
+      setTimeout(() => { location.href = "/job?id=" + encodeURIComponent(d.jobId); }, 800);
+    } catch (e) { ppr.disabled = false; toast("Could not start: " + (e.message || "failed")); }
+  };
   const ib = $("imgBtn");
   if (ib) ib.onclick = async () => {
     IMG_RUNNING = true; render();
@@ -535,8 +557,8 @@ async function load() {
     render();
     // History needs a GitHub round-trip — paint the page first, fill it in after.
     getJSON("/api/site-history?siteId=" + encodeURIComponent(ID))
-      .then((d) => { TARGET = d; render(); })
-      .catch((e) => { TARGET = { history: [], resolveError: e.message }; render(); });
+      .then((d) => { TARGET = { ...d, loading: false }; render(); })
+      .catch((e) => { TARGET = { history: [], loading: false, resolveError: e.message }; render(); });
   } catch (e) {
     $("wrap").innerHTML = `<p class="empty">Could not load this site: ${esc(e.message)}</p>`;
   }
