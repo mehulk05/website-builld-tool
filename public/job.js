@@ -50,19 +50,21 @@ function pageRows(j, live) {
     return `<div class="pg ${status}"><span class="dot ${dot}"></span><span class="pgn">${esc(label)}</span><span class="pgs">${esc(right)}</span></div>`;
   }).join("")}</div></div>`;
 }
-// One line per event this step put on the ledger — with the time, and the TED task it closes.
-// Rendered on the step itself because "kaunsa event kab nikla" is a question about a step, and a
-// list at the bottom of the page cannot answer it.
+// What left the building at this step: the callback posted to product-service, and any ledger event
+// that callback wrote for TED. Rendered on the step itself, because "kaunsa event kab nikla" is a
+// question about a step and a list at the bottom of the page cannot answer it.
 function stepEvents(j, i, s) {
-  const evs = stepEmissions(j, i, s.key, s.status);
-  if (!evs.length) return "";
-  return `<div class="sev">${evs.map((e) => `
-    <div class="sev-row ${e.state}">
+  const rows = stepEmissions(j, i, s.key, s.status);
+  if (!rows.length) return "";
+  return `<div class="sev">${rows.map((e) => `
+    <div class="sev-row ${e.state} ${e.kind}">
       <span class="dot ${e.state === "ok" ? "done" : "error"}"></span>
       <span class="sev-n">${esc(e.label)}</span>
-      <code class="sev-t">${esc(e.type)}</code>
+      ${e.type ? `<code class="sev-t">${esc(e.type)}</code>` : ""}
       ${e.task ? `<span class="sev-k" title="TED task closed by this event">${esc(e.task)}</span>` : ""}
-      <span class="sev-w">${e.at ? esc(relTime(e.at)) : "never emitted"}</span>
+      <span class="sev-d">${esc(e.detail)}</span>
+      <span class="sev-w">${e.at ? esc(relTime(e.at)) : (e.state === "missing" ? "never" : "")}</span>
+      ${e.error ? `<span class="sev-e">${esc(e.error)}</span>` : ""}
     </div>`).join("")}</div>`;
 }
 

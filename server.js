@@ -3191,11 +3191,38 @@ function emitAudit(job) {
       // step the job was on at the time. First write wins — a later duplicate callback must not
       // move the timestamp, or "when did content creation emit" answers with the wrong moment.
       eventLog: {},
+      // step index -> one row per pipeline step describing the callbacks posted while the job was
+      // on it: { firstAt, lastAt, attempts, httpStatus, status, events[], error }.
+      // Separate from history (which is capped at 12 and is a flat tail): keyed by step, it is
+      // bounded by the step count and never loses the early steps of a long build.
+      stepLog: {},
       history: [],
     };
   }
-  if (!job.emit.eventLog) job.emit.eventLog = {};   // jobs recorded before this existed
+  if (!job.emit.eventLog) job.emit.eventLog = {};   // jobs recorded before these existed
+  if (!job.emit.stepLog) job.emit.stepLog = {};
   return job.emit;
+}
+
+// Records one posted callback against the step the job was on. Called for successes AND failures,
+// because "we tried at this step and it 502'd" is the single most useful thing to know.
+function noteStep(job, { step, at, httpStatus, status, events, error }) {
+  const a = emitAudit(job);
+  if (step == null) return;
+  const key = String(step);
+  const row = a.stepLog[key] || (a.stepLog[key] = {
+    firstAt: at, lastAt: at, attempts: 0, httpStatus: null, status: null, events: [], error: null,
+  });
+  row.attempts += 1;
+  row.lastAt = at;
+  row.httpStatus = httpStatus != null ? httpStatus : row.httpStatus;
+  row.status = status || row.status;
+  // A later success must clear an earlier error on the same step; a later failure must not erase
+  // the events an earlier success already got onto the ledger.
+  row.error = error || null;
+  if (Array.isArray(events) && events.length) {
+    row.events = [...new Set([...(row.events || []), ...events])];
+  }
 }
 
 // Rebuild eventLog from the callback history for jobs that ran before it existed. The history
@@ -3204,6 +3231,22 @@ function emitAudit(job) {
 // First occurrence wins, matching how the live path records it.
 function backfillEventLog(job) {
   if (!job || !job.emit || !Array.isArray(job.emit.history)) return;
+  const steps = job.emit.stepLog || (job.emit.stepLog = {});
+  for (const h of job.emit.history) {
+    if (!h || h.step == null) continue;
+    const k = String(h.step);
+    const row = steps[k] || (steps[k] = {
+      firstAt: h.at, lastAt: h.at, attempts: 0, httpStatus: null, status: null, events: [], error: null,
+    });
+    row.attempts += 1;
+    row.lastAt = h.at;
+    if (h.httpStatus != null) row.httpStatus = h.httpStatus;
+    if (h.status) row.status = h.status;
+    row.error = h.error || null;
+    if (Array.isArray(h.events) && h.events.length) {
+      row.events = [...new Set([...(row.events || []), ...h.events])];
+    }
+  }
   const log = job.emit.eventLog || (job.emit.eventLog = {});
   for (const h of job.emit.history) {
     if (!h || !Array.isArray(h.events)) continue;
@@ -3304,6 +3347,10 @@ function postStatus(job, attempt = 0) {
       }
       // applied=true with an empty event list means "accepted, nothing new to read". Leave whatever
       // earlier callbacks established — a later duplicate must not undo a written event.
+      noteStep(job, {
+        step: snapshot.currentStep, at, httpStatus: r.status, status: snapshot.status,
+        events: events || [], error: applied === false ? ps.error : null,
+      });
       noteEmit(job, {
         productService: ps,
         ted,
@@ -3317,6 +3364,10 @@ function postStatus(job, attempt = 0) {
       const at = new Date().toISOString();
       const message = e.message || String(e);
       const retrying = attempt < G99_RETRY_DELAYS_MS.length;
+      noteStep(job, {
+        step: snapshot.currentStep, at, httpStatus: e.httpStatus || null,
+        status: snapshot.status, events: [], error: message,
+      });
       noteEmit(job, {
         productService: {
           state: retrying ? "retrying" : "error",
@@ -8424,4 +8475,11 @@ if (require.main === module) {
     console.log(`re-audit scheduled every ${reauditHours}h`);
   }
 }
-module.exports = { seoEnhance, audit, sharpenStitchImages, injectCanonicalNav, qcStitchImages, fixImages };
+// One export object, deliberately: a second `module.exports = {...}` further up silently replaces
+// this one, which is a 20-minute debugging session waiting to happen.
+// The job/postStatus entries are for the local test harness that drives the per-step emission audit
+// against a stub product-service without running a real build.
+module.exports = {
+  seoEnhance, audit, sharpenStitchImages, injectCanonicalNav, qcStitchImages, fixImages,
+  JOBS, postStatus, jobStatusSnapshot, saveJobs, loadJobs, emitAudit,
+};

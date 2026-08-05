@@ -352,26 +352,64 @@
   };
 
   /**
-   * Events to show against one pipeline step: those actually emitted while the job was on it, plus
-   * any this step owes that never arrived.
+   * The delivery story for ONE pipeline step, as rows the UI can paint.
    *
-   * A step that is still pending owes nothing yet — showing "missing" there would cry wolf on every
-   * running build. Only a finished step can be missing an event.
+   * Two hops, reported separately because they fail separately and mean different things:
+   *
+   *   post   — a status callback was POSTed to product-service while the job was on this step.
+   *            Every step transition posts one, so a done step with no post row is a real gap.
+   *   event  — that callback wrote a ledger event, which is what TED polls. Most posts write
+   *            nothing (product-service only writes on a status change) and that is NOT a failure,
+   *            so the absence of an event row is only called out for steps that owe one.
+   *
+   * A step that has not finished owes nothing yet — flagging it would cry wolf on every running
+   * build. Old jobs with no stepLog at all show nothing rather than a page full of false gaps.
    */
   function stepEmissions(job, stepIndex, stepKey, stepStatus) {
     if (!job || job.type !== "build") return [];
-    const log = (job.emit && job.emit.eventLog) || {};
+    const emit = job.emit || {};
+    const stepLog = emit.stepLog || {};
+    const eventLog = emit.eventLog || {};
+    const haveStepData = Object.keys(stepLog).length > 0;
+    const row = stepLog[String(stepIndex)];
     const out = [];
-    for (const [type, rec] of Object.entries(log)) {
-      if (rec && rec.step === stepIndex) {
-        out.push({ type, label: EVENT_LABEL[type] || type, task: EVENT_TASK[type] || null,
-                   at: rec.at, state: "ok" });
+
+    if (row) {
+      const failed = !!row.error;
+      out.push({
+        kind: "post",
+        label: "Posted to product service",
+        detail: (row.httpStatus ? "HTTP " + row.httpStatus : "no response")
+                + (row.attempts > 1 ? " \u00b7 " + row.attempts + " calls" : "")
+                + (row.status ? " \u00b7 " + row.status : ""),
+        at: row.lastAt || row.firstAt,
+        state: failed ? "missing" : "ok",
+        error: row.error || null,
+      });
+    } else if (haveStepData && stepStatus === "done") {
+      out.push({
+        kind: "post", label: "Posted to product service",
+        detail: "no callback recorded for this step", at: null, state: "missing", error: null,
+      });
+    }
+
+    // Ledger events, attributed to the step they were written from.
+    for (const [type, rec] of Object.entries(eventLog)) {
+      if (rec && String(rec.step) === String(stepIndex)) {
+        out.push({
+          kind: "event", label: EVENT_LABEL[type] || type, type,
+          task: EVENT_TASK[type] || null,
+          detail: "ledger event for TED", at: rec.at, state: "ok", error: null,
+        });
       }
     }
     for (const type of STEP_EVENTS[stepKey] || []) {
-      if (!log[type] && stepStatus === "done") {
-        out.push({ type, label: EVENT_LABEL[type] || type, task: EVENT_TASK[type] || null,
-                   at: null, state: "missing" });
+      if (!eventLog[type] && stepStatus === "done") {
+        out.push({
+          kind: "event", label: EVENT_LABEL[type] || type, type,
+          task: EVENT_TASK[type] || null,
+          detail: "expected from this step", at: null, state: "missing", error: null,
+        });
       }
     }
     return out;

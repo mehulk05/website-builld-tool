@@ -335,5 +335,13 @@ input::placeholder, textarea::placeholder { color: var(--muted); }
 .sev-row .sev-n { font-weight: 650; color: var(--ink); }
 .sev-row .sev-t { font-size: 10.5px; color: var(--muted); background: var(--line-2); padding: 0 5px; }
 .sev-row .sev-k { font-size: 10.5px; color: var(--accent); background: var(--accent-soft); padding: 0 5px; }
-.sev-row .sev-w { margin-left: auto; color: var(--muted); }
-.sev-row.missing .sev-n, .sev-row.missing .sev-w { color: var(--bad-ink); }
+.sev-row .sev-d { color: var(--muted); }
+.sev-row .sev-w { margin-left: auto; color: var(--muted); white-space: nowrap; }
+/* The post row is the quieter of the two: it happens on every step, so it must not shout as loudly
+   as an actual ledger event that a TED task depends on. */
+.sev-row.post .sev-n { font-weight: 600; color: var(--ink-3); }
+.sev-row.event .sev-n { font-weight: 700; color: var(--ink); }
+.sev-row.missing .sev-n, .sev-row.missing .sev-w, .sev-row.missing .sev-d { color: var(--bad-ink); }
+.sev-row .sev-e { flex-basis: 100%; margin-top: 3px; font-family: var(--mono, ui-monospace, monospace);
+                  font-size: 11px; color: var(--bad-ink); background: var(--bad-soft);
+                  padding: 4px 6px; overflow-wrap: anywhere; }
