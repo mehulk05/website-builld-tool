@@ -37,6 +37,12 @@ services:
         value: "60000"       # wait for the deploy to land before screenshotting
       - key: TED_SCREENSHOTS
         value: "on"          # off = outcome comments without the image
+      # Screenshots (TED outcome comments + CRO audit). Optional and PAID:
+      # microlink's keyless tier is 25/day per calling IP and Render's egress IP
+      # is shared, so it runs out here. Unset, captures fall back to WordPress
+      # mShots, which needs no key and has no quota.
+      - key: MICROLINK_API_KEY
+        sync: false          # set in dashboard only if you buy a microlink plan
       # Where build progress is reported back to Growth99 (dev). The G99 admin dashboard reads this
       # persisted status, so without it a build's outcome is never recorded on the platform side.
       # NOTE: this is the API-GATEWAY path. The gateway maps /publicv2/** -> public-api /api/public/v2/**;
