@@ -7435,6 +7435,144 @@ function preReleaseProofPages(pages, audited) {
   const failingSlugs = new Set((audited || []).filter((row) => row && row.pass === false).map((row) => String(row.slug || "")));
   return (pages || []).filter((page) => failingSlugs.has(String(page.slug || "")));
 }
+function partitionPreReleaseCaptures(rows) {
+  const successful = [], skipped = [];
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (row && !row.error && row.screenshot) successful.push(row);
+    else skipped.push(row || { error: "capture returned no result" });
+  }
+  return { successful, skipped };
+}
+
+function normalizeGeneratedFileContent(value) {
+  return String(value == null ? "" : value).replace(/[ \t]+(?=\r?\n|$)/g, "");
+}
+
+function buildPreReleaseReport(job) {
+const allBefore = Array.isArray(job.mobileBefore) ? job.mobileBefore : [];
+  const capturePartition = partitionPreReleaseCaptures(allBefore);
+  const before = capturePartition.successful;
+  const skippedByKey = new Map();
+  for (const page of [...capturePartition.skipped, ...(Array.isArray(job.mobileSkipped) ? job.mobileSkipped : []), ...(Array.isArray(job.mobileAfterSkipped) ? job.mobileAfterSkipped : [])]) {
+    const key = `${page && page.slug || ""}|${page && page.file || ""}|${page && page.url || ""}`;
+    if (!skippedByKey.has(key)) skippedByKey.set(key, page || { error: "capture returned no result" });
+  }
+  const skippedPages = [...skippedByKey.values()].map((page) => ({
+    page: page.title || page.slug || page.file || "Page", slug: page.slug || "", url: page.url || "", file: page.file || "",
+    phase: page.phase === "after" ? "After-fix capture" : "Initial capture", error: String(page.error || "Screenshot was not captured"),
+    action: page.phase === "after" ? "Human review required; after-fix evidence was unavailable." : "Human action required; page was excluded from AI audit and automated fixes.",
+  }));
+  const after = Array.isArray(job.mobileAfter) ? job.mobileAfter : [];
+  const afterBySlug = new Map(after.map((page) => [String(page.slug || ""), page]));
+  const summary = job.mobileSummary || null;
+  const findings = [];
+  for (const page of before) {
+    const afterPage = afterBySlug.get(String(page.slug || ""));
+    for (let index = 0; index < (Array.isArray(page.issues) ? page.issues : []).length; index++) {
+      const issue = page.issues[index] || {};
+      let outcome = "not-verified";
+      if (job.status === "error") outcome = "blocked";
+      else if (summary && summary.pass === true) outcome = "fixed";
+      else if (summary && summary.verificationDisabled) outcome = "not-verified";
+      else if (afterPage && afterPage.pass === true) outcome = "fixed";
+      else if (afterPage && afterPage.pass === false) outcome = "unresolved";
+      findings.push({
+        id: `${page.slug || "page"}:${index + 1}`,
+        page: page.title || page.slug || page.file || "Page", slug: page.slug || "", url: page.url || "", file: page.file || "",
+        kind: String(issue.kind || "mobile layout"), severity: String(issue.severity || "medium"),
+        description: String(issue.description || "Mobile layout issue"), evidence: String(issue.evidence || ""),
+        requestedFix: String(issue.fixHint || ""), outcome,
+        beforeScreenshot: page.screenshot || "", afterScreenshot: afterPage && afterPage.screenshot || "",
+      });
+    }
+  }
+  const checks = (job.steps || []).map((step, index) => ({
+    name: index === 8 ? "Check fixes on live site" : index === 9 ? "After-fix verification" : step.label,
+    result: index === 9 && summary && summary.verificationDisabled ? "skipped" : step.status,
+    detail: index === 9 && summary && summary.verificationDisabled
+      ? "Temporarily disabled; after-fix screenshots are available for human review."
+      : String(step.detail || ""),
+  })).concat((job.preReleaseCiChecks || []).map((check) => ({
+    name: `CI: ${check.name || "Unnamed check"}`,
+    result: check.status === "pass" ? "done" : check.status === "fail" ? "error" : check.status === "skipping" ? "skipped" : "pending",
+    detail: String(check.url || "GitHub Actions"),
+  })));
+  const dismissedFindings = [];
+  for (const page of before) {
+    for (let index = 0; index < (Array.isArray(page.rejectedIssues) ? page.rejectedIssues : []).length; index++) {
+      const issue = page.rejectedIssues[index] || {};
+      dismissedFindings.push({
+        id: `${page.slug || "page"}:dismissed:${index + 1}`, page: page.title || page.slug || page.file || "Page",
+        kind: String(issue.kind || "mobile layout"), severity: String(issue.severity || "medium"),
+        description: String(issue.description || "Mobile layout candidate"), evidence: String(issue.evidence || ""),
+        reason: "Dismissed by source and browser-geometry grounding; no code change requested.",
+      });
+    }
+  }
+  const actions = (job.editPlan || []).map((item) => ({
+    file: String(item.path || ""), operation: String(item.op || "modify"),
+    result: job.prUrl && job.status === "done" ? "released" : job.status === "error" ? "not-released" : "prepared",
+  }));
+  let decision = "in-progress", decisionLabel = "In progress", decisionDetail = "The job has not finished.";
+  if (job.status === "error") {
+    decision = "failed"; decisionLabel = "Failed"; decisionDetail = String(job.error || "The job stopped before release.");
+  } else if (job.status === "cancelled") {
+    decision = "cancelled"; decisionLabel = "Cancelled"; decisionDetail = "The job was cancelled before completion.";
+  } else if (job.status === "done" && skippedPages.length) {
+    decision = "review"; decisionLabel = "Completed - human action needed"; decisionDetail = `${skippedPages.length} page(s) could not be captured and were excluded from AI audit and fixes. All captured pages continued normally.`;
+  } else if (job.status === "done" && findings.length === 0) {
+    decision = "passed"; decisionLabel = "Passed"; decisionDetail = "All audited pages passed; no code change was required.";
+  } else if (job.status === "done" && summary && summary.pass === true) {
+    decision = "passed"; decisionLabel = "Passed"; decisionDetail = "All reported mobile issues passed after-fix verification.";
+  } else if (job.status === "done" && summary && summary.verificationDisabled) {
+    decision = "review"; decisionLabel = "Released — review evidence"; decisionDetail = "Changes passed source and CI checks and were released. After-fix screenshots were captured, but automated visual re-verification is temporarily disabled.";
+  } else if (job.status === "done") {
+    decision = "review"; decisionLabel = "Completed — review needed"; decisionDetail = "The job completed, but its evidence does not prove every finding is fixed.";
+  }
+  return {
+    schemaVersion: 2, runId: job.draftId || "", businessName: job.businessName || "", generatedAt: job.finishedAt || null,
+    decision: { code: decision, label: decisionLabel, detail: decisionDetail },
+    totals: {
+      pagesRegistered: (job.mobilePages || []).length || allBefore.length, pagesAudited: before.length, pagesSkipped: skippedPages.length, pagesWithIssues: new Set(findings.map((finding) => finding.slug)).size,
+      issuesFound: findings.length, fixed: findings.filter((finding) => finding.outcome === "fixed").length,
+      unresolved: findings.filter((finding) => finding.outcome === "unresolved").length,
+      notVerified: findings.filter((finding) => finding.outcome === "not-verified").length,
+      blocked: findings.filter((finding) => finding.outcome === "blocked").length,
+      dismissedCandidates: dismissedFindings.length, filesChanged: actions.length, afterScreenshots: after.length,
+    },
+    checks, findings, skippedPages, dismissedFindings, actions, pullRequest: job.prUrl || "", branch: job.branch || "", liveSite: job.liveUrl || "",
+    startedAt: job.startedAt || job.createdAt || null, finishedAt: job.finishedAt || null,
+  };
+}
+
+function preReleaseReportPath(job) {
+  const run = safeArtifactName(String(job && job.draftId || "run").replace(/^pre-release-/, ""));
+  return `/reports/perform-responsiveness-${run}.html`;
+}
+
+function renderPreReleaseReportHtml(report) {
+  const r = report || {}, t = r.totals || {}, decision = r.decision || {};
+  const checks = r.checks || [], findings = r.findings || [], skipped = r.skippedPages || [], dismissed = r.dismissedFindings || [], actions = r.actions || [];
+  const tone = (value) => value === "passed" || value === "done" || value === "fixed" || value === "released" ? "good"
+    : value === "failed" || value === "error" || value === "unresolved" || value === "blocked" || value === "not-released" ? "bad"
+    : value === "review" || value === "not-verified" ? "warn" : "";
+  const label = (value) => ({ done: "Passed", pending: "Pending", running: "Running", error: "Failed", skipped: "Skipped", fixed: "Fixed", unresolved: "Unresolved", "not-verified": "Not verified", blocked: "Blocked", released: "Released", "not-released": "Not released", prepared: "Prepared" }[value]
+    || String(value || "Unknown").replace(/(^|-)([a-z])/g, (_, dash, char) => (dash ? " " : "") + char.toUpperCase()));
+  const link = (href, text) => href ? `<a href="${escHtml(href)}" target="_blank" rel="noopener">${escHtml(text)} &#8599;</a>` : "";
+  const findingRows = findings.map((finding) => `<details class="report-finding"><summary><span class="report-severity ${escHtml(finding.severity)}">${escHtml(finding.severity)}</span><b>${escHtml(finding.page)}</b><span>${escHtml(finding.kind)}</span><span class="pill ${tone(finding.outcome)}">${escHtml(label(finding.outcome))}</span></summary><div class="report-finding-body"><p><b>Issue</b>${escHtml(finding.description)}</p>${finding.evidence ? `<p><b>Evidence</b>${escHtml(finding.evidence)}</p>` : ""}${finding.requestedFix ? `<p><b>Requested fix</b>${escHtml(finding.requestedFix)}</p>` : ""}<p><b>Source</b><code>${escHtml(finding.file || "-")}</code></p><div class="report-proof">${[link(finding.beforeScreenshot, "Before"), link(finding.afterScreenshot, "After fix")].filter(Boolean).join(" &middot; ")}</div></div></details>`).join("");
+  const dismissedRows = dismissed.map((finding) => `<details class="report-finding dismissed"><summary><span class="report-severity ${escHtml(finding.severity)}">${escHtml(finding.severity)}</span><b>${escHtml(finding.page)}</b><span>${escHtml(finding.kind)}</span><span class="pill">Dismissed</span></summary><div class="report-finding-body"><p><b>Candidate</b>${escHtml(finding.description)}</p>${finding.evidence ? `<p><b>Evidence</b>${escHtml(finding.evidence)}</p>` : ""}<p><b>Decision</b>${escHtml(finding.reason)}</p></div></details>`).join("");
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Perform Responsiveness report &mdash; ${escHtml(r.businessName)}</title><link rel="stylesheet" href="/theme.css?v=10"><style>
+  .wrap{max-width:880px;margin:0 auto;padding:30px 34px 90px}.prreport{border-top:4px solid var(--ink)}.prreport-h{align-items:flex-start}.report-kicker{display:block;margin-bottom:3px;color:var(--muted);font-size:9.5px;font-weight:800;letter-spacing:.1em;text-transform:uppercase}.report-decision{display:grid;grid-template-columns:minmax(150px,auto) 1fr;gap:16px;align-items:center;margin:14px 0 16px;padding:14px 16px;border:1px solid var(--line);border-left:4px solid var(--warn);background:var(--surface-2)}.report-decision.passed{border-left-color:var(--good)}.report-decision.failed,.report-decision.cancelled{border-left-color:var(--bad)}.report-stamp{font-size:13px;font-weight:850}.report-decision p{margin:0;color:var(--ink-2);font-size:12.5px;line-height:1.55}.report-facts{display:grid;grid-template-columns:repeat(7,1fr);border:1px solid var(--line)}.report-facts>div{min-width:0;padding:11px 10px;border-right:1px solid var(--line)}.report-facts>div:last-child{border-right:0}.report-facts b{display:block;font:800 18px/1 var(--display)}.report-facts span{display:block;margin-top:5px;color:var(--muted);font-size:9px;font-weight:700;letter-spacing:.03em;text-transform:uppercase}.report-links{min-height:18px;margin-top:9px;font-size:12px;font-weight:700}.report-section{margin-top:24px}.report-section h3{display:flex;align-items:center;gap:8px;margin:0 0 7px;font:800 13px var(--sans)}.report-section h3 span{display:inline-grid;min-width:19px;height:19px;place-items:center;border:1px solid var(--line);border-radius:50%;color:var(--muted);font-size:9px}.report-check{display:grid;grid-template-columns:8px minmax(150px,.8fr) auto 1.6fr;gap:10px;align-items:center;padding:9px 0;border-top:1px solid var(--line-2)}.report-check b{font-size:12.5px}.report-check p{margin:0;color:var(--muted);font-size:11.5px;line-height:1.45}.report-mark{width:7px;height:7px;border-radius:50%;background:var(--muted)}.report-mark.good{background:var(--good)}.report-mark.warn{background:var(--warn)}.report-mark.bad{background:var(--bad)}.report-finding{border-top:1px solid var(--line-2)}.report-finding.dismissed{opacity:.78}.report-finding summary{display:grid;grid-template-columns:64px minmax(130px,.75fr) 1.2fr auto;gap:10px;align-items:center;padding:10px 0;cursor:pointer}.report-finding summary b,.report-finding summary>span:nth-child(3){font-size:12px}.report-finding summary>span:nth-child(3){color:var(--muted)}.report-severity{width:fit-content;font-size:9px;font-weight:800;letter-spacing:.04em;text-transform:uppercase}.report-severity.high{color:var(--bad)}.report-severity.medium{color:var(--warn-ink)}.report-severity.low{color:var(--muted)}.report-finding-body{margin:0 0 12px 74px;padding:11px 13px;background:var(--surface-2);border-left:2px solid var(--line)}.report-finding-body p{margin:0 0 8px;color:var(--ink-2);font-size:12px;line-height:1.5}.report-finding-body p>b{display:block;margin-bottom:2px;color:var(--muted);font-size:9px;letter-spacing:.05em;text-transform:uppercase}.report-finding-body code,.report-actions code,.report-skips code{overflow-wrap:anywhere;font-size:11px}.report-proof{margin-top:8px;font-size:11.5px;font-weight:700}.report-actions>div{display:grid;grid-template-columns:68px 1fr auto;gap:10px;align-items:center;padding:8px 0;border-top:1px solid var(--line-2)}.report-skips>div{display:grid;grid-template-columns:minmax(120px,.7fr) 1fr auto;gap:8px 12px;align-items:center;padding:10px 0;border-top:1px solid var(--line-2)}.report-skips p{grid-column:2/-1;margin:0;color:var(--warn-ink);font-size:11.5px}.report-empty{color:var(--muted);font-size:12px}.report-foot{margin-top:22px;padding-top:11px;border-top:1px solid var(--line);color:var(--muted);font:10px var(--mono)}@media(max-width:760px){.wrap{padding:20px 16px 60px}.report-facts{grid-template-columns:repeat(3,1fr)}.report-check{grid-template-columns:8px 1fr auto}.report-check p{grid-column:2/-1}}@media(max-width:560px){.report-decision{grid-template-columns:1fr}.report-facts{grid-template-columns:repeat(2,1fr)}.report-finding summary{grid-template-columns:58px 1fr auto}.report-finding-body{margin-left:0}.report-skips>div{grid-template-columns:1fr auto}.report-skips code,.report-skips p{grid-column:1/-1}}
+  </style></head><body><main class="wrap"><div class="card pad prreport"><div class="card-h prreport-h"><div><span class="report-kicker">Completion report</span><h2>Perform Responsiveness report</h2></div></div><div class="report-decision ${escHtml(decision.code)}"><span class="report-stamp">${escHtml(decision.label)}</span><p>${escHtml(decision.detail)}</p></div><div class="report-facts"><div><b>${Number(t.pagesAudited || 0)}</b><span>Pages audited</span></div><div><b>${Number(t.issuesFound || 0)}</b><span>Issues found</span></div><div><b>${Number(t.fixed || 0)}</b><span>Fixed &amp; verified</span></div><div><b>${Number(t.notVerified || 0)}</b><span>Not verified</span></div><div><b>${Number(t.filesChanged || 0)}</b><span>Files changed</span></div><div><b>${Number(t.afterScreenshots || 0)}</b><span>After screenshots</span></div><div><b>${Number(t.pagesSkipped || 0)}</b><span>Skipped pages</span></div></div><div class="report-links">${[link(r.pullRequest,"Pull request"),link(r.liveSite,"Live site")].filter(Boolean).join(" &middot; ")}</div><section class="report-section"><h3>Checks <span>${checks.length}</span></h3><div class="report-checks">${checks.map((check) => `<div class="report-check"><span class="report-mark ${tone(check.result)}"></span><b>${escHtml(check.name)}</b><span class="pill ${tone(check.result)}">${escHtml(label(check.result))}</span><p>${escHtml(check.detail || "No additional detail")}</p></div>`).join("")}</div></section><section class="report-section"><h3>Findings <span>${findings.length}</span></h3>${findingRows || `<p class="report-empty">No responsive findings.</p>`}</section><section class="report-section"><h3>Skipped pages &middot; human action <span>${skipped.length}</span></h3>${skipped.length ? `<div class="report-skips">${skipped.map((page) => `<div><b>${escHtml(page.page)}</b><code>${escHtml(page.url || page.file || "-")}</code><span class="pill warn">${escHtml(page.phase || "Skipped")}</span><p>${escHtml(page.error)} &middot; ${escHtml(page.action)}</p></div>`).join("")}</div>` : `<p class="report-empty">No pages skipped.</p>`}</section><section class="report-section"><h3>Dismissed candidates <span>${dismissed.length}</span></h3>${dismissedRows || `<p class="report-empty">No candidates were dismissed.</p>`}</section><section class="report-section"><h3>Actions <span>${actions.length}</span></h3>${actions.length ? `<div class="report-actions">${actions.map((action) => `<div><span class="fop ${escHtml(action.operation)}">${escHtml(action.operation)}</span><code>${escHtml(action.file)}</code><span class="pill ${tone(action.result)}">${escHtml(label(action.result))}</span></div>`).join("")}</div>` : `<p class="report-empty">No files changed.</p>`}</section><div class="report-foot">Run ${escHtml(r.runId)}${r.finishedAt ? ` &middot; completed ${escHtml(r.finishedAt)}` : ""}</div></div></main></body></html>`;
+}
+function writePreReleaseReport(job) {
+  const reportUrl = preReleaseReportPath(job);
+  const dir = path.join(GEN, "reports");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, path.basename(reportUrl)), renderPreReleaseReportHtml(job.preReleaseReport), "utf8");
+  return reportUrl;
+}
+
 function mobileIssueBrief(rows) {
   return rows.filter((p) => p.issues && p.issues.length).map((p) => [
     `PAGE ${p.title} - ${p.file} - ${p.url}`,
@@ -7505,6 +7643,12 @@ function safeResponsivePlanFiles(modelFiles, themePath, failingRows, manifest) {
   const clean = (value) => String(value || "").replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
   const theme = clean(themePath);
   const known = new Set((manifest || []).map((file) => clean(file && file.path)).filter(Boolean));
+  const evidence = (failingRows || []).flatMap((page) => page.issues || [])
+    .map((issue) => `${issue.kind || ""} ${issue.description || ""} ${issue.evidence || ""}`).join(" ").toLowerCase();
+  const allowed = new Set((failingRows || []).map((page) => `${theme}/${clean(page.file)}`));
+  if (/footer/.test(evidence)) allowed.add(`${theme}/footer.php`);
+  if (/navigation|navbar|header|site title|mobile menu/.test(evidence)) allowed.add(`${theme}/header.php`);
+  if (/style\.css|stylesheet|global css|shared css/.test(evidence)) allowed.add(`${theme}/style.css`);
   const resolved = [];
   const seen = new Set();
   for (const file of Array.isArray(modelFiles) ? modelFiles : []) {
@@ -7514,7 +7658,7 @@ function safeResponsivePlanFiles(modelFiles, themePath, failingRows, manifest) {
     const byName = [...known].filter((path_) => path_.endsWith("/" + path.posix.basename(raw)));
     if (byName.length === 1) candidates.push(byName[0]);
     const path_ = candidates.find((candidate) => candidate.startsWith(theme + "/") && known.has(candidate));
-    if (!path_ || seen.has(path_)) continue;
+    if (!path_ || !allowed.has(path_) || seen.has(path_)) continue;
     seen.add(path_);
     resolved.push({ ...file, path: path_, op: "modify" });
   }
@@ -7530,10 +7674,9 @@ function safeResponsivePlanFiles(modelFiles, themePath, failingRows, manifest) {
     const descriptions = (page.issues || []).map((issue) => issue.description).filter(Boolean);
     add(page.file, `Fix the measured mobile defects on ${page.title || page.file}: ${descriptions.join(" | ")}`);
   }
-  const all = (failingRows || []).flatMap((page) => page.issues || [])
-    .map((issue) => `${issue.kind || ""} ${issue.description || ""} ${issue.evidence || ""}`).join(" ").toLowerCase();
-  if (/footer/.test(all)) add("footer.php", "Fix the measured shared mobile footer defects without changing desktop layout.");
-  if (/navigation|navbar|header|site title|mobile menu/.test(all)) add("header.php", "Fix the measured shared mobile header/navigation defects without changing desktop layout.");
+  if (/footer/.test(evidence)) add("footer.php", "Fix the measured shared mobile footer defects without changing desktop layout.");
+  if (/navigation|navbar|header|site title|mobile menu/.test(evidence)) add("header.php", "Fix the measured shared mobile header/navigation defects without changing desktop layout.");
+  if (/style\.css|stylesheet|global css|shared css/.test(evidence)) add("style.css", "Fix only the evidenced shared mobile CSS defect without changing unrelated pages or desktop layout.");
   return resolved.slice(0, 20);
 }
 function scanResponsiveTheme(root, themePath, muPath) {
@@ -7644,11 +7787,13 @@ async function runPreReleaseJob(job) {
           job.mobileBefore = before;
           saveJobs();
         }
-        const captureErrors = before.filter((x) => x.error);
-        if (captureErrors.length) throw new Error(`mobile screenshot failed for ${captureErrors.length}/${pages.length} page(s): ${captureErrors.map((x) => x.title).join(", ")}`);
-        jobStep(job, 2, "done", `${before.length} full-page mobile screenshot(s) captured`);
       }
 
+      const capturePartition = partitionPreReleaseCaptures(before);
+      job.mobileSkipped = capturePartition.skipped.map((page) => ({ ...page, humanActionRequired: true }));
+      before = capturePartition.successful;
+      job.mobileBefore = before;
+      jobStep(job, 2, "done", `${before.length}/${pages.length} screenshot(s) captured${job.mobileSkipped.length ? ` · ${job.mobileSkipped.length} skipped for human action` : ""}`);
       const existingAuditCount = before.filter((row) => Array.isArray(row.issues) && typeof row.pass === "boolean").length;
       audited = [];
       for (let i = 0; i < before.length; i++) {
@@ -7666,14 +7811,16 @@ async function runPreReleaseJob(job) {
     }
     const failing = audited.filter((x) => !x.pass);
     const issueCount = failing.reduce((n, x) => n + x.issues.length, 0);
-    jobStep(job, 3, "done", issueCount ? `${issueCount} issue(s) across ${failing.length}/${audited.length} page(s)` : `all ${audited.length} page(s) pass`);
+    const skippedCount = Array.isArray(job.mobileSkipped) ? job.mobileSkipped.length : 0;
+    const auditDetail = issueCount ? `${issueCount} issue(s) across ${failing.length}/${audited.length} captured page(s)` : `all ${audited.length} captured page(s) pass`;
+    jobStep(job, 3, "done", `${auditDetail}${skippedCount ? ` · ${skippedCount} page(s) skipped` : ""}`);
 
     if (!issueCount) {
       for (const i of [4, 5, 6, 7]) jobStep(job, i, "done", "skipped - no responsive defects found");
       job.mobileAfter = audited.map((x) => ({ ...x, phase: "before" }));
       jobStep(job, 8, "done", "Initial screenshots are release proof - no code changed");
-      job.mobileSummary = { pass: true, pages: audited.length, beforeIssues: 0, afterIssues: 0, changedFiles: 0 };
-      jobStep(job, 9, "done", `${audited.length}/${audited.length} pages pass`);
+      job.mobileSummary = { pass: true, pages: audited.length, registeredPages: pages.length, skippedPages: skippedCount, beforeIssues: 0, afterIssues: 0, changedFiles: 0 };
+      jobStep(job, 9, "done", `${audited.length} captured page(s) pass${skippedCount ? ` · ${skippedCount} skipped for human action` : ""}`);
       job.status = "done";
       return;
     }
@@ -7731,7 +7878,7 @@ async function runPreReleaseJob(job) {
         { aiModel: "gemini" }, { prompt: request });
       if (!content || (current.includes("<?php") && !content.includes("<?php"))) throw new Error("AI returned invalid content for " + f.path);
       fs.mkdirSync(path.dirname(abs), { recursive: true });
-      fs.writeFileSync(abs, content);
+      fs.writeFileSync(abs, normalizeGeneratedFileContent(content));
     }
     const markerPath = path.join(themeAbs, "g99-pre-release-marker.txt");
     fs.writeFileSync(markerPath, job.draftId + "\n");
@@ -7764,7 +7911,7 @@ async function runPreReleaseJob(job) {
         const current = fs.readFileSync(abs, "utf8");
         const repaired = await repairResponsiveFile(rel, current, misses, page);
         if (!repaired || (current.includes("<?php") && !repaired.includes("<?php"))) throw new Error("AI returned invalid repair content for " + rel);
-        fs.writeFileSync(abs, repaired);
+        fs.writeFileSync(abs, normalizeGeneratedFileContent(repaired));
         if (!job.editPlan.some((item) => item.path === rel)) job.editPlan.push({ path: rel, op: "modify" });
       }
       await run(`git add -A -- ${paths}`, tmp);
@@ -7811,6 +7958,7 @@ async function runPreReleaseJob(job) {
       // Integration installs the repository default site and never activates this generated theme; PHP build checks are the relevant release gate.
       try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); }
       catch (e) { await sleep(10000); continue; }
+      job.preReleaseCiChecks = (st.checks || []).map((check) => ({ name: check.name, status: check.status, url: check.url || "" }));
       jobStep(job, 7, "running", (st.checks || []).map((c) => `${c.name}:${c.status}`).join(" ") || "CI starting...");
       if (await ciEarlyExit(job, 7, P.siteId, st, i)) { merged = true; break; }
       if (st.allPass) {
@@ -7845,7 +7993,7 @@ async function runPreReleaseJob(job) {
     const reusableAfter = resumedRelease ? reusablePostReleaseCaptures(sourceJob, proofPages) : [];
     const reusableAfterBySlug = new Map(reusableAfter.map((row) => [String(row.slug || ""), row]));
     jobStep(job, 8, "running", `Checking ${proofPages.length} page(s) that had issues - reusing ${reusableAfter.length} screenshot(s)...`);
-    const after = [];
+    const after = [], afterSkipped = [];
     for (let i = 0; i < proofPages.length; i++) {
       const page = proofPages[i];
       jobStep(job, 8, "running", `${page.title} (${i + 1}/${proofPages.length})`);
@@ -7854,18 +8002,25 @@ async function runPreReleaseJob(job) {
         const layoutUrl = new URL(page.url);
         layoutUrl.searchParams.set("__g99_pr_layout", `${job.draftId}-${Date.now()}`);
         const layout = await captureMobileLayout(layoutUrl.toString());
-        if (layout.error) throw new Error(`after-fix layout refresh failed for ${page.title}: ${layout.error}`);
-        cap = { ...cap, layout, layoutRefreshedAt: new Date().toISOString() };
+        if (layout.error) cap = { ...page, phase: "after", error: `after-fix layout refresh failed: ${layout.error}` };
+        else cap = { ...cap, layout, layoutRefreshedAt: new Date().toISOString() };
       } else {
         cap = await captureMobilePage(job.draftId, "after", page);
       }
-      if (cap.error) throw new Error(`after-fix screenshot failed for ${page.title}: ${cap.error}`);
+      if (cap.error) {
+        afterSkipped.push({ ...page, phase: "after", error: String(cap.error), humanActionRequired: true });
+        job.mobileAfterSkipped = afterSkipped;
+        saveJobs();
+        continue;
+      }
       if (unresolvedIdenticalProof(auditedBySlug.get(String(page.slug || "")), cap)) throw new Error(`after-fix screenshot for ${page.title} is pixel-identical while its measured issue remains`);
       after.push(cap);
       job.mobileAfter = after;
       saveJobs();
     }
-    jobStep(job, 8, "done", `${after.length} after-fix screenshot(s) captured`);
+    job.mobileAfterSkipped = afterSkipped;
+    const totalSkippedCount = skippedCount + afterSkipped.length;
+    jobStep(job, 8, "done", `${after.length}/${proofPages.length} after-fix screenshot(s) captured${afterSkipped.length ? ` Â· ${afterSkipped.length} skipped for human action` : ""}`);
 
     if (PRE_RELEASE_AFTER_FIX_VERIFICATION) {
       const verified = [];
@@ -7877,15 +8032,15 @@ async function runPreReleaseJob(job) {
       }
       job.mobileAfter = verified;
       const remaining = verified.reduce((count, row) => count + (row.issues || []).length, 0);
-      job.mobileSummary = { pass: remaining === 0, pages: proofPages.length, beforeIssues: issueCount, afterIssues: remaining, changedFiles: (job.editPlan || []).length };
+      job.mobileSummary = { pass: remaining === 0, pages: proofPages.length, registeredPages: pages.length, skippedPages: totalSkippedCount, beforeIssues: issueCount, afterIssues: remaining, changedFiles: (job.editPlan || []).length };
       if (remaining) throw new Error(`after-fix mobile verification still found ${remaining} issue(s) - screenshots preserved for review`);
-      jobStep(job, 9, "done", `${proofPages.length}/${proofPages.length} affected pages pass`);
+      jobStep(job, 9, "done", `${after.length}/${proofPages.length} captured affected page(s) pass${afterSkipped.length ? ` Â· ${afterSkipped.length} skipped for human action` : ""}`);
     } else {
-      job.mobileSummary = { pass: null, pages: proofPages.length, beforeIssues: issueCount, afterIssues: null, changedFiles: (job.editPlan || []).length, verificationDisabled: true };
+      job.mobileSummary = { pass: null, pages: proofPages.length, registeredPages: pages.length, skippedPages: totalSkippedCount, beforeIssues: issueCount, afterIssues: null, changedFiles: (job.editPlan || []).length, verificationDisabled: true };
       jobStep(job, 9, "done", "Temporarily disabled");
     }
     job.status = "done";
-    notify(`After-fix screenshots captured for *${job.businessName}*: ${proofPages.length} affected page(s) - ${job.prUrl || ""}`);
+    notify(`After-fix screenshots captured for *${job.businessName}*: ${after.length}/${proofPages.length} affected page(s)${totalSkippedCount ? ` - ${totalSkippedCount} page(s) need human action` : ""} - ${job.prUrl || ""}`);
   } catch (e) {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
     if (e && e.cancelled) job.status = "cancelled";
@@ -7901,6 +8056,8 @@ async function runPreReleaseJob(job) {
     }
   } finally {
     job.finishedAt = new Date().toISOString();
+    job.preReleaseReport = buildPreReleaseReport(job);
+    job.reportUrl = writePreReleaseReport(job);
     saveJobs();
     COST_SINK = null;
   }
@@ -8156,6 +8313,11 @@ const server = http.createServer(async (req, res) => {
     }
     if (p === "/api/job" ) {
       const j = JOBS.get(u.searchParams.get("id"));
+      if (j && j.type === "pre-release" && j.finishedAt && Number(j.preReleaseReport && j.preReleaseReport.schemaVersion || 0) < 2) j.preReleaseReport = buildPreReleaseReport(j);
+      if (j && j.type === "pre-release" && j.finishedAt && (!j.reportUrl || !j.reportUrl.includes("/perform-responsiveness-") || !fs.existsSync(path.join(GEN, "reports", path.basename(j.reportUrl))))) {
+        j.reportUrl = writePreReleaseReport(j);
+        saveJobs();
+      }
       return j ? json(res, 200, j) : json(res, 404, { error: "job not found" });
     }
 
@@ -9489,5 +9651,5 @@ if (require.main === module) {
 module.exports = {
   seoEnhance, audit, sharpenStitchImages, injectCanonicalNav, qcStitchImages, fixImages,
   JOBS, postStatus, jobStatusSnapshot, saveJobs, loadJobs, emitAudit,
-  safeArtifactName, mobilePageUrl, isSafeArtifactSegment, browserlessScreenshotRequest, browserlessLayoutRequest, captureMobileLayout, issueSupportedByLayout, selectPrChecks, selectAutofixCheck, autofixFallbackPhpFiles, parseAiJson, reusablePreReleaseCaptures, reusablePreReleaseAudit, reusablePreReleasePr, reusableDeployedPreRelease, reusablePostReleaseCaptures, preReleaseMarkerUrl, screenshotBuffersEqual, unresolvedIdenticalProof, mobileAuditGeometryFallback, preReleaseProofPages, issueSupportedBySource, safeResponsivePlanFiles, verifyResponsiveDiff, repairResponsiveFile, readMuPages,
+  safeArtifactName, mobilePageUrl, isSafeArtifactSegment, browserlessScreenshotRequest, browserlessLayoutRequest, captureMobileLayout, issueSupportedByLayout, selectPrChecks, selectAutofixCheck, autofixFallbackPhpFiles, parseAiJson, reusablePreReleaseCaptures, reusablePreReleaseAudit, reusablePreReleasePr, reusableDeployedPreRelease, reusablePostReleaseCaptures, preReleaseMarkerUrl, screenshotBuffersEqual, unresolvedIdenticalProof, mobileAuditGeometryFallback, preReleaseProofPages, partitionPreReleaseCaptures, normalizeGeneratedFileContent, buildPreReleaseReport, preReleaseReportPath, renderPreReleaseReportHtml, writePreReleaseReport, issueSupportedBySource, safeResponsivePlanFiles, verifyResponsiveDiff, repairResponsiveFile, readMuPages,
 };

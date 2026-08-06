@@ -74,6 +74,55 @@
   .moberr { margin-top: 8px; color: var(--bad); font-size: 12px; font-weight: 600; }
   @media (max-width: 600px) { .mobgrid { grid-template-columns: 1fr; } }
 
+  /* Perform PR completion report: a compact release ledger, not another dashboard. */
+  .prreport { border-top: 4px solid var(--ink); }
+  .prreport-h { align-items: flex-start; }
+  .report-head-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  .report-kicker { display: block; margin-bottom: 3px; color: var(--muted); font-size: 9.5px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+  .report-decision { display: grid; grid-template-columns: minmax(150px, auto) 1fr; gap: 16px; align-items: center; margin: 14px 0 16px; padding: 14px 16px; border: 1px solid var(--line); border-left: 4px solid var(--warn); background: var(--surface-2); }
+  .report-decision.passed { border-left-color: var(--good); }
+  .report-decision.failed, .report-decision.cancelled { border-left-color: var(--bad); }
+  .report-stamp { font-size: 13px; font-weight: 850; color: var(--ink); }
+  .report-decision p { margin: 0; color: var(--ink-2); font-size: 12.5px; line-height: 1.55; }
+  .report-facts { display: grid; grid-template-columns: repeat(7, 1fr); border: 1px solid var(--line); }
+  .report-facts > div { min-width: 0; padding: 11px 10px; border-right: 1px solid var(--line); }
+  .report-facts > div:last-child { border-right: 0; }
+  .report-facts b { display: block; font: 800 18px/1 var(--display); }
+  .report-facts span { display: block; margin-top: 5px; color: var(--muted); font-size: 9px; font-weight: 700; letter-spacing: .03em; text-transform: uppercase; }
+  .report-links { min-height: 18px; margin-top: 9px; font-size: 12px; font-weight: 700; }
+  .report-links a, .report-proof a { display: inline-flex; align-items: center; gap: 3px; }
+  .report-section { margin-top: 24px; }
+  .report-section h3 { display: flex; align-items: center; gap: 8px; margin: 0 0 7px; font: 800 13px var(--sans); }
+  .report-section h3 span { display: inline-grid; min-width: 19px; height: 19px; place-items: center; border: 1px solid var(--line); border-radius: 50%; color: var(--muted); font-size: 9px; }
+  .report-check { display: grid; grid-template-columns: 8px minmax(150px, .8fr) auto 1.6fr; gap: 10px; align-items: center; padding: 9px 0; border-top: 1px solid var(--line-2); }
+  .report-check b { font-size: 12.5px; }
+  .report-check p { margin: 0; color: var(--muted); font-size: 11.5px; line-height: 1.45; }
+  .report-mark { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+  .report-mark.good { background: var(--good); } .report-mark.warn { background: var(--warn); } .report-mark.bad { background: var(--bad); }
+  .report-finding { border-top: 1px solid var(--line-2); }
+  .report-finding.dismissed { opacity: .78; }
+  .report-finding summary { display: grid; grid-template-columns: 64px minmax(130px, .75fr) 1.2fr auto; gap: 10px; align-items: center; padding: 10px 0; cursor: pointer; list-style-position: outside; }
+  .report-finding summary b, .report-finding summary > span:nth-child(3) { font-size: 12px; }
+  .report-finding summary > span:nth-child(3) { color: var(--muted); }
+  .report-severity { width: fit-content; font-size: 9px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
+  .report-severity.high { color: var(--bad); } .report-severity.medium { color: var(--warn-ink); } .report-severity.low { color: var(--muted); }
+  .report-finding-body { margin: 0 0 12px 74px; padding: 11px 13px; background: var(--surface-2); border-left: 2px solid var(--line); }
+  .report-finding-body p { margin: 0 0 8px; color: var(--ink-2); font-size: 12px; line-height: 1.5; }
+  .report-finding-body p:last-of-type { margin-bottom: 0; }
+  .report-finding-body p > b { display: block; margin-bottom: 2px; color: var(--muted); font-size: 9px; letter-spacing: .05em; text-transform: uppercase; }
+  .report-finding-body code { overflow-wrap: anywhere; font-size: 11px; }
+  .report-proof { margin-top: 8px; font-size: 11.5px; font-weight: 700; }
+  .report-actions > div { display: grid; grid-template-columns: 68px 1fr auto; gap: 10px; align-items: center; padding: 8px 0; border-top: 1px solid var(--line-2); }
+  .report-actions code { min-width: 0; overflow-wrap: anywhere; color: var(--ink-2); font-size: 11px; }
+  .report-skips > div { display: grid; grid-template-columns: minmax(120px, .7fr) 1fr auto; gap: 8px 12px; align-items: center; padding: 10px 0; border-top: 1px solid var(--line-2); }
+  .report-skips b { font-size: 12.5px; }
+  .report-skips code { overflow-wrap: anywhere; color: var(--ink-2); font-size: 11px; }
+  .report-skips p { grid-column: 2 / -1; margin: 0; color: var(--warn-ink); font-size: 11.5px; line-height: 1.45; }
+  .report-empty { color: var(--muted); font-size: 12px; }
+  .report-foot { margin-top: 22px; padding-top: 11px; border-top: 1px solid var(--line); color: var(--muted); font: 10px var(--mono); }
+  @media (max-width: 760px) { .report-facts { grid-template-columns: repeat(3, 1fr); } .report-facts > div:nth-child(3) { border-right: 0; } .report-facts > div:nth-child(-n+3) { border-bottom: 1px solid var(--line); } .report-check { grid-template-columns: 8px 1fr auto; } .report-check p { grid-column: 2 / -1; } }
+  @media (max-width: 560px) { .report-skips > div { grid-template-columns: 1fr auto; } .report-skips code, .report-skips p { grid-column: 1 / -1; } .report-decision { grid-template-columns: 1fr; gap: 7px; } .report-facts { grid-template-columns: repeat(2, 1fr); } .report-facts > div:nth-child(3) { border-right: 1px solid var(--line); } .report-facts > div:nth-child(even) { border-right: 0; } .report-facts > div:nth-child(-n+4) { border-bottom: 1px solid var(--line); } .report-finding summary { grid-template-columns: 58px 1fr auto; } .report-finding summary > span:nth-child(3) { grid-column: 2 / -1; } .report-finding-body { margin-left: 0; } .report-actions > div { grid-template-columns: 60px 1fr; } .report-actions .pill { grid-column: 2; width: fit-content; } }
+
   .disc-btn { display: flex; align-items: center; gap: 8px; width: 100%; background: none; border: none; padding: 0; font: inherit; cursor: pointer; color: var(--ink); }
   .disc-btn .t { font-size: 13.5px; font-weight: 700; }
   .disc-btn .h { margin-left: auto; font-size: 12px; color: var(--muted); font-weight: 600; }

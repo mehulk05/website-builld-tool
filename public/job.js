@@ -245,6 +245,48 @@ function seoCards(j) {
 }
 
 
+// ---- Pre-release completion report ------------------------------------------
+const reportTone = (value) => value === "passed" || value === "done" || value === "fixed" || value === "released" ? "good"
+  : value === "failed" || value === "error" || value === "unresolved" || value === "blocked" || value === "not-released" ? "bad"
+  : value === "review" || value === "not-verified" ? "warn" : "";
+const reportLabel = (value) => ({ done: "Passed", pending: "Pending", running: "Running", error: "Failed", skipped: "Skipped", fixed: "Fixed", unresolved: "Unresolved", "not-verified": "Not verified", blocked: "Blocked", released: "Released", "not-released": "Not released", prepared: "Prepared" }[value]
+  || String(value || "Unknown").replace(/(^|-)([a-z])/g, (_, dash, char) => (dash ? " " : "") + char.toUpperCase()));
+
+function preReleaseReportCard(j) {
+  if (j.type !== "pre-release" || !j.finishedAt || !j.preReleaseReport) return "";
+  const r = j.preReleaseReport, t = r.totals || {}, checks = r.checks || [], findings = r.findings || [], skipped = r.skippedPages || [], dismissed = r.dismissedFindings || [], actions = r.actions || [];
+  const link = (href, label) => href ? `<a href="${esc(href)}" target="_blank" rel="noopener">${esc(label)}${svg("ext", 11)}</a>` : "";
+  return `<div class="card pad prreport">
+    <div class="card-h prreport-h"><div><span class="report-kicker">Completion report</span><h2>Perform Responsiveness report</h2></div><div class="report-head-actions">${j.reportUrl ? `<a class="btn sm" href="${esc(j.reportUrl)}" target="_blank" rel="noopener">${svg("ext", 14)}Open report</a>` : ""}<button class="btn sm ghost" data-report-download>${svg("download", 14)}Download HTML</button></div></div>
+    <div class="report-decision ${esc(r.decision.code)}"><span class="report-stamp">${esc(r.decision.label)}</span><p>${esc(r.decision.detail)}</p></div>
+    <div class="report-facts"><div><b>${Number(t.pagesAudited || 0)}</b><span>Pages audited</span></div><div><b>${Number(t.issuesFound || 0)}</b><span>Issues found</span></div><div><b>${Number(t.fixed || 0)}</b><span>Fixed &amp; verified</span></div><div><b>${Number(t.notVerified || 0)}</b><span>Not verified</span></div><div><b>${Number(t.filesChanged || 0)}</b><span>Files changed</span></div><div><b>${Number(t.afterScreenshots || 0)}</b><span>After screenshots</span></div><div><b>${Number(t.pagesSkipped || 0)}</b><span>Skipped pages</span></div></div>
+    <div class="report-links">${[link(r.pullRequest, "Pull request"), link(r.liveSite, "Live site")].filter(Boolean).join(" · ")}</div>
+    <section class="report-section"><h3>Checks <span>${checks.length}</span></h3><div class="report-checks">${checks.map((check) => `<div class="report-check"><span class="report-mark ${reportTone(check.result)}"></span><b>${esc(check.name)}</b><span class="pill ${reportTone(check.result)}">${esc(reportLabel(check.result))}</span><p>${esc(check.detail || "No additional detail")}</p></div>`).join("")}</div></section>
+    <section class="report-section"><h3>Findings <span>${findings.length}</span></h3>${findings.length ? `<div class="report-findings">${findings.map((finding) => `<details class="report-finding" data-k="report-${esc(finding.id)}"><summary><span class="report-severity ${esc(finding.severity)}">${esc(finding.severity)}</span><b>${esc(finding.page)}</b><span>${esc(finding.kind)}</span><span class="pill ${reportTone(finding.outcome)}">${esc(reportLabel(finding.outcome))}</span></summary><div class="report-finding-body"><p><b>Issue</b>${esc(finding.description)}</p>${finding.evidence ? `<p><b>Evidence</b>${esc(finding.evidence)}</p>` : ""}${finding.requestedFix ? `<p><b>Requested fix</b>${esc(finding.requestedFix)}</p>` : ""}<p><b>Source</b><code>${esc(finding.file || "—")}</code></p><div class="report-proof">${[link(finding.beforeScreenshot, "Before"), link(finding.afterScreenshot, "After fix")].filter(Boolean).join(" · ")}</div></div></details>`).join("")}</div>` : `<p class="report-empty">No responsive findings.</p>`}</section>
+    <section class="report-section"><h3>Skipped pages · human action <span>${skipped.length}</span></h3>${skipped.length ? `<div class="report-skips">${skipped.map((page) => `<div><b>${esc(page.page)}</b><code>${esc(page.url || page.file || "—")}</code><span class="pill warn">${esc(page.phase || "Skipped")}</span><p>${esc(page.error)} · ${esc(page.action)}</p></div>`).join("")}</div>` : `<p class="report-empty">No pages skipped.</p>`}</section>
+    <section class="report-section"><h3>Dismissed candidates <span>${dismissed.length}</span></h3>${dismissed.length ? `<div class="report-findings">${dismissed.map((finding) => `<details class="report-finding dismissed" data-k="report-${esc(finding.id)}"><summary><span class="report-severity ${esc(finding.severity)}">${esc(finding.severity)}</span><b>${esc(finding.page)}</b><span>${esc(finding.kind)}</span><span class="pill">Dismissed</span></summary><div class="report-finding-body"><p><b>Candidate</b>${esc(finding.description)}</p>${finding.evidence ? `<p><b>Evidence</b>${esc(finding.evidence)}</p>` : ""}<p><b>Decision</b>${esc(finding.reason)}</p></div></details>`).join("")}</div>` : `<p class="report-empty">No candidates were dismissed.</p>`}</section>
+    <section class="report-section"><h3>Actions <span>${actions.length}</span></h3>${actions.length ? `<div class="report-actions">${actions.map((action) => `<div><span class="fop ${esc(action.operation)}">${esc(action.operation)}</span><code>${esc(action.file)}</code><span class="pill ${reportTone(action.result)}">${esc(reportLabel(action.result))}</span></div>`).join("")}</div>` : `<p class="report-empty">No files changed.</p>`}</section>
+    <div class="report-foot">Run ${esc(r.runId)}${r.finishedAt ? ` · completed ${esc(new Date(r.finishedAt).toLocaleString())}` : ""}</div>
+  </div>`;
+}
+
+function downloadablePreReleaseReport(j) {
+  const r = j.preReleaseReport;
+  if (!r) return;
+  const absolute = (value) => { try { return new URL(value, location.origin).href; } catch (_) { return value || ""; } };
+  const row = (cells) => `<tr>${cells.map((cell) => `<td>${cell}</td>`).join("")}</tr>`;
+  const checks = (r.checks || []).map((check) => row([esc(check.name), `<b>${esc(reportLabel(check.result))}</b>`, esc(check.detail || "")])).join("");
+  const findings = (r.findings || []).map((finding) => row([esc(finding.page), esc(finding.description), esc(finding.evidence || "—"), esc(finding.requestedFix || "—"), `<b>${esc(reportLabel(finding.outcome))}</b>${finding.beforeScreenshot ? `<br><a href="${esc(absolute(finding.beforeScreenshot))}">Before</a>` : ""}${finding.afterScreenshot ? ` · <a href="${esc(absolute(finding.afterScreenshot))}">After fix</a>` : ""}`])).join("");
+  const skipped = (r.skippedPages || []).map((page) => row([esc(page.page), `<code>${esc(page.url || page.file || "—")}</code>`, esc(page.error), `<b>${esc(page.phase || "Human action required")}</b><br>${esc(page.action)}`])).join("");
+  const dismissed = (r.dismissedFindings || []).map((finding) => row([esc(finding.page), esc(finding.description), esc(finding.evidence || "—"), esc(finding.reason)])).join("");
+  const actions = (r.actions || []).map((action) => row([esc(action.operation), `<code>${esc(action.file)}</code>`, `<b>${esc(reportLabel(action.result))}</b>`])).join("");
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Perform Responsiveness report — ${esc(r.businessName)}</title><style>body{font:14px/1.5 system-ui,sans-serif;color:#20222a;max-width:1120px;margin:36px auto;padding:0 24px}h1{margin-bottom:4px}h2{margin-top:32px}p.meta{color:#6b7280}.decision{border-left:5px solid #d68b22;background:#fff8e8;padding:14px 18px;margin:22px 0}.facts{display:flex;gap:22px;flex-wrap:wrap}.facts b{font-size:24px;display:block}.facts span{color:#6b7280}table{width:100%;border-collapse:collapse}th,td{text-align:left;vertical-align:top;padding:9px 10px;border-top:1px solid #e5e7eb}th{background:#f7f8fa}code{overflow-wrap:anywhere}a{color:#3156c8}@media print{body{margin:0;max-width:none}}</style></head><body><h1>Pre-release report — ${esc(r.businessName)}</h1><p class="meta">Run ${esc(r.runId)} · ${esc(r.finishedAt || "")}</p><div class="decision"><b>${esc(r.decision.label)}</b><br>${esc(r.decision.detail)}</div><div class="facts"><div><b>${r.totals.pagesAudited}</b><span>Pages audited</span></div><div><b>${r.totals.issuesFound}</b><span>Issues found</span></div><div><b>${r.totals.fixed}</b><span>Fixed &amp; verified</span></div><div><b>${r.totals.notVerified}</b><span>Not verified</span></div><div><b>${r.totals.filesChanged}</b><span>Files changed</span></div><div><b>${r.totals.pagesSkipped || 0}</b><span>Skipped pages</span></div></div><p>${r.pullRequest ? `<a href="${esc(r.pullRequest)}">Pull request</a>` : ""}${r.liveSite ? ` · <a href="${esc(r.liveSite)}">Live site</a>` : ""}</p><h2>Checks</h2><table><thead><tr><th>Check</th><th>Result</th><th>Detail</th></tr></thead><tbody>${checks}</tbody></table><h2>Findings</h2><table><thead><tr><th>Page</th><th>Issue</th><th>Evidence</th><th>Requested fix</th><th>Outcome</th></tr></thead><tbody>${findings || row(["—","No responsive findings","—","—","Passed"])}</tbody></table><h2>Skipped pages · human action</h2><table><thead><tr><th>Page</th><th>URL or file</th><th>Capture error</th><th>Action</th></tr></thead><tbody>${skipped || row(["—","No pages skipped","—","—"])}</tbody></table><h2>Dismissed candidates</h2><table><thead><tr><th>Page</th><th>Candidate</th><th>Evidence</th><th>Decision</th></tr></thead><tbody>${dismissed || row(["—","No candidates dismissed","—","—"])}</tbody></table><h2>Actions</h2><table><thead><tr><th>Action</th><th>File</th><th>Result</th></tr></thead><tbody>${actions || row(["—","No files changed","—"])}</tbody></table></body></html>`;
+  const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+  const url = URL.createObjectURL(blob), a = document.createElement("a");
+  a.href = url; a.download = `perform-responsiveness-report-${String(r.runId || "run").replace(/[^a-z0-9_-]/gi, "-")}.html`; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 // ---- Pre-release mobile evidence --------------------------------------------
 function mobileCards(j) {
   if (j.type !== "pre-release") return "";
@@ -272,8 +314,8 @@ function mobileCards(j) {
         : `<span class="right pill ${summary.pass ? "good" : "bad"}">${summary.pass ? "Passed" : "Needs review"} · ${summary.pages} pages</span>`) : ""}
     </div>
     ${summary ? (summary.verificationDisabled
-      ? `<div class="mobsummary"><b>${summary.beforeIssues}</b> issue(s) found · after-fix screenshots captured for <b>${summary.pages}</b> affected page(s) · <b>${summary.changedFiles}</b> file(s) changed</div>`
-      : `<div class="mobsummary"><b>${summary.beforeIssues}</b> issue(s) before · <b>${summary.afterIssues}</b> after · <b>${summary.changedFiles}</b> file(s) changed</div>`) : ""}
+      ? `<div class="mobsummary"><b>${summary.beforeIssues}</b> issue(s) found · after-fix screenshots captured for <b>${summary.pages}</b> affected page(s) · <b>${summary.changedFiles}</b> file(s) changed${summary.skippedPages ? ` · <b>${summary.skippedPages}</b> page(s) skipped for human action` : ""}</div>`
+      : `<div class="mobsummary"><b>${summary.beforeIssues}</b> issue(s) before · <b>${summary.afterIssues}</b> after · <b>${summary.changedFiles}</b> file(s) changed${summary.skippedPages ? ` · <b>${summary.skippedPages}</b> page(s) skipped for human action` : ""}</div>`) : ""}
     <div class="moblist">${rows.map((p) => {
       const a = afterBySlug.get(p.slug);
       return `<section class="mobrow">
@@ -476,6 +518,8 @@ function render() {
       </div>` : ""}
     </div>
 
+    ${preReleaseReportCard(j)}
+
     ${techCard(j)}`;
 
   $("techBtn").onclick = () => {
@@ -489,6 +533,7 @@ function render() {
     d.addEventListener("toggle", () => { if (d.open) OPEN.add(d.dataset.k); else OPEN.delete(d.dataset.k); });
   });
   document.querySelectorAll("[data-act]").forEach((b) => { b.onclick = () => act(b.dataset.act, b); });
+  document.querySelectorAll("[data-report-download]").forEach((b) => { b.onclick = () => downloadablePreReleaseReport(j); });
   if (TECH_OPEN) loadDiff();
 }
 

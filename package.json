@@ -4,7 +4,8 @@
   "description": "Growth99 website-build pipeline prototype: onboarding -> Stitch generate -> preview/export -> SEO audit",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test --test-isolation=none"
   },
   "license": "UNLICENSED"
 }
