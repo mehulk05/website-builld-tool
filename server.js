@@ -3183,8 +3183,19 @@ function tedRequestComment({ site, addr, subject, instruction, jobId }) {
 // multipart/form-data under the field name `files` — TED ignores `file` and
 // `attachments` silently — and Content-Type is deliberately left unset so fetch
 // can add the multipart boundary.
+// TED's comment endpoint returns 500 for any non-ASCII byte in the text — a
+// curly apostrophe is enough to lose the comment, and the failure looks like a
+// server fault rather than a payload problem. Business names, AI-written
+// summaries and pasted copy all carry smart quotes and dashes routinely, so the
+// text is folded to ASCII on the way out rather than gambling on it.
+const TED_ASCII = { "‘": "'", "’": "'", "“": '"', "”": '"', "–": "-", "—": "-", "…": "...", " ": " ", "•": "-", "×": "x" };
+function tedAscii(s) {
+  return String(s || "").replace(/[‘’“”–—… •×]/g, (c) => TED_ASCII[c])
+    .replace(/[^\x09\x0a\x0d\x20-\x7e]/g, "");
+}
 function tedComment(text, image = null, attempt = 0, taskId = null) {
   if (!TED_API_TOKEN || !text) return;
+  text = tedAscii(text);
   const target = taskId || TED_REVISIONS_TASK_ID;
   const headers = {};
   if (TED_AUTH_HEADER === "x-api-key") headers["X-Api-Key"] = TED_API_TOKEN;
@@ -8517,7 +8528,10 @@ function writeRedirectMap(themeAbs, themePath, pairs) {
     "",
   ].join("\n");
   fs.mkdirSync(path.join(themeAbs, "inc"), { recursive: true });
-  fs.writeFileSync(path.join(themeAbs, REDIRECT_FILE), php);
+  // The repo's .editorconfig sets insert_final_newline, and Pint fails the build
+  // on single_blank_line_at_eof. Normalising here rather than trusting the join
+  // means a later edit to the template above cannot quietly break CI.
+  fs.writeFileSync(path.join(themeAbs, REDIRECT_FILE), php.replace(/\s*$/, "") + "\n");
   const changed = [`${themePath}/${REDIRECT_FILE}`];
   // functions.php must actually load it, or the file is decoration.
   const fnAbs = path.join(themeAbs, "functions.php");
