@@ -257,8 +257,19 @@ async function composeBrand() {
 function pageSections(key) {
   const headline = $("headline").value, featured = $("featured").value;
   const providers = val(A.team_roster);
+  const DIRECTIVES = `
+PROMPT BLUEPRINT DIRECTIVES (INSPIRED BY RUMA, HELLOSKIN, ER INJECTABLES & AUSTIN AESTHETIC COUTURE):
+- PHOTO ENGRAVED TEXT & FLOATING BADGES: High-resolution treatment and provider photography MUST feature floating glassmorphism badges ("4.9★ CLINIC RATED", "BOARD CERTIFIED FACIAL SPECIALISTS") and text written directly ON the photo image under a bottom gradient scrim.
+- OVERSIZED PARALLAX BACKGROUND WATERMARK: Render an oversized, 14–22rem 5% opacity brand wordmark watermark bleeding behind Section 3 and the Footer with micro-parallax depth.
+- TWO-PART HEADINGS (REQUIRED): Every section heading MUST be a two-part composition. Line 1: Main display serif headline. Line 2 (directly under it in accent gold): an italicized or small-caps sub-line.
+- ASYMMETRIC 40/60 LAYOUTS: Avoid plain 3-identical-box grids. Use asymmetric 40/60 splits, arched photo tiles with offset 1px gold borders, and staggered height card grids.
+- 60FPS SCROLL ANIMATIONS: Include embedded CSS keyframe animations: @keyframes float, @keyframes pulseGlow, @keyframes fadeInUp. Apply transform: translateY(-8px) scale(1.02) hover states on cards and buttons.
+- CONCRETE MEDSPA COPY: Use explicit, non-placeholder MedSpa editorial copy for every section.
+- DO NOT: Do NOT use plain white background on 3 consecutive sections. Do NOT use placeholder text. Do NOT use purple/neon gradients.
+`;
   return {
     home: [`Sections (each a DISTINCT layout — do not repeat patterns):`,
+      DIRECTIVES,
       `1. HERO — full-viewport cinematic image under a dark gradient; oversized serif headline "${headline}"; subheadline "${A.hero_subheadline}"; two CTAs ("${A.primary_cta}" + "Explore treatments"); a floating glass trust-bar pinned to the hero bottom (Physician-led · Board-certified · 5★ Google · 5,000+ treatments).`,
       `2. INTRO — asymmetric 45/55 split: a tall arched portrait image offset upward on one side, editorial copy with an uppercase kicker "Our Ethos" and pull-quote on the other: "${A.why_patients_choose}".`,
       `3. SIGNATURE TREATMENTS — staggered/offset editorial grid (not equal cards) for ${featured}; each item large image + name + one-line benefit + hover zoom + "Learn more".`,
