@@ -10310,9 +10310,17 @@ async function postPerformPrToTed(job, extra, phase = "final") {
     : [`Pre-release checks completed for ${job.businessName}.`];
   lines.push("", `${(job.prTasks || []).length} checks ran. ${n("done")} done, ${n("decision")} need a decision, ${n("pending")} pending.`);
   if (fixed.length) lines.push("", "Fixed in this run:", ...fixed.map((t) => `- ${t.label}: ${t.detail || ""}`));
+  // The hosted report lives on an ephemeral filesystem and does not survive a
+  // redeploy, so the comment has to carry enough on its own to still be worth
+  // reading after the link has died. What needs a human decision is the part
+  // that matters, so it goes in the text rather than only behind the link.
+  const decisions = collapseFindings(f.filter((x) => x.outcome === OUTCOME.DECISION), 2);
+  if (decisions.length) {
+    lines.push("", "Needs a decision:", ...decisions.slice(0, 8).map((x) => `- ${x.rollup ? x.message : `${x.page ? x.page + ": " : ""}${x.message}`}`));
+  }
   if (extra) lines.push("", extra);
   if (job.prUrl) lines.push("", `Pull request: ${job.prUrl}`);
-  if (job.reportUrl) lines.push("", "Report:", absUrl(job.reportUrl));
+  if (job.reportUrl) lines.push("", "Full report (expires on redeploy):", absUrl(job.reportUrl));
   const text = lines.join("\n");
   // One eventKey per job per phase: TED treats it as an idempotency key, so a
   // retry after a timeout updates that comment rather than adding another.
