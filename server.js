@@ -10732,7 +10732,7 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ accepted: true, dedupe, draftId: job.draftId, status: job.status, monitor: "/jobs" }));
     }
 
-    // TED task event → Perform PR. Sits outside the admin-key gate because it
+    // TED pre-release task event → Perform PR. Sits outside the admin-key gate.
     // carries its own secret, like the other webhooks.
     //
     // TED does not send a siteId — it sends a client name and a task. So the
@@ -10742,35 +10742,46 @@ const server = http.createServer(async (req, res) => {
     //
     // The webhook's "Include Sibling Task Details" option puts the task to
     // report against in `target`, so the run knows where to post its findings.
-    if (p === "/api/webhook/ted-task" && req.method === "POST") {
-      const secret = process.env.WEBHOOK_SECRET || "";
-      if (!secret || (req.headers["x-webhook-secret"] || "") !== secret) return json(res, 401, { error: "bad webhook secret" });
-      const body = JSON.parse(await readBody(req) || "{}");
+    if (p === "/api/webhook/pre-release" && req.method === "POST") {
+      // Optional shared secret. Off by default so this matches the TED webhook
+      // that already exists — but worth setting, because unlike that one (which
+      // only reads and posts a report) this endpoint can open and merge a pull
+      // request against a client's repository.
+      const secret = (process.env.PRE_RELEASE_WEBHOOK_SECRET || "").trim();
+      if (secret && (req.headers["x-webhook-secret"] || "") !== secret) return json(res, 401, { error: "bad webhook secret" });
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || "{}"); } catch (e) { return json(res, 400, { error: "bad json" }); }
+      // Shape confirmed by the mockup.create webhook already in production:
+      //   { event, trigger: { clientName, templateKey, status }, target: { id, templateKey } }
+      const trig = body.trigger || {}, tgt = body.target || {};
       const dig = (...keys) => {
         for (const k of keys) {
-          for (const src of [body, body.task, body.data, body.record, body.payload]) {
+          for (const src of [trig, body, tgt, body.task, body.data]) {
             const v = src && src[k];
             if (v != null && String(v).trim()) return String(v).trim();
           }
         }
         return "";
       };
-      const clientName = dig("clientName", "client_name", "client", "customerName", "accountName", "businessName");
-      const templateKey = dig("templateKey", "template_key", "taskTemplateKey", "key");
+      const clientName = dig("clientName", "client_name", "client", "customerName", "businessName");
+      const templateKey = dig("templateKey", "template_key", "taskTemplateKey");
       const status = dig("status", "taskStatus", "newStatus");
-      const targetTask = (body.target && (body.target.id || body.target.taskId)) || dig("targetTaskId");
-      // Until a real payload has been seen, log the whole thing. "Test Webhook"
-      // then tells us the field names instead of us guessing at them.
+      const targetTask = tgt.id || tgt.taskId || dig("targetTaskId", "id");
       if (!clientName) {
-        console.warn("ted-task webhook: no client name found. payload:", JSON.stringify(body).slice(0, 1200));
-        return json(res, 422, { error: "no client name in payload", seen: Object.keys(body), hint: "send clientName, or tell Studio which field carries it" });
+        console.warn("pre-release webhook: no client name. payload:", JSON.stringify(body).slice(0, 1200));
+        return json(res, 422, { error: "no client name in payload", seen: Object.keys(body), hint: "expected trigger.clientName" });
       }
-      // Only the configured trigger should start a run. With "All Events" selected
-      // in TED this endpoint would otherwise fire on every comment and edit.
-      const wantKey = (process.env.TED_PERFORM_PR_KEY || "").trim();
+      // TED's UI offers "All Events", which would fire this on every comment and
+      // edit. Default to the pre-release template key so a mis-set webhook cannot
+      // start a merge on unrelated activity; override per deployment if it moves.
+      const wantKey = (process.env.TED_PERFORM_PR_KEY || "beta_site.release_approval").trim();
       const wantStatus = (process.env.TED_PERFORM_PR_STATUS || "").trim();
-      if (wantKey && templateKey && templateKey !== wantKey) return json(res, 200, { ignored: true, reason: `template key ${templateKey} is not ${wantKey}` });
-      if (wantStatus && status && status.toLowerCase() !== wantStatus.toLowerCase()) return json(res, 200, { ignored: true, reason: `status ${status} is not ${wantStatus}` });
+      if (wantKey && wantKey !== "*" && templateKey && templateKey !== wantKey) {
+        return json(res, 200, { ignored: true, reason: `template key ${templateKey} is not ${wantKey}` });
+      }
+      if (wantStatus && status && status.toLowerCase() !== wantStatus.toLowerCase()) {
+        return json(res, 200, { ignored: true, reason: `status ${status} is not ${wantStatus}` });
+      }
 
       let sites; try { sites = await getWebsites(true); } catch (e) { return json(res, 502, { error: "NocoDB lookup failed: " + e.message }); }
       const norm = (s) => String(s || "").toLowerCase().replace(/\(.*?\)/g, "").replace(/[^a-z0-9]+/g, " ").trim();
