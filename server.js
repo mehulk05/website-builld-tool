@@ -3560,6 +3560,358 @@ function tedPostOutcome(job, outcome) {
   }, TED_SHOT_DELAY_MS);
 }
 
+// ============================================================ Wireframe QA (CRO audit → TED)
+// Runs once the site's service pages exist: audits Home / a Service page / About / Contact with the
+// SAME croAudit() rubric used for the build's before/after score, captures a screenshot of each, and
+// posts the result onto a TED task AS the AI Agent — moving it to In Progress and assigning it to AI,
+// but never closing it (the audit only observes; a human closes). Read-only against the site.
+//
+// Two entry points: the standalone `POST /api/wireframe-qa` route (used for on-demand runs and the
+// NUVO test), and an inline fire-and-forget hook at the end of runEnrichJob for the real build flow.
+const WIREFRAME_QA_BUDGET_BYTES = 1_500_000;   // total inline screenshot bytes we allow in one comment
+
+// GET a TED task. Returns { status, aiAssigned, templateKey } or null (missing/unreachable). Used to
+// gate the post on the prerequisite task being Completed.
+async function tedGetTask(taskId) {
+  if (!TED_API_TOKEN || !taskId) return null;
+  const headers = {};
+  if (TED_AUTH_HEADER === "x-api-key") headers["X-Api-Key"] = TED_API_TOKEN;
+  else headers["Authorization"] = "Bearer " + TED_API_TOKEN;
+  try {
+    const r = await fetch(`${TED_BASE}/api/tasks/${taskId}`, { headers });
+    if (!r.ok) return null;
+    if (/html/i.test(r.headers.get("content-type") || "")) return null;   // Angular shell = route missing
+    const t = await r.json();
+    return {
+      status: t.status || t.Status || null,
+      aiAssigned: (t.aiAssigned != null ? t.aiAssigned : null),
+      templateKey: (t.automation && t.automation.templateKey) || null,
+    };
+  } catch (e) { return null; }
+}
+
+// POST an AI-agent result onto a TED task. Unlike fire-and-forget tedComment this is awaitable — the
+// caller wants to know whether it landed. Sends JSON {text, eventKey, inProgress, assignAi}; the
+// booleans are stringified because TED reads the body as a String map.
+async function tedAiResult(taskId, html, opts = {}) {
+  const { eventKey = "", inProgress = true, assignAi = true } = opts;
+  if (!TED_API_TOKEN) return { ok: false, error: "TED_API_TOKEN not set" };
+  const headers = { "Content-Type": "application/json" };
+  if (TED_AUTH_HEADER === "x-api-key") headers["X-Api-Key"] = TED_API_TOKEN;
+  else headers["Authorization"] = "Bearer " + TED_API_TOKEN;
+  const body = JSON.stringify({ text: html, eventKey, inProgress: String(inProgress), assignAi: String(assignAi) });
+  try {
+    const r = await fetch(`${TED_BASE}/api/tasks/${taskId}/comments/ai`, { method: "POST", headers, body });
+    const ct = r.headers.get("content-type") || "";
+    if (/html/i.test(ct)) return { ok: false, error: "endpoint not deployed (got the TED web app, not the API)" };
+    const payload = ct.includes("json") ? await r.json().catch(() => ({})) : {};
+    if (!r.ok) return { ok: false, error: `HTTP ${r.status}`, payload };
+    return { ok: true, payload };
+  } catch (e) { return { ok: false, error: String(e.message || e) }; }
+}
+
+// Pick ONE service page to audit when the caller didn't name one. Real service pages usually live
+// under /services/ (the home nav often only links the listing), so scan that first, then the home
+// page as a fallback. Skips structural / non-service paths.
+async function wqDiscoverService(baseUrl) {
+  const NON_SERVICE = new Set(["about", "contact", "services", "team", "brand-guide", "blog", "privacy",
+    "terms", "home", "sitemap", "wp-content", "wp-admin", "wp-json", "wp-includes", "feed", "gallery",
+    "reviews", "app", "assets", "themes", "cart", "checkout", "account", "shop", "careers", "faq"]);
+  const root = String(baseUrl).replace(/\/+$/, "");
+  const scan = async (url) => {
+    try {
+      const html = await (await fetch(url)).text();
+      const re = /href="([^"]+)"/gi; let m; const out = [];
+      while ((m = re.exec(html))) {
+        const mm = m[1].match(/^(?:https?:\/\/[^/]+)?\/([a-z0-9][a-z0-9-]{2,})\/?$/i);
+        if (!mm) continue;
+        const slug = mm[1].toLowerCase();
+        if (!NON_SERVICE.has(slug)) out.push(slug);
+      }
+      return out;
+    } catch (e) { return []; }
+  };
+  for (const url of [`${root}/services/`, `${root}/`]) {
+    const found = await scan(url);
+    if (found.length) {
+      const slug = found[0];
+      return { name: slug.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase()), slug };
+    }
+  }
+  return null;
+}
+
+// Dedupe (case-insensitive), trim blanks, cap to n.
+function wqUniqTop(arr, n) {
+  const seen = new Set(), out = [];
+  for (const x of (arr || [])) {
+    const s = String(x == null ? "" : x).trim(); if (!s) continue;
+    const k = s.toLowerCase(); if (seen.has(k)) continue;
+    seen.add(k); out.push(s); if (out.length >= n) break;
+  }
+  return out;
+}
+
+// Build the comment HTML. Only tags sanitizeCommentHtml keeps: strong/em/p/ul/li/a/br, plus
+// <img src="data:…"> and the comment-shots/comment-shot structural classes (same markup TED itself
+// uses for build mockups, so the images render and open full-size).
+function wireframeQaReportHtml(d) {
+  const P = [];
+  P.push(`<p><strong>🔍 Wireframe QA — CRO audit</strong></p>`);
+  if (d.isTestUrl) {
+    P.push(`<p><em>⚠️ No beta site URL on record for this client — audited a stand-in test site: `
+      + `<a href="${esc(d.betaUrl)}">${esc(d.betaUrl)}</a>. Scores are indicative, not this client's own site.</em></p>`);
+  } else {
+    P.push(`<p>Audited site: <a href="${esc(d.betaUrl)}">${esc(d.betaUrl)}</a></p>`);
+  }
+  P.push(`<p><strong>Overall CRO score: ${d.avg.overall} / 100</strong> <em>(whole-site average of ${d.pages.length} pages)</em></p>`);
+  P.push(`<p>Discipline scores — <strong>Visual</strong> ${d.avg.vision.score} · <strong>UX</strong> ${d.avg.ux.score} · `
+    + `<strong>CRO</strong> ${d.avg.cro.score} · <strong>Content</strong> ${d.avg.content.score}</p>`);
+  if (d.strengths.length) P.push(`<p><strong>✅ What's working</strong></p><ul>${d.strengths.map(s => `<li>${esc(s)}</li>`).join("")}</ul>`);
+  if (d.weaknesses.length) P.push(`<p><strong>⚠️ What's missing / weak</strong></p><ul>${d.weaknesses.map(s => `<li>${esc(s)}</li>`).join("")}</ul>`);
+  if (d.recs.length) P.push(`<p><strong>Top recommendations</strong></p><ul>${d.recs.map(s => `<li>${esc(s)}</li>`).join("")}</ul>`);
+  if (d.perPage.length) P.push(`<p><strong>Per-page scores</strong></p><ul>`
+    + d.perPage.map(p => `<li><strong>${esc(p.label)}</strong> — ${p.overall}/100${p.error ? ` <em>(audit failed: ${esc(p.error)})</em>` : ""}</li>`).join("") + `</ul>`);
+  // Screenshots inline, budget-capped.
+  const shotHtml = []; let budget = WIREFRAME_QA_BUDGET_BYTES, shown = 0; const skipped = [];
+  for (const s of d.shots) {
+    if (!s.dataUri) continue;
+    if (s.dataUri.length > budget) { skipped.push(s.label); continue; }
+    budget -= s.dataUri.length; shown++;
+    const fname = String(s.label || "page").replace(/[^a-z0-9]+/gi, "-").toLowerCase();
+    shotHtml.push(`<div class="comment-shot"><div class="comment-shot-label"><strong>${shown}. ${esc(s.label)}</strong>`
+      + (s.url ? ` <a href="${esc(s.url)}">${esc(s.url)}</a>` : "") + `</div>`
+      + `<img src="${esc(s.dataUri)}" alt="${esc(s.label)}" data-attachment-type="image" data-filename="${esc(fname)}.png"></div>`);
+  }
+  if (shown) {
+    P.push(`<p><strong>QA screenshots — ${shown} ${shown === 1 ? "page" : "pages"}</strong> <em>(click any image for full size)</em></p>`);
+    P.push(`<div class="comment-shots">${shotHtml.join("")}</div>`);
+  }
+  if (skipped.length) P.push(`<p><em>Screenshots not attached (size limit): ${esc(skipped.join(", "))}</em></p>`);
+  P.push(`<p><em>AI UX Inspector · audited ${esc(d.pages.map(p => p.label).join(", "))} · ${esc(d.when)}</em></p>`);
+  return P.join("");
+}
+
+// Run the audit and (optionally) post it to TED. Returns a structured result for the route / test.
+async function wireframeQaAudit(opts = {}) {
+  const {
+    betaUrl, tedTaskId = null, prereqTaskId = null,
+    services = null, serviceSlug = null, serviceName = null,
+    isTestUrl = false, postToTed = true,
+  } = opts;
+  if (!betaUrl) return { ok: false, error: "betaUrl required" };
+  const root = String(betaUrl).replace(/\/+$/, "");
+
+  // Resolve the one service page: explicit array > explicit slug > discovered from the home page.
+  let svc = null;
+  if (Array.isArray(services) && services.find(s => s && s.slug)) svc = services.find(s => s && s.slug);
+  else if (serviceSlug) svc = { name: serviceName || serviceSlug, slug: serviceSlug };
+  else svc = await wqDiscoverService(root + "/");
+
+  const pages = [
+    { label: "Home", url: `${root}/` },
+    ...(svc ? [{ label: `Service — ${svc.name}`, url: `${root}/${svc.slug}/` }] : []),
+    { label: "About", url: `${root}/about/` },
+    { label: "Contact", url: `${root}/contact/` },
+  ];
+
+  // 1) CRO audit each page (sequential — Gemini RPM), keep per-page + merged whole-site score.
+  const reports = [];
+  for (const pg of pages) {
+    try {
+      const rep = await croAudit({ url: pg.url, label: pg.label });
+      reports.push({ ...rep, label: pg.label });
+    } catch (e) {
+      reports.push({ label: pg.label, overall: 0, error: String(e.message || e),
+        vision: { score: 0 }, ux: { score: 0 }, cro: { score: 0 }, content: { score: 0 }, summary: {} });
+    }
+    await sleep(800);
+  }
+  const good = reports.filter(r => !r.error);
+  const avg = croAverage(good.length ? good : reports, `Wireframe QA (${(good.length || reports.length)} pages)`);
+
+  const strengths = wqUniqTop(good.flatMap(r => (r.summary && r.summary.strengths) || []), 5);
+  const weaknesses = wqUniqTop([
+    ...good.flatMap(r => (r.summary && r.summary.weaknesses) || []),
+    ...good.flatMap(r => (r.cro && r.cro.issues) || []),
+  ], 6);
+  const recs = wqUniqTop(good.flatMap(r => (r.summary && r.summary.topRecommendations) || []), 5);
+
+  // 2) Screenshots (PSI data URIs) of the same page set.
+  let shots = [];
+  try { shots = await captureMockups(root, svc ? [svc] : []); } catch (e) { shots = []; }
+
+  // 3) Build the comment HTML.
+  const when = new Date().toISOString().replace("T", " ").slice(0, 16) + " UTC";
+  const html = wireframeQaReportHtml({ betaUrl: root + "/", isTestUrl, pages, avg, strengths, weaknesses, recs, shots,
+    perPage: reports.map(r => ({ label: r.label, overall: r.overall || 0, error: r.error || null })), when });
+
+  const result = {
+    ok: true, betaUrl: root + "/", isTestUrl, overall: avg.overall,
+    disciplines: { vision: avg.vision.score, ux: avg.ux.score, cro: avg.cro.score, content: avg.content.score },
+    perPage: reports.map(r => ({ label: r.label, overall: r.overall || 0, error: r.error || null })),
+    strengths, weaknesses, recs,
+    screenshots: shots.map(s => ({ label: s.label, url: s.url, ok: !!s.dataUri, error: s.error || null })),
+    htmlLength: html.length, posted: null, prereq: null,
+  };
+
+  if (!postToTed || !tedTaskId) { result.posted = { skipped: "post disabled or no tedTaskId" }; return result; }
+
+  // 4) Gate on the prerequisite task (e.g. mockup.create) being Completed.
+  if (prereqTaskId) {
+    const pre = await tedGetTask(prereqTaskId);
+    result.prereq = { id: prereqTaskId, status: pre ? pre.status : "unreachable" };
+    if (!pre || String(pre.status).toLowerCase() !== "completed") {
+      result.posted = { skipped: `prereq task ${prereqTaskId} not Completed (status=${pre ? pre.status : "unreachable"})` };
+      return result;
+    }
+  }
+
+  // 5) Post: In Progress + AI-assigned + comment. Idempotent via a stable eventKey.
+  const eventKey = `wireframe-qa:${tedTaskId}:${root}`;
+  result.posted = await tedAiResult(tedTaskId, html, { eventKey, inProgress: true, assignAi: true });
+  return result;
+}
+
+// GET a client's site URLs from TED (id-free: the webhook gives a clientId, TED knows the URL).
+async function tedGetClientInfo(clientId) {
+  if (!TED_API_TOKEN || !clientId) return null;
+  const headers = {};
+  if (TED_AUTH_HEADER === "x-api-key") headers["X-Api-Key"] = TED_API_TOKEN;
+  else headers["Authorization"] = "Bearer " + TED_API_TOKEN;
+  try {
+    const r = await fetch(`${TED_BASE}/api/clients/${clientId}/info`, { headers });
+    if (!r.ok) return null;
+    if (/html/i.test(r.headers.get("content-type") || "")) return null;
+    return await r.json();
+  } catch (e) { return null; }
+}
+
+// Stand-in site when a client has no beta URL yet (rule 7.1: audit it and flag it).
+const WIREFRAME_QA_TEST_URL = process.env.WIREFRAME_QA_TEST_URL || "https://prodteam1.gogroth.com/";
+
+const WQ_STEPS = [
+  "Resolve beta site URL",
+  "Discover pages",
+  "CRO audit (Home + Service + About + Contact)",
+  "Capture screenshots",
+  "Compose CRO report",
+  "Post to TED wireframe QA task",
+];
+
+function newWireframeAuditJob(payload) {
+  return {
+    type: "wireframe-audit",
+    draftId: String(payload.draftId || ("wfqa-" + (payload.clientId || "x") + "-" + Date.now())),
+    businessId: payload.businessId || null,
+    businessName: payload.clientName || payload.businessName || ("Client " + (payload.clientId || "?")),
+    status: "queued", currentStep: 0,
+    steps: WQ_STEPS.map((label) => ({ label, status: "pending", detail: "" })),
+    payload, liveUrl: null, error: null,
+    cost: { gemini: 0, stitch: 0 }, cancelRequested: false,
+    createdAt: new Date().toISOString(), startedAt: null, finishedAt: null, result: null,
+  };
+}
+
+// Queue a visible wireframe-audit job. Deduped: one non-terminal job per target task.
+function enqueueWireframeAuditJob(payload) {
+  for (const j of JOBS.values()) {
+    if (j.type === "wireframe-audit" && j.payload
+        && String(j.payload.targetTaskId) === String(payload.targetTaskId)
+        && (j.status === "queued" || j.status === "running")) {
+      return j;
+    }
+  }
+  const job = newWireframeAuditJob(payload);
+  JOBS.set(job.draftId, job);
+  JOB_QUEUE.push(job.draftId); saveJobs();
+  processJobQueue();
+  return job;
+}
+
+// The visible job: resolve URL → audit → screenshots → report → post to the TED task the webhook
+// handed us. Reuses croAudit/captureMockups/wireframeQaReportHtml/tedAiResult, but drives the steps
+// so the run is watchable in the Studio UI.
+async function runWireframeAudit(job) {
+  job.status = "running"; job.startedAt = new Date().toISOString();
+  const P = job.payload;                        // { clientId, targetTaskId, targetTemplateKey, clientName }
+  const targetTaskId = P.targetTaskId;
+  try {
+    // 1 — beta URL, from client-info or a flagged stand-in.
+    jobStep(job, 0, "running", "Looking up client " + (P.clientId || "?"));
+    let betaUrl = P.betaUrl || null, isTestUrl = false;
+    if (!betaUrl && P.clientId) {
+      const info = await tedGetClientInfo(P.clientId);
+      betaUrl = (info && (info.betaSiteUrl || info.liveSiteUrl)) || null;
+    }
+    if (!betaUrl) { betaUrl = WIREFRAME_QA_TEST_URL; isTestUrl = true; }
+    job.liveUrl = betaUrl;
+    jobStep(job, 0, "done", (isTestUrl ? "No client beta URL — test site " : "Beta URL ") + betaUrl);
+    const root = String(betaUrl).replace(/\/+$/, "");
+
+    // 2 — one service page + the fixed set.
+    jobStep(job, 1, "running", "Scanning /services/ + home");
+    const svc = await wqDiscoverService(root + "/");
+    const pages = [
+      { label: "Home", url: `${root}/` },
+      ...(svc ? [{ label: `Service — ${svc.name}`, url: `${root}/${svc.slug}/` }] : []),
+      { label: "About", url: `${root}/about/` },
+      { label: "Contact", url: `${root}/contact/` },
+    ];
+    jobStep(job, 1, "done", pages.map(p => p.label).join(", "));
+
+    // 3 — CRO audit each page (sequential — Gemini RPM).
+    jobStep(job, 2, "running", `Auditing ${pages.length} pages`);
+    const reports = [];
+    for (const pg of pages) {
+      try { reports.push({ ...(await croAudit({ url: pg.url, label: pg.label })), label: pg.label }); }
+      catch (e) { reports.push({ label: pg.label, overall: 0, error: String(e.message || e), vision: { score: 0 }, ux: { score: 0 }, cro: { score: 0 }, content: { score: 0 }, summary: {} }); }
+      await sleep(800);
+    }
+    const good = reports.filter(r => !r.error);
+    const avg = croAverage(good.length ? good : reports, `Wireframe QA (${(good.length || reports.length)} pages)`);
+    jobStep(job, 2, "done", `Overall CRO ${avg.overall}/100`);
+
+    // 4 — screenshots.
+    jobStep(job, 3, "running", "PSI screenshots");
+    let shots = [];
+    try { shots = await captureMockups(root, svc ? [svc] : []); } catch (e) { shots = []; }
+    jobStep(job, 3, "done", `${shots.filter(s => s.dataUri).length}/${shots.length} captured`);
+
+    // 5 — report HTML.
+    jobStep(job, 4, "running", "Building comment");
+    const strengths = wqUniqTop(good.flatMap(r => (r.summary && r.summary.strengths) || []), 5);
+    const weaknesses = wqUniqTop([...good.flatMap(r => (r.summary && r.summary.weaknesses) || []),
+      ...good.flatMap(r => (r.cro && r.cro.issues) || [])], 6);
+    const recs = wqUniqTop(good.flatMap(r => (r.summary && r.summary.topRecommendations) || []), 5);
+    const when = new Date().toISOString().replace("T", " ").slice(0, 16) + " UTC";
+    const html = wireframeQaReportHtml({ betaUrl: root + "/", isTestUrl, pages, avg, strengths, weaknesses, recs, shots,
+      perPage: reports.map(r => ({ label: r.label, overall: r.overall || 0, error: r.error || null })), when });
+    job.result = { overall: avg.overall, isTestUrl, betaUrl: root + "/", pages: pages.length,
+      disciplines: { vision: avg.vision.score, ux: avg.ux.score, cro: avg.cro.score, content: avg.content.score } };
+    jobStep(job, 4, "done", `Report ${Math.round(html.length / 1024)}KB`);
+
+    // 6 — post to the TED task the webhook resolved. Never closes it.
+    jobStep(job, 5, "running", "Posting to task " + targetTaskId);
+    if (!targetTaskId) {
+      jobStep(job, 5, "done", "No target task — report computed only");
+    } else {
+      const eventKey = `wireframe-qa:${targetTaskId}:${P.clientId || root}`;
+      const posted = await tedAiResult(targetTaskId, html, { eventKey, inProgress: true, assignAi: true });
+      job.result.posted = posted;
+      if (posted.ok) jobStep(job, 5, "done", "Posted to task " + targetTaskId + " (In Progress + AI-assigned)");
+      else jobStep(job, 5, "error", "Post failed: " + (posted.error || "?"));
+    }
+    job.status = "done"; job.finishedAt = new Date().toISOString(); saveJobs();
+  } catch (e) {
+    job.error = String(e.message || e); job.status = "error";
+    const cs = job.steps[job.currentStep];
+    if (cs && cs.status === "running") { cs.status = "error"; cs.detail = job.error.slice(0, 240); }
+    job.finishedAt = new Date().toISOString(); saveJobs();
+    console.error("[wireframe-audit] failed:", job.error);
+  }
+}
+
 // ---- G99 status callback ------------------------------------------------------
 // Reports build progress back to Growth99 (product-service) so the admin dashboard has a durable
 // record of every build: whether it ran, how far it got, where it failed, and the live site URL.
@@ -4187,7 +4539,7 @@ async function processJobQueue() {
   if (!id) return;
   JOB_RUNNING = true;
   const job = JOBS.get(id);
-  const RUNNER = { edit: runEditJob, restore: runRestoreJob, enrich: runEnrichJob, seo: runSeoJob, "pre-release": runPreReleaseJob, "perform-pr": runPerformPrJob };
+  const RUNNER = { edit: runEditJob, restore: runRestoreJob, enrich: runEnrichJob, seo: runSeoJob, "pre-release": runPreReleaseJob, "perform-pr": runPerformPrJob, "wireframe-audit": runWireframeAudit };
   try { await ((job && RUNNER[job.type] ? RUNNER[job.type] : runJob)(job)); }
   catch (e) { console.error("job runner crashed:", e); }
   finally { JOB_RUNNING = false; processJobQueue(); }
@@ -6322,6 +6674,24 @@ async function runEnrichJob(job) {
     job.status = "done";
     mirrorToParent(job, "done", `${services.length} service page(s) + brand guide merged`);
     notify(`✨ Enriched *${job.businessName}*: ${services.length} service pages + brand guide · ${job.prUrl || ""}`);
+
+    // Inline wireframe QA / CRO audit — fire-and-forget so it never blocks or breaks completion.
+    // Runs only when product-service told us which TED tasks to target (it knows the client's task
+    // ids; we don't). Without them, the standalone POST /api/wireframe-qa route is used instead.
+    const wqTask = P.wireframeQaTaskId || process.env.TED_WIREFRAME_QA_TASK_ID;
+    if (TED_API_TOKEN && wqTask) {
+      const auditUrl = job.liveUrl || P.betaSiteUrl || LIVE_URL;
+      const usedFallback = !P.betaSiteUrl && !job.liveUrl;   // fell back to the shared default URL
+      wireframeQaAudit({
+        betaUrl: auditUrl,
+        tedTaskId: wqTask,
+        prereqTaskId: P.mockupTaskId || process.env.TED_MOCKUP_TASK_ID || null,
+        services,
+        isTestUrl: usedFallback,
+      })
+        .then(r => console.log(`[wireframe-qa] overall=${r && r.overall} posted=${JSON.stringify(r && r.posted)}`))
+        .catch(e => console.error("[wireframe-qa] failed:", e.message));
+    }
   } catch (e) {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
     if (e && e.cancelled) { job.status = "cancelled"; mirrorToParent(job, "error", "Enrichment cancelled"); }
@@ -9917,6 +10287,31 @@ const server = http.createServer(async (req, res) => {
 
     // G99 platform → tool: onboarding wizard Part 2 submitted. Fire-and-forget:
     // validates the shared secret, maps answers, queues the pipeline, replies 202.
+    // TED task-status webhook (Phase-4 template-key subscription). When mockup.create closes for a
+    // client, TED sends us the resolved wireframe.qa target task; we run the visible CRO audit job
+    // and post the report onto that task. No secret configured — accepts on payload shape alone.
+    if (p === "/api/webhook/ted-task-status" && req.method === "POST") {
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || "{}"); } catch (e) { return json(res, 400, { error: "bad json" }); }
+      const trig = body.trigger || {}, tgt = body.target || {};
+      const isClose = body.event === "TASK_STATUS_CHANGED"
+        && trig.templateKey === "mockup.create"
+        && String(trig.status).toLowerCase() === "completed";
+      if (!isClose) {
+        return json(res, 200, { ok: true, ignored: `not a mockup.create completion (event=${body.event}, key=${trig.templateKey}, status=${trig.status})` });
+      }
+      const targetTaskId = tgt.id || null;
+      const wantKey = body.targetTemplateKey || tgt.templateKey;
+      if (!targetTaskId || wantKey !== "wireframe.qa") {
+        return json(res, 200, { ok: true, ignored: `no wireframe.qa target (target=${targetTaskId}, key=${wantKey})` });
+      }
+      const job = enqueueWireframeAuditJob({
+        clientId: trig.clientId, clientName: trig.clientName,
+        targetTaskId, targetTemplateKey: wantKey,
+      });
+      return json(res, 202, { ok: true, jobId: job.draftId, status: job.status, targetTaskId });
+    }
+
     if (p === "/api/webhook/onboarding-submitted" && req.method === "POST") {
       const secret = process.env.WEBHOOK_SECRET || "";
       if (!secret || (req.headers["x-webhook-secret"] || "") !== secret) return json(res, 401, { error: "bad webhook secret" });
@@ -11097,6 +11492,16 @@ const server = http.createServer(async (req, res) => {
         delta: (beforeScore != null && afterScore != null) ? afterScore - beforeScore : null,
         metrics: { vision: cat("vision"), ux: cat("ux"), cro: cat("cro"), content: cat("content") },
       });
+    }
+
+    // Wireframe QA / CRO audit of a live site (Home + one Service + About + Contact) → optionally
+    // post the result onto a TED task (In Progress + AI-assigned + comment, never closed). Body:
+    // { betaUrl, tedTaskId?, prereqTaskId?, serviceSlug?, serviceName?, services?, isTestUrl?, postToTed? }
+    if (p === "/api/wireframe-qa" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req) || "{}");
+      if (!body.betaUrl) return json(res, 400, { error: "betaUrl required" });
+      const out = await wireframeQaAudit(body);
+      return json(res, out.ok ? 200 : 400, out);
     }
 
     // Whole-site QA audit: critique every Stitch page, cache comments for refine.

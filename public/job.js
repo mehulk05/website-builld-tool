@@ -165,7 +165,7 @@ function actions(j) {
   return b.join("");
 }
 
-const TYPE_LABEL = { edit: "Edit", enrich: "Enrich", restore: "Restore", build: "Build", seo: "SEO", "pre-release": "Pre-release" };
+const TYPE_LABEL = { edit: "Edit", enrich: "Enrich", restore: "Restore", build: "Build", seo: "SEO", "pre-release": "Pre-release", "wireframe-audit": "Wireframe QA" };
 
 // ---- SEO run detail ----------------------------------------------------------
 // What the run decided, page by page, plus the two things it deliberately did
