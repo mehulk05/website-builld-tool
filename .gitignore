@@ -10,6 +10,7 @@ node_modules/
 test-full.js
 test-invalid.js
 jobs.json
+onboarding.json
 registry.json
 reaudit.json
 site-audits.json
