@@ -3183,8 +3183,9 @@ function tedRequestComment({ site, addr, subject, instruction, jobId }) {
 // multipart/form-data under the field name `files` — TED ignores `file` and
 // `attachments` silently — and Content-Type is deliberately left unset so fetch
 // can add the multipart boundary.
-function tedComment(text, image = null, attempt = 0) {
+function tedComment(text, image = null, attempt = 0, taskId = null) {
   if (!TED_API_TOKEN || !text) return;
+  const target = taskId || TED_REVISIONS_TASK_ID;
   const headers = {};
   if (TED_AUTH_HEADER === "x-api-key") headers["X-Api-Key"] = TED_API_TOKEN;
   else headers["Authorization"] = "Bearer " + TED_API_TOKEN;
@@ -3200,7 +3201,7 @@ function tedComment(text, image = null, attempt = 0) {
     body = JSON.stringify({ text });
   }
 
-  fetch(`${TED_BASE}/api/tasks/${TED_REVISIONS_TASK_ID}/comments`, { method: "POST", headers, body })
+  fetch(`${TED_BASE}/api/tasks/${target}/comments`, { method: "POST", headers, body })
     .then((r) => {
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       // TED serves its Angular shell for any /api route it does not register —
@@ -3213,17 +3214,36 @@ function tedComment(text, image = null, attempt = 0) {
       // fails is retried once as text, which is the part that actually matters.
       if (image) {
         console.error(`TED screenshot upload failed (${e.message}) — posting the comment without it`);
-        return tedComment(text, null, attempt);
+        return tedComment(text, null, attempt, target);
       }
       // A dead token, a wrong header or a missing route are all settled facts —
       // retrying three more times would only delay the log line that says so.
       const fatal = /HTTP 40[13]|not deployed/.test(e.message);
       if (!fatal && attempt < G99_RETRY_DELAYS_MS.length) {
-        setTimeout(() => tedComment(text, null, attempt + 1), G99_RETRY_DELAYS_MS[attempt]);
+        setTimeout(() => tedComment(text, null, attempt + 1, target), G99_RETRY_DELAYS_MS[attempt]);
       } else {
         console.error(`TED comment on task ${TED_REVISIONS_TASK_ID} failed:`, e.message);
       }
     });
+}
+
+// Hand the ticket back: mark it as done by the AI rather than leaving a human to
+// close a task they did not do. Awaited, unlike tedComment — a caller that says
+// "comment then close" needs to know the close actually happened.
+async function tedUpdateTask(taskId, fields) {
+  if (!TED_API_TOKEN) return { ok: false, reason: "TED_API_TOKEN not set" };
+  if (!taskId) return { ok: false, reason: "no task id" };
+  const headers = { "Content-Type": "application/json" };
+  if (TED_AUTH_HEADER === "x-api-key") headers["X-Api-Key"] = TED_API_TOKEN;
+  else headers["Authorization"] = "Bearer " + TED_API_TOKEN;
+  try {
+    const r = await fetch(`${TED_BASE}/api/tasks/${taskId}`, { method: "PUT", headers, body: JSON.stringify(fields) });
+    // Same trap as the comment endpoint: TED answers 200 with its Angular shell
+    // for any /api route it does not register, so status alone proves nothing.
+    if (/html/i.test(r.headers.get("content-type") || "")) return { ok: false, reason: "endpoint not deployed (got the TED web app, not the API)" };
+    if (!r.ok) return { ok: false, reason: `HTTP ${r.status}` };
+    return { ok: true, body: (await r.text()).slice(0, 400) };
+  } catch (e) { return { ok: false, reason: String(e && e.message || e).slice(0, 140) }; }
 }
 
 // The other half of the loop: the request comment says what was asked for, this
@@ -11122,6 +11142,7 @@ module.exports = {
   splitLocationSlug, findingsUrlStructure, pageSpeedRun, findingsPageSpeed, psiReportUrl, collapseFindings,
   fixSpelling, fixCta, extractCtaBlock, fixImages, cdnWebpUrl, imageSubject, uniqueImageName,
   writeRedirectMap, readRedirectMap, fixUrlStructure, findingsInternalLinks, bestRedirectTarget, fixInternalLinks,
+  tedComment, tedUpdateTask,
   OUTCOME, OUTCOME_LABEL, resolveFindingOutcomes, replaceInTextNodes, fixBusinessName,
   imageSources, findingsImages, readSeoPages, synthMuSource, pageText,
   fixFavicon, fixSocialImage, fix404, fixCallNow, fixBlvd, fixBlogLinkColor, fixClickable,
