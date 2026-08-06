@@ -10227,6 +10227,40 @@ function performPrPrBody(job, reportUrl) {
   return L.join("\n");
 }
 
+// A run that cannot merge leaves its pull request open. Unattended — which is
+// what the TED webhook makes this — those accumulate until someone notices a
+// list of stale pre-release PRs, each one carrying changes that made sense
+// against a repository state that has since moved on. Merging one of those later
+// is how this site got 301s pointing at pages that no longer existed.
+//
+// So each new run closes the ones it supersedes. Deliberately narrow: only open
+// PRs, only branches this job names for this exact theme, never the one just
+// opened. A human's PR, another client's, or the responsive job's cannot match
+// the prefix. Fail-soft — losing the tidy-up must not fail an otherwise good run.
+async function closeSupersededPerformPrs(repo, themeSlug, keepPrUrl) {
+  if ((process.env.PERFORM_PR_CLOSE_SUPERSEDED || "on").toLowerCase() === "off") return [];
+  const prefix = `g99/perform-pr-${String(themeSlug || "").replace(/^g99-/, "")}-`;
+  const keepNum = ((keepPrUrl || "").match(/\/pull\/(\d+)/) || [])[1];
+  try {
+    const r = await sh(`gh pr list --repo ${repo} --state open --limit 60 --json number,headRefName`);
+    if (r.code) return [];
+    const stale = JSON.parse(r.stdout || "[]")
+      .filter((pr) => String(pr.headRefName || "").startsWith(prefix) && String(pr.number) !== keepNum);
+    const closed = [];
+    for (const pr of stale) {
+      const body = `Superseded by #${keepNum} — a newer pre-release run has been opened for this site. Closing so its changes, which were built against an older state of this repository, are not merged later by mistake.`;
+      await sh(`gh pr comment ${pr.number} --repo ${repo} --body "${body.replace(/"/g, "'")}"`);
+      const c = await sh(`gh pr close ${pr.number} --repo ${repo} --delete-branch`);
+      if (!c.code) closed.push(pr.number);
+    }
+    if (closed.length) console.log(`perform-pr: closed superseded PR(s) ${closed.map((n) => "#" + n).join(", ")}`);
+    return closed;
+  } catch (e) {
+    console.warn("perform-pr: could not close superseded PRs:", e.message);
+    return [];
+  }
+}
+
 // Report back to the task that asked for the run. Only when the run was started
 // by a TED webhook — a run kicked off from the dashboard has no ticket to answer,
 // and posting to a default task would put one client's findings on another's thread.
@@ -10460,7 +10494,10 @@ async function runPerformPrJob(job) {
     fs.rmSync(bodyFile, { force: true });
     job.prUrl = (r.stdout.match(/https:\/\/github\.com\/\S+/) || [""])[0];
     if (!job.prUrl) throw new Error("PR create failed: " + r.stderr.slice(-200));
-    jobStep(job, 8, "done", job.prUrl);
+    // Only once this run's PR exists, so a failure above can never close the
+    // previous one and leave the site with no open pre-release PR at all.
+    job.supersededPrs = await closeSupersededPerformPrs(repo, P.themeSlug, job.prUrl);
+    jobStep(job, 8, "done", job.prUrl + (job.supersededPrs.length ? ` · closed ${job.supersededPrs.map((n) => "#" + n).join(", ")}` : ""));
 
     jobStep(job, 9, "running", "Watching CI build checks...");
     let fixes = 0, merged = false;
@@ -12367,6 +12404,7 @@ module.exports = {
   splitLocationSlug, findingsUrlStructure, pageSpeedRun, findingsPageSpeed, psiReportUrl, collapseFindings,
   fixSpelling, fixCta, extractCtaBlock, performPrFixImages, cdnWebpUrl, imageSubject, uniqueImageName,
   writeRedirectMap, readRedirectMap, fixUrlStructure, findingsInternalLinks, bestRedirectTarget, fixInternalLinks, themeChromePages,
+  closeSupersededPerformPrs,
   tedComment, tedUpdateTask,
   OUTCOME, OUTCOME_LABEL, resolveFindingOutcomes, replaceInTextNodes, fixBusinessName,
   imageSources, findingsImages, readSeoPages, synthMuSource, pageText,
