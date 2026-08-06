@@ -3597,6 +3597,41 @@ function tedAscii(s) {
   return String(s || "").replace(/[‘’“”–—… •×]/g, (c) => TED_ASCII[c])
     .replace(/[^\x09\x0a\x0d\x20-\x7e]/g, "");
 }
+// Post as the AI agent rather than as whoever's token this is. TED's /comments/ai
+// endpoint differs from the plain one in three ways that all matter: it wants
+// X-Api-Key rather than a bearer token, it renders HTML rather than plain text,
+// and it takes an eventKey it uses for idempotency — so a retry after a timeout
+// updates the same comment instead of posting a second one.
+//
+// Falls back to the ordinary comment endpoint, because a report that lands under
+// a person's name is far better than one that does not land at all.
+const TED_AI_TOKEN = process.env.TED_AI_API_KEY || process.env.TED_API_TOKEN || "";
+function tedHtml(text) {
+  const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  return String(text || "").split(/\n{2,}/).map((block) => {
+    const lines = block.split("\n").filter((l) => l.trim());
+    if (lines.length > 1 && lines.every((l) => /^\s*[-*]\s/.test(l))) {
+      return "<ul>" + lines.map((l) => `<li>${esc(l.replace(/^\s*[-*]\s/, ""))}</li>`).join("") + "</ul>";
+    }
+    return `<p>${lines.map((l) => esc(l)).join("<br>")}</p>`;
+  }).join("");
+}
+async function tedAiComment(taskId, text, eventKey) {
+  if (!TED_AI_TOKEN || !taskId || !text) return { ok: false, reason: "missing token, task or text" };
+  try {
+    const r = await fetch(`${TED_BASE}/api/tasks/${taskId}/comments/ai`, {
+      method: "POST",
+      headers: { "X-Api-Key": TED_AI_TOKEN, "content-type": "application/json" },
+      body: JSON.stringify({ text: tedHtml(text), ...(eventKey ? { eventKey } : {}) }),
+    });
+    // TED answers 200 with its Angular shell for routes it does not register, so
+    // the status alone proves nothing — same trap as every other TED endpoint.
+    if (/html/i.test(r.headers.get("content-type") || "")) return { ok: false, reason: "endpoint not deployed (got the TED web app)" };
+    if (!r.ok) return { ok: false, reason: `HTTP ${r.status}: ${(await r.text()).slice(0, 160)}` };
+    return { ok: true, body: (await r.text()).slice(0, 300) };
+  } catch (e) { return { ok: false, reason: String(e && e.message || e).slice(0, 140) }; }
+}
+
 function tedComment(text, image = null, attempt = 0, taskId = null) {
   if (!TED_API_TOKEN || !text) return;
   text = tedAscii(text);
@@ -10264,22 +10299,27 @@ async function closeSupersededPerformPrs(repo, themeSlug, keepPrUrl) {
 // Report back to the task that asked for the run. Only when the run was started
 // by a TED webhook — a run kicked off from the dashboard has no ticket to answer,
 // and posting to a default task would put one client's findings on another's thread.
-function postPerformPrToTed(job, extra) {
+async function postPerformPrToTed(job, extra, phase = "final") {
   const taskId = job.payload && job.payload.tedTaskId;
   if (!taskId) return;
   const f = job.prFindings || [];
   const n = (o) => f.filter((x) => x.outcome === o).length;
   const fixed = (job.prTasks || []).filter((t) => t.status === "fixed");
-  const lines = [
-    `Pre-release checks completed for ${job.businessName}.`,
-    "",
-    `${(job.prTasks || []).length} checks ran. ${n("done")} done, ${n("decision")} need a decision, ${n("pending")} pending.`,
-  ];
+  const lines = phase === "interim"
+    ? [`Pre-release checks ran for ${job.businessName}. Applying fixes and waiting on CI — the full report follows when it merges.`]
+    : [`Pre-release checks completed for ${job.businessName}.`];
+  lines.push("", `${(job.prTasks || []).length} checks ran. ${n("done")} done, ${n("decision")} need a decision, ${n("pending")} pending.`);
   if (fixed.length) lines.push("", "Fixed in this run:", ...fixed.map((t) => `- ${t.label}: ${t.detail || ""}`));
   if (extra) lines.push("", extra);
   if (job.prUrl) lines.push("", `Pull request: ${job.prUrl}`);
   if (job.reportUrl) lines.push("", "Report:", absUrl(job.reportUrl));
-  tedComment(lines.join("\n"), null, 0, String(taskId));
+  const text = lines.join("\n");
+  // One eventKey per job per phase: TED treats it as an idempotency key, so a
+  // retry after a timeout updates that comment rather than adding another.
+  const ai = await tedAiComment(taskId, text, `perform-pr:${job.draftId}:${phase}`);
+  if (ai.ok) return;
+  console.warn(`TED AI comment failed (${ai.reason}) — falling back to a normal comment`);
+  tedComment(text, null, 0, String(taskId));
 }
 
 function newPerformPrJob(payload) {
@@ -10498,6 +10538,10 @@ async function runPerformPrJob(job) {
     // previous one and leave the site with no open pre-release PR at all.
     job.supersededPrs = await closeSupersededPerformPrs(repo, P.themeSlug, job.prUrl);
     jobStep(job, 8, "done", job.prUrl + (job.supersededPrs.length ? ` · closed ${job.supersededPrs.map((n) => "#" + n).join(", ")}` : ""));
+    // Everything the audit found is already known here. CI, the deploy wait and
+    // PageSpeed add several minutes and change none of it, so the findings go to
+    // the task now rather than at the end. The final comment replaces this one.
+    postPerformPrToTed(job, null, "interim").catch(() => {});
 
     jobStep(job, 9, "running", "Watching CI build checks...");
     let fixes = 0, merged = false;
@@ -12405,7 +12449,7 @@ module.exports = {
   fixSpelling, fixCta, extractCtaBlock, performPrFixImages, cdnWebpUrl, imageSubject, uniqueImageName,
   writeRedirectMap, readRedirectMap, fixUrlStructure, findingsInternalLinks, bestRedirectTarget, fixInternalLinks, themeChromePages,
   closeSupersededPerformPrs,
-  tedComment, tedUpdateTask,
+  tedComment, tedUpdateTask, tedAiComment, tedHtml,
   OUTCOME, OUTCOME_LABEL, resolveFindingOutcomes, replaceInTextNodes, fixBusinessName,
   imageSources, findingsImages, readSeoPages, synthMuSource, pageText,
   fixFavicon, fixSocialImage, fix404, fixCallNow, fixBlvd, fixBlogLinkColor, fixClickable,
