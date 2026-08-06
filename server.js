@@ -3672,16 +3672,59 @@ function wireframeQaReportHtml(d) {
   if (d.recs.length) P.push(`<p><strong>Top recommendations</strong></p><ul>${d.recs.map(s => `<li>${esc(s)}</li>`).join("")}</ul>`);
   if (d.perPage.length) P.push(`<p><strong>Per-page scores</strong></p><ul>`
     + d.perPage.map(p => `<li><strong>${esc(p.label)}</strong> — ${p.overall}/100${p.error ? ` <em>(audit failed: ${esc(p.error)})</em>` : ""}</li>`).join("") + `</ul>`);
-  // Screenshots inline, budget-capped.
-  const shotHtml = []; let budget = WIREFRAME_QA_BUDGET_BYTES, shown = 0; const skipped = [];
+
+  // One shared byte budget across BOTH screenshot groups so the comment never overflows TED.
+  let budget = WIREFRAME_QA_BUDGET_BYTES;
+  const imgTag = (uri, label) => {
+    const fname = String(label || "img").replace(/[^a-z0-9]+/gi, "-").toLowerCase();
+    return `<img src="${esc(uri)}" alt="${esc(label)}" data-attachment-type="image" data-filename="${esc(fname)}.png">`;
+  };
+
+  // --- Responsive & accessibility (measured on Home) --------------------------
+  const r = d.responsive;
+  if (r && !r.error) {
+    const sc = (v) => (v == null ? "—" : v);
+    P.push(`<p><strong>📱 Responsive & accessibility</strong> <em>(measured on Home)</em></p>`);
+    P.push(`<p><strong>Mobile</strong> ${sc(r.mobile && r.mobile.score)}/100 · `
+      + `<strong>Tablet</strong> ${sc(r.tablet && r.tablet.score)}/100 <em>(visual)</em> · `
+      + `<strong>Desktop</strong> ${sc(r.desktop && r.desktop.score)}/100 · `
+      + `<strong>Accessibility (WCAG)</strong> ${sc(r.accessibility && r.accessibility.score)}/100</p>`);
+    const notes = [];
+    if (r.mobile && r.mobile.note) notes.push(`<li><strong>Mobile:</strong> ${esc(r.mobile.note)}</li>`);
+    if (r.tablet && r.tablet.note) notes.push(`<li><strong>Tablet:</strong> ${esc(r.tablet.note)}</li>`);
+    if (r.desktop && r.desktop.note) notes.push(`<li><strong>Desktop:</strong> ${esc(r.desktop.note)}</li>`);
+    if (notes.length) P.push(`<ul>${notes.join("")}</ul>`);
+    const LABEL = {
+      "viewport": "Viewport meta tag", "content-width": "No horizontal scroll (content fits the screen)",
+      "tap-targets": "Tap targets large enough (mobile)", "color-contrast": "Sufficient colour contrast (WCAG)",
+      "image-alt": "Images have alt text", "document-title": "Page has a title",
+      "html-has-lang": "HTML lang attribute set", "heading-order": "Headings in order", "link-name": "Links have names",
+    };
+    const seen = new Set(), rows = [];
+    for (const a of [].concat((r.mobile && r.mobile.checks) || [], (r.accessibility && r.accessibility.checks) || [])) {
+      if (!a || a.pass == null || seen.has(a.id)) continue;
+      seen.add(a.id);
+      rows.push(`<li>${a.pass ? "✅" : "⚠️"} ${esc(LABEL[a.id] || a.title || a.id)}${a.display ? ` <em>(${esc(a.display)})</em>` : ""}</li>`);
+    }
+    if (rows.length) P.push(`<p><strong>Checks</strong></p><ul>${rows.join("")}</ul>`);
+    const vshots = [["Mobile — 375px", r.shots && r.shots.mobile], ["Tablet — 768px", r.shots && r.shots.tablet], ["Desktop — 1280px", r.shots && r.shots.desktop]];
+    const vHtml = [];
+    for (const [lab, uri] of vshots) {
+      if (!uri || uri.length > budget) continue;
+      budget -= uri.length;
+      vHtml.push(`<div class="comment-shot"><div class="comment-shot-label"><strong>${esc(lab)}</strong></div>${imgTag(uri, lab)}</div>`);
+    }
+    if (vHtml.length) P.push(`<p><strong>Responsive screenshots (Home)</strong></p><div class="comment-shots">${vHtml.join("")}</div>`);
+  }
+
+  // --- Per-page QA screenshots (share the remaining budget) -------------------
+  const shotHtml = []; let shown = 0; const skipped = [];
   for (const s of d.shots) {
     if (!s.dataUri) continue;
     if (s.dataUri.length > budget) { skipped.push(s.label); continue; }
     budget -= s.dataUri.length; shown++;
-    const fname = String(s.label || "page").replace(/[^a-z0-9]+/gi, "-").toLowerCase();
     shotHtml.push(`<div class="comment-shot"><div class="comment-shot-label"><strong>${shown}. ${esc(s.label)}</strong>`
-      + (s.url ? ` <a href="${esc(s.url)}">${esc(s.url)}</a>` : "") + `</div>`
-      + `<img src="${esc(s.dataUri)}" alt="${esc(s.label)}" data-attachment-type="image" data-filename="${esc(fname)}.png"></div>`);
+      + (s.url ? ` <a href="${esc(s.url)}">${esc(s.url)}</a>` : "") + `</div>${imgTag(s.dataUri, s.label)}</div>`);
   }
   if (shown) {
     P.push(`<p><strong>QA screenshots — ${shown} ${shown === 1 ? "page" : "pages"}</strong> <em>(click any image for full size)</em></p>`);
@@ -3741,9 +3784,13 @@ async function wireframeQaAudit(opts = {}) {
   let shots = [];
   try { shots = await captureMockups(root, svc ? [svc] : []); } catch (e) { shots = []; }
 
+  // 2b) Responsive + accessibility on Home (mobile/tablet/desktop). Never fatal.
+  let responsive = null;
+  try { responsive = await responsiveAudit(`${root}/`); } catch (e) { responsive = { error: String(e.message || e) }; }
+
   // 3) Build the comment HTML.
   const when = new Date().toISOString().replace("T", " ").slice(0, 16) + " UTC";
-  const html = wireframeQaReportHtml({ betaUrl: root + "/", isTestUrl, pages, avg, strengths, weaknesses, recs, shots,
+  const html = wireframeQaReportHtml({ betaUrl: root + "/", isTestUrl, pages, avg, strengths, weaknesses, recs, shots, responsive,
     perPage: reports.map(r => ({ label: r.label, overall: r.overall || 0, error: r.error || null })), when });
 
   const result = {
@@ -3751,6 +3798,9 @@ async function wireframeQaAudit(opts = {}) {
     disciplines: { vision: avg.vision.score, ux: avg.ux.score, cro: avg.cro.score, content: avg.content.score },
     perPage: reports.map(r => ({ label: r.label, overall: r.overall || 0, error: r.error || null })),
     strengths, weaknesses, recs,
+    responsive: responsive && !responsive.error
+      ? { mobile: responsive.mobile.score, tablet: responsive.tablet.score, desktop: responsive.desktop.score, accessibility: responsive.accessibility.score }
+      : null,
     screenshots: shots.map(s => ({ label: s.label, url: s.url, ok: !!s.dataUri, error: s.error || null })),
     htmlLength: html.length, posted: null, prereq: null,
   };
@@ -3771,6 +3821,115 @@ async function wireframeQaAudit(opts = {}) {
   const eventKey = `wireframe-qa:${tedTaskId}:${root}`;
   result.posted = await tedAiResult(tedTaskId, html, { eventKey, inProgress: true, assignAi: true });
   return result;
+}
+
+// ---- Responsive & accessibility audit (hybrid: PSI/Lighthouse facts + Gemini visual) ----------
+function wqSplitDataUri(u) {
+  const m = /^data:([^;]+);base64,(.*)$/.exec(u || "");
+  return m ? { mime: m[1], b64: m[2] } : null;
+}
+
+// A screenshot at a given viewport width, as a compact JPEG data URI (for the responsive strip).
+async function wqShotAt(url, width) {
+  const shot = await microlinkShot(url, `&type=jpeg&quality=55&viewport.width=${width}`, 20000);
+  return shot ? `data:${shot.contentType};base64,${shot.buf.toString("base64")}` : null;
+}
+
+// One PSI/Lighthouse run: accessibility score + the responsive/a11y audits + a viewport screenshot.
+// `strategy` = "mobile" | "desktop". tap-targets is mobile-only (absent → pass:null, ignored).
+async function wqPsi(url, strategy) {
+  if (!PSI_API_KEY) return { error: "PSI_API_KEY not set" };
+  try {
+    const api = `${PSI_ENDPOINT}?url=${encodeURIComponent(url)}&key=${PSI_API_KEY}`
+      + `&strategy=${strategy}&category=performance&category=accessibility`;
+    const res = await fetch(api);
+    const ct = (res.headers.get("content-type") || "").toLowerCase();
+    if (!ct.includes("json")) return { error: `PSI ${strategy} returned ${ct || "no type"} (HTTP ${res.status})` };
+    const body = await res.json();
+    if (body.error) return { error: `PSI ${strategy}: ${String(body.error.message || "").slice(0, 120)}` };
+    const lr = body.lighthouseResult || {};
+    const A = lr.audits || {};
+    const info = (id) => {
+      const a = A[id];
+      if (!a) return null;
+      return { id, title: a.title, pass: a.score == null ? null : a.score >= 0.9, display: a.displayValue || null };
+    };
+    const ids = ["viewport", "content-width", "tap-targets", "color-contrast", "image-alt",
+      "document-title", "html-has-lang", "heading-order", "link-name"];
+    const shot = lr.fullPageScreenshot && lr.fullPageScreenshot.screenshot;
+    return {
+      accessibilityScore: (lr.categories && lr.categories.accessibility && lr.categories.accessibility.score != null)
+        ? Math.round(lr.categories.accessibility.score * 100) : null,
+      audits: ids.map(info).filter(Boolean),
+      screenshotDataUri: (shot && shot.data && String(shot.data).startsWith("data:image/")) ? shot.data : null,
+    };
+  } catch (e) { return { error: String(e.message || e).slice(0, 160) }; }
+}
+
+// Gemini looks at the three viewport screenshots and rates how well the layout holds at each width.
+async function wqViewportScores(shots) {
+  const parts = [{
+    text: "You are a senior responsive-web QA reviewer for a LUXURY MEDSPA website. Three screenshots"
+      + " follow in order — MOBILE (375px), TABLET (768px), DESKTOP (1280px). For EACH width rate 0-100"
+      + " how well the layout works (no horizontal overflow, legible text, tappable/clickable controls,"
+      + " sensible spacing, nothing broken or overlapping) and give ONE short note. Return ONLY JSON:"
+      + ' {"mobile":{"score":0-100,"note":"..."},"tablet":{"score":0-100,"note":"..."},"desktop":{"score":0-100,"note":"..."}}',
+  }];
+  for (const uri of [shots.mobile, shots.tablet, shots.desktop]) {
+    const d = wqSplitDataUri(uri);
+    if (d) parts.push({ inline_data: { mime_type: d.mime, data: d.b64 } });
+  }
+  if (parts.length === 1) return {};
+  try {
+    const t = await geminiCall(parts, { temperature: 0.3, maxOutputTokens: 1500 });
+    return JSON.parse((t.match(/\{[\s\S]*\}/) || [t])[0]);
+  } catch (e) { return {}; }
+}
+
+// Blend the deterministic pass-ratio (0..1) with the Gemini visual score (0..100), 60/40.
+function wqBlend(det, vis) {
+  if (det == null && vis == null) return null;
+  if (det == null) return Math.round(vis);
+  if (vis == null) return Math.round(det * 100);
+  return Math.round(det * 100 * 0.6 + vis * 0.4);
+}
+
+// Per-viewport responsive scores + a WCAG accessibility mini-audit for ONE page (Home). Mobile and
+// Desktop are backed by Lighthouse facts (blended with the visual read); Tablet is visual-only
+// because PSI has no tablet strategy. Never throws — degrades to whatever succeeded.
+async function responsiveAudit(url) {
+  const [mob, desk] = await Promise.all([wqPsi(url, "mobile"), wqPsi(url, "desktop")]);
+  const shots = {
+    mobile: (mob && mob.screenshotDataUri) || await wqShotAt(url, 375),
+    tablet: await wqShotAt(url, 768),
+    desktop: (desk && desk.screenshotDataUri) || await wqShotAt(url, 1280),
+  };
+  const vis = await wqViewportScores(shots);
+  const ratio = (res, ids) => {
+    if (!res || res.error || !res.audits) return null;
+    const rel = res.audits.filter(a => ids.includes(a.id) && a.pass != null);
+    return rel.length ? rel.filter(a => a.pass).length / rel.length : null;
+  };
+  const A11Y_IDS = ["color-contrast", "image-alt", "document-title", "html-has-lang", "heading-order", "link-name"];
+  return {
+    mobile: {
+      score: wqBlend(ratio(mob, ["viewport", "content-width", "tap-targets"]), vis.mobile && vis.mobile.score),
+      note: vis.mobile && vis.mobile.note,
+      checks: (mob && mob.audits) ? mob.audits.filter(a => ["viewport", "content-width", "tap-targets"].includes(a.id)) : [],
+    },
+    tablet: { score: (vis.tablet && vis.tablet.score != null) ? Math.round(vis.tablet.score) : null, note: vis.tablet && vis.tablet.note },
+    desktop: {
+      score: wqBlend(ratio(desk, ["viewport", "content-width"]), vis.desktop && vis.desktop.score),
+      note: vis.desktop && vis.desktop.note,
+      checks: (desk && desk.audits) ? desk.audits.filter(a => ["viewport", "content-width"].includes(a.id)) : [],
+    },
+    accessibility: {
+      score: (mob && mob.accessibilityScore != null) ? mob.accessibilityScore : (desk && desk.accessibilityScore),
+      checks: (mob && mob.audits) ? mob.audits.filter(a => A11Y_IDS.includes(a.id)) : [],
+    },
+    shots,
+    error: (mob && mob.error && desk && desk.error) ? (mob.error) : null,
+  };
 }
 
 // GET a client's site URLs from TED (id-free: the webhook gives a clientId, TED knows the URL).
@@ -3794,6 +3953,7 @@ const WQ_STEPS = [
   "Resolve beta site URL",
   "Discover pages",
   "CRO audit (Home + Service + About + Contact)",
+  "Responsive & accessibility (mobile/tablet/desktop)",
   "Capture screenshots",
   "Compose CRO report",
   "Post to TED wireframe QA task",
@@ -3872,35 +4032,46 @@ async function runWireframeAudit(job) {
     const avg = croAverage(good.length ? good : reports, `Wireframe QA (${(good.length || reports.length)} pages)`);
     jobStep(job, 2, "done", `Overall CRO ${avg.overall}/100`);
 
-    // 4 — screenshots.
-    jobStep(job, 3, "running", "PSI screenshots");
+    // 4 — responsive + accessibility on Home (mobile/tablet/desktop). Never fatal.
+    jobStep(job, 3, "running", "Mobile / Tablet / Desktop + WCAG");
+    let responsive = null;
+    try { responsive = await responsiveAudit(`${root}/`); } catch (e) { responsive = { error: String(e.message || e) }; }
+    if (responsive && !responsive.error) {
+      jobStep(job, 3, "done", `Mobile ${responsive.mobile.score ?? "—"} · Tablet ${responsive.tablet.score ?? "—"} · Desktop ${responsive.desktop.score ?? "—"} · a11y ${responsive.accessibility.score ?? "—"}`);
+    } else {
+      jobStep(job, 3, "done", "Skipped: " + ((responsive && responsive.error) || "no data"));
+    }
+
+    // 5 — screenshots (the 4 page captures).
+    jobStep(job, 4, "running", "PSI screenshots");
     let shots = [];
     try { shots = await captureMockups(root, svc ? [svc] : []); } catch (e) { shots = []; }
-    jobStep(job, 3, "done", `${shots.filter(s => s.dataUri).length}/${shots.length} captured`);
+    jobStep(job, 4, "done", `${shots.filter(s => s.dataUri).length}/${shots.length} captured`);
 
-    // 5 — report HTML.
-    jobStep(job, 4, "running", "Building comment");
+    // 6 — report HTML.
+    jobStep(job, 5, "running", "Building comment");
     const strengths = wqUniqTop(good.flatMap(r => (r.summary && r.summary.strengths) || []), 5);
     const weaknesses = wqUniqTop([...good.flatMap(r => (r.summary && r.summary.weaknesses) || []),
       ...good.flatMap(r => (r.cro && r.cro.issues) || [])], 6);
     const recs = wqUniqTop(good.flatMap(r => (r.summary && r.summary.topRecommendations) || []), 5);
     const when = new Date().toISOString().replace("T", " ").slice(0, 16) + " UTC";
-    const html = wireframeQaReportHtml({ betaUrl: root + "/", isTestUrl, pages, avg, strengths, weaknesses, recs, shots,
+    const html = wireframeQaReportHtml({ betaUrl: root + "/", isTestUrl, pages, avg, strengths, weaknesses, recs, shots, responsive,
       perPage: reports.map(r => ({ label: r.label, overall: r.overall || 0, error: r.error || null })), when });
     job.result = { overall: avg.overall, isTestUrl, betaUrl: root + "/", pages: pages.length,
-      disciplines: { vision: avg.vision.score, ux: avg.ux.score, cro: avg.cro.score, content: avg.content.score } };
-    jobStep(job, 4, "done", `Report ${Math.round(html.length / 1024)}KB`);
+      disciplines: { vision: avg.vision.score, ux: avg.ux.score, cro: avg.cro.score, content: avg.content.score },
+      responsive: responsive && !responsive.error ? { mobile: responsive.mobile.score, tablet: responsive.tablet.score, desktop: responsive.desktop.score, accessibility: responsive.accessibility.score } : null };
+    jobStep(job, 5, "done", `Report ${Math.round(html.length / 1024)}KB`);
 
-    // 6 — post to the TED task the webhook resolved. Never closes it.
-    jobStep(job, 5, "running", "Posting to task " + targetTaskId);
+    // 7 — post to the TED task the webhook resolved. Never closes it.
+    jobStep(job, 6, "running", "Posting to task " + targetTaskId);
     if (!targetTaskId) {
-      jobStep(job, 5, "done", "No target task — report computed only");
+      jobStep(job, 6, "done", "No target task — report computed only");
     } else {
       const eventKey = `wireframe-qa:${targetTaskId}:${P.clientId || root}`;
       const posted = await tedAiResult(targetTaskId, html, { eventKey, inProgress: true, assignAi: true });
       job.result.posted = posted;
-      if (posted.ok) jobStep(job, 5, "done", "Posted to task " + targetTaskId + " (In Progress + AI-assigned)");
-      else jobStep(job, 5, "error", "Post failed: " + (posted.error || "?"));
+      if (posted.ok) jobStep(job, 6, "done", "Posted to task " + targetTaskId + " (In Progress + AI-assigned)");
+      else jobStep(job, 6, "error", "Post failed: " + (posted.error || "?"));
     }
     job.status = "done"; job.finishedAt = new Date().toISOString(); saveJobs();
   } catch (e) {
