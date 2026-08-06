@@ -10325,9 +10325,32 @@ async function postPerformPrToTed(job, extra, phase = "final") {
   // One eventKey per job per phase: TED treats it as an idempotency key, so a
   // retry after a timeout updates that comment rather than adding another.
   const ai = await tedAiComment(taskId, text, `perform-pr:${job.draftId}:${phase}`);
-  if (ai.ok) return;
+  if (ai.ok) {
+    await closeTedTaskIfFinal(job, taskId, phase);
+    return;
+  }
   console.warn(`TED AI comment failed (${ai.reason}) — falling back to a normal comment`);
   tedComment(text, null, 0, String(taskId));
+  await closeTedTaskIfFinal(job, taskId, phase);
+}
+
+// Hand the ticket back once the run is actually over: mark it done by the AI so
+// nobody closes a task they did not do. Only on the final comment — the interim
+// one goes out while CI is still running, and closing a task that has not
+// finished is worse than leaving it open.
+//
+// A run that could not merge leaves the ticket open on purpose. Its pull request
+// is still waiting on a human, so the work is not complete however good the
+// report is.
+async function closeTedTaskIfFinal(job, taskId, phase) {
+  if (phase !== "final") return;
+  if (!job.prUrl || job.error) {
+    console.log(`TED task ${taskId} left open — the run did not merge (${job.error || "no pull request"})`);
+    return;
+  }
+  const r = await tedUpdateTask(taskId, { aiAssigned: true, status: "Completed" });
+  if (r.ok) console.log(`TED task ${taskId} marked Completed and assigned to AI`);
+  else console.warn(`TED task ${taskId} could not be updated: ${r.reason}`);
 }
 
 function newPerformPrJob(payload) {
@@ -12457,7 +12480,7 @@ module.exports = {
   fixSpelling, fixCta, extractCtaBlock, performPrFixImages, cdnWebpUrl, imageSubject, uniqueImageName,
   writeRedirectMap, readRedirectMap, fixUrlStructure, findingsInternalLinks, bestRedirectTarget, fixInternalLinks, themeChromePages,
   closeSupersededPerformPrs,
-  tedComment, tedUpdateTask, tedAiComment, tedHtml,
+  tedComment, tedUpdateTask, tedAiComment, tedHtml, closeTedTaskIfFinal,
   OUTCOME, OUTCOME_LABEL, resolveFindingOutcomes, replaceInTextNodes, fixBusinessName,
   imageSources, findingsImages, readSeoPages, synthMuSource, pageText,
   fixFavicon, fixSocialImage, fix404, fixCallNow, fixBlvd, fixBlogLinkColor, fixClickable,
