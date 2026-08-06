@@ -72,6 +72,14 @@ const MICROLINK_API_KEY = process.env.MICROLINK_API_KEY || "";
 if (!API_KEY) console.warn("⚠ STITCH_API_KEY not set — Stitch generation will fail. Add it to .env or the platform env vars.");
 if (!NOCODB_TOKEN) console.warn("⚠ NOCODB_TOKEN not set — the All Sites / Edit Sites website list will be empty until it's added to .env.");
 if (!GEMINI_KEYS.length) console.warn("⚠ GEMINI_KEYS not set — all AI features (CRO, prompt, bind, QC) will fail.");
+// Live per-treatment photo search — real variety instead of the fixed ~14-photo
+// curated pool (which has shipped at least one plainly wrong photo — a
+// construction site under "Medical Weight Loss", a t-shirt elsewhere — because
+// a small hardcoded list has no way to catch a mislabeled entry). Optional:
+// unset = every image-replacement path below falls back to the curated pool
+// exactly as before, fail-soft, same pattern as PSI/Browserless.
+const UNSPLASH_ACCESS_KEY = process.env.UNSPLASH_ACCESS_KEY || "";
+if (!UNSPLASH_ACCESS_KEY) console.warn("⚠ UNSPLASH_ACCESS_KEY not set — image replacement falls back to the small curated photo pool (same ~14 photos for every client).");
 let GEMINI_KEY = GEMINI_KEYS[0];                 // kept for legacy call sites
 // Default off gemini-flash-lite-latest: on 2026-07-28 that alias accepted
 // connections and never responded, stalling every AI step until it timed out.
@@ -1416,12 +1424,18 @@ function sharpenStitchImages(html) {
 }
 
 // Curated, clean, text-free, on-topic replacement photos (validated to load).
+// photo-1512207736890-6ffed8a84e8d is NOT on this list on purpose — confirmed
+// on a real generation, 2026-08-05/06: it rendered as a black-and-white
+// construction/rebar site photo, not a medspa photo. A fixed list this small
+// has no way to catch a mislabeled entry itself (that's exactly what the live
+// Unsplash search below replaces) — removed rather than left in on the
+// assumption nobody would draw it.
 const CURATED_IMAGES = [
   "photo-1570172619644-dfd03ed5d881", "photo-1512290923902-8a9f81dc236c", "photo-1519824145371-296894a0daa9",
   "photo-1616394584738-fc6e612e71b9", "photo-1600334129128-685c5582fd35", "photo-1544161515-4ab6ce6db874",
-  "photo-1515377905703-c4788e51af15", "photo-1596755094514-f87e34085b2c", "photo-1487412720507-e7ab37603c6f",
+  "photo-1515377905703-c4788e51af15", "photo-1487412720507-e7ab37603c6f",
   "photo-1629909613654-28e377c37b09", "photo-1552693673-1bf958298935", "photo-1571019613454-1cb2f99b2d8b",
-  "photo-1583900985737-6d0495555783", "photo-1512207736890-6ffed8a84e8d",
+  "photo-1583900985737-6d0495555783",
 ].map(id => `https://images.unsplash.com/${id}?w=1600&q=80&auto=format&fit=crop`);
 
 // Every site used to draw from this pool starting at index 0, through three
@@ -1447,11 +1461,119 @@ function seedCuratedPhotos(name) {
 }
 const curatedPhoto = () => CURATED_IMAGES[(CURATED_OFFSET + CURATED_CURSOR++) % CURATED_IMAGES.length];
 
+// Live per-category Unsplash search. Real variety instead of the fixed
+// CURATED_IMAGES pool (14 photos, same for every client, and — per the
+// construction-site photo above — with no way to catch a wrong entry itself).
+// Off (returns null, callers fall back to the curated pool) unless
+// UNSPLASH_ACCESS_KEY is set. Cached per query for the process lifetime — a
+// single page asks for the same category many times over and this must not
+// burn a free-tier ~50 req/hour limit re-fetching the same search.
+const UNSPLASH_QUERY_BY_CATEGORY = {
+  injectables: "botox filler injection cosmetic clinic",
+  laser: "laser skin treatment clinic",
+  facial: "facial spa treatment skincare",
+  body: "body contouring medspa treatment",
+  team: "medical clinic doctor team portrait",
+  hero: "luxury medspa clinic interior",
+  interior: "modern medical spa interior design",
+};
+const UNSPLASH_CACHE = new Map();   // query -> array of image URLs, or null on failure
+// Unsplash's own search ranking is not trustworthy enough to accept blind —
+// confirmed on a real generation, 2026-08-06: a "luxury medspa clinic
+// interior" style query returned a photo of a SHIRT as its top hit (fashion
+// photography apparently ranks for "clinic"/"treatment"-adjacent terms too).
+// So every candidate is cross-checked against its OWN alt_description/
+// description/tags for an actual medical/spa/beauty term before being
+// accepted — Unsplash's ranking picks the candidate pool, this decides
+// what's actually on-topic. A candidate with no metadata at all is rejected
+// rather than assumed innocent.
+const UNSPLASH_RELEVANCE_TERMS = /\b(medic|clinic|doctor|physician|nurse|dermatolog|skin\w*|spa\b|wellness|beauty|cosmetic|aesthetic|facial|treatment|therap|inject|botox|filler|laser|massage|salon|patient|health)/i;
+async function unsplashSearch(query, count = 20) {
+  if (!UNSPLASH_ACCESS_KEY) return null;
+  const key = query.toLowerCase().trim();
+  if (UNSPLASH_CACHE.has(key)) return UNSPLASH_CACHE.get(key);
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 10000);
+    const url = `https://api.unsplash.com/search/photos?query=${encodeURIComponent(query)}&per_page=${count}&orientation=landscape&content_filter=high`;
+    const r = await fetch(url, { signal: ctl.signal, headers: { Authorization: `Client-ID ${UNSPLASH_ACCESS_KEY}` } });
+    clearTimeout(t);
+    if (!r.ok) { console.warn(`unsplash search "${query}" -> HTTP ${r.status}`); UNSPLASH_CACHE.set(key, null); return null; }
+    const d = await r.json();
+    // Real HD source only — never accept a small original and let CSS stretch
+    // it, same standard qcImageResolution holds Stitch's own images to.
+    const relevant = (d.results || []).filter((ph) => {
+      if ((ph.width || 0) < 1600) return false;
+      const text = [ph.alt_description, ph.description, ...(ph.tags || []).map((tg) => tg.title)].filter(Boolean).join(" ");
+      return UNSPLASH_RELEVANCE_TERMS.test(text);
+    });
+    const urls = relevant.map((ph) => `${ph.urls.raw}&w=1600&q=80&auto=format&fit=crop`);
+    if (!urls.length) {
+      console.warn(`unsplash search "${query}" -> ${(d.results || []).length} result(s), none passed the relevance check`);
+      UNSPLASH_CACHE.set(key, null);
+      return null;
+    }
+    UNSPLASH_CACHE.set(key, urls);
+    return urls;
+  } catch (e) {
+    console.warn(`unsplash search "${query}" failed:`, String(e.message || e).slice(0, 120));
+    UNSPLASH_CACHE.set(key, null);
+    return null;
+  }
+}
+// Generic (no page-text context) HD replacement used by fixImages/
+// qcImageResolution when a broken/low-res image needs swapping and there's
+// nothing to search with beyond "hero or not". Falls back to
+// curatedHero()/curatedPhoto() exactly as before when Unsplash is off/failed.
+async function unsplashOrCurated(isHero) {
+  if (UNSPLASH_ACCESS_KEY) {
+    const results = await unsplashSearch(isHero ? UNSPLASH_QUERY_BY_CATEGORY.hero : "luxury medical spa clinic treatment");
+    if (results && results.length) return results[CURATED_CURSOR++ % results.length];
+  }
+  return isHero ? curatedHero() : curatedPhoto();
+}
+// Category-matched (from surrounding alt/class text) live search, falling
+// back to a generic HD photo when no category matches or Unsplash is off.
+async function contextualMedspaPhoto(txt) {
+  const t = String(txt || "").toLowerCase();
+  let category = null;
+  if (/botox|filler|inject|neuromodulator|juvederm|dysport|sculptra|kybella/i.test(t)) category = "injectables";
+  else if (/laser|peel|resurfacing|ipl|bbl|moxi|morpheus|skin-tightening/i.test(t)) category = "laser";
+  else if (/facial|hydrafacial|skincare|acne|glow|peel|dermaplan/i.test(t)) category = "facial";
+  else if (/body|contour|sculpt|weight|loss|slimming|coolsculpt|emsculpt/i.test(t)) category = "body";
+  else if (/team|doctor|physician|provider|staff|director|clinician|nurse|injector/i.test(t)) category = "team";
+  else if (/hero|flagship|banner|welcome|philosophy|about/i.test(t)) category = "hero";
+
+  if (category && UNSPLASH_ACCESS_KEY) {
+    const results = await unsplashSearch(UNSPLASH_QUERY_BY_CATEGORY[category]);
+    if (results && results.length) return results[CURATED_CURSOR++ % results.length];
+  }
+  return unsplashOrCurated(category === "hero");
+}
+// Runs contextualMedspaPhoto over every <img src> in the page — replaces
+// whatever Stitch/Gemini picked with a real, category-matched photo. Async:
+// each image is resolved concurrently, then swapped in — a plain sync
+// .replace() can't await.
+async function sanitizeAllImages(html) {
+  if (!html || !UNSPLASH_ACCESS_KEY) return html;   // off unless a key is configured
+  const src = String(html);
+  const re = /<img\b([^>]*?)\bsrc=["']([^"']+)["']([^>]*?)>/gi;
+  const matches = [...src.matchAll(re)];
+  if (!matches.length) return html;
+  const urls = await Promise.all(matches.map((m) => contextualMedspaPhoto((m[1] || "") + " " + (m[3] || ""))));
+  let i = 0;
+  return src.replace(re, (match, p1, srcUrl, p2) => `<img${p1}src="${urls[i++]}"${p2}>`);
+}
+
 // Guarantee no broken images: Stitch sometimes emits session-bound
 // lh3.googleusercontent.com/aida/... URLs that fail in the browser (and even
 // /aida-public/ ones expire). Replace any image that isn't a stable, loading
 // image with a curated topical photo. Deterministic, no LLM needed.
 async function fixImages(html) {
+  // Category-relevance pass first (off/no-op unless UNSPLASH_ACCESS_KEY is
+  // set) — this is what makes a "botox" section actually show an injection
+  // photo instead of whatever Stitch happened to pick.
+  html = await sanitizeAllImages(html);
   const urls = [...new Set((html.match(/https:\/\/lh3\.googleusercontent\.com\/[A-Za-z0-9_\-\/=]+/g) || []))];
   if (!urls.length) return html;
   for (const u of urls) {
@@ -1465,7 +1587,7 @@ async function fixImages(html) {
         if (!r.ok || !((r.headers.get("content-type") || "").startsWith("image"))) replace = true;
       } catch (e) { replace = true; }
     }
-    if (replace) { const c = curatedPhoto(); html = html.split(u).join(c); console.log(`  img fix: ${u.slice(40, 56)}… -> curated`); }
+    if (replace) { const c = await unsplashOrCurated(false); html = html.split(u).join(c); console.log(`  img fix: ${u.slice(40, 56)}… -> ${UNSPLASH_ACCESS_KEY ? "unsplash/curated" : "curated"}`); }
   }
   return html;
 }
@@ -1835,7 +1957,8 @@ async function qcImageResolution(html, minWidth = 1000) {
   const dims = await Promise.all(urls.map((u) => imageDims(u)));
   const heroes = heroImageUrls(html);
   const report = []; let swapped = 0;
-  urls.forEach((u, i) => {
+  for (let i = 0; i < urls.length; i++) {
+    const u = urls[i];
     const d = dims[i];
     const isHero = heroes.has(u);
     const need = isHero ? HERO_MIN_WIDTH : minWidth;
@@ -1845,7 +1968,7 @@ async function qcImageResolution(html, minWidth = 1000) {
       // unreadable header ≠ broken image (some CDNs refuse ranged reads), so only
       // replace when we positively measured it as too small
       if (d) {
-        const repl = isHero ? curatedHero() : curatedPhoto();
+        const repl = await unsplashOrCurated(isHero);
         html = html.split(u).join(repl);
         row.action = `replaced (${d.w}px < ${need}px${isHero ? ", hero" : ""})`; swapped++;
       } else {
@@ -1853,7 +1976,7 @@ async function qcImageResolution(html, minWidth = 1000) {
       }
     }
     report.push(row);
-  });
+  }
   if (swapped) console.log(`  image QC: replaced ${swapped}/${urls.length} under-resolution image(s) (hero bar ${HERO_MIN_WIDTH}px, inline ${minWidth}px)`);
   return { html, report };
 }
@@ -1955,6 +2078,23 @@ function retargetNav(html, theme) {
 // replacing it — two footers stacked on every assembled page (confirmed on a
 // real generation, 2026-08-06).
 function stripSiteChrome(html, opts = {}) {
+  // A <footer> commonly wraps its own link columns in a <nav> — a valid,
+  // common HTML5 pattern (the earlier screenshot's own "SERVICES"/"LEGAL"
+  // footer columns are exactly this shape). The nav-stripping pass below scans
+  // the WHOLE document, not just the top of the page, so a footer's internal
+  // nav — especially one that includes a "Home" link or the word "menu", both
+  // routine in a footer's quick-links — gets misread as a SITE header nav and
+  // gutted. When the footer isn't about to be replaced (opts.footer is
+  // false), NOTHING refills that gap: the footer silently loses its content
+  // and just looks broken. Set the whole footer aside first so the nav-strip
+  // pass below can never reach into it; splice it back untouched afterward.
+  // If the footer IS about to be replaced, no protection needed — it's coming
+  // out entirely a few lines down regardless of what's inside it.
+  let savedFooter = null;
+  if (!opts.footer) {
+    const m = html.match(/<footer\b[\s\S]*?<\/footer>/i);
+    if (m) { savedFooter = m[0]; html = html.replace(m[0], " G99FOOTERSAVED "); }
+  }
   html = html.replace(/<header\b[\s\S]*?<\/header>/gi, "");
   html = html.replace(/<nav\b[^>]*>[\s\S]*?<\/nav>/gi, (m) => {
     const head = m.slice(0, 240).toLowerCase();
@@ -1963,6 +2103,7 @@ function stripSiteChrome(html, opts = {}) {
     return isSiteNav ? "" : m;
   });
   if (opts.footer) html = html.replace(/<footer\b[\s\S]*?<\/footer>/gi, "");
+  else if (savedFooter != null) html = html.replace(" G99FOOTERSAVED ", savedFooter);
   return html;
 }
 function injectCanonicalNav(html, theme) {
