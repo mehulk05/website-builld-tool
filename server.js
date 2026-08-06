@@ -1301,7 +1301,7 @@ async function bindSiteSmart(engineSuffix, theme) {
   const written = [];
   for (const [k, out] of present) {
     let html = read(k);
-    html = stripSiteChrome(html);
+    html = stripSiteChrome(html, { footer: !!(chrome && chrome.footer) });
     if (chrome) {
       html = html.replace(/<body[^>]*>/i, (mm) => mm + "\n" + banner + "\n" + chrome.header);
       if (chrome.footer) html = html.replace(/<\/body>/i, chrome.footer + "\n</body>");
@@ -1948,7 +1948,13 @@ function retargetNav(html, theme) {
 // Remove ALL top-of-site chrome the model produced (it may emit several: a
 // fixed bar, a mobile menu, a duplicate) so ours is the ONLY header — then
 // inject one canonical nav. In-content sub-navs (category tabs) are left alone.
-function stripSiteChrome(html) {
+// opts.footer strips the page's own <footer> too — only pass this when a
+// replacement footer is actually about to be injected; otherwise the page
+// loses its footer with nothing put back. Without this, bindSiteSmart injected
+// its chosen chrome.footer AFTER the page's own original footer instead of
+// replacing it — two footers stacked on every assembled page (confirmed on a
+// real generation, 2026-08-06).
+function stripSiteChrome(html, opts = {}) {
   html = html.replace(/<header\b[\s\S]*?<\/header>/gi, "");
   html = html.replace(/<nav\b[^>]*>[\s\S]*?<\/nav>/gi, (m) => {
     const head = m.slice(0, 240).toLowerCase();
@@ -1956,6 +1962,7 @@ function stripSiteChrome(html) {
       || /book|consult|home<\/a>|home\s*<|menu/i.test(m);
     return isSiteNav ? "" : m;
   });
+  if (opts.footer) html = html.replace(/<footer\b[\s\S]*?<\/footer>/gi, "");
   return html;
 }
 function injectCanonicalNav(html, theme) {
@@ -4631,23 +4638,31 @@ async function runJob(job) {
     jobStep(job, 2, "done", `${ok.length}/${(gen.pages || []).length} pages generated`);
 
     // 3.5 — Compare Existing Website Design Score with Stitch Generated Design
+    // Was: beforeScore/afterScore silently fell back to hardcoded 52/94 whenever
+    // job.before was missing (no existing-site URL given) or the audit came back
+    // with a falsy .overall — so the step could show a fake "Existing 52/100 ->
+    // Stitch 94/100" that had nothing to do with the real site. And the catch
+    // block swallowed the real failure reason and reported a fake "completed" —
+    // exactly the "benchmark sahi se kaam nahi kar raha" symptom. Report a real
+    // number or say plainly why there isn't one; never substitute a constant.
     jobStep(job, 3, "running", "Auditing Stitch generated design & comparing with existing website…");
     try {
       const stitchAudit = await localApi("/api/cro-audit-beta", { engine: "" });
-      const beforeScore = (job.before && job.before.overall) || 52;
-      const afterScore = (stitchAudit && stitchAudit.overall) || 94;
-      const delta = afterScore - beforeScore;
+      const beforeScore = (job.before && typeof job.before.overall === "number") ? job.before.overall : null;
+      const afterScore = (stitchAudit && typeof stitchAudit.overall === "number") ? stitchAudit.overall : null;
+      const delta = (beforeScore != null && afterScore != null) ? afterScore - beforeScore : null;
       job.designComparison = {
-        beforeScore,
-        afterScore,
-        delta,
+        beforeScore, afterScore, delta,
         beforeAudit: job.before || null,
         stitchAudit: stitchAudit || null,
-        comparisonSummary: `Existing Site (${beforeScore}/100) vs Stitch Luxury Design (${afterScore}/100) — Improvement: ${delta >= 0 ? "+" : ""}${delta} pts`
+        comparisonSummary: beforeScore == null
+          ? (afterScore == null ? "No existing-site audit and the generated-design audit returned no score." : `No existing site was audited (nothing to compare against) — generated design: ${afterScore}/100.`)
+          : (afterScore == null ? `Existing site: ${beforeScore}/100 — the generated-design audit returned no score.` : `Existing Site (${beforeScore}/100) vs Stitch Luxury Design (${afterScore}/100) — ${delta >= 0 ? "+" : ""}${delta} pts`),
       };
-      jobStep(job, 3, "done", `Design Score: Existing ${beforeScore}/100 ➔ Stitch ${afterScore}/100 (${delta >= 0 ? "+" : ""}${delta} pts)`);
+      jobStep(job, 3, "done", job.designComparison.comparisonSummary);
     } catch (e) {
-      jobStep(job, 3, "done", "Design Benchmark comparison completed");
+      job.designComparison = { beforeScore: null, afterScore: null, delta: null, error: e.message };
+      jobStep(job, 3, "error", "Could not compute the design benchmark: " + String(e.message).slice(0, 180));
     }
 
     // 4 — assemble into one coherent site
@@ -9401,7 +9416,15 @@ function cdnWebpUrl(src, width = IMG_TARGET_WIDTH) {
   }
   return null;
 }
-async function fixImages(themeAbs, pages, businessName, facts, themePath) {
+// NOTE: named performPrFixImages, not fixImages — a same-file "async function
+// fixImages(html)" already exists above (the image-QC helper every generate-site/
+// enrich call site depends on). A same-name function declaration in JS silently
+// wins over an earlier one for EVERY call site, not just this feature's own — that
+// collision made /api/generate-site call this one instead, with html positionally
+// bound to themeAbs and everything else undefined, throwing on facts.city.
+// Confirmed live, 2026-08-06: "Cannot read properties of undefined (reading 'city')"
+// at this line, reproduced by calling fixImages(html) exactly as generate-site does.
+async function performPrFixImages(themeAbs, pages, businessName, facts, themePath) {
   const bizSlug = prSlugify(businessName).split("-").slice(0, 3).join("-");
   const loc = facts.city ? `in-${prSlugify(facts.city)}${facts.region ? "-" + prSlugify(facts.region) : ""}` : "";
   const dir = path.join(themeAbs, "assets", "img");
@@ -10024,7 +10047,7 @@ async function runPerformPrJob(job) {
     record("CTA on every page", fixCta(themeAbs, pages, job.prFindings, P.themePath), "cta");
     // Images last of the content fixes: it rewrites src attributes across every
     // template, so it should not race the edits above on the same files.
-    const imgFix = await fixImages(themeAbs, pages, P.businessName, facts, P.themePath);
+    const imgFix = await performPrFixImages(themeAbs, pages, P.businessName, facts, P.themePath);
     job.imageSwaps = imgFix.swaps || [];
     record("Image naming", imgFix, "image-naming");
     if ((imgFix.changed || []).length) { fixedTasks.add("image-format"); fixedTasks.add("image-weight"); }
@@ -11449,27 +11472,25 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, rep);
     }
 
-    // Design Benchmark Comparison API endpoint
+    // Design Benchmark Comparison API endpoint.
+    // NOTE: not called by any current frontend — but a hardcoded-fake-score
+    // endpoint is a landmine for whoever wires it up next, so it reports real
+    // numbers (or null) instead of the constants (52/94, and four metrics that
+    // never moved regardless of the actual site) it shipped with before.
     if (p === "/api/design-benchmark" && req.method === "GET") {
-      let beforeScore = 52, afterScore = 94;
-      try {
-        const ex = JSON.parse(fs.readFileSync(path.join(GEN, ".cro-existing.json"), "utf8"));
-        if (ex && ex.overall) beforeScore = ex.overall;
-      } catch (e) {}
-      try {
-        const beta = JSON.parse(fs.readFileSync(path.join(GEN, ".cro-beta.json"), "utf8"));
-        if (beta && beta.overall) afterScore = beta.overall;
-      } catch (e) {}
+      let ex = null, beta = null;
+      try { ex = JSON.parse(fs.readFileSync(path.join(GEN, ".cro-existing.json"), "utf8")); } catch (e) {}
+      try { beta = JSON.parse(fs.readFileSync(path.join(GEN, ".cro-beta.json"), "utf8")); } catch (e) {}
+      const beforeScore = ex && typeof ex.overall === "number" ? ex.overall : null;
+      const afterScore = beta && typeof beta.overall === "number" ? beta.overall : null;
+      const cat = (k) => ({
+        before: ex && ex[k] && typeof ex[k].score === "number" ? ex[k].score : null,
+        after: beta && beta[k] && typeof beta[k].score === "number" ? beta[k].score : null,
+      });
       return json(res, 200, {
-        beforeScore,
-        afterScore,
-        delta: afterScore - beforeScore,
-        metrics: {
-          visualElegance: 96,
-          conversionArchitecture: 94,
-          colorHarmony: 95,
-          layoutRhythm: 98
-        }
+        beforeScore, afterScore,
+        delta: (beforeScore != null && afterScore != null) ? afterScore - beforeScore : null,
+        metrics: { vision: cat("vision"), ux: cat("ux"), cro: cat("cro"), content: cat("content") },
       });
     }
 
@@ -11898,7 +11919,7 @@ module.exports = {
   findingsBusinessName, findingsContact, findingsClickable, findingsCta, findingsFavicon,
   fetchLiveSitemap, sitemapLocs, urlSlug, findingsMissingPages, resolveLiveSite,
   splitLocationSlug, findingsUrlStructure, pageSpeedRun, findingsPageSpeed, psiReportUrl, collapseFindings,
-  fixSpelling, fixCta, extractCtaBlock, fixImages, cdnWebpUrl, imageSubject, uniqueImageName,
+  fixSpelling, fixCta, extractCtaBlock, performPrFixImages, cdnWebpUrl, imageSubject, uniqueImageName,
   writeRedirectMap, readRedirectMap, fixUrlStructure, findingsInternalLinks, bestRedirectTarget, fixInternalLinks,
   tedComment, tedUpdateTask,
   OUTCOME, OUTCOME_LABEL, resolveFindingOutcomes, replaceInTextNodes, fixBusinessName,

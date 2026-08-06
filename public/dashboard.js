@@ -150,14 +150,16 @@ function setStep(n, state, msg) {
 }
 function out(n, html) { $("out" + n).innerHTML = html; }
 
-// gauge svg (0-100)
+// gauge svg (0-100). score == null renders an empty ring + "—", not a fake 0.
 function gauge(score, label) {
-  const s = Math.max(0, Math.min(100, score || 0)); const r = 38, c = 2 * Math.PI * r, off = c * (1 - s / 100);
-  const col = s >= 75 ? "var(--good)" : s >= 50 ? "var(--warn)" : "var(--bad)";
+  const known = typeof score === "number";
+  const s = known ? Math.max(0, Math.min(100, score)) : 0;
+  const r = 38, c = 2 * Math.PI * r, off = known ? c * (1 - s / 100) : c;
+  const col = !known ? "var(--line-light)" : s >= 75 ? "var(--good)" : s >= 50 ? "var(--warn)" : "var(--bad)";
   return `<div class="gauge-item"><div class="gauge"><svg viewBox="0 0 100 100">
     <circle cx="50" cy="50" r="${r}" fill="none" stroke="var(--line-light)" stroke-width="8"/>
     <circle cx="50" cy="50" r="${r}" fill="none" stroke="${col}" stroke-width="8" stroke-linecap="round" stroke-dasharray="${c.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}"/>
-  </svg><div class="n">${s}</div></div><div class="lbl">${esc(label)}</div></div>`;
+  </svg><div class="n">${known ? s : "—"}</div></div><div class="lbl">${esc(label)}</div></div>`;
 }
 function catsHtml(rep) {
   return `<div class="cats">${["vision", "ux", "cro", "content"].map((k) => {
@@ -405,55 +407,54 @@ async function buildBetaSite() {
     out(3, `${thumbStrip([...okKeys])}${progressRowsFinal(okKeys)}<div style="margin-top:12px"><a class="prlink" href="${esc(bound.siteUrl || "/site/")}" target="_blank">↗ Preview assembled site</a></div>${okPages.length < PAGES.length ? `<div class="hint">⚠ ${PAGES.length - okPages.length} page(s) failed in Stitch — retry Build for a full set.</div>` : ""}`);
 
     // Step 4 — Design Score Benchmark
+    // Was: sAfter forced to Math.max(96, sBefore+34) whenever the real audit
+    // scored under 88 — so a mediocre generation still reported a fake ~96+.
+    // And the four "metric" boxes below (Typography 96, Conversion 94, Color
+    // 95, Layout 98) were literal HTML, never computed from anything. Both
+    // replaced with the audit's own real per-category scores; when there's no
+    // real number, say so instead of showing one.
     setStep(4, "run", "Benchmarking generated design...");
     let betaAudit = null;
     try { betaAudit = await api("/api/cro-audit-beta", { engine: "" }); } catch (e) {}
-    const sBefore = croBefore ? croBefore.overall : 62;
-    const sAfter = (betaAudit && betaAudit.overall && betaAudit.overall >= 88) ? betaAudit.overall : Math.max(96, sBefore + 34);
-    const dScore = sAfter - sBefore;
-    setStep(4, "done", `Benchmark: Existing ${sBefore}/100 ➔ Stitch ${sAfter}/100 (${dScore >= 0 ? "+" : ""}${dScore} pts).`);
+    const sBefore = croBefore ? croBefore.overall : null;
+    const sAfter = (betaAudit && typeof betaAudit.overall === "number") ? betaAudit.overall : null;
+    const dScore = (sBefore != null && sAfter != null) ? sAfter - sBefore : null;
+    const benchLine = sBefore == null
+      ? (sAfter == null ? "No existing-site audit and the generated-design audit returned no score." : `No existing site was audited — generated design: ${sAfter}/100.`)
+      : (sAfter == null ? `Existing site: ${sBefore}/100 — the generated-design audit returned no score.` : `Benchmark: Existing ${sBefore}/100 ➔ Stitch ${sAfter}/100 (${dScore >= 0 ? "+" : ""}${dScore} pts).`);
+    setStep(4, "done", benchLine);
+    const catBox = (label, key) => {
+      const b = croBefore && croBefore[key] && typeof croBefore[key].score === "number" ? croBefore[key].score : null;
+      const a = betaAudit && betaAudit[key] && typeof betaAudit[key].score === "number" ? betaAudit[key].score : null;
+      const d = (b != null && a != null) ? a - b : null;
+      return `<div style="background:var(--bg-input); border:1px solid var(--line); border-radius:8px; padding:10px 12px;">
+      <div style="font-size:10.5px; color:var(--muted); text-transform:uppercase; font-weight:600">${esc(label)}</div>
+      <div style="font-size:15px; font-weight:700; color:var(--good); margin-top:2px">${a == null ? "—" : a + "/100"}${d == null ? "" : ` (${d >= 0 ? "+" : ""}${d} pts)`}</div>
+      <div style="font-size:11px; color:var(--muted); margin-top:2px">${b == null ? "no existing-site score" : "was " + b + "/100"}</div>
+    </div>`;
+    };
+    const notes = (betaAudit && betaAudit.summary && betaAudit.summary.strengths) || [];
     out(4, `
 <div style="margin-top:10px; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px;">
   <div style="display:flex; align-items:center; gap:24px; flex-wrap:wrap; margin-bottom:14px;">
     ${gauge(sBefore, "Existing site")}
     ${gauge(sAfter, "Stitch Design")}
     <div style="display:flex; flex-direction:column; gap:2px;">
-      <span style="font-size:20px; font-weight:800; color:${dScore >= 0 ? "var(--good)" : "var(--bad)"}">${dScore >= 0 ? "▲ +" : "▼ "}${dScore} Points Improvement</span>
-      <span style="font-size:11.5px; color:var(--muted)">Elevated from legacy directory to outcome-focused luxury destination</span>
+      <span style="font-size:20px; font-weight:800; color:${dScore == null ? "var(--muted)" : dScore >= 0 ? "var(--good)" : "var(--bad)"}">${dScore == null ? "—" : (dScore >= 0 ? "▲ +" : "▼ ") + dScore + " Points"}</span>
+      <span style="font-size:11.5px; color:var(--muted)">${esc(benchLine)}</span>
     </div>
   </div>
 
   <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:10px; margin-bottom:14px;">
-    <div style="background:var(--bg-input); border:1px solid var(--line); border-radius:8px; padding:10px 12px;">
-      <div style="font-size:10.5px; color:var(--muted); text-transform:uppercase; font-weight:600">Typography & Hierarchy</div>
-      <div style="font-size:15px; font-weight:700; color:var(--good); margin-top:2px">96/100 (+32 pts)</div>
-      <div style="font-size:11px; color:var(--muted); margin-top:2px">Tenor Sans & Lora 2-Part Headings</div>
-    </div>
-    <div style="background:var(--bg-input); border:1px solid var(--line); border-radius:8px; padding:10px 12px;">
-      <div style="font-size:10.5px; color:var(--muted); text-transform:uppercase; font-weight:600">Conversion Architecture</div>
-      <div style="font-size:15px; font-weight:700; color:var(--good); margin-top:2px">94/100 (+35 pts)</div>
-      <div style="font-size:11px; color:var(--muted); margin-top:2px">Sticky CTAs & Guarantee Badges</div>
-    </div>
-    <div style="background:var(--bg-input); border:1px solid var(--line); border-radius:8px; padding:10px 12px;">
-      <div style="font-size:10.5px; color:var(--muted); text-transform:uppercase; font-weight:600">Color Palette & Contrast</div>
-      <div style="font-size:15px; font-weight:700; color:var(--good); margin-top:2px">95/100 (+28 pts)</div>
-      <div style="font-size:11px; color:var(--muted); margin-top:2px">WCAG Onyx & Champagne Gold</div>
-    </div>
-    <div style="background:var(--bg-input); border:1px solid var(--line); border-radius:8px; padding:10px 12px;">
-      <div style="font-size:10.5px; color:var(--muted); text-transform:uppercase; font-weight:600">Layout Rhythm & Parallax</div>
-      <div style="font-size:15px; font-weight:700; color:var(--good); margin-top:2px">98/100 (+38 pts)</div>
-      <div style="font-size:11px; color:var(--muted); margin-top:2px">14rem Engraved Watermark & Motion</div>
-    </div>
+    ${catBox("Visual design", "vision")}
+    ${catBox("UX & usability", "ux")}
+    ${catBox("CRO & conversion", "cro")}
+    ${catBox("Content & copy", "content")}
   </div>
 
-  <div style="font-size:12px; font-weight:700; color:var(--ink); margin-bottom:4px">Key Design Improvements Applied by Stitch:</div>
-  <ul style="margin:0; padding-left:16px; font-size:11.5px; color:var(--muted); line-height:1.5">
-    <li><b>Engraved Parallax Brand Wordmark</b>: 14rem ultra-subtle brand watermark bleeding behind mid-page sections & footer.</li>
-    <li><b>Two-Part Luxury Headings</b>: Display serif headline paired with accent gold italicized sub-lines across all sections.</li>
-    <li><b>Caption-on-Photo Cards</b>: Service cards feature prices and labels written directly ON the photo under a gradient scrim.</li>
-    <li><b>Sticky Mobile Conversion Bar</b>: Fixed mobile CTA bar with one-tap calling and instant appointment booking.</li>
-    <li><b>60fps CSS Keyframe Animations</b>: Embedded scroll-reveal entrance keyframes, floating trust pills, and 3D hover scale transforms.</li>
-  </ul>
+  ${notes.length ? `<div style="font-size:12px; font-weight:700; color:var(--ink); margin-bottom:4px">What the new design does well:</div>
+  <ul style="margin:0; padding-left:16px; font-size:11.5px; color:var(--muted); line-height:1.5">${notes.slice(0, 6).map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}
+  <div style="font-size:10.5px; color:var(--muted); margin-top:10px">Score is a Gemini-judged read of design/UX/conversion/copy signals — treat the delta as directional, not a lab measurement.</div>
 </div>`);
 
     // Step 5 — WP theme + PR (site already bound above; skipRebind avoids doing it twice)
