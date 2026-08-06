@@ -9187,7 +9187,7 @@ const OUTCOME_LABEL = { done: "Done", pending: "Pending", decision: "Decision", 
 const NOT_HERE_TASKS = new Set([]);
 // Tasks phase 2 owns. Anything here starts as pending and is upgraded to done
 // only when the corresponding fix reports that it changed a file.
-const FIXABLE_TASKS = new Set(["favicon", "clickable-contact", "business-name", "url-structure", "internal-links",
+const FIXABLE_TASKS = new Set(["favicon", "clickable-contact", "business-name", "internal-links",
   "spelling", "cta", "image-naming", "image-format", "image-weight"]);
 function resolveFindingOutcomes(findings, fixedTasks) {
   for (const f of findings) {
@@ -9488,8 +9488,10 @@ function writeRedirectMap(themeAbs, themePath, pairs) {
     map.set(from, to);
   }
   if (!map.size) return { changed: [], entries: 0 };
+  // Eight spaces, not four: the array opens inside a closure that is already
+  // indented, and Pint fails the build on array_indentation.
   const rows = [...map.entries()].filter(([f, t]) => f !== t)
-    .map(([f, t]) => `    '${f.replace(/'/g, "\\'")}' => '${t.replace(/'/g, "\\'")}',`).join("\n");
+    .map(([f, t]) => `        '${f.replace(/'/g, "\\'")}' => '${t.replace(/'/g, "\\'")}',`).join("\n");
   const php = [
     "<?php",
     "",
@@ -9537,10 +9539,25 @@ function writeRedirectMap(themeAbs, themePath, pairs) {
   return { changed, entries: map.size };
 }
 
-// The slug lives in the mu-plugin's $pages array, which is the authority on which
-// template serves which URL. Templates keep their filenames — only the slug moves.
+// Renaming a slug here does NOT rename the page. The mu-plugin seeds pages into
+// the WordPress database once and guards it with a per-build option flag, so a
+// changed slug creates nothing — the old page keeps serving the old URL and the
+// new URL has no page behind it. Shipping that produced 301s into 404s on a live
+// site: /medical-spa-services/ redirected to a location URL that did not exist.
+//
+// The slug lives in the database, and a pull request cannot reach it. So this is
+// a decision for a human with wp-admin, not an automatic fix. Left here, and
+// deliberately inert, because the audit that finds these URLs is still correct
+// and worth reporting — it is only the applying that was wrong.
+const URL_RENAME_ENABLED = process.env.PERFORM_PR_RENAME_SLUGS === "on";
 function fixUrlStructure(themeAbs, muAbs, muPath, themePath, renames) {
   if (!renames.length) return { changed: [], note: "every service URL already carries the location", skipped: true, renamed: [] };
+  if (!URL_RENAME_ENABLED) {
+    return {
+      changed: [], skipped: true, renamed: [],
+      note: `${renames.length} URL(s) need the location, but the slug lives in the WordPress database — rename in wp-admin, then re-run`,
+    };
+  }
   if (!muAbs || !fs.existsSync(muAbs)) return { changed: [], note: "no mu-plugin found — slugs cannot be changed safely", skipped: true, renamed: [] };
   let mu = fs.readFileSync(muAbs, "utf8");
   const applied = [];
@@ -10198,6 +10215,27 @@ function performPrPrBody(job, reportUrl) {
   return L.join("\n");
 }
 
+// Report back to the task that asked for the run. Only when the run was started
+// by a TED webhook — a run kicked off from the dashboard has no ticket to answer,
+// and posting to a default task would put one client's findings on another's thread.
+function postPerformPrToTed(job, extra) {
+  const taskId = job.payload && job.payload.tedTaskId;
+  if (!taskId) return;
+  const f = job.prFindings || [];
+  const n = (o) => f.filter((x) => x.outcome === o).length;
+  const fixed = (job.prTasks || []).filter((t) => t.status === "fixed");
+  const lines = [
+    `Pre-release checks completed for ${job.businessName}.`,
+    "",
+    `${(job.prTasks || []).length} checks ran. ${n("done")} done, ${n("decision")} need a decision, ${n("pending")} pending.`,
+  ];
+  if (fixed.length) lines.push("", "Fixed in this run:", ...fixed.map((t) => `- ${t.label}: ${t.detail || ""}`));
+  if (extra) lines.push("", extra);
+  if (job.prUrl) lines.push("", `Pull request: ${job.prUrl}`);
+  if (job.reportUrl) lines.push("", "Report:", absUrl(job.reportUrl));
+  tedComment(lines.join("\n"), null, 0, String(taskId));
+}
+
 function newPerformPrJob(payload) {
   return {
     type: "perform-pr", draftId: String(payload.jobId), businessId: null,
@@ -10469,6 +10507,7 @@ async function runPerformPrJob(job) {
       job.status = "done";
       job.error = `PR opened but not merged — ${why}. ${job.prUrl}`;
       notify(`Perform PR audited *${job.businessName}* but did not merge (${why}) — ${absUrl(job.reportUrl)}`);
+      postPerformPrToTed(job, `The pull request is open but not merged (${why}).`);
       return;
     }
 
@@ -10502,6 +10541,7 @@ async function runPerformPrJob(job) {
     jobStep(job, 12, "done", `${job.prFindings.length} finding(s) · ${job.prChanged.length} file(s) changed`);
     job.status = "done";
     notify(`Perform PR finished for *${job.businessName}*: ${job.prChanged.length} file(s) fixed, ${job.prFindings.length} finding(s) (${high} high) — ${absUrl(job.reportUrl)}`);
+    postPerformPrToTed(job);
   } catch (e) {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
     if (e && e.cancelled) job.status = "cancelled";
@@ -10677,6 +10717,76 @@ const server = http.createServer(async (req, res) => {
         + (confirmedBrand ? ` · client-confirmed brand ${confirmedBrand.primaryColor || "?"}/${confirmedBrand.accentColor || "?"} ${confirmedBrand.headingFont || "?"}` : " · no confirmed brand (will derive)"));
       res.writeHead(202, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ accepted: true, dedupe, draftId: job.draftId, status: job.status, monitor: "/jobs" }));
+    }
+
+    // TED task event → Perform PR. Sits outside the admin-key gate because it
+    // carries its own secret, like the other webhooks.
+    //
+    // TED does not send a siteId — it sends a client name and a task. So the
+    // client is resolved against NocoDB by name, and the run is refused rather
+    // than guessed when that lookup is ambiguous: starting a pre-release pass on
+    // the wrong client's repository is not a recoverable mistake.
+    //
+    // The webhook's "Include Sibling Task Details" option puts the task to
+    // report against in `target`, so the run knows where to post its findings.
+    if (p === "/api/webhook/ted-task" && req.method === "POST") {
+      const secret = process.env.WEBHOOK_SECRET || "";
+      if (!secret || (req.headers["x-webhook-secret"] || "") !== secret) return json(res, 401, { error: "bad webhook secret" });
+      const body = JSON.parse(await readBody(req) || "{}");
+      const dig = (...keys) => {
+        for (const k of keys) {
+          for (const src of [body, body.task, body.data, body.record, body.payload]) {
+            const v = src && src[k];
+            if (v != null && String(v).trim()) return String(v).trim();
+          }
+        }
+        return "";
+      };
+      const clientName = dig("clientName", "client_name", "client", "customerName", "accountName", "businessName");
+      const templateKey = dig("templateKey", "template_key", "taskTemplateKey", "key");
+      const status = dig("status", "taskStatus", "newStatus");
+      const targetTask = (body.target && (body.target.id || body.target.taskId)) || dig("targetTaskId");
+      // Until a real payload has been seen, log the whole thing. "Test Webhook"
+      // then tells us the field names instead of us guessing at them.
+      if (!clientName) {
+        console.warn("ted-task webhook: no client name found. payload:", JSON.stringify(body).slice(0, 1200));
+        return json(res, 422, { error: "no client name in payload", seen: Object.keys(body), hint: "send clientName, or tell Studio which field carries it" });
+      }
+      // Only the configured trigger should start a run. With "All Events" selected
+      // in TED this endpoint would otherwise fire on every comment and edit.
+      const wantKey = (process.env.TED_PERFORM_PR_KEY || "").trim();
+      const wantStatus = (process.env.TED_PERFORM_PR_STATUS || "").trim();
+      if (wantKey && templateKey && templateKey !== wantKey) return json(res, 200, { ignored: true, reason: `template key ${templateKey} is not ${wantKey}` });
+      if (wantStatus && status && status.toLowerCase() !== wantStatus.toLowerCase()) return json(res, 200, { ignored: true, reason: `status ${status} is not ${wantStatus}` });
+
+      let sites; try { sites = await getWebsites(true); } catch (e) { return json(res, 502, { error: "NocoDB lookup failed: " + e.message }); }
+      const norm = (s) => String(s || "").toLowerCase().replace(/\(.*?\)/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+      const want = norm(clientName);
+      const exact = sites.filter((s) => norm(s.businessName) === want);
+      const loose = exact.length ? exact : sites.filter((s) => norm(s.businessName).includes(want) || want.includes(norm(s.businessName)));
+      if (loose.length !== 1) {
+        return json(res, 409, {
+          error: loose.length ? `"${clientName}" matches ${loose.length} sites` : `no NocoDB site matches "${clientName}"`,
+          candidates: loose.map((s) => s.businessName).slice(0, 5),
+        });
+      }
+      const site = loose[0];
+      if (!site.githubRepo) return json(res, 409, { error: site.businessName + " has no repository set in NocoDB" });
+      if (!site.liveUrl) return json(res, 409, { error: site.businessName + " has no Domain set in NocoDB" });
+      let target; try { target = await resolveEditTarget(site); } catch (e) { return json(res, 409, { error: e.message }); }
+      const running = [...JOBS.values()].find((j) => j.type === "perform-pr"
+        && (j.status === "queued" || j.status === "running") && j.payload && j.payload.siteId === site.siteId);
+      if (running) return json(res, 202, { jobId: running.draftId, dedupe: true, site: site.businessName });
+      const job = enqueuePerformPrJob({
+        jobId: "perform-pr-" + Date.now(), siteId: site.siteId,
+        businessName: site.businessName, githubRepo: site.githubRepo,
+        themeSlug: target.themeSlug, themePath: target.themePath,
+        muPath: target.muPath, liveUrl: site.liveUrl,
+        existingSiteUrl: site.existingSiteUrl || "",
+        // Where the report goes when the run finishes.
+        tedTaskId: targetTask || dig("id", "taskId") || "",
+      });
+      return json(res, 202, { jobId: job.draftId, site: site.businessName, tedTaskId: job.payload.tedTaskId || null });
     }
 
     // Inbound email → website change. Any transport that can POST JSON works;
