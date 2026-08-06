@@ -9584,6 +9584,18 @@ function fixUrlStructure(themeAbs, muAbs, muPath, themePath, renames) {
 // Internal links that point at a page this site does not have. Checked against
 // the page list rather than over the network, so it runs before the PR instead
 // of after the deploy — which is the only point at which it can still be fixed.
+// header.php and footer.php are not page templates, so they were outside this
+// check — and they are exactly where a broken link does the most damage, because
+// it appears on every page. /services/ and /about/ sat 404ing in this site's nav
+// and footer while the check reported "every internal link resolves".
+function themeChromePages(themeAbs) {
+  const out = [];
+  for (const file of ["header.php", "footer.php"]) {
+    const abs = path.join(themeAbs, file);
+    if (fs.existsSync(abs)) out.push({ slug: `(${file.replace(".php", "")})`, file, php: fs.readFileSync(abs, "utf8") });
+  }
+  return out;
+}
 function findingsInternalLinks(pages, muPages) {
   const known = new Set(["", "home", ...muPages.map((p) => String(p.slug || "").toLowerCase())]);
   const out = [];
@@ -10339,7 +10351,8 @@ async function runPerformPrJob(job) {
       `${urls.detail}${urls.findings.length ? ` — ${urls.findings.length} issue(s)` : " — all correct"}`, urls.findings);
     // Checked against the page list rather than over the network, so a dead
     // internal link can still be fixed in this PR instead of found after deploy.
-    const linkF = findingsInternalLinks(pages, muPages);
+    // Page templates plus header/footer: a bad link in the chrome is on every page.
+    const linkF = findingsInternalLinks([...pages, ...themeChromePages(themeAbs)], muPages);
     task("Internal links", linkF.length ? "fail" : "pass", linkF.length ? `${linkF.length} link(s) point at a missing page` : "every internal link resolves", linkF);
     const nameF = findingsBusinessName(pages, P.businessName);
     task("Business name", nameF.length ? "fail" : "pass", nameF.length ? `${nameF.length} inconsistency(ies)` : `"${P.businessName}" used consistently`, nameF);
@@ -12342,7 +12355,7 @@ module.exports = {
   fetchLiveSitemap, sitemapLocs, urlSlug, findingsMissingPages, resolveLiveSite,
   splitLocationSlug, findingsUrlStructure, pageSpeedRun, findingsPageSpeed, psiReportUrl, collapseFindings,
   fixSpelling, fixCta, extractCtaBlock, performPrFixImages, cdnWebpUrl, imageSubject, uniqueImageName,
-  writeRedirectMap, readRedirectMap, fixUrlStructure, findingsInternalLinks, bestRedirectTarget, fixInternalLinks,
+  writeRedirectMap, readRedirectMap, fixUrlStructure, findingsInternalLinks, bestRedirectTarget, fixInternalLinks, themeChromePages,
   tedComment, tedUpdateTask,
   OUTCOME, OUTCOME_LABEL, resolveFindingOutcomes, replaceInTextNodes, fixBusinessName,
   imageSources, findingsImages, readSeoPages, synthMuSource, pageText,
