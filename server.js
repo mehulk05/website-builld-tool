@@ -11470,7 +11470,17 @@ const server = http.createServer(async (req, res) => {
       try { r = await tedResolveSubtaskRequest(taskId); }
       catch (e) {
         if (e && e.ignore) return json(res, 200, { ignored: true, taskId, reason: e.message });
-        console.warn(`ted-subtask webhook: could not read task ${taskId}:`, e.message);
+        // TED answers a deleted task exactly as it answers an outage — 200 with
+        // the Angular shell — so the response cannot tell them apart. One cheap
+        // probe of a known-good route can: if the rest of TED is answering, the
+        // task itself is gone, and a 502 would have TED retrying an event about
+        // a task that no longer exists until someone noticed.
+        const alive = await tedFetchJson("/api/me").then(() => true).catch(() => false);
+        if (alive) {
+          console.warn(`ted-subtask webhook: task ${taskId} is unreadable but TED is up — treating it as gone`);
+          return json(res, 200, { ignored: true, taskId, reason: `task ${taskId} could not be read (deleted, or not visible to this token)` });
+        }
+        console.warn(`ted-subtask webhook: TED unreachable while reading task ${taskId}:`, e.message);
         return json(res, 502, { error: `TED lookup failed for task ${taskId}: ${e.message}` });
       }
 
