@@ -3305,7 +3305,27 @@ function queueEmailReply(job, text) {
   const p = job && job.payload;
   if (!p || p.source !== "email" || !p.threadId || !text) return;
   const o = readOutbox();
-  o.pending.push({ id: "r" + Date.now() + Math.random().toString(36).slice(2, 6), threadId: p.threadId, text, at: new Date().toISOString() });
+  o.pending.push({ id: "r" + Date.now() + Math.random().toString(36).slice(2, 6), mode: "reply", threadId: p.threadId, text, at: new Date().toISOString() });
+  o.pending = o.pending.slice(-100);
+  writeOutbox(o);
+}
+// Queue a NEW email — its own thread, not a reply — for something that must not
+// get buried at the bottom of the original request thread: a clarification ask
+// on items this run could not complete. Needs the requester's address, not just
+// a threadId, since Apps Script sends this with GmailApp.sendEmail(), not reply().
+function queueClarificationEmail(job, unresolved) {
+  const p = job && job.payload;
+  if (!p || p.source !== "email" || !p.requestedBy || !unresolved || !unresolved.length) return;
+  const text = [
+    "A few items from your request need clarification before I can complete them:",
+    "",
+    ...unresolved.map((u) => `- ${u}`),
+    "",
+    "Reply to this email with more detail on each and I will pick it back up.",
+  ].join("\n");
+  const subject = "Clarification needed — " + (p.emailSubject || p.businessName || "your requested website change");
+  const o = readOutbox();
+  o.pending.push({ id: "r" + Date.now() + Math.random().toString(36).slice(2, 6), mode: "new", to: p.requestedBy, subject, text, at: new Date().toISOString() });
   o.pending = o.pending.slice(-100);
   writeOutbox(o);
 }
@@ -5787,6 +5807,11 @@ async function runEditJob(job) {
     jobStep(job, 6, "done", "Done — change is live on merge/deploy");
     await postEditPrComment(job);
     job.status = "done";
+    // Anything skipped has to be said out loud — otherwise "done" reads as "all
+    // of it done". Two ways an item can be missing: too vague to attempt, or
+    // attempted and not found in the diff afterwards.
+    const skipped = (job.workOrder && job.workOrder.unclear) || [];
+    const notDone = check ? check.results.filter((r2) => r2.done !== true) : [];
     // The second and final message. One line saying what shipped, then the
     // site. No pull request link: internal plumbing, and merged by now anyway.
     // The summary already reads as a sentence, so nothing is appended to it.
@@ -5794,14 +5819,16 @@ async function runEditJob(job) {
       "The change is live now " + String.fromCharCode(8212) + " " + (job.editSummaryEmail || "your requested update").trim(),
       P.liveUrl ? "\n" + P.liveUrl : "",
     ].join("\n").trim());
+    // A separate, brand-new email (not a reply buried under the above) for
+    // anything this run could not finish — too vague to attempt, or attempted
+    // and not confirmed in the diff — asking the requester to clarify it.
+    queueClarificationEmail(job, [
+      ...skipped,
+      ...notDone.map((r2) => String(r2.what || "").trim()).filter(Boolean),
+    ]);
     // Same news to TED, with a screenshot of the updated page. Detached: it
     // waits for the deploy to land, and the job is finished by then.
     tedPostOutcome(job, { ok: true, detail: (job.editSummary || "Your requested update.").trim() });
-    // Anything skipped has to be said out loud — otherwise "done" reads as "all
-    // of it done". Two ways an item can be missing: too vague to attempt, or
-    // attempted and not found in the diff afterwards.
-    const skipped = (job.workOrder && job.workOrder.unclear) || [];
-    const notDone = check ? check.results.filter((r2) => r2.done !== true) : [];
     notify(`✏️ Edit merged for *${job.businessName}*: ${job.editSummary || ""} · ${job.prUrl || ""}`
       + (check ? `\n${check.done}/${check.total} item(s) confirmed in the diff${job.retried ? " (after one retry)" : ""}` : "")
       + (notDone.length ? `\n⚠️ ${notDone.map((r2) => `${r2.done === false ? "not done" : "unverified"}: ${r2.what}`).join("; ")}` : "")
@@ -11014,8 +11041,11 @@ const server = http.createServer(async (req, res) => {
       tedComment(tedRequestComment({ site, addr, subject, instruction, jobId: job.draftId }));
       // Echoing the parsed instruction back is the cheapest guard against a
       // misread: the sender sees what will actually be done before it ships.
-      // The first of only two messages the requester ever gets. Deliberately
-      // short: they wrote the request, so quoting it back adds nothing.
+      // The first message the requester gets. Deliberately short: they wrote
+      // the request, so quoting it back adds nothing. Normally followed by one
+      // more ("live now") on this same thread; a run that leaves anything
+      // unresolved also sends a separate clarification email (see
+      // queueClarificationEmail) rather than burying that in this thread.
       const ack = [
         "Got it " + String.fromCharCode(8212) + " I will review this and work on it.",
         "",
