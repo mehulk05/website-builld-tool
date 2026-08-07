@@ -4010,6 +4010,36 @@ async function tedAiResult(taskId, html, opts = {}) {
   } catch (e) { return { ok: false, error: String(e.message || e) }; }
 }
 
+// Direct artifact push to TED — the screenshots / service-page content handed over as-is, so TED
+// never has to fetch them back from product-service by deal id (a dependency that has repeatedly
+// left task-close comments with no images/content: product-service down, or no deal id filed for a
+// business with no local run yet). This does NOT replace the existing G99 status callback
+// (postStatus/mirrorToParent) — that keeps firing unchanged, and product-service's own milestone
+// webhook to TED stays fully functional as the fallback path. This is simply a second, more direct
+// route for the two artifact-heavy events, since this process already holds the real data in memory.
+async function tedPushArtifacts(eventType, { businessId, draftId, mockups, servicePages, siteUrl } = {}) {
+  if (!TED_API_TOKEN) return { ok: false, error: "TED_API_TOKEN not set" };
+  const headers = { "Content-Type": "application/json" };
+  if (TED_AUTH_HEADER === "x-api-key") headers["X-Api-Key"] = TED_API_TOKEN;
+  else headers["Authorization"] = "Bearer " + TED_API_TOKEN;
+  const body = JSON.stringify({
+    eventType, businessId, draftId,
+    mockups: (mockups || []).map(m => ({ label: m.label, url: m.url, dataUri: m.dataUri || null, error: m.error || null })),
+    servicePages: (servicePages || []).map(p => ({
+      name: p.name, slug: p.slug, status: p.status, engine: p.engine, sourceUrl: p.sourceUrl, brief: p.brief,
+    })),
+    siteUrl: siteUrl || null,
+  });
+  try {
+    const r = await fetch(`${TED_BASE}/api/webhooks/onboarding/artifacts`, { method: "POST", headers, body });
+    const ct = r.headers.get("content-type") || "";
+    if (/html/i.test(ct)) return { ok: false, error: "endpoint not deployed (got the TED web app, not the API)" };
+    const payload = ct.includes("json") ? await r.json().catch(() => ({})) : {};
+    if (!r.ok) return { ok: false, error: `HTTP ${r.status}`, payload };
+    return { ok: true, payload };
+  } catch (e) { return { ok: false, error: String(e.message || e) }; }
+}
+
 // Pick ONE service page to audit when the caller didn't name one. Real service pages usually live
 // under /services/ (the home nav often only links the listing), so scan that first, then the home
 // page as a fallback. Skips structural / non-service paths.
@@ -7327,6 +7357,16 @@ async function runEnrichJob(job) {
       saveJobs();
     } catch (e) {
       job.mockups = [];   // never block completion on a screenshot
+    }
+
+    // Push the real artifacts straight to TED — fire-and-forget, never blocks completion. This is a
+    // second, independent delivery route alongside the G99 status callback below; it does not replace it.
+    if (job.businessId) {
+      tedPushArtifacts("MOCKUPS_CAPTURED", { businessId: job.businessId, draftId: job.draftId, mockups: job.mockups })
+        .then(r => console.log(`[ted-push] MOCKUPS_CAPTURED biz=${job.businessId} -> ${JSON.stringify(r).slice(0, 200)}`));
+      tedPushArtifacts("SERVICE_PAGES_CREATED", {
+        businessId: job.businessId, draftId: job.draftId, servicePages: job.serviceDetail, siteUrl: job.liveUrl,
+      }).then(r => console.log(`[ted-push] SERVICE_PAGES_CREATED biz=${job.businessId} -> ${JSON.stringify(r).slice(0, 200)}`));
     }
 
     job.status = "done";
