@@ -1065,6 +1065,14 @@ async function buildWpTheme(slug, biz, opts = {}) {
   if (!fs.existsSync(path.join(siteDir, "index.html"))) throw new Error("Bind the site first (Step 4) — no /site/ bundle found.");
   const themeDir = path.join(GEN, "wp-theme", slug);
   const buildId = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, ""); // YYYYMMDDHHMM — keys one-time auto-activation per deploy
+  // DIAGNOSTIC: GEN is a single shared dir. Log the source bundle's freshness so the deployed logs
+  // reveal whether the theme is built from THIS run's generation or a stale/clobbered GEN/site.
+  try {
+    const idx = path.join(siteDir, "index.html");
+    const st = fs.statSync(idx);
+    const sha = require("crypto").createHash("sha256").update(fs.readFileSync(idx)).digest("hex").slice(0, 12);
+    console.log(`[buildWpTheme] slug=${slug} reads GEN/site/index.html mtime=${st.mtime.toISOString()} bytes=${st.size} sha=${sha}`);
+  } catch (e) { console.warn("[buildWpTheme] could not stat GEN/site:", e.message); }
   fs.rmSync(themeDir, { recursive: true, force: true });
   fs.mkdirSync(themeDir, { recursive: true });
   // Use the HOME page's head + header + footer as the shared chrome
@@ -12506,6 +12514,13 @@ const server = http.createServer(async (req, res) => {
         } catch (e) { console.error("manifest seed skipped:", e.message); }
         await run(`git checkout -b "${branch}"`, tmp);
         await run(`git add -A "${rel}" "${muRel}"`, tmp);
+        // DIAGNOSTIC: how many files does git actually see staged? 0 → the copied theme matched HEAD
+        // (stale GEN/site), which is the "nothing to commit" case we're proving.
+        try {
+          const st = await run(`git status --porcelain`, tmp);
+          const changed = (st.stdout || "").split("\n").filter(l => l.trim()).length;
+          console.log(`[push-wordpress] slug=${slug} copied ${built.files.length} files → git sees ${changed} changed path(s) staged before commit`);
+        } catch (e) { console.warn("[push-wordpress] git status diag failed:", e.message); }
         r = await run(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "Add ${a.business_name} beta theme + auto-activator (Growth99 generated)"`, tmp);
         if (r.code) throw new Error("commit failed: " + (r.stderr || r.stdout).slice(-200));
         r = await run(`git push -u origin "${branch}"`, tmp);
