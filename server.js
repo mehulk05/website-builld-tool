@@ -953,7 +953,14 @@ function splitPage(html) {
   const head = (html.match(/<head[^>]*>([\s\S]*?)<\/head>/i) || [, ""])[1];
   let body = (html.match(/<body[^>]*>([\s\S]*?)<\/body>/i) || [, html])[1];
   body = stripReviewBar(body);
-  const header = (body.match(/<nav\b[\s\S]*?<\/nav>/i) || body.match(/<header\b[\s\S]*?<\/header>/i) || [""])[0];
+  // <header> FIRST, <nav> only as fallback. Generated pages nest the nav inside the
+  // header (`<header class="fixed top-0 z-50 …"><nav class="hidden md:flex">…</nav></header>`),
+  // so taking the nav cut the chrome at the wrong boundary: header.php got a desktop-only
+  // link list with no logo, no CTA, no hamburger and none of the fixed/backdrop styling,
+  // while every page template kept the leftover <header> shell — a second fixed bar with
+  // the branding but no links. This also matches bindSiteSmart(), which already prefers
+  // <header>; the two disagreeing is what made the preview look right and the theme break.
+  const header = (body.match(/<header\b[\s\S]*?<\/header>/i) || body.match(/<nav\b[\s\S]*?<\/nav>/i) || [""])[0];
   const footer = (body.match(/<footer\b[\s\S]*?<\/footer>/i) || [""])[0];
   let main = body;
   if (header) main = main.replace(header, "");
@@ -1388,7 +1395,8 @@ function assembleSite(engineSuffix) {
   const read = (k) => { const f = path.join(GEN, k + sfx + ".html"); return fs.existsSync(f) ? fs.readFileSync(f, "utf8") : null; };
   const home = read("home");
   if (!home) throw new Error(`no home${sfx}.html generated yet`);
-  const nav = extractBlock(home, "nav") || extractBlock(home, "header");
+  // <header> first — same reason as splitPage(): the nav is nested inside it.
+  const nav = extractBlock(home, "header") || extractBlock(home, "nav");
   const footer = extractBlock(home, "footer");
   const siteDir = path.join(GEN, engineSuffix ? `site-${engineSuffix}` : "site");
   if (!fs.existsSync(siteDir)) fs.mkdirSync(siteDir, { recursive: true });
@@ -1399,7 +1407,7 @@ function assembleSite(engineSuffix) {
     if (!html) continue;
     if (key !== "home") {
       // swap in the canonical nav + footer so every page matches home
-      const ownNav = extractBlock(html, "nav") || extractBlock(html, "header");
+      const ownNav = extractBlock(html, "header") || extractBlock(html, "nav");
       if (nav && ownNav) html = html.replace(ownNav, nav);
       const ownFooter = extractBlock(html, "footer");
       if (footer && ownFooter) html = html.replace(ownFooter, footer);
@@ -1453,10 +1461,13 @@ const CURATED_IMAGES = [
 // bespoke — 14 photos is still a small pool. Per-client image search is the real
 // fix (DESIGN_QUALITY_PLAN.md task 0.2); this is the half that needs no new key.
 let CURATED_OFFSET = 0, CURATED_CURSOR = 0;
+function fnv1a(s) {                                     // stable across runs and processes
+  let h = 2166136261;
+  for (const ch of String(s || "")) { h ^= ch.charCodeAt(0); h = (h * 16777619) >>> 0; }
+  return h;
+}
 function seedCuratedPhotos(name) {
-  let h = 2166136261;                                   // FNV-1a: stable across runs
-  for (const ch of String(name || "")) { h ^= ch.charCodeAt(0); h = (h * 16777619) >>> 0; }
-  CURATED_OFFSET = h % CURATED_IMAGES.length;
+  CURATED_OFFSET = fnv1a(name) % CURATED_IMAGES.length;
   CURATED_CURSOR = 0;
 }
 const curatedPhoto = () => CURATED_IMAGES[(CURATED_OFFSET + CURATED_CURSOR++) % CURATED_IMAGES.length];
@@ -1468,11 +1479,26 @@ const curatedPhoto = () => CURATED_IMAGES[(CURATED_OFFSET + CURATED_CURSOR++) % 
 // UNSPLASH_ACCESS_KEY is set. Cached per query for the process lifetime — a
 // single page asks for the same category many times over and this must not
 // burn a free-tier ~50 req/hour limit re-fetching the same search.
+// Audited live against the Unsplash API, 2026-08-07 (per-page=20, landscape,
+// content_filter=high), because a query that matches NOTHING fails silently —
+// the caller just falls through to the generic pool, so a "Medical Weight Loss"
+// card quietly got whatever "luxury medical spa clinic treatment" returned (a
+// red-light therapy bed). Search behaves like AND over the terms, so the more
+// words a query has the likelier it is to return zero: "laser skin treatment
+// clinic" and "body contouring medspa treatment" both returned 0 results, while
+// dropping one word made each return 20. Keep these at three words or fewer and
+// re-check with a real API call before changing one.
+//   injectables 9 usable · laser 9 · facial 9 · body 6 · team 20 · interior 4
+// hero is the exception: every rewrite tried ("medical spa interior", "spa
+// clinic interior" → 0 results; "luxury spa interior", "modern spa interior" →
+// 2 usable, and those were chairs and a table). It stays a known-empty query so
+// heroes keep falling back to the hand-vetted CURATED_HERO_IMAGES at w=2400,
+// which is the better picture for a full-bleed band anyway.
 const UNSPLASH_QUERY_BY_CATEGORY = {
   injectables: "botox filler injection cosmetic clinic",
-  laser: "laser skin treatment clinic",
+  laser: "laser skin treatment",
   facial: "facial spa treatment skincare",
-  body: "body contouring medspa treatment",
+  body: "body contouring",
   team: "medical clinic doctor team portrait",
   hero: "luxury medspa clinic interior",
   interior: "modern medical spa interior design",
@@ -1532,21 +1558,63 @@ async function unsplashOrCurated(isHero) {
   }
   return isHero ? curatedHero() : curatedPhoto();
 }
-// Category-matched (from surrounding alt/class text) live search, falling
-// back to a generic HD photo when no category matches or Unsplash is off.
-async function contextualMedspaPhoto(txt) {
+// The text AROUND an <img> — the card's heading and copy — is what says which
+// service the picture is for. The img's own attributes do not: Stitch writes a
+// data-alt describing the picture it invented ("a woman receiving a facial
+// treatment") while the service label sits in a sibling <h3> in the overlay
+// below it. Classifying on attributes alone is exactly how a card titled "Botox"
+// shipped with a facial-mask photo. A window, not the whole document: page-wide
+// matching would label every image with whatever section happened to come first.
+const IMG_CONTEXT_BEFORE = 400, IMG_CONTEXT_AFTER = 1200;
+function imageContext(html, at, len) {
+  const before = html.slice(Math.max(0, at - IMG_CONTEXT_BEFORE), at);
+  const after = html.slice(at + len, at + len + IMG_CONTEXT_AFTER);
+  const text = (s) => s.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  // The heading that labels THIS image: the first one after it (overlay cards put
+  // the title under the picture), else the nearest one before it (section headers).
+  const hAfter = after.match(/<h[1-4]\b[^>]*>([\s\S]*?)<\/h[1-4]>/i);
+  const hBefore = [...before.matchAll(/<h[1-4]\b[^>]*>([\s\S]*?)<\/h[1-4]>/gi)].pop();
+  return {
+    label: text((hAfter && hAfter[1]) || (hBefore && hBefore[1]) || "").slice(0, 60),
+    text: text(before) + " " + text(after),
+  };
+}
+function medspaCategory(txt) {
   const t = String(txt || "").toLowerCase();
-  let category = null;
-  if (/botox|filler|inject|neuromodulator|juvederm|dysport|sculptra|kybella/i.test(t)) category = "injectables";
-  else if (/laser|peel|resurfacing|ipl|bbl|moxi|morpheus|skin-tightening/i.test(t)) category = "laser";
-  else if (/facial|hydrafacial|skincare|acne|glow|peel|dermaplan/i.test(t)) category = "facial";
-  else if (/body|contour|sculpt|weight|loss|slimming|coolsculpt|emsculpt/i.test(t)) category = "body";
-  else if (/team|doctor|physician|provider|staff|director|clinician|nurse|injector/i.test(t)) category = "team";
-  else if (/hero|flagship|banner|welcome|philosophy|about/i.test(t)) category = "hero";
+  if (!t.trim()) return null;
+  if (/botox|filler|inject|neuromodulator|juvederm|dysport|sculptra|kybella/i.test(t)) return "injectables";
+  if (/laser|peel|resurfacing|ipl|bbl|moxi|morpheus|skin-tightening/i.test(t)) return "laser";
+  if (/facial|hydrafacial|skincare|acne|glow|peel|dermaplan/i.test(t)) return "facial";
+  if (/body|contour|sculpt|weight|loss|slimming|coolsculpt|emsculpt/i.test(t)) return "body";
+  if (/team|doctor|physician|provider|staff|director|clinician|nurse|injector/i.test(t)) return "team";
+  if (/hero|flagship|banner|welcome|philosophy|about/i.test(t)) return "hero";
+  return null;
+}
+// Category-matched live search, falling back to a generic HD photo when no
+// category matches or Unsplash is off.
+async function contextualMedspaPhoto(txt, label) {
+  // The card's own heading decides FIRST, and only falls through to the wider
+  // text when the heading names no category. A card titled "Botox" sitting next
+  // to a data-alt that describes a facial has to read as injectables, and the
+  // combined string can't do that — whichever branch is earlier in the chain
+  // wins regardless of which one the visitor actually reads.
+  //
+  // Not searched as free text ("<label> treatment clinic"): checked live against
+  // the Unsplash API, 2026-08-07 — "Botox treatment clinic" returns 0 results at
+  // all, and "Medical Weight Loss treatment clinic" returns a hair-salon portrait
+  // as its top relevance-passing hit. The fixed per-category queries are the
+  // vetted ones; the label picks the bucket, it does not become the query.
+  const category = medspaCategory(label) || medspaCategory(txt);
 
   if (category && UNSPLASH_ACCESS_KEY) {
     const results = await unsplashSearch(UNSPLASH_QUERY_BY_CATEGORY[category]);
-    if (results && results.length) return results[CURATED_CURSOR++ % results.length];
+    // Indexed by the label's hash rather than the shared cursor, so one service
+    // shows the SAME photo everywhere it appears (home card, services page, its
+    // own page) instead of a different one per placement. Unlabelled images keep
+    // the rolling cursor, which is what stops a page repeating one photo.
+    if (results && results.length) {
+      return results[label ? fnv1a(label) % results.length : CURATED_CURSOR++ % results.length];
+    }
   }
   return unsplashOrCurated(category === "hero");
 }
@@ -1560,7 +1628,10 @@ async function sanitizeAllImages(html) {
   const re = /<img\b([^>]*?)\bsrc=["']([^"']+)["']([^>]*?)>/gi;
   const matches = [...src.matchAll(re)];
   if (!matches.length) return html;
-  const urls = await Promise.all(matches.map((m) => contextualMedspaPhoto((m[1] || "") + " " + (m[3] || ""))));
+  const urls = await Promise.all(matches.map((m) => {
+    const ctx = imageContext(src, m.index, m[0].length);
+    return contextualMedspaPhoto(`${m[1] || ""} ${m[3] || ""} ${ctx.text}`, ctx.label);
+  }));
   let i = 0;
   return src.replace(re, (match, p1, srcUrl, p2) => `<img${p1}src="${urls[i++]}"${p2}>`);
 }
@@ -12484,6 +12555,7 @@ module.exports = {
   // Design-quality pass (DESIGN_QUALITY_PLAN.md) — exported for test-design.js.
   retargetNav, vibeFor, designMdFor, clampViewportHeights, enforceArbitraryColors,
   seedCuratedPhotos, curatedPhoto, CURATED_IMAGES,
+  splitPage, imageContext, medspaCategory,
   safeArtifactName, mobilePageUrl, isSafeArtifactSegment, browserlessScreenshotRequest, browserlessLayoutRequest, captureMobileLayout, issueSupportedByLayout, selectPrChecks, preReleaseMarkerUrl, screenshotBuffersEqual, issueSupportedBySource, safeResponsivePlanFiles, verifyResponsiveDiff, repairResponsiveFile, readMuPages,
   // Perform PR: the pure halves are exported so the audits and fixes can be
   // exercised against a real theme without cloning a repo or opening a PR.

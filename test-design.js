@@ -230,4 +230,74 @@ ok("leaves a role untouched when its hex isn't known", () => {
   assert.ok(out.includes("bg-accent"), "rewrote a role with no known hex");
 });
 
+
+console.log("\nsplitPage — shared chrome is the <header>, not the nav inside it");
+
+// The real shape every generated page uses: the nav is NESTED in the header,
+// which also carries the logo, the CTA and the fixed/backdrop styling.
+const NESTED_CHROME = `<!DOCTYPE html><html><head><title>x</title></head><body>
+<header class="fixed top-0 z-50 backdrop-blur-md" id="navbar">
+  <a href="/">NUVO</a>
+  <nav class="hidden md:flex gap-8"><a href="/services/">Treatments</a></nav>
+  <button class="md:hidden">menu</button>
+</header>
+<main><h1>Hello</h1></main>
+<footer class="bg-black">bye</footer></body></html>`;
+
+ok("takes the whole <header>, keeping logo + CTA + fixed styling", () => {
+  const p = S.splitPage(NESTED_CHROME);
+  assert.ok(/^<header/.test(p.header.trim()), "chrome did not start at <header>");
+  assert.ok(p.header.includes("NUVO"), "logo lost from the shared chrome");
+  assert.ok(p.header.includes("md:hidden"), "mobile menu button lost from the shared chrome");
+  assert.ok(p.header.includes("fixed top-0"), "fixed/backdrop styling lost from the shared chrome");
+});
+
+ok("leaves no <header> shell behind in the page body", () => {
+  const p = S.splitPage(NESTED_CHROME);
+  assert.ok(!/<header/i.test(p.main), "a second header would render under the shared one");
+  assert.ok(!/<nav/i.test(p.main), "nav left in the body");
+  assert.ok(p.main.includes("<h1>Hello</h1>"), "page content was cut");
+});
+
+ok("falls back to <nav> when the page has no <header>", () => {
+  const p = S.splitPage(`<html><body><nav class="top">links</nav><main>x</main></body></html>`);
+  assert.ok(/^<nav/.test(p.header.trim()), "no chrome extracted from a nav-only page");
+  assert.ok(!/<nav/i.test(p.main), "nav left in the body");
+});
+
+console.log("\nimage context — the card's heading, not the AI's own alt text");
+
+// Stitch writes a data-alt describing the picture it invented; the service name
+// sits in a sibling <h3> in the overlay BELOW the image.
+const CARD = `<div class="card"><img class="object-cover" data-alt="A serene portrait of a woman receiving a facial treatment" src="https://x/y.jpg"/>
+<div class="overlay"><h3 class="text-white">Botox</h3><span>Starting at $12/unit</span></div></div>`;
+
+ok("reads the label from the heading after the image", () => {
+  const at = CARD.indexOf("<img");
+  const len = CARD.slice(at).indexOf(">") + 1;
+  assert.strictEqual(S.imageContext(CARD, at, len).label, "Botox");
+});
+
+ok("falls back to the nearest heading before the image", () => {
+  const html = `<section><h2>Meet the Team</h2><img src="https://x/y.jpg"/></section>`;
+  const at = html.indexOf("<img");
+  const len = html.slice(at).indexOf(">") + 1;
+  assert.strictEqual(S.imageContext(html, at, len).label, "Meet the Team");
+});
+
+ok("the heading beats the invented alt text — Botox is injectables, not facial", () => {
+  const at = CARD.indexOf("<img");
+  const len = CARD.slice(at).indexOf(">") + 1;
+  const ctx = S.imageContext(CARD, at, len);
+  const attrs = CARD.slice(at, at + len);
+  assert.strictEqual(S.medspaCategory(attrs), "facial", "precondition: the alt text alone reads as facial");
+  assert.strictEqual(S.medspaCategory(ctx.label) || S.medspaCategory(attrs), "injectables");
+});
+
+ok("unlabelled images still classify off the surrounding text", () => {
+  assert.strictEqual(S.medspaCategory(""), null, "empty label must not match a category");
+  assert.strictEqual(S.medspaCategory("laser resurfacing session"), "laser");
+});
+
+
 console.log(`\n${pass} checks passed.`);
