@@ -8,8 +8,11 @@
  * Reading a message here is safe — only the label decides what has been done.
  *
  * Studio cannot send email, so this script is also its outbox: each run it
- * collects any replies Studio has queued ("ready to review", "shipped",
- * "failed") and sends them on the original thread.
+ * collects any messages Studio has queued. Most are replies on the original
+ * thread ("ready to review", "shipped", "failed"); a queued item can also be
+ * marked mode:"new", which this script sends as a brand-new email instead —
+ * used when a run finishes with something unresolved that needs its own
+ * clarification email rather than a reply buried at the bottom of the thread.
  *
  * SETUP
  *  1. script.google.com  →  New project  →  paste this file
@@ -123,6 +126,15 @@ function sendQueuedReplies() {
   const sent = [];
   pending.forEach(function (item) {
     try {
+      if (item.mode === 'new') {
+        // A clarification ask must not land as a reply at the bottom of the
+        // original thread — it needs its own thread so it isn't missed.
+        if (!item.to) { sent.push(item.id); return; }   // nothing to send to — drop it
+        GmailApp.sendEmail(item.to, item.subject || 'Requested Website Changes — clarification needed', item.text);
+        sent.push(item.id);
+        Logger.log('sent new email to ' + item.to);
+        return;
+      }
       const thread = GmailApp.getThreadById(item.threadId);
       if (!thread) { sent.push(item.id); return; }   // thread gone — drop it
       replyToRequester(thread, item.text);
