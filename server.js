@@ -5482,6 +5482,11 @@ async function runEditJob(job) {
     }
     job.editPlan = plan.files.map(f => ({ path: f.path, op: f.op }));
     job.editSummary = plan.summary || swapsText(swaps);
+    // Client-facing version of the same summary: what changed, never which file it
+    // lives in — file names are implementation detail, not something to put in a
+    // reply email. swapsText() names files on purpose (it's used in Slack/PR/TED,
+    // where that detail is exactly what a developer wants).
+    job.editSummaryEmail = plan.summary || swaps.map((s) => s.what).filter(Boolean).join("; ");
     jobStep(job, 1, "done", plan.summary || swapsText(swaps) || `${plan.files.length} file(s)`);
 
     // 3 — apply
@@ -5610,7 +5615,7 @@ async function runEditJob(job) {
     // site. No pull request link: internal plumbing, and merged by now anyway.
     // The summary already reads as a sentence, so nothing is appended to it.
     queueEmailReply(job, [
-      "The change is live now " + String.fromCharCode(8212) + " " + (job.editSummary || "your requested update").trim(),
+      "The change is live now " + String.fromCharCode(8212) + " " + (job.editSummaryEmail || "your requested update").trim(),
       P.liveUrl ? "\n" + P.liveUrl : "",
     ].join("\n").trim());
     // Same news to TED, with a screenshot of the updated page. Detached: it
