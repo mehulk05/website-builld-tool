@@ -2552,7 +2552,7 @@ function localApi(pathName, body, timeoutMs = 30 * 60 * 1000) {
 
 const JOB_STEPS = [
   "CRO audit — existing site", "Compose build prompt", "Generate pages (Stitch)",
-  "Design Score Benchmark (Existing vs Stitch)", "Assemble site", "WordPress theme + PR",
+  "Assemble site", "WordPress theme + PR",
   "CI checks → auto-merge", "Theme activation watch", "CRO after-audit + comparison",
   // Runs as its OWN job (see runEnrichJob); this step mirrors its progress so the
   // build timeline shows the whole story and can link straight to that run.
@@ -2562,7 +2562,7 @@ const ENRICH_STEP_IDX = JOB_STEPS.length - 1;
 
 // Stable machine ids, positionally paired with JOB_STEPS.
 const JOB_STEP_KEYS = [
-  "cro_audit_before", "compose_prompt", "generate_pages", "design_benchmark_compare", "assemble_site",
+  "cro_audit_before", "compose_prompt", "generate_pages", "assemble_site",
   "wp_theme_pr", "ci_automerge", "theme_activation_watch", "cro_audit_after",
   "service_pages",
 ];
@@ -5004,69 +5004,41 @@ async function runJob(job) {
     }
     jobStep(job, 2, "done", `${ok.length}/${(gen.pages || []).length} pages generated`);
 
-    // 3.5 — Compare Existing Website Design Score with Stitch Generated Design
-    // Was: beforeScore/afterScore silently fell back to hardcoded 52/94 whenever
-    // job.before was missing (no existing-site URL given) or the audit came back
-    // with a falsy .overall — so the step could show a fake "Existing 52/100 ->
-    // Stitch 94/100" that had nothing to do with the real site. And the catch
-    // block swallowed the real failure reason and reported a fake "completed" —
-    // exactly the "benchmark sahi se kaam nahi kar raha" symptom. Report a real
-    // number or say plainly why there isn't one; never substitute a constant.
-    jobStep(job, 3, "running", "Auditing Stitch generated design & comparing with existing website…");
-    try {
-      const stitchAudit = await localApi("/api/cro-audit-beta", { engine: "" });
-      const beforeScore = (job.before && typeof job.before.overall === "number") ? job.before.overall : null;
-      const afterScore = (stitchAudit && typeof stitchAudit.overall === "number") ? stitchAudit.overall : null;
-      const delta = (beforeScore != null && afterScore != null) ? afterScore - beforeScore : null;
-      job.designComparison = {
-        beforeScore, afterScore, delta,
-        beforeAudit: job.before || null,
-        stitchAudit: stitchAudit || null,
-        comparisonSummary: beforeScore == null
-          ? (afterScore == null ? "No existing-site audit and the generated-design audit returned no score." : `No existing site was audited (nothing to compare against) — generated design: ${afterScore}/100.`)
-          : (afterScore == null ? `Existing site: ${beforeScore}/100 — the generated-design audit returned no score.` : `Existing Site (${beforeScore}/100) vs Stitch Luxury Design (${afterScore}/100) — ${delta >= 0 ? "+" : ""}${delta} pts`),
-      };
-      jobStep(job, 3, "done", job.designComparison.comparisonSummary);
-    } catch (e) {
-      job.designComparison = { beforeScore: null, afterScore: null, delta: null, error: e.message };
-      jobStep(job, 3, "error", "Could not compute the design benchmark: " + String(e.message).slice(0, 180));
-    }
-
     // 4 — assemble into one coherent site
-    jobStep(job, 4, "running", "Binding site with AI chrome…");
+    jobStep(job, 3, "running", "Binding site with AI chrome…");
     const bound = await localApi("/api/bind-site", { engine: "", theme });
     job.siteUrl = bound.siteUrl || "/site/";
-    jobStep(job, 4, "done", `Assembled (${bound.chromeSource || "AI chrome"})`);
+    jobStep(job, 3, "done", `Assembled (${bound.chromeSource || "AI chrome"})`);
 
     // 5 — WordPress theme + PR
-    jobStep(job, 5, "running", "Building theme, pushing, opening PR…");
+    jobStep(job, 4, "running", "Building theme, pushing, opening PR…");
     const push = await localApi("/api/push-wordpress", { theme, skipRebind: true, githubRepo: job.repo }, 15 * 60 * 1000);
     job.prUrl = push.prUrl; job.branch = push.branch;
     const slug = ((push.themePath || "").match(/g99-([a-z0-9-]+)\//) || [])[1] || "";
     if (!job.prUrl) throw new Error("push succeeded but no PR URL returned");
-    jobStep(job, 5, "done", job.prUrl);
+    jobStep(job, 4, "done", job.prUrl);
 
     // 6 — CI watch → auto-fix → auto-merge
-    jobStep(job, 6, "running", "Watching CI build checks…");
+    jobStep(job, 5, "running", "Watching CI build checks…");
     let fixes = 0, merged = false;
     for (let i = 0; i < 240 && !merged; i++) {
       let st;
       try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); }
       catch (e) { await sleep(10000); continue; }
       const summary = (st.checks || []).map((c) => `${c.name}:${c.status}`).join(" ");
-      jobStep(job, 6, "running", summary || "CI starting…");
-      if (await ciEarlyExit(job, 6, "g99-" + slug, st, i)) { merged = true; break; }
+      jobStep(job, 5, "running", summary || "CI starting…");
+      if (await ciEarlyExit(job, 5, "g99-" + slug, st, i)) { merged = true; break; }
       if (st.allPass) {
-        await awaitApprovalIfNeeded(job, "g99-" + slug, 6);
+        await awaitApprovalIfNeeded(job, "g99-" + slug, 5);
         await localApi("/api/pr-merge", { prUrl: job.prUrl });
         merged = true;
-        jobStep(job, 6, "done", `Merged${fixes ? ` after ${fixes} auto-fix(es)` : ""}`);
+        jobStep(job, 5, "done", `Merged${fixes ? ` after ${fixes} auto-fix(es)` : ""}`);
         break;
       }
       if (st.anyFail) {
         if (fixes >= 3) throw new Error("CI still failing after 3 auto-fix attempts — see " + job.prUrl);
         fixes++;
-        jobStep(job, 6, "running", `Build failed — Gemini auto-fix ${fixes}/3…`);
+        jobStep(job, 5, "running", `Build failed — Gemini auto-fix ${fixes}/3…`);
         const fix = await localApi("/api/pr-autofix", { prUrl: job.prUrl }, 5 * 60 * 1000);
         if (fix.billing) throw new Error(fix.message);
         if (!fix.fixed || !fix.fixed.length) throw new Error("auto-fix could not resolve CI failure: " + (fix.message || ""));
@@ -5078,22 +5050,22 @@ async function runJob(job) {
     if (!merged) throw new Error("CI watch timed out after ~40 min — " + job.prUrl);
 
     // 7 — wait for the mu-plugin to activate the theme on the live site
-    jobStep(job, 7, "running", "Waiting for deploy + activation on " + job.liveUrl);
+    jobStep(job, 6, "running", "Waiting for deploy + activation on " + job.liveUrl);
     let active = false;
     for (let i = 0; i < 40 && !active; i++) {
       try { active = (await localApi("/api/theme-live", { url: job.liveUrl, slug })).active; } catch (e) { /* keep polling */ }
-      if (!active) { jobStep(job, 7, "running", `Not active yet (check ${i + 1}/40)…`); await sleep(15000); }
+      if (!active) { jobStep(job, 6, "running", `Not active yet (check ${i + 1}/40)…`); await sleep(15000); }
     }
     if (!active) throw new Error("theme not detected on live within ~10 min — deploy may be slow; re-run after-audit manually");
-    jobStep(job, 7, "done", "Theme active on " + job.liveUrl);
+    jobStep(job, 6, "done", "Theme active on " + job.liveUrl);
 
     // 8 — after-audit + comparison + report
-    jobStep(job, 8, "running", "Auditing the new live site…");
+    jobStep(job, 7, "running", "Auditing the new live site…");
     job.after = await localApi("/api/cro-audit-url", { url: job.liveUrl });
     job.delta = job.before ? job.after.overall - job.before.overall : null;
     job.reportUrl = writeComparisonReport(job);
     await postPrComment(job);
-    jobStep(job, 8, "done", job.before ? `${job.before.overall} → ${job.after.overall} (${job.delta >= 0 ? "+" : ""}${job.delta})` : `New site: ${job.after.overall}/100`);
+    jobStep(job, 7, "done", job.before ? `${job.before.overall} → ${job.after.overall} (${job.delta >= 0 ? "+" : ""}${job.delta})` : `New site: ${job.after.overall}/100`);
 
     try { await syncSiteRegistry(); } catch (e) { /* non-fatal: keep registry current so the new site is editable */ }
 
@@ -6693,9 +6665,16 @@ function mirrorToParent(job, status, detail) {
   const pid = job.payload && job.payload.parentDraftId;
   if (!pid) return;
   const parent = JOBS.get(String(pid));
-  if (!parent || !parent.steps || !parent.steps[ENRICH_STEP_IDX]) return;
-  parent.steps[ENRICH_STEP_IDX].status = status;
-  parent.steps[ENRICH_STEP_IDX].detail = String(detail || "").slice(0, 240);
+  if (!parent || !parent.steps) return;
+  // By key, not by ENRICH_STEP_IDX: a parent reloaded from jobs.json carries the step
+  // list it was created with, so a build started before a step was added/removed has the
+  // service-pages row at a different index — writing the constant would overwrite whatever
+  // sits there now (the after-audit row) instead.
+  const step = parent.steps.find((s) => s.key === SERVICE_PAGES_STEP_KEY)
+    || (parent.steps.length ? parent.steps[parent.steps.length - 1] : null);
+  if (!step) return;
+  step.status = status;
+  step.detail = String(detail || "").slice(0, 240);
   parent.enrichJobId = job.draftId;
   // Stamp once — the enrich run can report "done" more than once (retries, manual re-runs) and
   // the first completion is the honest timestamp.

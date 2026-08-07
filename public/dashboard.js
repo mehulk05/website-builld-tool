@@ -133,7 +133,6 @@ const STEPS = [
   ["CRO audit — existing site", "Scoring the client's current website for conversion."],
   ["Compose build prompt", "AI writes the brand system + build brief from the CRO findings and site."],
   ["Generate pages (Stitch)", "Building Home, Services, About, Contact."],
-  ["Design Score Benchmark (Existing vs Stitch)", "Comparing existing website score with Stitch generated luxury design."],
   ["WordPress theme + open PR", "Packaging a classic WP theme and opening a GitHub PR."],
   ["Paste the live URL", "Where the pushed site is deployed."],
   ["CRO audit — new site", "Scoring the deployed beta site."],
@@ -284,16 +283,16 @@ async function watchPrBuilds(prUrl) {
       try {
         await api("/api/pr-merge", { prUrl });
         if ($("ciHint")) $("ciHint").textContent = "Merged ✓ — deploy will pick it up from main.";
-        setStep(5, "done", `PR merged${fixes ? ` (after ${fixes} auto-fix${fixes > 1 ? "es" : ""})` : ""} — builds green, integration ignored.`);
+        setStep(4, "done", `PR merged${fixes ? ` (after ${fixes} auto-fix${fixes > 1 ? "es" : ""})` : ""} — builds green, integration ignored.`);
         return "merged";
       } catch (e) {
-        setStep(5, "done", "Builds green but auto-merge failed: " + e.message + " — merge manually.");
+        setStep(4, "done", "Builds green but auto-merge failed: " + e.message + " — merge manually.");
         return "merge-failed";
       }
     }
     if (st.anyFail) {
       if (fixes >= MAX_FIXES) {
-        setStep(5, "err", `Build still failing after ${MAX_FIXES} auto-fix attempts — check the PR logs.`);
+        setStep(4, "err", `Build still failing after ${MAX_FIXES} auto-fix attempts — check the PR logs.`);
         if ($("ciHint")) $("ciHint").textContent = "Auto-fix limit reached.";
         return;
       }
@@ -302,20 +301,20 @@ async function watchPrBuilds(prUrl) {
       try {
         const fix = await api("/api/pr-autofix", { prUrl });
         if (!fix.fixed || !fix.fixed.length) {
-          setStep(5, "err", `Build failing and auto-fix could not resolve it: ${fix.message || "unknown"}.`);
+          setStep(4, "err", `Build failing and auto-fix could not resolve it: ${fix.message || "unknown"}.`);
           return;
         }
         if ($("ciHint")) $("ciHint").innerHTML = `<span class="spin"></span>Fix committed (${esc(fix.fixed.join(", "))}) — waiting for CI to re-run…`;
         await wait(20000); // give CI time to restart on the new commit
         continue;
       } catch (e) {
-        setStep(5, "err", "Auto-fix failed: " + e.message);
+        setStep(4, "err", "Auto-fix failed: " + e.message);
         return;
       }
     }
     await wait(10000);
   }
-  setStep(5, "err", "CI watch timed out (~15 min) — check the PR on GitHub.");
+  setStep(4, "err", "CI watch timed out (~15 min) — check the PR on GitHub.");
 }
 
 // ---------- step 6: watch the live site until the mu-plugin activates the theme ----------
@@ -328,7 +327,7 @@ async function watchThemeLive(slug) {
       const d = await api("/api/theme-live", { url, slug });
       if (d.active) {
         if ($("liveHint")) $("liveHint").textContent = "Theme is live and active ✓";
-        setStep(6, "done", "Theme activated on " + url);
+        setStep(5, "done", "Theme activated on " + url);
         return true;
       }
       if ($("liveHint")) $("liveHint").innerHTML = `<span class="spin"></span>Deploy in progress — theme not active yet (check ${i + 1}/${MAX}, HTTP ${d.httpStatus || "?"})…`;
@@ -406,82 +405,31 @@ async function buildBetaSite() {
     setStep(3, "done", `Generated ${okPages.length} of ${PAGES.length} pages · site assembled (${bound.chromeSource || "AI chrome"}).`);
     out(3, `${thumbStrip([...okKeys])}${progressRowsFinal(okKeys)}<div style="margin-top:12px"><a class="prlink" href="${esc(bound.siteUrl || "/site/")}" target="_blank">↗ Preview assembled site</a></div>${okPages.length < PAGES.length ? `<div class="hint">⚠ ${PAGES.length - okPages.length} page(s) failed in Stitch — retry Build for a full set.</div>` : ""}`);
 
-    // Step 4 — Design Score Benchmark
-    // Was: sAfter forced to Math.max(96, sBefore+34) whenever the real audit
-    // scored under 88 — so a mediocre generation still reported a fake ~96+.
-    // And the four "metric" boxes below (Typography 96, Conversion 94, Color
-    // 95, Layout 98) were literal HTML, never computed from anything. Both
-    // replaced with the audit's own real per-category scores; when there's no
-    // real number, say so instead of showing one.
-    setStep(4, "run", "Benchmarking generated design...");
-    let betaAudit = null;
-    try { betaAudit = await api("/api/cro-audit-beta", { engine: "" }); } catch (e) {}
-    const sBefore = croBefore ? croBefore.overall : null;
-    const sAfter = (betaAudit && typeof betaAudit.overall === "number") ? betaAudit.overall : null;
-    const dScore = (sBefore != null && sAfter != null) ? sAfter - sBefore : null;
-    const benchLine = sBefore == null
-      ? (sAfter == null ? "No existing-site audit and the generated-design audit returned no score." : `No existing site was audited — generated design: ${sAfter}/100.`)
-      : (sAfter == null ? `Existing site: ${sBefore}/100 — the generated-design audit returned no score.` : `Benchmark: Existing ${sBefore}/100 ➔ Stitch ${sAfter}/100 (${dScore >= 0 ? "+" : ""}${dScore} pts).`);
-    setStep(4, "done", benchLine);
-    const catBox = (label, key) => {
-      const b = croBefore && croBefore[key] && typeof croBefore[key].score === "number" ? croBefore[key].score : null;
-      const a = betaAudit && betaAudit[key] && typeof betaAudit[key].score === "number" ? betaAudit[key].score : null;
-      const d = (b != null && a != null) ? a - b : null;
-      return `<div style="background:var(--bg-input); border:1px solid var(--line); border-radius:8px; padding:10px 12px;">
-      <div style="font-size:10.5px; color:var(--muted); text-transform:uppercase; font-weight:600">${esc(label)}</div>
-      <div style="font-size:15px; font-weight:700; color:var(--good); margin-top:2px">${a == null ? "—" : a + "/100"}${d == null ? "" : ` (${d >= 0 ? "+" : ""}${d} pts)`}</div>
-      <div style="font-size:11px; color:var(--muted); margin-top:2px">${b == null ? "no existing-site score" : "was " + b + "/100"}</div>
-    </div>`;
-    };
-    const notes = (betaAudit && betaAudit.summary && betaAudit.summary.strengths) || [];
-    out(4, `
-<div style="margin-top:10px; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px;">
-  <div style="display:flex; align-items:center; gap:24px; flex-wrap:wrap; margin-bottom:14px;">
-    ${gauge(sBefore, "Existing site")}
-    ${gauge(sAfter, "Stitch Design")}
-    <div style="display:flex; flex-direction:column; gap:2px;">
-      <span style="font-size:20px; font-weight:800; color:${dScore == null ? "var(--muted)" : dScore >= 0 ? "var(--good)" : "var(--bad)"}">${dScore == null ? "—" : (dScore >= 0 ? "▲ +" : "▼ ") + dScore + " Points"}</span>
-      <span style="font-size:11.5px; color:var(--muted)">${esc(benchLine)}</span>
-    </div>
-  </div>
-
-  <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:10px; margin-bottom:14px;">
-    ${catBox("Visual design", "vision")}
-    ${catBox("UX & usability", "ux")}
-    ${catBox("CRO & conversion", "cro")}
-    ${catBox("Content & copy", "content")}
-  </div>
-
-  ${notes.length ? `<div style="font-size:12px; font-weight:700; color:var(--ink); margin-bottom:4px">What the new design does well:</div>
-  <ul style="margin:0; padding-left:16px; font-size:11.5px; color:var(--muted); line-height:1.5">${notes.slice(0, 6).map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}
-  <div style="font-size:10.5px; color:var(--muted); margin-top:10px">Score is a Gemini-judged read of design/UX/conversion/copy signals — treat the delta as directional, not a lab measurement.</div>
-</div>`);
-
-    // Step 5 — WP theme + PR (site already bound above; skipRebind avoids doing it twice)
-    setStep(5, "run", "Building WordPress theme, pushing, opening PR…");
+    // Step 4 — WP theme + PR (site already bound above; skipRebind avoids doing it twice)
+    setStep(4, "run", "Building WordPress theme, pushing, opening PR…");
     const push = await api("/api/push-wordpress", { theme, skipRebind: true });
     prUrl = push.prUrl;
     const slug = ((push.themePath || "").match(/g99-([a-z0-9-]+)\//) || [])[1] || "";
     let merged = false;
     if (!prUrl) {
-      setStep(5, "done", `Pushed to ${push.branch || "branch"} — no PR URL returned, check GitHub.`);
+      setStep(4, "done", `Pushed to ${push.branch || "branch"} — no PR URL returned, check GitHub.`);
     } else {
-      out(5, `<a class="prlink" href="${esc(prUrl)}" target="_blank">↗ View pull request</a><div class="hint" id="ciHint"><span class="spin"></span>Watching CI build checks…</div><div id="ciChecks" style="margin-top:8px"></div>`);
-      setStep(5, "run", `PR opened — watching CI build checks (every 10s)…`);
+      out(4, `<a class="prlink" href="${esc(prUrl)}" target="_blank">↗ View pull request</a><div class="hint" id="ciHint"><span class="spin"></span>Watching CI build checks…</div><div id="ciChecks" style="margin-top:8px"></div>`);
+      setStep(4, "run", `PR opened — watching CI build checks (every 10s)…`);
       merged = (await watchPrBuilds(prUrl)) === "merged";   // green builds → auto-merge (integration ignored)
     }
 
-    // Step 6 — after merge, watch the live site for theme activation, then
+    // Step 5 — after merge, watch the live site for theme activation, then
     // run the after-audit automatically. Manual input stays as fallback.
-    out(6, `<div class="urlrow"><input id="liveUrl" placeholder="https://prodteam.gogroth.com/" value="https://prodteam.gogroth.com/"><button class="btn sm" onclick="runAfter()">Run after-audit →</button></div><div class="hint" id="liveHint"></div>`);
+    out(5, `<div class="urlrow"><input id="liveUrl" placeholder="https://prodteam.gogroth.com/" value="https://prodteam.gogroth.com/"><button class="btn sm" onclick="runAfter()">Run after-audit →</button></div><div class="hint" id="liveHint"></div>`);
     if (merged && slug) {
-      setStep(6, "run", "Merged — waiting for deploy + theme activation on the live site…");
+      setStep(5, "run", "Merged — waiting for deploy + theme activation on the live site…");
       const activated = await watchThemeLive(slug);
-      if (activated) { await runAfter(); return; } // runs steps 7 + 8
-      setStep(6, "run", "Theme not detected yet — deploy may still be running. Paste/confirm the URL and click Run after-audit.");
+      if (activated) { await runAfter(); return; } // runs steps 6 + 7
+      setStep(5, "run", "Theme not detected yet — deploy may still be running. Paste/confirm the URL and click Run after-audit.");
     } else {
-      setStep(6, "run", merged ? "Merged — paste the live URL below." : "Merge & deploy the PR, then paste the live URL below.");
-      toast("Pipeline paused at step 6 — confirm the live URL.");
+      setStep(5, "run", merged ? "Merged — paste the live URL below." : "Merge & deploy the PR, then paste the live URL below.");
+      toast("Pipeline paused at step 5 — confirm the live URL.");
     }
   } catch (e) {
     // mark the running step as errored
@@ -493,18 +441,18 @@ async function buildBetaSite() {
   }
 }
 
-// ---------- steps 7 & 8 ----------
+// ---------- steps 6 & 7 ----------
 async function runAfter() {
   const url = ($("liveUrl") && $("liveUrl").value || "").trim();
   if (!url) { toast("Enter the live URL first"); return; }
-  setStep(6, "done", "Live URL: " + url);
-  setStep(7, "run", "Auditing the deployed beta site…");
+  setStep(5, "done", "Live URL: " + url);
+  setStep(6, "run", "Auditing the deployed beta site…");
   try {
     croAfter = await api("/api/cro-audit-url", { url });
-    setStep(7, "done", `New site scores ${croAfter.overall}/100.`);
-    out(7, `<div class="gauges">${gauge(croAfter.overall, "New site")}<div>${catsHtml(croAfter)}</div></div>${recsHtml(croAfter)}`);
+    setStep(6, "done", `New site scores ${croAfter.overall}/100.`);
+    out(6, `<div class="gauges">${gauge(croAfter.overall, "New site")}<div>${catsHtml(croAfter)}</div></div>${recsHtml(croAfter)}`);
     renderComparison();
-  } catch (e) { setStep(7, "err", "Error: " + e.message); toast("After-audit failed: " + e.message); }
+  } catch (e) { setStep(6, "err", "Error: " + e.message); toast("After-audit failed: " + e.message); }
 }
 function shot(url) {
   if (!url) return "";
@@ -514,7 +462,7 @@ function renderComparison() {
   if (!croBefore || !croAfter) return;
   const d = croAfter.overall - croBefore.overall;
   const verdict = d >= 20 ? "a major improvement" : d >= 8 ? "a significant improvement" : d > 0 ? "an improvement" : d === 0 ? "no change" : "a regression";
-  setStep(8, "done", d >= 0 ? `Conversion score up ${d} points.` : `Score down ${Math.abs(d)} points.`);
+  setStep(7, "done", d >= 0 ? `Conversion score up ${d} points.` : `Score down ${Math.abs(d)} points.`);
   const cats = ["vision", "ux", "cro", "content"].map((k) => {
     const b = croBefore[k] && croBefore[k].score || 0, a = croAfter[k] && croAfter[k].score || 0, dd = a - b;
     return `<div class="cat"><span class="cname">${k}</span><span class="bar"><i style="width:${a}%"></i></span><span class="cv">${b}→${a} <b style="color:${dd >= 0 ? "var(--good)" : "var(--bad)"}">${dd >= 0 ? "+" : ""}${dd}</b></span></div>`;
@@ -524,7 +472,7 @@ function renderComparison() {
       <figure><img src="${bImg}" alt="before" loading="lazy"><figcaption>Before</figcaption></figure>
       <figure><img src="${aImg}" alt="after" loading="lazy"><figcaption>After</figcaption></figure>
     </div>` : "";
-  out(8, `<div class="ba-hero">
+  out(7, `<div class="ba-hero">
       <div class="ba-score"><div class="ba-num" style="color:${croBefore.overall >= 75 ? "var(--good)" : croBefore.overall >= 50 ? "var(--warn)" : "var(--bad)"}">${croBefore.overall}</div><div class="ba-lbl">Before</div></div>
       <div class="ba-mid"><div class="ba-delta ${d >= 0 ? "up" : "down"}">${d >= 0 ? "▲ +" : "▼ "}${d}</div><div class="ba-verdict">${verdict}</div></div>
       <div class="ba-score"><div class="ba-num" style="color:${croAfter.overall >= 75 ? "var(--good)" : croAfter.overall >= 50 ? "var(--warn)" : "var(--bad)"}">${croAfter.overall}</div><div class="ba-lbl">After</div></div>
@@ -568,7 +516,7 @@ function monitorJob(id) {
       monRendered.form = true;
     }
 
-    const s = j.steps; // server steps s0..s7 → dashboard steps d1..d7
+    const s = j.steps; // server steps s0..s7 → dashboard steps d1..d6
     setStep(1, CLS[s[0].status], s[0].detail || s[0].label);
     if (!monRendered.before && j.before) { out(1, `<div class="gauges">${gauge(j.before.overall, "Existing site")}<div>${catsHtml(j.before)}</div></div>${recsHtml(j.before)}`); monRendered.before = true; }
     // Step 2 — brand strip + the composed build prompt (read-only), like the live run.
