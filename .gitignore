@@ -17,3 +17,12 @@ server.out
 ide-workspace/
 email-requests.json
 email-outbox.json
+
+# GitHub App private keys — the repo is public; a key dropped here (e.g. a Render
+# Secret File mirrored locally) must never be committable.
+*.pem
+*.key
+# Render Secret Files are named after the variable they replace, so they carry no
+# extension and *.pem would not catch them.
+GH_APP_PRIVATE_KEY
+GH_APP_PRIVATE_KEY.*
