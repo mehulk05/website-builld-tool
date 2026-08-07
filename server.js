@@ -40,8 +40,35 @@ const WP_REPO = process.env.WP_REPO || "G99agency/prodteam.gogroth.com";
 // PAT is kept for anything the App cannot do.
 const GH_APP_ID = process.env.GH_APP_ID || "";
 const GH_APP_INSTALLATION_ID = process.env.GH_APP_INSTALLATION_ID || "";
-// Env vars cannot hold real newlines, so the PEM is stored with \n escapes.
-const GH_APP_PRIVATE_KEY = (process.env.GH_APP_PRIVATE_KEY || "").replace(/\\n/g, "\n");
+// The PEM, from whichever source this environment offers. A real FILE is preferred: env vars
+// cannot hold newlines, so the key has to be \n-escaped, and a multi-line paste silently
+// truncates to "-----BEGIN RSA PRIVATE KEY-----" and fails at signing time. Render's Secret
+// Files (app root and /etc/secrets/<name>) avoid that trap entirely.
+const GH_APP_PRIVATE_KEY = (function readAppKey() {
+  // Render drops a Secret File both at the app root and at /etc/secrets/<filename>, and the
+  // natural thing to call it is after the variable it replaces — so GH_APP_PRIVATE_KEY (no
+  // extension) is checked alongside the .pem names.
+  const names = ["g99-gitops.pem", "GH_APP_PRIVATE_KEY", "GH_APP_PRIVATE_KEY.pem"];
+  const candidates = [process.env.GH_APP_PRIVATE_KEY_FILE]
+    .concat(names.map((n) => path.join(DIR, n)))
+    .concat(names.map((n) => "/etc/secrets/" + n))
+    .filter(Boolean);
+  for (const f of candidates) {
+    try {
+      if (fs.existsSync(f)) {
+        const pem = fs.readFileSync(f, "utf8").trim();
+        // Only accept something that really is a key: an empty or half-saved Secret File
+        // must fall through to the env var rather than break signing.
+        if (pem.includes("PRIVATE KEY")) {
+          console.log("GitHub App key loaded from file:", f);
+          return pem;
+        }
+      }
+    } catch (e) { /* unreadable — fall through */ }
+  }
+  // Env-var fallback. Must be one line with \n escapes; a multi-line paste truncates.
+  return (process.env.GH_APP_PRIVATE_KEY || "").replace(/\\n/g, "\n");
+})();
 const GH_APP_CONFIGURED = !!(GH_APP_ID && GH_APP_INSTALLATION_ID && GH_APP_PRIVATE_KEY);
 
 function ghAppJwt() {
