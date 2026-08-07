@@ -5,6 +5,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const crypto = require("crypto");   // GitHub App JWT signing
 const { exec, spawn } = require("child_process");
 const { URL } = require("url");
 
@@ -26,10 +27,107 @@ const DIR = __dirname;
 if (fs.existsSync(path.join(DIR, "bin"))) process.env.PATH = path.join(DIR, "bin") + path.delimiter + process.env.PATH;
 
 const WP_REPO = process.env.WP_REPO || "G99agency/prodteam.gogroth.com";
-// Run a shell command (gh reads GH_TOKEN from env; locally it uses your gh login).
+
+// ---- GitHub auth ---------------------------------------------------------------
+// Preferred: the g99-gitops GitHub App. An App is installed on the org rather than owned by a
+// person, so beta-site repos keep working when someone leaves, and its installation tokens
+// last 60 minutes instead of forever. The classic PAT stays as the fallback.
+//
+// The catch that decides which one is used: an App only gets the permissions its settings
+// grant. This pipeline needs contents (push), pull_requests (open/merge) and checks +
+// statuses (the CI watch). Until those are granted AND the org accepts the permission update,
+// using the App would break PR creation — so capability is verified once at startup and the
+// PAT is kept for anything the App cannot do.
+const GH_APP_ID = process.env.GH_APP_ID || "";
+const GH_APP_INSTALLATION_ID = process.env.GH_APP_INSTALLATION_ID || "";
+// Env vars cannot hold real newlines, so the PEM is stored with \n escapes.
+const GH_APP_PRIVATE_KEY = (process.env.GH_APP_PRIVATE_KEY || "").replace(/\\n/g, "\n");
+const GH_APP_CONFIGURED = !!(GH_APP_ID && GH_APP_INSTALLATION_ID && GH_APP_PRIVATE_KEY);
+
+function ghAppJwt() {
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
+  const now = Math.floor(Date.now() / 1000);
+  // iat is backdated a minute to absorb clock skew; GitHub rejects a JWT from the future.
+  const head = b64({ alg: "RS256", typ: "JWT" });
+  const body = b64({ iat: now - 60, exp: now + 540, iss: GH_APP_ID });
+  const sig = crypto.sign("RSA-SHA256", Buffer.from(head + "." + body), GH_APP_PRIVATE_KEY);
+  return `${head}.${body}.${sig.toString("base64url")}`;
+}
+
+// Installation tokens expire after an hour and a build can outlive that, so the token is
+// re-minted whenever less than 10 minutes remain rather than once per job.
+let GH_APP_TOKEN = { value: "", expiresAt: 0 };
+async function ghAppToken() {
+  if (!GH_APP_CONFIGURED) return "";
+  if (GH_APP_TOKEN.value && GH_APP_TOKEN.expiresAt - Date.now() > 10 * 60 * 1000) return GH_APP_TOKEN.value;
+  const r = await fetch(`https://api.github.com/app/installations/${GH_APP_INSTALLATION_ID}/access_tokens`, {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer " + ghAppJwt(),
+      Accept: "application/vnd.github+json",
+      "User-Agent": "g99-website-build-tool",
+    },
+  });
+  if (!r.ok) throw new Error(`GitHub App token failed (${r.status}): ${(await r.text()).slice(0, 160)}`);
+  const d = await r.json();
+  GH_APP_TOKEN = { value: d.token, expiresAt: new Date(d.expires_at).getTime() };
+  return GH_APP_TOKEN.value;
+}
+
+// Whether the App can drive the WHOLE pipeline. Checked once against a real repo, because the
+// permissions an App was created with and the permissions the org actually accepted can differ.
+let GH_APP_USABLE = null;
+async function ghAppUsable() {
+  if (GH_APP_USABLE !== null) return GH_APP_USABLE;
+  if (!GH_APP_CONFIGURED) return (GH_APP_USABLE = false);
+  try {
+    const token = await ghAppToken();
+    const H = { Authorization: "token " + token, Accept: "application/vnd.github+json", "User-Agent": "g99-website-build-tool" };
+    const probe = async (p) => (await fetch(`https://api.github.com/repos/${WP_REPO}${p}`, { headers: H })).status;
+    const [pulls, checks] = await Promise.all([probe("/pulls?per_page=1"), probe("/commits/main/check-runs")]);
+    GH_APP_USABLE = pulls === 200 && checks === 200;
+    if (!GH_APP_USABLE) {
+      console.warn(`⚠ GitHub App is authenticated but lacks pipeline permissions `
+        + `(pulls=${pulls}, checks=${checks}) — falling back to GH_TOKEN. Grant the App `
+        + `"Pull requests: Read and write", "Checks: Read-only" and "Commit statuses: Read-only", `
+        + `then accept the permission update on the organisation.`);
+    } else {
+      console.log("✓ GitHub App g99-gitops authenticated — using installation tokens for git and gh");
+    }
+  } catch (e) {
+    console.warn("⚠ GitHub App unusable:", e.message, "— falling back to GH_TOKEN");
+    GH_APP_USABLE = false;
+  }
+  return GH_APP_USABLE;
+}
+
+// The token every git/gh call should use: the App when it can do the job, else the PAT.
+async function ghToken() {
+  if (await ghAppUsable()) {
+    try { return await ghAppToken(); } catch (e) { console.error("app token refresh failed:", e.message); }
+  }
+  return process.env.GH_TOKEN || "";
+}
+
+// Authenticated clone/push URL. Always built from a FRESH token — an installation token minted
+// at the start of a long build would already be expiring by the time the push happens.
+async function ghCloneUrl(repo) {
+  const t = await ghToken();
+  return t ? `https://x-access-token:${t}@github.com/${repo}.git` : `https://github.com/${repo}.git`;
+}
+
+// Run a shell command. `gh` reads GH_TOKEN from the environment; when the App is in use its
+// installation token is injected here so every gh call is authenticated as the App.
 function sh(cmd, cwd) {
-  return new Promise((resolve) => exec(cmd, { cwd, maxBuffer: 1e8, windowsHide: true },
-    (e, stdout, stderr) => resolve({ code: e ? (e.code || 1) : 0, stdout: stdout || "", stderr: stderr || "" })));
+  return new Promise((resolve) => {
+    const go = (token) => exec(cmd, {
+      cwd, maxBuffer: 1e8, windowsHide: true,
+      env: token ? { ...process.env, GH_TOKEN: token, GITHUB_TOKEN: token } : process.env,
+    }, (e, stdout, stderr) => resolve({ code: e ? (e.code || 1) : 0, stdout: stdout || "", stderr: stderr || "" }));
+    // Only gh needs the injected token; plain shell commands skip the lookup entirely.
+    if (!GH_APP_CONFIGURED || !/^\s*gh\b/.test(cmd)) return go(process.env.GH_TOKEN || "");
+    ghToken().then(go).catch(() => go(process.env.GH_TOKEN || ""));
+  });
 }
 
 const GEN = path.join(DIR, "generated");
@@ -974,6 +1072,14 @@ async function buildWpTheme(slug, biz, opts = {}) {
   if (!fs.existsSync(path.join(siteDir, "index.html"))) throw new Error("Bind the site first (Step 4) — no /site/ bundle found.");
   const themeDir = path.join(GEN, "wp-theme", slug);
   const buildId = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, ""); // YYYYMMDDHHMM — keys one-time auto-activation per deploy
+  // DIAGNOSTIC: GEN is a single shared dir. Log the source bundle's freshness so the deployed logs
+  // reveal whether the theme is built from THIS run's generation or a stale/clobbered GEN/site.
+  try {
+    const idx = path.join(siteDir, "index.html");
+    const st = fs.statSync(idx);
+    const sha = require("crypto").createHash("sha256").update(fs.readFileSync(idx)).digest("hex").slice(0, 12);
+    console.log(`[buildWpTheme] slug=${slug} reads GEN/site/index.html mtime=${st.mtime.toISOString()} bytes=${st.size} sha=${sha}`);
+  } catch (e) { console.warn("[buildWpTheme] could not stat GEN/site:", e.message); }
   fs.rmSync(themeDir, { recursive: true, force: true });
   fs.mkdirSync(themeDir, { recursive: true });
   // Use the HOME page's head + header + footer as the shared chrome
@@ -4848,6 +4954,102 @@ function backfillPool() {
 }
 setTimeout(backfillPool, 2000);
 
+// ---- credentials smoke test -----------------------------------------------------
+// Clones a repo, appends one line to .g99/smoke-test.md, pushes a branch and opens a PR.
+// It runs through the SAME auth layer as the real pipeline (ghToken / ghCloneUrl / sh) rather
+// than a copy, so a pass here means the pipeline's credentials work — a copy could drift and
+// pass while the real thing fails. Push and PR are reported separately because they need
+// DIFFERENT permissions, which is exactly where the GitHub App currently falls short.
+const SMOKE_FILE = ".g99/smoke-test.md";
+
+async function runPrSmoke(mode, repoIn, baseIn) {
+  const repo = normalizeRepo(repoIn) || "G99agency/prodteam1.gogroth.com";
+  const base = (baseIn || "main").replace(/[^A-Za-z0-9._\-\/]/g, "");
+  const steps = [];
+  const step = (label, ok, detail, extra) =>
+    steps.push({ label, ok, detail: String(detail == null ? "" : detail).slice(0, 400), ...(extra || {}) });
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "g99-smoke-"));
+
+  try {
+    let appTok = "";
+    if (mode !== "pat" && GH_APP_CONFIGURED) {
+      try { appTok = await ghAppToken(); step("Mint GitHub App token", true, "installation " + GH_APP_INSTALLATION_ID); }
+      catch (e) { step("Mint GitHub App token", false, e.message); }
+    } else if (mode !== "pat") {
+      step("Mint GitHub App token", false, "App not configured — set the GH_APP_* vars in .env");
+    }
+    if (mode === "app" && !appTok) throw new Error("App mode requested but no App token could be minted");
+
+    const pushTok = mode === "pat" ? (process.env.GH_TOKEN || "") : (appTok || process.env.GH_TOKEN || "");
+    const pushWho = mode === "pat" ? "PAT" : (appTok ? "GitHub App" : "PAT");
+    if (!pushTok) throw new Error("no credentials — set GH_TOKEN or the GH_APP_* vars in .env");
+
+    let r = await sh(`git clone --depth 1 --branch ${base} "https://x-access-token:${pushTok}@github.com/${repo}.git" "${tmp}"`);
+    if (r.code) throw new Error("clone failed: " + (r.stderr || r.stdout).slice(-220));
+    step(`Clone ${repo}`, true, `branch ${base}, authenticated as ${pushWho}`);
+
+    const stamp = new Date().toISOString();
+    const branch = "g99/smoke-" + stamp.slice(0, 19).replace(/[-:T]/g, "");
+    const abs = path.join(tmp, SMOKE_FILE);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    // Append rather than overwrite, so the file is a log of every run.
+    const prev = fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : "# Growth99 connectivity smoke tests\n\n";
+    fs.writeFileSync(abs, `${prev}- ${stamp} — smoke test via ${pushWho}\n`);
+    step("Write a small change", true, SMOKE_FILE);
+
+    await sh(`git checkout -b "${branch}"`, tmp);
+    await sh(`git add -A "${SMOKE_FILE}"`, tmp);
+    r = await sh(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "Smoke test: verify ${pushWho} can push"`, tmp);
+    if (r.code) throw new Error("commit failed: " + (r.stderr || r.stdout).slice(-220));
+    r = await sh(`git push -u origin "${branch}"`, tmp);
+    if (r.code) throw new Error(`push failed as ${pushWho}: ` + r.stderr.slice(-240));
+    step("Push branch", true, `${branch} — pushed as ${pushWho}`);
+
+    const payload = {
+      title: `Smoke test: ${stamp.slice(0, 16)}`,
+      head: branch,
+      base,
+      body: `Automated connectivity check from the Growth99 build tool.\n\n`
+        + `- push authenticated as: **${pushWho}**\n- change: \`${SMOKE_FILE}\`\n\nSafe to close.`,
+    };
+    const openPr = (token) => fetch(`https://api.github.com/repos/${repo}/pulls`, {
+      method: "POST",
+      headers: {
+        Authorization: "token " + token, Accept: "application/vnd.github+json",
+        "User-Agent": "g99-website-build-tool", "X-GitHub-Api-Version": "2022-11-28",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    let created = null, prWho = "";
+    if (appTok && mode !== "pat") {
+      const res = await openPr(appTok);
+      if (res.ok) { created = await res.json(); prWho = "GitHub App"; }
+      else {
+        // GitHub names the permission it wanted — surface that instead of a bare 403.
+        const need = res.headers.get("x-accepted-github-permissions") || "";
+        step("Open PR as the GitHub App", false,
+          `HTTP ${res.status}${need ? ` — GitHub says this needs: ${need}` : ""} ${(await res.text()).slice(0, 200)}`);
+        if (mode === "app") throw new Error("the App cannot open PRs — grant it \"Pull requests: Read and write\"");
+      }
+    }
+    if (!created) {
+      if (!process.env.GH_TOKEN) throw new Error("PR not created and no GH_TOKEN to fall back to");
+      const res = await openPr(process.env.GH_TOKEN);
+      if (!res.ok) throw new Error(`PR create failed (PAT): HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
+      created = await res.json();
+      prWho = "PAT";
+    }
+    step("Open pull request", true, `#${created.number} — opened by ${prWho}`, { url: created.html_url });
+    return { ok: true, repo, prUrl: created.html_url, branch, steps };
+  } catch (e) {
+    step("Failed", false, e.message);
+    return { ok: false, repo, error: e.message, steps };
+  } finally {
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
+  }
+}
+
 function siteRequiresApproval(siteId) {
   return !!readApprovals()[siteId];
 }
@@ -5633,10 +5835,10 @@ async function runEditJob(job) {
     // 1 — pull latest
     jobStep(job, 0, "running", "Cloning " + repo);
     let r = await runRetry(`gh repo clone ${repo} "${tmp}" -- --depth 1`);
-    const cloneUrl = process.env.GH_TOKEN ? `https://x-access-token:${process.env.GH_TOKEN}@github.com/${repo}.git` : `https://github.com/${repo}.git`;
+    const cloneUrl = await ghCloneUrl(repo);
     if (r.code) r = await runRetry(`git clone --depth 1 "${cloneUrl}" "${tmp}"`);
     if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
-    if (process.env.GH_TOKEN) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
+    if (/x-access-token:/.test(cloneUrl)) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
     const themeAbs = path.join(tmp, P.themePath);
     if (!fs.existsSync(themeAbs)) throw new Error("theme not found in repo: " + P.themePath);
     jobStep(job, 0, "done", "Latest code pulled");
@@ -5916,10 +6118,10 @@ async function runRestoreJob(job) {
     // 1 — full clone: unlike an edit, this needs the history the sha lives in.
     jobStep(job, 0, "running", "Cloning " + repo);
     let r = await runRetry(`gh repo clone ${repo} "${tmp}"`);
-    const cloneUrl = process.env.GH_TOKEN ? `https://x-access-token:${process.env.GH_TOKEN}@github.com/${repo}.git` : `https://github.com/${repo}.git`;
+    const cloneUrl = await ghCloneUrl(repo);
     if (r.code) r = await runRetry(`git clone "${cloneUrl}" "${tmp}"`);
     if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
-    if (process.env.GH_TOKEN) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
+    if (/x-access-token:/.test(cloneUrl)) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
     r = await run(`git rev-parse --verify --quiet ${P.sha}`, tmp);
     if (r.code || !r.stdout.trim()) throw new Error(`commit ${P.sha.slice(0, 7)} isn't in ${repo}`);
     const full = r.stdout.trim();
@@ -6798,10 +7000,10 @@ async function runEnrichJob(job) {
     } else {
       jobStep(job, 0, "running", "Cloning " + repo);
       r = await runRetry(`gh repo clone ${repo} "${tmp}" -- --depth 1`);
-      const cloneUrl = process.env.GH_TOKEN ? `https://x-access-token:${process.env.GH_TOKEN}@github.com/${repo}.git` : `https://github.com/${repo}.git`;
+      const cloneUrl = await ghCloneUrl(repo);
       if (r.code) r = await runRetry(`git clone --depth 1 "${cloneUrl}" "${tmp}"`);
       if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
-      if (process.env.GH_TOKEN) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
+      if (/x-access-token:/.test(cloneUrl)) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
       themeAbs = path.join(tmp, P.themePath);
       muAbs = path.join(tmp, P.muPath);
       if (!fs.existsSync(themeAbs)) throw new Error("theme not found in repo: " + P.themePath);
@@ -7977,10 +8179,10 @@ async function runSeoJob(job) {
     } else {
       jobStep(job, 0, "running", "Cloning " + repo);
       r = await runRetry(`gh repo clone ${repo} "${tmp}" -- --depth 1`);
-      const cloneUrl = process.env.GH_TOKEN ? `https://x-access-token:${process.env.GH_TOKEN}@github.com/${repo}.git` : `https://github.com/${repo}.git`;
+      const cloneUrl = await ghCloneUrl(repo);
       if (r.code) r = await runRetry(`git clone --depth 1 "${cloneUrl}" "${tmp}"`);
       if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
-      if (process.env.GH_TOKEN) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
+      if (/x-access-token:/.test(cloneUrl)) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
       jobStep(job, 0, "done", "Latest code pulled");
     }
     const themeAbs = path.join(workRoot, P.themePath);
@@ -8647,10 +8849,10 @@ async function runPreReleaseJob(job) {
   try {
     jobStep(job, 0, "running", "Cloning " + repo);
     let r = await runRetry(`gh repo clone ${repo} "${tmp}" -- --depth 1`);
-    const cloneUrl = process.env.GH_TOKEN ? `https://x-access-token:${process.env.GH_TOKEN}@github.com/${repo}.git` : `https://github.com/${repo}.git`;
+    const cloneUrl = await ghCloneUrl(repo);
     if (r.code) r = await runRetry(`git clone --depth 1 "${cloneUrl}" "${tmp}"`);
     if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
-    if (process.env.GH_TOKEN) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
+    if (/x-access-token:/.test(cloneUrl)) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
     const themeAbs = path.join(tmp, P.themePath);
     const muAbs = P.muPath ? path.join(tmp, P.muPath) : "";
     if (!fs.existsSync(themeAbs)) throw new Error("theme not found: " + P.themePath);
@@ -10478,10 +10680,10 @@ async function runPerformPrJob(job) {
     // ---- phase 0 -------------------------------------------------------------
     jobStep(job, 0, "running", "Cloning " + repo);
     let r = await runRetry(`gh repo clone ${repo} "${tmp}" -- --depth 1`);
-    const cloneUrl = process.env.GH_TOKEN ? `https://x-access-token:${process.env.GH_TOKEN}@github.com/${repo}.git` : `https://github.com/${repo}.git`;
+    const cloneUrl = await ghCloneUrl(repo);
     if (r.code) r = await runRetry(`git clone --depth 1 "${cloneUrl}" "${tmp}"`);
     if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
-    if (process.env.GH_TOKEN) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
+    if (/x-access-token:/.test(cloneUrl)) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
     const themeAbs = path.join(tmp, P.themePath);
     if (!fs.existsSync(themeAbs)) throw new Error("theme not found: " + P.themePath);
     const muAbs = P.muPath ? path.join(tmp, P.muPath) : "";
@@ -11412,6 +11614,31 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // Credentials smoke test. Deliberately NOT in the nav — it pushes a real branch and opens a
+    // real PR, so it is reached by URL when you are actually testing GitHub access.
+    if (p === "/pr-smoke" || p === "/pr-smoke.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "pr-smoke.html")));
+    if (p === "/pr-smoke.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "pr-smoke.js")));
+    // Which GitHub credentials this deployment actually has, and whether the App is enough.
+    if (p === "/api/gh-auth") {
+      const usable = await ghAppUsable();
+      const pat = !!process.env.GH_TOKEN;
+      return json(res, 200, {
+        appConfigured: GH_APP_CONFIGURED,
+        appUsable: usable,
+        patConfigured: pat,
+        installationId: GH_APP_INSTALLATION_ID || null,
+        mode: usable ? "GitHub App" : (pat ? (GH_APP_CONFIGURED ? "App push + PAT fallback" : "PAT only") : "no credentials"),
+        warning: usable ? "" : GH_APP_CONFIGURED
+          ? 'The GitHub App can push, but PRs and CI checks return 403 — grant it "Pull requests: Read and write", "Checks: Read-only" and "Commit statuses: Read-only", then accept the update on the organisation.'
+          : "No GitHub App configured — everything runs on the personal access token.",
+      });
+    }
+    if (p === "/api/pr-smoke" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req) || "{}");
+      const mode = ["app", "pat", "auto"].includes(body.mode) ? body.mode : "auto";
+      return json(res, 200, await runPrSmoke(mode, body.repo, body.base));
+    }
+
     if (p === "/clients" || p === "/clients.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "clients.html")));
     if (p === "/clients.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "clients.js")));
     if (p === "/coverage" || p === "/coverage.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "coverage.html")));
@@ -12283,13 +12510,11 @@ const server = http.createServer(async (req, res) => {
         let r = await runRetry(`gh repo clone ${repo} "${tmp}" -- --depth 1`);
         // Fallback avoids api.github.com (flaky DNS). With GH_TOKEN (deployed),
         // embed it so the plain clone is authenticated too.
-        const cloneUrl = process.env.GH_TOKEN
-          ? `https://x-access-token:${process.env.GH_TOKEN}@github.com/${repo}.git`
-          : `https://github.com/${repo}.git`;
+        const cloneUrl = await ghCloneUrl(repo);
         if (r.code) r = await runRetry(`git clone --depth 1 "${cloneUrl}" "${tmp}"`);
         if (r.code) throw new Error("clone failed (network — could not reach GitHub): " + r.stderr.slice(-200));
         // Deployed (headless) git push must authenticate via the token URL too.
-        if (process.env.GH_TOKEN) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
+        if (/x-access-token:/.test(cloneUrl)) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
         const dest = path.join(tmp, rel);
         // Delete-then-copy so an UPDATE PR also shows file removals (copy alone
         // would leave stale templates from earlier merged builds in the repo).
@@ -12339,6 +12564,13 @@ const server = http.createServer(async (req, res) => {
         } catch (e) { console.error("manifest seed skipped:", e.message); }
         await run(`git checkout -b "${branch}"`, tmp);
         await run(`git add -A "${rel}" "${muRel}"`, tmp);
+        // DIAGNOSTIC: how many files does git actually see staged? 0 → the copied theme matched HEAD
+        // (stale GEN/site), which is the "nothing to commit" case we're proving.
+        try {
+          const st = await run(`git status --porcelain`, tmp);
+          const changed = (st.stdout || "").split("\n").filter(l => l.trim()).length;
+          console.log(`[push-wordpress] slug=${slug} copied ${built.files.length} files → git sees ${changed} changed path(s) staged before commit`);
+        } catch (e) { console.warn("[push-wordpress] git status diag failed:", e.message); }
         r = await run(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "Add ${a.business_name} beta theme + auto-activator (Growth99 generated)"`, tmp);
         if (r.code) throw new Error("commit failed: " + (r.stderr || r.stdout).slice(-200));
         r = await run(`git push -u origin "${branch}"`, tmp);
