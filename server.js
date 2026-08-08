@@ -101,36 +101,48 @@ async function ghAppToken() {
   return GH_APP_TOKEN.value;
 }
 
-// Whether the App can drive the WHOLE pipeline. Checked once against a real repo, because the
-// permissions an App was created with and the permissions the org actually accepted can differ.
-let GH_APP_USABLE = null;
-async function ghAppUsable() {
-  if (GH_APP_USABLE !== null) return GH_APP_USABLE;
-  if (!GH_APP_CONFIGURED) return (GH_APP_USABLE = false);
+// What the App can actually do, probed once against a real repo — the permissions an App was
+// created with, and the ones the org accepted, can differ. Capability is PER AREA rather than
+// all-or-nothing: an App that can push and open PRs but cannot read check runs should still
+// drive the pipeline, with only the CI reads borrowing the PAT.
+let GH_APP_CAPS = null;
+async function ghAppCaps() {
+  if (GH_APP_CAPS) return GH_APP_CAPS;
+  if (!GH_APP_CONFIGURED) return (GH_APP_CAPS = { any: false, pulls: false, checks: false });
   try {
     const token = await ghAppToken();
     const H = { Authorization: "token " + token, Accept: "application/vnd.github+json", "User-Agent": "g99-website-build-tool" };
     const probe = async (p) => (await fetch(`https://api.github.com/repos/${WP_REPO}${p}`, { headers: H })).status;
-    const [pulls, checks] = await Promise.all([probe("/pulls?per_page=1"), probe("/commits/main/check-runs")]);
-    GH_APP_USABLE = pulls === 200 && checks === 200;
-    if (!GH_APP_USABLE) {
-      console.warn(`⚠ GitHub App is authenticated but lacks pipeline permissions `
-        + `(pulls=${pulls}, checks=${checks}) — falling back to GH_TOKEN. Grant the App `
-        + `"Pull requests: Read and write", "Checks: Read-only" and "Commit statuses: Read-only", `
-        + `then accept the permission update on the organisation.`);
-    } else {
-      console.log("✓ GitHub App g99-gitops authenticated — using installation tokens for git and gh");
-    }
+    const [pulls, checks, statuses] = await Promise.all([
+      probe("/pulls?per_page=1"), probe("/commits/main/check-runs"), probe("/commits/main/status"),
+    ]);
+    GH_APP_CAPS = { any: true, pulls: pulls === 200, checks: checks === 200 && statuses === 200 };
+    const missing = [
+      !GH_APP_CAPS.pulls ? '"Pull requests: Read and write"' : "",
+      checks !== 200 ? '"Checks: Read-only"' : "",
+      statuses !== 200 ? '"Commit statuses: Read-only"' : "",
+    ].filter(Boolean);
+    if (!missing.length) console.log("✓ GitHub App g99-gitops — full pipeline access, GH_TOKEN no longer needed");
+    else if (GH_APP_CAPS.pulls) console.log(`✓ GitHub App g99-gitops — push, PR and merge run as the App. Still missing ${missing.join(" + ")}, so CI status reads use GH_TOKEN.`);
+    else console.warn(`⚠ GitHub App cannot open PRs — running on GH_TOKEN. Grant ${missing.join(", ")} and accept the update on the organisation.`);
   } catch (e) {
     console.warn("⚠ GitHub App unusable:", e.message, "— falling back to GH_TOKEN");
-    GH_APP_USABLE = false;
+    GH_APP_CAPS = { any: false, pulls: false, checks: false };
   }
-  return GH_APP_USABLE;
+  return GH_APP_CAPS;
 }
+// Kept for callers that only want a yes/no on "is the App running the pipeline".
+const ghAppUsable = async () => (await ghAppCaps()).pulls;
 
-// The token every git/gh call should use: the App when it can do the job, else the PAT.
-async function ghToken() {
-  if (await ghAppUsable()) {
+// The token a given call should use.
+//   purpose "write"  — clone, push, PR create/merge  → needs contents + pull_requests
+//   purpose "checks" — CI status reads               → needs checks + statuses
+// Each falls back to the PAT only for the area the App is missing, so granting the last two
+// permissions is all that stands between here and dropping GH_TOKEN entirely.
+async function ghToken(purpose = "write") {
+  const caps = await ghAppCaps();
+  const ok = purpose === "checks" ? caps.checks : caps.pulls;
+  if (ok) {
     try { return await ghAppToken(); } catch (e) { console.error("app token refresh failed:", e.message); }
   }
   return process.env.GH_TOKEN || "";
@@ -153,7 +165,10 @@ function sh(cmd, cwd) {
     }, (e, stdout, stderr) => resolve({ code: e ? (e.code || 1) : 0, stdout: stdout || "", stderr: stderr || "" }));
     // Only gh needs the injected token; plain shell commands skip the lookup entirely.
     if (!GH_APP_CONFIGURED || !/^\s*gh\b/.test(cmd)) return go(process.env.GH_TOKEN || "");
-    ghToken().then(go).catch(() => go(process.env.GH_TOKEN || ""));
+    // CI status reads need checks+statuses, which the App may not have yet, while push/PR/merge
+    // need pull_requests, which it may. Pick the token per command rather than per process.
+    const purpose = /\bpr\s+checks\b|check-runs|commits\/[^\s"]*\/status/.test(cmd) ? "checks" : "write";
+    ghToken(purpose).then(go).catch(() => go(process.env.GH_TOKEN || ""));
   });
 }
 
@@ -11909,17 +11924,26 @@ const server = http.createServer(async (req, res) => {
     if (p === "/pr-smoke.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "pr-smoke.js")));
     // Which GitHub credentials this deployment actually has, and whether the App is enough.
     if (p === "/api/gh-auth") {
-      const usable = await ghAppUsable();
+      const caps = await ghAppCaps();
       const pat = !!process.env.GH_TOKEN;
+      const full = caps.pulls && caps.checks;
       return json(res, 200, {
         appConfigured: GH_APP_CONFIGURED,
-        appUsable: usable,
+        appUsable: caps.pulls,
+        canOpenPrs: caps.pulls,
+        canReadChecks: caps.checks,
         patConfigured: pat,
+        patStillNeeded: !full,
         installationId: GH_APP_INSTALLATION_ID || null,
-        mode: usable ? "GitHub App" : (pat ? (GH_APP_CONFIGURED ? "App push + PAT fallback" : "PAT only") : "no credentials"),
-        warning: usable ? "" : GH_APP_CONFIGURED
-          ? 'The GitHub App can push, but PRs and CI checks return 403 — grant it "Pull requests: Read and write", "Checks: Read-only" and "Commit statuses: Read-only", then accept the update on the organisation.'
-          : "No GitHub App configured — everything runs on the personal access token.",
+        mode: full ? "GitHub App (PAT not needed)"
+          : caps.pulls ? "GitHub App — PAT only for CI status"
+            : (pat ? (GH_APP_CONFIGURED ? "PAT (App cannot open PRs)" : "PAT only") : "no credentials"),
+        warning: full ? ""
+          : caps.pulls
+            ? 'Push, PR and merge run as the App. Grant "Checks: Read-only" and "Commit statuses: Read-only" (then accept the update on the organisation) and GH_TOKEN can be removed.'
+            : GH_APP_CONFIGURED
+              ? 'The App cannot open PRs — grant "Pull requests: Read and write" and accept the update on the organisation.'
+              : "No GitHub App configured — everything runs on the personal access token.",
       });
     }
     if (p === "/api/pr-smoke" && req.method === "POST") {
