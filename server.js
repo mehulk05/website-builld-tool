@@ -2068,6 +2068,43 @@ ${h ? `h1,h2,h3,h4{letter-spacing:-.01em}` : ""}
     ? String(html).replace(/<\/head>/i, block + "\n</head>")
     : String(html) + block;
 }
+const escapeRe = (s) => String(s || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// Deterministic footer facts — the FOOTER_DIRECTIVE prompt addition got the
+// legal row (Privacy/Terms/Accessibility) to show up reliably, but confirmed
+// on a real generation (2026-08-08): the footer's own brand-name heading still
+// came back hallucinated ("AESTHETICA ARTISAN MEDICAL" for a business actually
+// named "Lumiere Aesthetics Studio"), and no phone number landed inside the
+// footer at all even though it appeared elsewhere on the page. Same lesson as
+// enforceArbitraryColors/enforceBrandFonts above: asking is not enough for an
+// exact fact in an exact spot — rewrite it after the fact instead.
+function enforceFooterFacts(html) {
+  const m = String(html).match(/<footer\b[\s\S]*?<\/footer>/i);
+  if (!m) return html;
+  let footer = m[0];
+  let A = {};
+  try { A = JSON.parse(fs.readFileSync(path.join(DIR, "onboarding.json"), "utf8")).answers || {}; } catch (e) { return html; }
+
+  // The footer's own "brand" line is almost always the first heading/strong/bold
+  // text node right after <footer> opens — replace its TEXT only, same markup,
+  // same technique retargetNav uses on nav anchors (edit in place, don't rebuild).
+  const bizName = A.business_name;
+  if (bizName && !new RegExp(escapeRe(bizName), "i").test(footer)) {
+    const brandTag = footer.match(/<(h[1-6]|strong|b)\b([^>]*)>([\s\S]*?)<\/\1>/i);
+    if (brandTag) footer = footer.replace(brandTag[0], `<${brandTag[1]}${brandTag[2]}>${escHtml(bizName)}</${brandTag[1]}>`);
+  }
+
+  // Phone: if no real phone digits appear anywhere in the footer, append one as
+  // a tel: link rather than guess which element was "supposed" to hold it —
+  // guessing wrong would silently overwrite unrelated real footer content.
+  const digitsOf = (s) => String(s || "").replace(/\D/g, "");
+  const phoneDigits = digitsOf(A.phone_for_website);
+  if (phoneDigits.length >= 7 && !digitsOf(footer).includes(phoneDigits)) {
+    const telHref = "tel:+1" + phoneDigits.slice(-10);
+    footer = footer.replace(/<\/footer>/i,
+      `<p style="margin:8px 0;text-align:center;font-size:13px"><a href="${telHref}" style="color:inherit;text-decoration:none">${escHtml(A.phone_for_website)}</a></p></footer>`);
+  }
+  return footer === m[0] ? html : html.replace(m[0], footer);
+}
 
 // `stylingConstraint()` tells the model to use only standard/arbitrary-value
 // Tailwind utilities, never a NAMED custom color (bg-secondary, text-primary) —
@@ -13094,6 +13131,7 @@ const server = http.createServer(async (req, res) => {
             let html = await geminiGenerate(tokens + "\n\n" + pg.prompt + (contract || ""));
             html = seoEnhance(html, key);
             html = injectCanonicalNav(html, theme || {});
+            html = enforceFooterFacts(html);
             fs.writeFileSync(path.join(GEN, key + ".html"), html);
             return { page: key, pageKey: pg.key, engine: "gemini", htmlBytes: html.length, previewUrl: `/preview/${key}`, exportUrl: `/export/${key}`, screenshotUrl: "" };
           } catch (e) { return { pageKey: pg.key, engine: "gemini", error: e.message }; }
@@ -13143,6 +13181,7 @@ const server = http.createServer(async (req, res) => {
         html = await qcStitchImages(html);          // swap any text-baked images for clean photos
         html = seoEnhance(html, r.key);
         html = injectCanonicalNav(html, theme || {});
+        html = enforceFooterFacts(html);
         fs.writeFileSync(path.join(GEN, r.key + ".html"), html);
         genProg(r.key, "done", { bytes: html.length });
         return { page: r.key, pageKey: r.key, engine: "stitch", htmlBytes: html.length, previewUrl: `/preview/${r.key}`, exportUrl: `/export/${r.key}`, screenshotUrl: r.screenshotUrl || "" };
