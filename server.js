@@ -174,7 +174,11 @@ function sh(cmd, cwd) {
 
 const GEN = path.join(DIR, "generated");
 const PORT = process.env.PORT || 8793;
-const API_KEY = process.env.STITCH_API_KEY || "";
+// Comma-separated so multiple keys can be pooled under the one env var name —
+// no rename needed, existing deployments with a single key keep working as-is.
+const STITCH_KEYS = String(process.env.STITCH_API_KEY || "").split(",").map(s => s.trim()).filter(Boolean);
+const API_KEY = STITCH_KEYS[0] || "";   // kept for any legacy reference
+let skIdx = 0;
 const MCP_URL = "https://stitch.googleapis.com/mcp";
 const GEMINI_KEYS = (process.env.GEMINI_KEYS || "").split(",").map(s => s.trim()).filter(Boolean);
 // NocoDB is the source of truth for real websites (name / domain / repo). The
@@ -209,7 +213,8 @@ const TED_SHOT_MAX_BYTES = 400 * 1024;
 // tenants long before we get to it. Unset works fine locally and fails on
 // Render for reasons no log used to explain. Also used by the CRO audit.
 const MICROLINK_API_KEY = process.env.MICROLINK_API_KEY || "";
-if (!API_KEY) console.warn("⚠ STITCH_API_KEY not set — Stitch generation will fail. Add it to .env or the platform env vars.");
+if (!STITCH_KEYS.length) console.warn("⚠ STITCH_API_KEY not set — Stitch generation will fail. Add it to .env or the platform env vars.");
+else if (STITCH_KEYS.length > 1) console.log(`Stitch: ${STITCH_KEYS.length} keys pooled, will rotate on quota exhaustion`);
 if (!NOCODB_TOKEN) console.warn("⚠ NOCODB_TOKEN not set — the All Sites / Edit Sites website list will be empty until it's added to .env.");
 if (!GEMINI_KEYS.length) console.warn("⚠ GEMINI_KEYS not set — all AI features (CRO, prompt, bind, QC) will fail.");
 // Live per-treatment photo search — real variety instead of the fixed ~14-photo
@@ -352,35 +357,55 @@ async function aiCall(parts, opts = {}) {
   }
 }
 
+// A quota-exhausted key answers with 429 (or 403 RESOURCE_EXHAUSTED) — same signal
+// geminiCall rotates on. One key still works exactly as before (loop runs once).
+function isQuotaError(status, text) {
+  return status === 429 || (status === 403 && /RESOURCE_EXHAUSTED|quota/i.test(text || ""));
+}
 async function rpc(method, params, notify = false, timeoutMs = 90000) {
   const body = { jsonrpc: "2.0", method };
   if (!notify) body.id = ++rpcId;
   if (params) body.params = params;
-  const ac = new AbortController();
-  const to = setTimeout(() => ac.abort(), timeoutMs);
-  let res;
-  try {
-    res = await fetch(MCP_URL, {
-      method: "POST",
-      signal: ac.signal,
-      headers: {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-        "X-Goog-Api-Key": API_KEY,
-        "MCP-Protocol-Version": PROTO,
-      },
-      body: JSON.stringify(body),
-    });
-  } catch (e) {
-    throw new Error(e.name === "AbortError" ? `Stitch ${method} timed out after ${timeoutMs}ms` : `Stitch ${method}: ${e.message}`);
-  } finally {
-    clearTimeout(to);
+  let lastErr = null;
+  for (let i = 0; i < Math.max(STITCH_KEYS.length, 1); i++) {
+    const key = STITCH_KEYS[(skIdx + i) % Math.max(STITCH_KEYS.length, 1)] || "";
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort(), timeoutMs);
+    let res;
+    try {
+      res = await fetch(MCP_URL, {
+        method: "POST",
+        signal: ac.signal,
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json, text/event-stream",
+          "X-Goog-Api-Key": key,
+          "MCP-Protocol-Version": PROTO,
+        },
+        body: JSON.stringify(body),
+      });
+    } catch (e) {
+      lastErr = e.name === "AbortError" ? new Error(`Stitch ${method} timed out after ${timeoutMs}ms`) : new Error(`Stitch ${method}: ${e.message}`);
+      continue;
+    } finally {
+      clearTimeout(to);
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      if (isQuotaError(res.status, text) && i < STITCH_KEYS.length - 1) {
+        lastErr = new Error(`Stitch HTTP ${res.status} on ${method}: ${text.slice(0, 300)}`);
+        console.warn(`Stitch key #${(skIdx + i) % STITCH_KEYS.length + 1} exhausted (${res.status}) — rotating to next key`);
+        continue;
+      }
+      throw new Error(`Stitch HTTP ${res.status} on ${method}: ${text.slice(0, 300)}`);
+    }
+    skIdx = (skIdx + i) % Math.max(STITCH_KEYS.length, 1);
+    if (notify) return {};
+    const parsed = parsePayload(await res.text());
+    if (parsed && parsed.error) throw new Error(`Stitch RPC error: ${JSON.stringify(parsed.error)}`);
+    return parsed ? parsed.result : {};
   }
-  if (!res.ok) throw new Error(`Stitch HTTP ${res.status} on ${method}: ${(await res.text().catch(() => "")).slice(0, 300)}`);
-  if (notify) return {};
-  const parsed = parsePayload(await res.text());
-  if (parsed && parsed.error) throw new Error(`Stitch RPC error: ${JSON.stringify(parsed.error)}`);
-  return parsed ? parsed.result : {};
+  throw lastErr || new Error(`Stitch ${method}: no API key configured`);
 }
 function parsePayload(raw) {
   if (!raw || !raw.trim()) return null;
@@ -1934,6 +1959,32 @@ function extractPalette(html) {
   }
   return Object.entries(count).sort((a, b) => b[1] - a[1]).map(([h]) => h);
 }
+// Some reference sites' "real font" is a self-hosted/Typekit/custom font that
+// doesn't exist on Google Fonts at all — confirmed on ruma.com: "Editor Note"
+// 404s https://fonts.googleapis.com/css2?family=Editor+Note (the exact request
+// enforceBrandFonts sends), so that <link> silently fails to load and every
+// heading falls back to the CSS's own literal "sans-serif" keyword — flat and
+// generic, the opposite of the point of reading the site's real font at all.
+// Verify before trusting a candidate. A rejected font is DROPPED, not
+// force-replaced with a guess, so the compose-brand Gemini call is free to
+// pick a real font instead — exactly what already happens when no fonts are
+// found at all, so this doesn't need its own fallback list.
+const GOOGLE_FONT_CACHE = new Map();
+async function verifyGoogleFont(name) {
+  if (!name) return false;
+  const key = name.toLowerCase();
+  if (GOOGLE_FONT_CACHE.has(key)) return GOOGLE_FONT_CACHE.get(key);
+  let ok = false;
+  try {
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 6000);
+    const url = `https://fonts.googleapis.com/css2?family=${encodeURIComponent(name).replace(/%20/g, "+")}:wght@400&display=swap`;
+    const r = await fetch(url, { signal: ctl.signal, headers: { "User-Agent": "Mozilla/5.0" } });
+    clearTimeout(t);
+    ok = r.ok;
+  } catch (e) { ok = false; }
+  GOOGLE_FONT_CACHE.set(key, ok);
+  return ok;
+}
 // Fetch a live site and read its ACTUAL type + palette.
 async function readSiteBrand(url) {
   if (!url) return null;
@@ -1941,9 +1992,22 @@ async function readSiteBrand(url) {
     const r = await fetch(url, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 G99Bot", "Cache-Control": "no-cache" } });
     if (!r.ok) return null;
     const html = await r.text();
-    const fonts = extractFontFamilies(html), pal = extractPalette(html);
+    let fonts = extractFontFamilies(html);
+    const pal = extractPalette(html);
+    const verified = await Promise.all(fonts.map((f) => verifyGoogleFont(f)));
+    const rejected = fonts.filter((f, i) => !verified[i]);
+    fonts = fonts.filter((f, i) => verified[i]);
+    if (rejected.length) console.warn(`  readSiteBrand(${url}): rejected non-Google-Fonts candidate(s): ${rejected.join(", ")}`);
     if (!fonts.length && !pal.length) return null;
-    return { fonts, headingFont: fonts[0] || null, bodyFont: fonts[1] || fonts[0] || null, palette: pal };
+    // Only claim a heading/body PAIR when two distinct real fonts survived
+    // verification. With just one (e.g. the reference site's actual heading
+    // face wasn't a real Google Font and got rejected above), pinning both
+    // roles to that single font in compose-brand would flatten the page —
+    // heading and body identical, no type hierarchy. Leaving headingFont null
+    // here means compose-brand's own Gemini pairing suggestion is used
+    // instead (it isn't force-pinned unless this returns a truthy value) —
+    // bodyFont still gets the one real font, so brand continuity isn't lost.
+    return { fonts, headingFont: fonts.length >= 2 ? fonts[0] : null, bodyFont: fonts[fonts.length >= 2 ? 1 : 0] || null, palette: pal };
   } catch (e) { return null; }
 }
 // The brand a THEME actually renders. Derived from the theme's own files rather
@@ -2087,21 +2151,48 @@ function enforceFooterFacts(html) {
   // The footer's own "brand" line is almost always the first heading/strong/bold
   // text node right after <footer> opens — replace its TEXT only, same markup,
   // same technique retargetNav uses on nav anchors (edit in place, don't rebuild).
+  // Compare with accents stripped: Stitch itself sometimes stylizes the real
+  // name ("Lumière" for "Lumiere") — that's correct, not missing, and must not
+  // get re-flagged and overwritten.
+  const norm = (s) => String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
   const bizName = A.business_name;
-  if (bizName && !new RegExp(escapeRe(bizName), "i").test(footer)) {
-    const brandTag = footer.match(/<(h[1-6]|strong|b)\b([^>]*)>([\s\S]*?)<\/\1>/i);
+  if (bizName && !norm(footer).includes(norm(bizName))) {
+    const brandTag = footer.match(/<(h[1-6]|strong|b|span)\b([^>]*)>([\s\S]*?)<\/\1>/i);
     if (brandTag) footer = footer.replace(brandTag[0], `<${brandTag[1]}${brandTag[2]}>${escHtml(bizName)}</${brandTag[1]}>`);
   }
 
-  // Phone: if no real phone digits appear anywhere in the footer, append one as
-  // a tel: link rather than guess which element was "supposed" to hold it —
-  // guessing wrong would silently overwrite unrelated real footer content.
+  // Phone: if no real phone digits appear anywhere in the footer, add one as a
+  // tel: link — anchored next to a REAL, visible link, never a bare <div>.
+  // Two bugs fixed here (both confirmed on real generations, 2026-08-08):
+  // (1) appending a plain <p> after the grid rendered as a disconnected,
+  //     oddly-spaced orphan line below the whole footer;
+  // (2) the "first <div>" fallback matched whatever div happened to open
+  //     first — on one generation that was the decorative, pointer-events-none
+  //     background wordmark, so the phone link became invisible; cloning that
+  //     div's sibling <a>'s attrs without stripping its own href="#" also
+  //     produced an invalid tag with two href attributes.
+  // Fix: only ever anchor next to an existing <a> (guaranteed visible content,
+  // never the wordmark), and strip any href from the cloned attrs first.
   const digitsOf = (s) => String(s || "").replace(/\D/g, "");
   const phoneDigits = digitsOf(A.phone_for_website);
   if (phoneDigits.length >= 7 && !digitsOf(footer).includes(phoneDigits)) {
     const telHref = "tel:+1" + phoneDigits.slice(-10);
-    footer = footer.replace(/<\/footer>/i,
-      `<p style="margin:8px 0;text-align:center;font-size:13px"><a href="${telHref}" style="color:inherit;text-decoration:none">${escHtml(A.phone_for_website)}</a></p></footer>`);
+    const cloneAttrs = (attrs) => (attrs || "").replace(/\s*href\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/i, "");
+    const phoneElFrom = (attrs) => `<a${cloneAttrs(attrs)} href="${telHref}">${escHtml(A.phone_for_website)}</a>`;
+    // The city is the SECOND comma-segment ("123 Main St, Boston, MA" — index
+    // 0 is the street, not the city); a wrong segment here just fails to
+    // match anything below, harmless, but worth getting right.
+    const cityWord = (A.location || "").split(",")[1] && (A.location || "").split(",")[1].trim().split(/\s+/)[0];
+    const addrLink = cityWord && cityWord.length > 2
+      ? footer.match(new RegExp(`<a\\b([^>]*)>[^<]*${escapeRe(cityWord)}[^<]*<\\/a>`, "i")) : null;
+    if (addrLink) {
+      footer = footer.replace(addrLink[0], addrLink[0] + phoneElFrom(addrLink[1]));
+    } else {
+      const anyLink = footer.match(/<a\b([^>]*)>[\s\S]*?<\/a>/i);
+      footer = anyLink
+        ? footer.replace(anyLink[0], anyLink[0] + phoneElFrom(anyLink[1]))
+        : footer.replace(/<\/footer>/i, phoneElFrom("") + "</footer>");   // last resort: no <a> at all in the footer
+    }
   }
   return footer === m[0] ? html : html.replace(m[0], footer);
 }
@@ -13141,7 +13232,14 @@ const server = http.createServer(async (req, res) => {
         `\n== ${croBlock}`,
         `\n== IMAGERY DIRECTION (REQUIRED) ==\nSpecify a cohesive, HIGH-QUALITY photographic art direction: editorial, photorealistic medical-aesthetic photography — real clinic interiors, close-up treatment/skin/results shots, warm authentic provider & patient portraits. Describe subjects, lighting (soft natural / golden), color grade, and composition so every section has intentional, premium imagery. NO low-resolution, cartoonish, or generic clip-art stock. Images must reinforce trust and the luxury feel.`,
         siteBrand && siteBrand.fonts.length
-          ? `\n== TYPOGRAPHY RULE ==\nThat site really uses: ${siteBrand.fonts.slice(0, 4).join(", ")}. Set "headingFont" and "bodyFont" to those EXACT families (heading = the display/serif one, body = the clean sans one) so the new site stays typographically continuous with the brand. Substitute only if a family isn't on Google Fonts — then pick the closest Google equivalent with the same character.`
+          ? (siteBrand.headingFont
+              ? `\n== TYPOGRAPHY RULE ==\nThat site really uses: ${siteBrand.fonts.slice(0, 4).join(", ")}. Set "headingFont" and "bodyFont" to those EXACT families (heading = the display/serif one, body = the clean sans one) so the new site stays typographically continuous with the brand. Substitute only if a family isn't on Google Fonts — then pick the closest Google equivalent with the same character.`
+              // Only one of the site's fonts survived Google-Fonts verification (its
+              // real heading/display face is a custom/self-hosted font — confirmed
+              // on ruma.com's "Editor Note", which 404s on Google Fonts). Do NOT
+              // reuse the one verified font for both roles — that collapses the
+              // type system to a single flat weight. Ask for a real pairing instead.
+              : `\n== TYPOGRAPHY RULE ==\nThat site's one VERIFIED, Google-Fonts-loadable font is "${siteBrand.bodyFont}" — set "bodyFont" to it exactly. Its real heading/display font is a custom or self-hosted face not available on Google Fonts, so it cannot be reused. Choose your OWN distinctive Google Fonts DISPLAY/serif family for "headingFont" that pairs well with ${siteBrand.bodyFont} and fits a luxury medical-aesthetics brand — heading and body must be two DIFFERENT families, never the same one twice.`)
           : "",
         `\n== OUTPUT ==\nReturn ONLY minified JSON with these keys:`,
         `{"primary":"#hex","secondary":"#hex","accent":"#hex","headingFont":"a Google serif display font name","bodyFont":"a clean Google sans font name","imageryDirection":"2-3 sentences of concrete photographic art direction","brief":"a DETAILED, multi-paragraph art-direction + build brief (250-400 words) written as concrete design directives: overall look & feel, layout sophistication and section rhythm, typographic system, color usage, component styling, the specific imagery to use per section, and the exact CRO fixes this new site must implement based on the audit above. Be specific, not vague."}`,
@@ -13635,8 +13733,12 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/theme-live" && req.method === "POST") {
       const { url, slug } = JSON.parse(await readBody(req) || "{}");
       if (!url || !slug) return json(res, 400, { error: "url and slug required" });
+      // job.liveUrl is stored bare (no scheme) — fetch() throws on a schemeless
+      // URL, which this endpoint's catch turned into a silent, permanent "active:
+      // false" no matter what the live site actually served.
+      const fullUrl = /^https?:\/\//i.test(url) ? url : "https://" + url;
       try {
-        const r = await fetch(url, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36", "Cache-Control": "no-cache" } });
+        const r = await fetch(fullUrl, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36", "Cache-Control": "no-cache" } });
         const html = r.ok ? await r.text() : "";
         return json(res, 200, { active: html.includes(`/themes/g99-${slug}/`), httpStatus: r.status });
       } catch (e) { return json(res, 200, { active: false, error: e.message.slice(0, 120) }); }
