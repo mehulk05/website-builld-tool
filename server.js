@@ -11940,12 +11940,26 @@ const server = http.createServer(async (req, res) => {
       if (secret && (req.headers["x-webhook-secret"] || "") !== secret) return json(res, 401, { error: "bad webhook secret" });
       let body = {};
       try { body = JSON.parse(await readBody(req) || "{}"); } catch (e) { return json(res, 400, { error: "bad json" }); }
-      const tgt = body.target || {}, trig = body.trigger || {};
-      const taskId = String(body.taskId || tgt.taskId || tgt.id || trig.taskId || trig.id
-        || (body.task && body.task.id) || (body.comment && body.comment.taskId) || body.id || "").trim();
+      // TED wraps task events as { event, timestamp, source, data, subscriptionId }
+      // — the task rides in `data`, which is where the id actually lives. The
+      // flatter shapes are kept behind it because the pre-release webhook sends
+      // trigger/target instead, and a test delivery sends neither.
+      const dat = body.data || {}, tgt = body.target || {}, trig = body.trigger || {};
+      const taskId = String(
+        body.taskId || dat.taskId || dat.id || (dat.task && (dat.task.id || dat.task.taskId))
+        || (dat.comment && dat.comment.taskId) || tgt.taskId || tgt.id || trig.taskId || trig.id
+        || (body.task && body.task.id) || (body.comment && body.comment.taskId) || body.id || ""
+      ).trim();
       if (!taskId) {
         console.warn("ted-subtask webhook: no task id. payload:", JSON.stringify(body).slice(0, 1200));
-        return json(res, 422, { error: "no task id in payload", seen: Object.keys(body) });
+        // Report the nested keys too. The top-level ones alone said only that
+        // everything lives under `data`, which cost a round of testing to learn.
+        return json(res, 422, {
+          error: "no task id in payload",
+          seen: Object.keys(body),
+          dataKeys: dat && typeof dat === "object" ? Object.keys(dat) : null,
+          hint: "expected the task id at data.id, data.taskId or data.task.id",
+        });
       }
       let r;
       // Most events on a TED board are not a revision request, so a refusal is a
