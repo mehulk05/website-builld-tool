@@ -1789,26 +1789,67 @@ async function sanitizeAllImages(html) {
 // /aida-public/ ones expire). Replace any image that isn't a stable, loading
 // image with a curated topical photo. Deterministic, no LLM needed.
 async function fixImages(html) {
-  // Category-relevance pass first (off/no-op unless UNSPLASH_ACCESS_KEY is
-  // set) — this is what makes a "botox" section actually show an injection
-  // photo instead of whatever Stitch happened to pick.
-  html = await sanitizeAllImages(html);
+  // NOTE: the old unconditional sanitizeAllImages() relevance-swap pass was
+  // removed from here on purpose (2026-08-08) — it replaced EVERY image on
+  // EVERY page whenever UNSPLASH_ACCESS_KEY was set, good or bad, which is
+  // exactly the "why did my images change for no reason" complaint. Images
+  // are now only ever replaced for a concrete defect: broken/unreliable URL,
+  // or measurably blurry (see isImageBlurry). A good image is left alone.
   const urls = [...new Set((html.match(/https:\/\/lh3\.googleusercontent\.com\/[A-Za-z0-9_\-\/=]+/g) || []))];
   if (!urls.length) return html;
   for (const u of urls) {
-    let replace = false;
+    let replace = false, reason = "";
     if (!/\/aida-public\//.test(u)) {
-      replace = true;                       // /aida/ screenshot-type → browser-unreliable
+      replace = true; reason = "unreliable-url";   // /aida/ screenshot-type → browser-unreliable
     } else {
       try {
         const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 8000);
         const r = await fetch(u, { signal: ctl.signal }); clearTimeout(t);
-        if (!r.ok || !((r.headers.get("content-type") || "").startsWith("image"))) replace = true;
-      } catch (e) { replace = true; }
+        if (!r.ok || !((r.headers.get("content-type") || "").startsWith("image"))) { replace = true; reason = "broken"; }
+      } catch (e) { replace = true; reason = "fetch-failed"; }
     }
-    if (replace) { const c = await unsplashOrCurated(false); html = html.split(u).join(c); console.log(`  img fix: ${u.slice(40, 56)}… -> ${UNSPLASH_ACCESS_KEY ? "unsplash/curated" : "curated"}`); }
+    if (!replace) {
+      const { blurry, variance, error } = await isImageBlurry(u);
+      if (blurry) { replace = true; reason = `blurry(var=${variance.toFixed(1)}<${BLUR_VARIANCE_THRESHOLD})`; }
+      else console.log(`  img OK, keeping: ${u.slice(40, 56)}… sharpness=${variance != null ? variance.toFixed(1) : "n/a" + (error ? ` (${error})` : "")}`);
+    }
+    if (replace) { const c = await unsplashOrCurated(false); html = html.split(u).join(c); console.log(`  img replaced (${reason}): ${u.slice(40, 56)}… -> ${UNSPLASH_ACCESS_KEY ? "unsplash/curated" : "curated"}`); }
   }
   return html;
+}
+// Real blur detection (Laplacian-variance edge sharpness), not a relevance/QC
+// heuristic: downscale to a fixed width, greyscale, measure the variance of a
+// simple edge filter. Sharp photos have lots of high-contrast edges (high
+// variance); blurry/soft ones don't. This is the ONLY reason to replace an
+// otherwise-fine image — a good photo must never get swapped just because a
+// 3rd-party pool exists. The one deliberate dependency in an otherwise
+// dependency-free server (see file header) — pure-JS decode, no native build.
+const BLUR_VARIANCE_THRESHOLD = 60;
+async function isImageBlurry(url, threshold = BLUR_VARIANCE_THRESHOLD) {
+  try {
+    const { Jimp } = require("jimp");
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 10000);
+    const buf = Buffer.from(await (await fetch(url, { signal: ctl.signal })).arrayBuffer());
+    clearTimeout(t);
+    const img = await Jimp.read(buf);
+    img.resize({ w: 300 });
+    img.greyscale();
+    const { width: w, height: h, data } = img.bitmap;
+    let sum = 0, sumSq = 0, n = 0;
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const i = (y * w + x) * 4;
+        const lap = -4 * data[i] + data[i - 4] + data[i + 4] + data[i - w * 4] + data[i + w * 4];
+        sum += lap; sumSq += lap * lap; n++;
+      }
+    }
+    const mean = sum / n;
+    const variance = sumSq / n - mean * mean;
+    return { blurry: variance < threshold, variance };
+  } catch (e) {
+    // Fail-soft: cannot measure it -> leave the image alone rather than churn it.
+    return { blurry: false, variance: null, error: String(e.message || e).slice(0, 120) };
+  }
 }
 // Ask Gemini vision whether an image contains baked-in text / UI / a website
 // mockup (Stitch sometimes renders a fake nav bar INTO the photo pixels).
@@ -1850,11 +1891,21 @@ async function qcStitchImages(html) {
 // Everything that is a system/fallback face, an icon font, or a theme-plugin font
 // rather than a brand choice. WordPress themes ship a long default stack
 // (-apple-system, …, Oxygen-Sans, Ubuntu, Cantarell, …) which is NOT the brand.
-const GENERIC_FONTS = /^(sans-serif|serif|monospace|cursive|fantasy|inherit|initial|unset|revert|auto|system-ui|ui-sans-serif|ui-serif|ui-monospace|-apple-system|BlinkMacSystemFont|Segoe UI|Roboto|Roboto Slab|Roboto Condensed|Helvetica|Helvetica Neue|Arial|Arial Black|Times|Times New Roman|Georgia|Courier|Courier New|Verdana|Tahoma|Trebuchet MS|Palatino|Garamond|Oxygen|Oxygen-Sans|Ubuntu|Cantarell|Fira Sans|Droid Sans|Noto Sans|Noto Serif|Liberation Sans|DejaVu Sans|Segoe UI Emoji|Segoe UI Symbol|Apple Color Emoji|Consolas|Menlo|Monaco|Lucida.*|MS .*|.*Emoji.*|.*icons?|.*Icons?|dashicons|eicons|elementskit.*|fontawesome|Font Awesome.*|swiper.*|revicons|bootstrap-icons|feather|simple-line-icons|themify|linearicons)$/i;
+const GENERIC_FONTS = /^(sans-serif|serif|monospace|cursive|fantasy|inherit|initial|unset|revert|auto|system-ui|ui-sans-serif|ui-serif|ui-monospace|-apple-system|BlinkMacSystemFont|Segoe UI|Roboto|Roboto Slab|Roboto Condensed|Helvetica|Helvetica Neue|Arial|Arial Black|Times|Times New Roman|Georgia|Courier|Courier New|Verdana|Tahoma|Trebuchet MS|Palatino|Garamond|Oxygen|Oxygen-Sans|Ubuntu|Cantarell|Fira Sans|Droid Sans|Noto Sans|Noto Serif|Liberation Sans|DejaVu Sans|Segoe UI Emoji|Segoe UI Symbol|Apple Color Emoji|Consolas|Menlo|Monaco|Lucida.*|MS .*|.*Emoji.*|.*icons?|.*Icons?|dashicons|eicons|elementskit.*|elementor.*|eicon.*|fontawesome|Font Awesome.*|swiper.*|revicons|bootstrap-icons|feather|simple-line-icons|themify|linearicons|WooCommerce|woocommerce.*|jkit.*|uael.*|pixicon.*|iconsmind.*|glyphicons.*|material.?icons.*|typicons.*)$/i;
+// Custom icon fonts are frequently named after their OWN content — a plugin
+// registers a font-face literally called "star" because that's the glyph it
+// renders — so no library-name blocklist can ever fully cover this. Confirmed
+// live on ruma.com: `font-family:star` (a bare, unquoted, single lowercase
+// word) is a WooCommerce/Elementor rating-icon font, not a brand typeface,
+// and it won headingFont over the real "Editor Note" simply by appearing
+// first in the HTML. Real font names in CSS are essentially never a single
+// all-lowercase dictionary word with no space/hyphen/digit — reject that shape
+// outright rather than trying to enumerate every plugin's icon-font name.
+const LOOKS_LIKE_ICON_WORD = /^[a-z]+$/;
 function extractFontFamilies(html) {
   const s = String(html);
   const norm = (raw) => String(raw || "").replace(/\+/g, " ").replace(/["']/g, "").trim();
-  const keep = (n) => n && n.length <= 40 && !GENERIC_FONTS.test(n) && !/^var\(|^\$|^#|^\d/.test(n);
+  const keep = (n) => n && n.length <= 40 && !GENERIC_FONTS.test(n) && !/^var\(|^\$|^#|^\d/.test(n) && !LOOKS_LIKE_ICON_WORD.test(n);
   const push = (list, n) => { if (keep(n) && !list.some((x) => x.toLowerCase() === n.toLowerCase())) list.push(n); };
 
   // 1) Google Fonts links — the authoritative signal for a site's brand type.
@@ -2362,21 +2413,33 @@ function seoEnhance(html, pageKey) {
     if (desc.length > 160) desc = desc.slice(0, 157).replace(/\s+\S*$/, "") + "…";
     headInjects.push(`<meta name="description" content="${desc.replace(/"/g, "&quot;")}">`);
   }
-  // canonical + Open Graph
-  const canonical = `https://elanaesthetics.com/${pageKey === "home" ? "" : pageKey}`;
+  // canonical + Open Graph. This used to hardcode https://elanaesthetics.com
+  // (a DIFFERENT client's domain, left over from whichever run last edited
+  // this function) — every generated site was shipping another business's
+  // domain in its canonical/OG tags. Use this job's own beta/site URL if one
+  // is known yet; a path-only canonical (no wrong host) beats a wrong host.
+  const ownHost = ob.betaSiteUrl || ob.existingWebsite || "";
+  let canonical = `/${pageKey === "home" ? "" : pageKey}`;
+  try { if (ownHost) canonical = new URL(/^https?:\/\//i.test(ownHost) ? ownHost : "https://" + ownHost).origin + canonical; } catch (e) { /* keep relative */ }
   if (!/rel=["']canonical["']/i.test(html)) headInjects.push(`<link rel="canonical" href="${canonical}">`);
   if (!/property=["']og:title["']/i.test(html)) {
     headInjects.push(`<meta property="og:title" content="${a.business_name.replace(/"/g, "&quot;")}">`);
     headInjects.push(`<meta property="og:type" content="website">`);
     headInjects.push(`<meta property="og:url" content="${canonical}">`);
   }
-  // JSON-LD LocalBusiness/MedicalBusiness
+  // JSON-LD LocalBusiness/MedicalBusiness. addressLocality/Region used to be
+  // hardcoded "Scottsdale, AZ" regardless of the real client (2026-08-08 fix)
+  // — every generated site claimed to be in Scottsdale. Parse from the same
+  // free-text `location` answer everything else here already uses.
   if (!/application\/ld\+json/i.test(html)) {
+    const locParts = String(a.location || "").split(",").map((s) => s.trim()).filter(Boolean);
+    const addressLocality = locParts.length >= 2 ? locParts[locParts.length - 2] : "";
+    const addressRegion = locParts.length >= 1 ? (locParts[locParts.length - 1].match(/\b[A-Z]{2}\b/) || [locParts[locParts.length - 1]])[0] : "";
     const ld = {
       "@context": "https://schema.org", "@type": "MedicalBusiness",
       name: a.business_name, description: a.business_description,
       telephone: a.phone_for_website, url: canonical,
-      address: { "@type": "PostalAddress", addressLocality: "Scottsdale", addressRegion: "AZ", streetAddress: a.location },
+      address: { "@type": "PostalAddress", addressLocality, addressRegion, streetAddress: a.location },
       openingHours: "Mo-Fr 09:00-18:00 Sa 09:00-14:00",
       priceRange: "$$$",
     };
@@ -3292,6 +3355,45 @@ function selectPrChecks(rows, requireAllChecks = false) {
     if (!current || rank(check.status) > rank(current.status)) byName[check.name] = check;
   }
   return Object.values(byName);
+}
+// PR check status, read entirely over REST instead of `gh pr checks` / `--json
+// statusCheckRollup`. Both of those go through GraphQL, which always asks for
+// checkSuite.workflowRun as part of the rollup — a field that needs "Actions: Read-only",
+// a permission the g99-gitops App does not have. The App-token call then fails with a
+// partial GraphQL error on stderr and EMPTY stdout, which every caller was silently reading
+// as "no checks yet" — the tool would poll forever past a check that had already passed.
+// REST needs only "checks"/"statuses" read, which the App already has, and returns the
+// same [name, status, "", url] row shape selectPrChecks() expects, so nothing downstream
+// has to change.
+async function fetchCheckRows(repo, prNum) {
+  const pv = await sh(`gh pr view ${prNum} --repo ${repo} --json headRefOid,state,mergedAt`);
+  let sha = "", prState = "", merged = false;
+  try {
+    const v = JSON.parse(pv.stdout || "{}");
+    sha = v.headRefOid || ""; prState = v.state || ""; merged = prState === "MERGED" || !!v.mergedAt;
+  } catch (e) { /* leave unknown — the watcher just keeps waiting */ }
+  if (!sha) return { rows: [], prState, merged };
+  const [runsR, statusR] = await Promise.all([
+    sh(`gh api repos/${repo}/commits/${sha}/check-runs`),
+    sh(`gh api repos/${repo}/commits/${sha}/status`),
+  ]);
+  const rows = [];
+  try {
+    for (const c of (JSON.parse(runsR.stdout || "{}").check_runs || [])) {
+      const status = c.status !== "completed" ? "pending"
+        : ["success", "neutral", "skipped"].includes(c.conclusion) ? "pass" : "fail";
+      rows.push([c.name || "", status, "", c.html_url || c.details_url || ""]);
+    }
+  } catch (e) { /* check-runs endpoint returned something unparseable — statuses may still work */ }
+  try {
+    // Legacy commit-status contexts (pre-Checks-API CI, e.g. old Travis/Jenkins integrations) —
+    // rare on this repo's Actions-only setup, included for any repo that still uses them.
+    for (const s of (JSON.parse(statusR.stdout || "{}").statuses || [])) {
+      const status = s.state === "success" ? "pass" : s.state === "pending" ? "pending" : "fail";
+      rows.push([s.context || "", status, "", s.target_url || ""]);
+    }
+  } catch (e) { /* no legacy statuses — fine, check-runs already covers Actions */ }
+  return { rows, prState, merged };
 }
 function ciRollup(rollup) {
   if (!Array.isArray(rollup) || !rollup.length) return "none";
@@ -5454,6 +5556,12 @@ function mapG99Answers(list) {
 }
 
 // Server-side copy of the dashboard's per-page prompt sections.
+// Shared footer requirement, real medspa sites always ship this — a thin
+// "Call Now"-only footer reads as an unfinished/generic AI page. Required on
+// every page, not just contact, since the section-flow scan strips the
+// footer before classifying sections (so it never shows up "in the flow").
+const FOOTER_DIRECTIVE = (A) =>
+  `FOOTER (required): ${A.business_name || "the business"}, full address "${A.location || "(address)"}", phone as a tel: link "${A.phone_for_website || ""}", and a legal/policy row (Privacy Policy · Terms · Accessibility).`;
 function jobPageSections(key, A) {
   const val2 = (v) => Array.isArray(v) ? v.map((x) => (x && typeof x === "object") ? [x.name, x.title].filter(Boolean).join(" — ") + (x.bio ? ": " + x.bio : "") : String(x)).join(Array.isArray(v) && v.some((x) => x && typeof x === "object") ? "; " : ", ") : (v == null ? "" : String(v));
   const featured = val2(A.revenue_services), providers = val2(A.team_roster), services = val2(A.services_offered);
@@ -5479,17 +5587,17 @@ PROMPT BLUEPRINT DIRECTIVES (INSPIRED BY RUMA, HELLOSKIN, ER INJECTABLES & AUSTI
       `5. STATS / TRUST band with animated counter badges. 6. FEATURE with curved image masks and gold borders.`,
       `7. PROVIDERS — offset portraits with credentials: ${providers}.`,
       `8. TESTIMONIAL — oversized pull-quote: "${A.featured_review || "Jeannine always makes me feel super comfortable when I’m getting my Botox or filler."}".`,
-      `9. MEMBERSHIP & FINANCING: ${val2(A.financing_offered)}. 10. CLOSING CTA "${A.primary_cta || "Book Online"}".`,
-      `11. FOOTER: ${A.business_name || "NUVO Aesthetics Clinic"}, ${A.location || "437 W State St, Sycamore, IL 60178"}, phone ${A.phone_for_website || "+13203387829"}.`].join("\n"),
+      `9. MEMBERSHIP & FINANCING: ${val2(A.financing_offered)}. 10. BOOKING PANEL — a persistent scheduling-panel-styled section (date/time-picker visual, service selector) driving to "${A.primary_cta || "Book Online"}", not just a repeated text button.`,
+      `${FOOTER_DIRECTIVE(A)}`].join("\n"),
     services: [`Sections:`, DIRECTIVES, `1. Same transparent nav as home.`, `2. Editorial hero "Our Treatments".`,
       `3. One section per category — ${services} — with interactive cards + "${A.primary_cta || "Book Online"}" CTAs.`,
-      `4. Signature spotlight: ${featured}. 5. Financing: ${val2(A.financing_offered)}. 6. CTA. 7. Footer.`].join("\n"),
+      `4. Signature spotlight: ${featured}. 5. Financing: ${val2(A.financing_offered)}. 6. BOOKING PANEL (scheduling-panel styling, not a plain button). 7. ${FOOTER_DIRECTIVE(A)}`].join("\n"),
     about: [`Sections:`, DIRECTIVES, `1. Same nav.`, `2. Practice story: "${A.why_patients_choose || "Dedicated to medical precision and aesthetic balance."}".`,
       `3. Meet the team — portrait cards: ${providers}. 4. Values with curved masks.`,
-      `5. Testimonial: ${A.featured_review || ""}. 6. CTA. 7. Footer.`].join("\n"),
+      `5. Testimonial: ${A.featured_review || ""}. 6. BOOKING PANEL. 7. ${FOOTER_DIRECTIVE(A)}`].join("\n"),
     contact: [`Sections:`, DIRECTIVES, `1. Same nav.`, `2. Split layout: consultation form beside imagery.`,
-      `3. ${A.booking_platform || "Online"} booking panel. 4. Location: ${A.location || ""}, phone ${A.phone_for_website || ""}.`,
-      `5. CTA band. 6. Footer.`].join("\n"),
+      `3. ${A.booking_platform || "Online"} booking panel — full scheduling-panel styling (date/time-picker visual, service selector), not just a text link. 4. Location: ${A.location || ""}, phone ${A.phone_for_website || ""}.`,
+      `5. CTA band. 6. ${FOOTER_DIRECTIVE(A)}`].join("\n"),
   })[key];
 }
 
@@ -5586,8 +5694,13 @@ async function runJob(job) {
     // on the generation prompt, DEV_PAGES=on cuts a build to home only — 1 Stitch
     // call instead of 4, ~2 min instead of ~8. Unset/off = unchanged production
     // behavior (all 4 pages). Remove this block once the design pass is done.
-    const DEV_PAGES = (process.env.DEV_PAGES || "off").toLowerCase() === "on"
-      ? ["home"] : ["home", "services", "about", "contact"];
+    // DEV_PAGES: "off" (default, unchanged prod behavior, all 4) | "on" (home
+    // only, legacy shortcut) | a comma list e.g. "home,about" for a scoped
+    // local test run of exactly those pages.
+    const DEV_PAGES_RAW = (process.env.DEV_PAGES || "off").toLowerCase();
+    const DEV_PAGES = DEV_PAGES_RAW === "off" ? ["home", "services", "about", "contact"]
+      : DEV_PAGES_RAW === "on" ? ["home"]
+      : DEV_PAGES_RAW.split(",").map((s) => s.trim()).filter(Boolean);
     // Read the client's OWN pages first and let Gemini turn each real structure into that
     // page's brief. Without this every client got the same hardcoded 11-section blueprint,
     // which is why a generated home page looked nothing like theirs. Fail-soft per page: any
@@ -5644,6 +5757,15 @@ async function runJob(job) {
     const bound = await localApi("/api/bind-site", { engine: "", theme });
     job.siteUrl = bound.siteUrl || "/site/";
     jobStep(job, 3, "done", `Assembled (${bound.chromeSource || "AI chrome"})`);
+
+    // SKIP_PUSH=on: local test mode — stop here, don't push/PR to GitHub.
+    // Assembled /site/ is already on disk for review in the browser. The
+    // outer `finally` below still runs (finishedAt/postStatus/mirrorPool).
+    if ((process.env.SKIP_PUSH || "off").toLowerCase() === "on") {
+      job.status = "done";
+      console.log(`  SKIP_PUSH=on: stopping after bind-site. Review at ${job.siteUrl}`);
+      return;
+    }
 
     // 5 — WordPress theme + PR
     jobStep(job, 4, "running", "Building theme, pushing, opening PR…");
@@ -6752,7 +6874,13 @@ async function scanPageStructure(url) {
     const r = await fetch(url, { redirect: "follow", signal: ctl.signal, headers: { "User-Agent": "Mozilla/5.0 G99Bot" } });
     if (!r.ok) throw new Error("HTTP " + r.status);
     html = await r.text();
-  } catch (e) { return null; } finally { clearTimeout(timer); }
+  } catch (e) {
+    // Was silent before (2026-08-08) — a scan failure here means this page
+    // silently drops to the generic jobPageSections blueprint with nothing
+    // telling anyone why. Log it so a bad build is traceable to its cause.
+    console.warn(`  scan failed for ${url}: ${String(e.message || e).slice(0, 160)}`);
+    return null;
+  } finally { clearTimeout(timer); }
 
   const body = html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ");
   const head = (html.match(/<head[\s\S]*?<\/head>/i) || [""])[0];
@@ -6784,14 +6912,19 @@ async function scanPageStructure(url) {
   const headings = [...main.matchAll(/<(h1|h2|h3)[^>]*>([\s\S]*?)<\/\1>/gi)];
   const sections = [];
   const seen = new Set();
-  for (let i = 0; i < headings.length && sections.length < 20; i++) {
+  // Raised from 20/4000/220/300 (2026-08-08): those caps were quietly cutting
+  // the scan off partway down real pages, so the composed brief only ever saw
+  // the top of the site. This feeds a design brief, not a raw dump, but "top
+  // to bottom, everything" means the LAST section on a long page must still
+  // show up, not just the first ~4-5.
+  for (let i = 0; i < headings.length && sections.length < 40; i++) {
     const label = textOf(headings[i][2]);
     if (!label || label.length > 120) continue;
     const dedupe = label.toLowerCase();
     if (seen.has(dedupe)) continue;      // repeated chrome that survived the strip
     seen.add(dedupe);
     const from = headings[i].index + headings[i][0].length;
-    const to = i + 1 < headings.length ? headings[i + 1].index : Math.min(main.length, from + 4000);
+    const to = i + 1 < headings.length ? headings[i + 1].index : Math.min(main.length, from + 8000);
     const chunk = main.slice(from, to);
     // Lazy-loaded sites put the real URL in data-src / srcset, so count those too.
     const images = (chunk.match(/<img|data-src=|srcset=|background-image/gi) || []).length;
@@ -6799,7 +6932,7 @@ async function scanPageStructure(url) {
       heading: label,
       kind: classifySection(label + " " + textOf(chunk).slice(0, 300)),
       images,
-      copy: textOf(chunk).slice(0, 220),
+      copy: textOf(chunk).slice(0, 600),
     });
   }
 
@@ -6853,7 +6986,9 @@ async function scanSiteStructure(siteUrl) {
       const s = await scanPageStructure(c);
       if (s && s.sections.length) { out.pages[key] = s; break; }
     }
+    if (!out.pages[key]) console.warn(`  scanSiteStructure: no ${key} page found (tried: ${candidates.join(", ")}) — falls back to the generic blueprint`);
   }
+  console.log(`  scanSiteStructure(${origin}): found ${Object.keys(out.pages).join(", ")} (${Object.values(out.pages).reduce((n, p) => n + p.sections.length, 0)} sections total)`);
   out.scannedAt = new Date().toISOString();
   return out;
 }
@@ -6867,7 +7002,7 @@ async function composeCorePagePrompt(key, struct, A, composed, allStruct) {
   if (!struct) return null;
   const val = (v) => Array.isArray(v) ? v.map((x) => (x && typeof x === "object" ? (x.name || x.title || "") : String(x))).filter(Boolean).join(", ") : (v == null ? "" : String(v));
   const flow = struct.sections.map((s, i) =>
-    `${i + 1}. [${s.kind}] "${s.heading}"${s.images ? ` — ${s.images} image(s)` : ""}${s.copy ? ` — copy: ${s.copy.slice(0, 120)}` : ""}`).join("\n");
+    `${i + 1}. [${s.kind}] "${s.heading}"${s.images ? ` — ${s.images} image(s)` : ""}${s.copy ? ` — copy: ${s.copy.slice(0, 400)}` : ""}`).join("\n");
 
   const p = [
     `Write a DESIGN BRIEF (a page-generation prompt) for the ${key.toUpperCase()} page of a medical-aesthetics website. Return ONLY the brief text — no preamble, no markdown fences.`,
@@ -6889,6 +7024,8 @@ async function composeCorePagePrompt(key, struct, A, composed, allStruct) {
     `- Keep their real headings and CTA wording where it works; sharpen it where it is weak. Their CTA language is what their patients respond to.`,
     `- Where a section has images, the rebuilt section must be equally image-led.`,
     `- Improve what is objectively weak: visual hierarchy, whitespace, mobile layout, contrast, scannability, and a clear conversion path to "${A.primary_cta || struct.ctas[0] || "Book an appointment"}".`,
+    `- FOOTER is required on every page, regardless of what the section flow above shows (footers are stripped before the flow is scanned): it must include the business name, the full address ("${A.location || "the practice's address"}"), the phone number as a tel: link ("${A.phone_for_website || ""}"), and a legal/policy row (Privacy Policy · Terms · Accessibility) — real medical-aesthetics sites always ship this, a thin one-link footer reads as unfinished.`,
+    `- BOOKING must be more than a nav-bar button: include at least one section on the page styled as a persistent booking/scheduling panel (date/time-picker visual treatment, staff/service selector look) that drives to "${A.primary_cta || "Book Now"}" — not just a plain text link repeated in different colors.`,
     ``,
     `PRACTICE FACTS to use as real copy (never placeholders):`,
     `Business: ${A.business_name || ""}. Location: ${A.location || ""}. Phone: ${A.phone_for_website || ""}.`,
@@ -12962,6 +13099,10 @@ const server = http.createServer(async (req, res) => {
       const built = await buildStitchSite(pages.map(pg => ({ key: pg.key.replace(/[^a-z0-9_-]/gi, ""), prompt: pg.prompt + "\n\n" + designTokensBlock(theme) + STITCH_IMG_CLAUSE + stylingConstraint(theme || {}) })), theme || {}, deviceType);
       const out = await Promise.all(built.results.map(async r => {
         if (!r.html) return { pageKey: r.key, engine: "stitch", error: r.error || "no HTML" };
+        // Exact, untouched Stitch output, saved BEFORE any of our post-processing —
+        // so "does the shipped page match what Stitch gave" can be answered by a
+        // diff instead of a guess. Debug-only artifact, never read by the pipeline.
+        try { fs.writeFileSync(path.join(GEN, r.key + ".stitch-raw.html"), r.html); } catch (e) { /* debug-only, non-fatal */ }
         let html = clampViewportHeights(enforceBrandFonts(r.html, theme));  // pin brand type; bound vh heroes
         html = enforceArbitraryColors(html, theme);  // named tailwind-config colors die when <head> is stripped
         html = sharpenStitchImages(html);
@@ -13282,23 +13423,14 @@ const server = http.createServer(async (req, res) => {
       const { prUrl, requireAllChecks } = JSON.parse(await readBody(req) || "{}");
       const prNum = ((prUrl || "").match(/\/pull\/(\d+)/) || [])[1];
       if (!prNum) return json(res, 400, { error: "prUrl with /pull/<n> required" });
-      const r = await sh(`gh pr checks ${prNum} --repo ${repoFromPrUrl(prUrl)}`);
-      // output lines: <name>\t<pass|fail|pending|skipping>\t<duration>\t<url>
-      const rows = (r.stdout || "").split("\n").map(l => l.split("\t")).filter(c => c.length >= 2);
-      // Most workflows retain the historical build-only gate. Pre-release passes
-      // requireAllChecks=true because visual fixes must not merge while any test fails.
-      const list = selectPrChecks(rows, !!requireAllChecks);
       // "No checks" is ambiguous on its own: CI may not have registered yet, or the repo may
       // have no workflows at all. Report the PR's own state and whether the repo even has
       // workflows, so a watcher can tell those apart instead of polling for 40 minutes.
       const repo = repoFromPrUrl(prUrl);
-      const pv = await sh(`gh pr view ${prNum} --repo ${repo} --json state,mergedAt`);
-      let prState = "", merged = false;
-      try {
-        const v = JSON.parse(pv.stdout || "{}");
-        prState = v.state || "";
-        merged = prState === "MERGED" || !!v.mergedAt;
-      } catch (e) { /* leave unknown — the watcher just keeps waiting */ }
+      // Most workflows retain the historical build-only gate. Pre-release passes
+      // requireAllChecks=true because visual fixes must not merge while any test fails.
+      const { rows, prState, merged } = await fetchCheckRows(repo, prNum);
+      const list = selectPrChecks(rows, !!requireAllChecks);
       return json(res, 200, {
         prNum, checks: list, prState, merged,
         hasWorkflows: await repoHasWorkflows(repo),
@@ -13342,7 +13474,7 @@ const server = http.createServer(async (req, res) => {
       const branch = (await sh(`gh pr view ${prNum} --repo ${repoFromPrUrl(prUrl)} --json headRefName --jq .headRefName`)).stdout.trim();
       if (!branch) return json(res, 500, { error: "could not resolve PR branch" });
       // find a failing build check and its run id
-      const checks = (await sh(`gh pr checks ${prNum} --repo ${repoFromPrUrl(prUrl)}`)).stdout.split("\n").map(l => l.split("\t"));
+      const { rows: checks } = await fetchCheckRows(repoFromPrUrl(prUrl), prNum);
       const failing = checks.find(c => /^build/i.test((c[0] || "").trim()) && (c[1] || "").trim() === "fail");
       if (!failing) return json(res, 200, { fixed: [], message: "no failing build check found" });
       const runId = ((failing[3] || "").match(/\/runs\/(\d+)/) || [])[1];
