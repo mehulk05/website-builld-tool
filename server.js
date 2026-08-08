@@ -413,7 +413,20 @@ async function rpc(method, params, notify = false, timeoutMs = 90000) {
       }
       throw new Error(`Stitch RPC error: ${errStr}`);
     }
-    return parsed ? parsed.result : {};
+    // Third quota shape: HTTP 200, no parsed.error, but result.isError=true with quota text in content.
+    // Do NOT retry within this rpc loop — tool calls like generate_screen_from_text embed a projectId
+    // that is scoped to the exhausted key; retrying with the same projectId on a new key returns
+    // "entity not found". Instead, advance skIdx so the CALLER's retry loop (generateWithRetry)
+    // creates a fresh project under the new key on its next attempt.
+    const result = parsed ? parsed.result : {};
+    if (result && result.isError) {
+      const toolErr = (result.content || []).map(c => c.text).join("");
+      if (/RESOURCE_EXHAUSTED|quota/i.test(toolErr)) {
+        skIdx = (skIdx + i + 1) % Math.max(STITCH_KEYS.length, 1);
+        console.warn(`Stitch key #${(i % STITCH_KEYS.length) + 1} isError quota on ${method} — advanced skIdx to key ${skIdx + 1}, caller must reset project and retry`);
+      }
+    }
+    return result;
   }
   throw lastErr || new Error(`Stitch ${method}: no API key configured`);
 }
@@ -946,10 +959,42 @@ async function buildStitchSite(pages, theme, deviceType) {
   const meta = { projectId: pid, designSystem, screens: {} };
   results.forEach(r => { if (r.screenId) meta.screens[r.key] = r.screenId; });
   results.forEach(r => { if (r.error) console.warn(`stitch page "${r.key}" failed:`, String(r.error).slice(0, 240)); });
+  // If any page hit a quota error, surface it so buildStitchSiteWithKeyRotation can rotate the key.
+  const quotaErr = results.find(r => r.error && /RESOURCE_EXHAUSTED|quota/i.test(r.error));
+  if (quotaErr) throw new Error(`stitch quota: ${quotaErr.error}`);
+
   fs.writeFileSync(path.join(GEN, ".stitch-metadata.json"), JSON.stringify(meta, null, 2));
   const okCount = results.filter(r => r.html).length;
   console.log(`stitch: ${okCount}/${results.length} pages generated (project ${pid})`);
   return { projectId: pid, designSystem, results };
+}
+
+// Wrapper: retry buildStitchSite with a fresh Stitch key when quota is exhausted.
+// Each Stitch API key belongs to a separate Google account, so a project created
+// under key N is not accessible by key N+1 — the entire build (project + design
+// system + all pages) must restart under the new key.
+async function buildStitchSiteWithKeyRotation(pages, theme, deviceType) {
+  let lastErr = null;
+  const attempts = Math.max(STITCH_KEYS.length, 1);
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      // Reset Stitch MCP session so ensureInit() (called inside generateWithRetry)
+      // creates a brand-new project under the current skIdx key.
+      PROJECT = null; SCREENS_MADE = 0; DESIGN_SYSTEM = null; PROTO = "2024-11-05";
+      return await buildStitchSite(pages, theme, deviceType);
+    } catch (e) {
+      lastErr = e;
+      const isQuota = /RESOURCE_EXHAUSTED|quota/i.test(e.message);
+      console.warn(`buildStitchSite attempt ${attempt}/${attempts} failed (quota=${isQuota}): ${e.message.slice(0, 160)}`);
+      if (isQuota && attempt < attempts) {
+        skIdx = (skIdx + 1) % Math.max(STITCH_KEYS.length, 1);
+        console.warn(`Stitch key exhausted — rotating to key ${skIdx + 1} and rebuilding from scratch`);
+        continue;
+      }
+      throw e; // non-quota error or no keys left
+    }
+  }
+  throw lastErr;
 }
 
 // ------------------------------------------------------------ Gemini engine
@@ -8075,7 +8120,7 @@ async function runEnrichJob(job) {
         // export/rebind) — snapshot + restore so the enrich run never clobbers it.
         const metaFile = path.join(GEN, ".stitch-metadata.json");
         const metaBak = fs.existsSync(metaFile) ? fs.readFileSync(metaFile) : null;
-        try { results = (await buildStitchSite(pages, theme, "DESKTOP")).results; }
+        try { results = (await buildStitchSiteWithKeyRotation(pages, theme, "DESKTOP")).results; }
         finally { if (metaBak) fs.writeFileSync(metaFile, metaBak); }
       } catch (e) { console.warn("enrich: Stitch generation failed, falling back to Gemini:", e.message.slice(0, 160)); }
       const okStitch = (results || []).filter((r) => r.html);
@@ -13380,7 +13425,7 @@ const server = http.createServer(async (req, res) => {
       // Same reasoning as the Gemini branch above: this is the main 4-page
       // build, not just service pages, and it feeds the same splitPage()/
       // buildWpTheme() head-stripping — so it needs the same guard.
-      const built = await buildStitchSite(pages.map(pg => ({ key: pg.key.replace(/[^a-z0-9_-]/gi, ""), prompt: pg.prompt + "\n\n" + designTokensBlock(theme) + STITCH_IMG_CLAUSE + stylingConstraint(theme || {}) })), theme || {}, deviceType);
+      const built = await buildStitchSiteWithKeyRotation(pages.map(pg => ({ key: pg.key.replace(/[^a-z0-9_-]/gi, ""), prompt: pg.prompt + "\n\n" + designTokensBlock(theme) + STITCH_IMG_CLAUSE + stylingConstraint(theme || {}) })), theme || {}, deviceType);
       const out = await Promise.all(built.results.map(async r => {
         if (!r.html) return { pageKey: r.key, engine: "stitch", error: r.error || "no HTML" };
         // Exact, untouched Stitch output, saved BEFORE any of our post-processing —
