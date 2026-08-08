@@ -4271,7 +4271,18 @@ async function tedResolveSubtaskRequest(taskId) {
   // Title and description are what the person wrote first; comments are where
   // they add the detail they forgot. All of it is the request.
   const comments = await tedTaskComments(taskId);
-  if (!comments.length) throw tedSkip(`task ${taskId} has no comments yet — nothing to act on`);
+  const description = String(task.description || "").trim();
+
+  // Either half can carry the request. TED's Subtask Activity trigger fires on
+  // creation, when a subtask has a description and cannot yet have a comment;
+  // the comment trigger fires later, when someone adds the detail they left out.
+  // Insisting on a comment would have made the creation path impossible.
+  //
+  // The title alone is not enough: "Website Change" names a subtask without
+  // saying what to change, and building from that would be guessing.
+  if (!description && !comments.length) {
+    throw tedSkip(`task ${taskId} has no description or comments yet — nothing to act on`);
+  }
 
   // The run's own outcome ("Change is live ...") is posted as a comment on this
   // same subtask, and a comment is what triggers this endpoint. Left alone, the
@@ -4285,12 +4296,14 @@ async function tedResolveSubtaskRequest(taskId) {
   // comments to the person who owns it, so this tool posts under a real name —
   // the same name that person uses when they write a genuine request by hand.
   // Matching on the author would ignore the token owner's own requests.
-  const newest = comments.reduce((a, b) => (String(b.createdAt) > String(a.createdAt) ? b : a), comments[0]);
-  if (newest.aiGenerated || newest.text.includes(TED_AUTOMATION_MARK)) {
-    throw tedSkip(`the last comment on ${taskId} was posted by this tool — not a new request`);
+  if (comments.length) {
+    const newest = comments.reduce((a, b) => (String(b.createdAt) > String(a.createdAt) ? b : a), comments[0]);
+    if (newest.aiGenerated || newest.text.includes(TED_AUTOMATION_MARK)) {
+      throw tedSkip(`the last comment on ${taskId} was posted by this tool — not a new request`);
+    }
   }
 
-  const instruction = [task.title, task.description, ...comments.map((c) => c.text)]
+  const instruction = [task.title, description, ...comments.map((c) => c.text)]
     .map((s) => String(s || "").trim()).filter(Boolean).join("\n\n");
   return { task, parent, site, clientName, instruction };
 }
