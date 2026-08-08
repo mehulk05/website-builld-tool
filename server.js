@@ -399,7 +399,6 @@ async function rpc(method, params, notify = false, timeoutMs = 90000) {
       }
       throw new Error(`Stitch HTTP ${res.status} on ${method}: ${text.slice(0, 300)}`);
     }
-    skIdx = (skIdx + i) % Math.max(STITCH_KEYS.length, 1);
     if (notify) return {};
     const parsed = parsePayload(await res.text());
     if (parsed && parsed.error) {
