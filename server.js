@@ -4345,6 +4345,128 @@ async function tedResolveSubtaskRequest(taskId) {
   return { task, parent, site, clientName, instruction };
 }
 
+// Real sub-tasks and checklist rows both come back here; the caller filters.
+async function tedListSubtasks(parentId) {
+  const d = await tedFetchJson(`/api/tasks/${parentId}/subtasks`);
+  return Array.isArray(d) ? d : (d.items || d.data || d.list || []);
+}
+
+// Everything between "here is a subtask id" and "a job is running for it".
+// Shared by the webhook and the poller below so the two cannot drift: whichever
+// notices the subtask first, the decision to run it is made in exactly one place.
+// Which subtasks this tool has already taken responsibility for. Persisted: a
+// redeploy that forgot would re-run every open request at once, and on the first
+// dry run of the poller that meant five builds off stale test fixtures.
+const TED_SEEN_FILE = path.join(DIR, "ted-subtasks.json");
+const TED_STARTED = new Set();
+const TED_LOGGED = new Set();   // refusals already reported, so the log says each thing once
+let TED_SEEN_LOADED = false;
+function loadTedSeen() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(TED_SEEN_FILE, "utf8"));
+    (raw.seen || []).forEach((id) => TED_STARTED.add(String(id)));
+    TED_SEEN_LOADED = true;
+  } catch (e) { TED_SEEN_LOADED = false; }   // absent on a first boot; seeded by the first poll
+  return TED_SEEN_LOADED;
+}
+function saveTedSeen() {
+  try { fs.writeFileSync(TED_SEEN_FILE, JSON.stringify({ seen: [...TED_STARTED] }, null, 2)); }
+  catch (e) { console.warn("could not persist ted-subtasks.json:", e.message); }
+}
+async function startTedSubtaskRun(taskId, { dryRun = false } = {}) {
+  const r = await tedResolveSubtaskRequest(taskId);   // throws; .ignore marks a refusal
+  const running = [...JOBS.values()].find((j) => j.type === "edit" && j.payload
+    && String(j.payload.tedSubtaskId) === String(taskId) && (j.status === "queued" || j.status === "running"));
+  if (running) return { dedupe: true, jobId: running.draftId, businessName: r.site.businessName };
+  const target = await resolveEditTarget(r.site);
+  if (dryRun) {
+    return { dryRun: true, taskId, parentId: r.task.parentId, businessName: r.site.businessName,
+      themeSlug: target.themeSlug, instruction: r.instruction };
+  }
+  const job = enqueueEditJob({
+    jobId: "edit-" + Date.now(),
+    siteId: r.site.siteId, businessName: r.site.businessName, githubRepo: r.site.githubRepo,
+    themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
+    prompt: r.instruction, forceApproval: true,
+    // Not "email": there is no thread and nobody to reply to, and the email
+    // reply path keys off that. The subtask id is what makes the outcome
+    // comment land back where the request was made.
+    source: "ted-subtask", requestedBy: r.task.reporterName || "TED",
+    tedSubtaskId: String(taskId), liveUrl: r.site.liveUrl || "",
+  });
+  TED_STARTED.add(String(taskId));
+  saveTedSeen();
+  // Says the request was picked up, and — because every comment this tool writes
+  // carries the automation mark — it is also what stops the poller starting the
+  // same subtask again on its next pass. The acknowledgement and the guard are
+  // deliberately the same act: one cannot be forgotten without the other.
+  tedComment([
+    `Picked up by Growth99 Studio - ${r.site.businessName}`,
+    `Studio job: ${job.draftId} - building now, held for approval before anything merges.`,
+  ].join("\n"), null, 0, String(taskId));
+  notify(`📝 TED subtask ${taskId} → *${r.site.businessName}*: ${r.instruction.slice(0, 140)} (needs your approval before merge)`);
+  return { jobId: job.draftId, taskId, businessName: r.site.businessName };
+}
+
+// A webhook that never arrives is indistinguishable from one that was never
+// sent, and TED's subtask trigger is new enough that neither of us can promise
+// it fires for every kind of subtask. So the tool also looks for itself: every
+// few minutes it reads each client's revision-cycle task and starts anything it
+// has not started yet. The webhook stays the fast path — this is what makes the
+// feature work without depending on it.
+//
+// Re-running is prevented by the acknowledgement comment rather than by memory,
+// so a redeploy mid-flight cannot cause a second run of the same request.
+const TED_POLL_MS = Number(process.env.TED_SUBTASK_POLL_MS || 180000);
+async function pollTedSubtasks() {
+  if (!TED_API_TOKEN || !TED_SUBTASKS) return;
+  // First boot on a deployment: adopt whatever is already there without acting on
+  // it. Those subtasks predate this feature — some are answered, some are old test
+  // rows — and starting a build for each one because the tool had just learned to
+  // look would be indefensible. Only what appears afterwards is acted on.
+  const seeding = !TED_SEEN_LOADED && !loadTedSeen();
+  let sites = [];
+  try { sites = await getWebsites(false); } catch (e) { return console.warn("subtask poll: NocoDB unavailable:", e.message); }
+  if (seeding) {
+    for (const site of sites) {
+      try {
+        const pid = await tedRevisionParent(site.businessName);
+        (await tedListSubtasks(pid)).forEach((s) => s && s.id && TED_STARTED.add(String(s.id)));
+      } catch (e) { /* a client with no revision task contributes nothing to seed */ }
+    }
+    TED_SEEN_LOADED = true;
+    saveTedSeen();
+    console.log(`subtask poll: adopted ${TED_STARTED.size} existing subtask(s) without running them; new ones from here on`);
+    return;
+  }
+  for (const site of sites) {
+    let parentId, subs;
+    try { parentId = await tedRevisionParent(site.businessName); } catch (e) { continue; }   // no revision task for this client
+    try { subs = await tedListSubtasks(parentId); } catch (e) { console.warn(`subtask poll: could not list ${parentId}:`, e.message); continue; }
+    for (const s of subs) {
+      const id = String((s && s.id) || "");
+      // Checklist rows cannot hold a request; skip without a round trip.
+      if (!id || /^sub_/i.test(id) || TED_STARTED.has(id)) continue;
+      try {
+        const out = await startTedSubtaskRun(id);
+        if (out && out.jobId && !out.dedupe) console.log(`subtask poll: started ${out.jobId} for TED subtask ${id} (${out.businessName})`);
+      } catch (e) {
+        // Logged either way — silence here is indistinguishable from a poller
+        // that never looked, which is the doubt this feature exists to remove.
+        // A refusal is NOT remembered: "no description yet" and "the tool spoke
+        // last" both stop being true the moment someone types something, and a
+        // subtask filled in after it was first seen must still get its run.
+        // Logged once per id per process so a permanent refusal does not repeat
+        // every few minutes forever.
+        const first = !TED_LOGGED.has(id);
+        TED_LOGGED.add(id);
+        if (e && e.ignore) { if (first) console.log(`subtask poll: ${id} skipped — ${e.message}`); }
+        else console.warn(`subtask poll: ${id} failed:`, (e && e.message) || e);
+      }
+    }
+  }
+}
+
 // The other half of the loop: the request comment says what was asked for, this
 // says how it ended. Both carry the same job id so they read as a pair.
 function tedOutcomeComment(job, outcome) {
@@ -12039,31 +12161,14 @@ const server = http.createServer(async (req, res) => {
         return json(res, 502, { error: `TED lookup failed for task ${taskId}: ${e.message}` });
       }
 
-      // One run per subtask at a time. A second comment while the first is still
-      // going is more detail on the same request, not a new one.
-      const running = [...JOBS.values()].find((j) => j.type === "edit" && j.payload
-        && String(j.payload.tedSubtaskId) === taskId && (j.status === "queued" || j.status === "running"));
-      if (running) return json(res, 202, { jobId: running.draftId, dedupe: true, taskId });
-
-      let target; try { target = await resolveEditTarget(r.site); }
-      catch (e) { return json(res, 409, { error: `no editable theme for ${r.site.businessName}: ${e.message}` }); }
-      if (body.dryRun) {
-        return json(res, 200, { accepted: true, dryRun: true, taskId, parentId: r.task.parentId,
-          businessName: r.site.businessName, themeSlug: target.themeSlug, instruction: r.instruction });
-      }
-      const job = enqueueEditJob({
-        jobId: "edit-" + Date.now(),
-        siteId: r.site.siteId, businessName: r.site.businessName, githubRepo: r.site.githubRepo,
-        themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
-        prompt: r.instruction, forceApproval: true,
-        // Not "email": there is no thread and nobody to reply to, and the email
-        // reply path keys off that. The subtask id is what makes the outcome
-        // comment land back where the request was made.
-        source: "ted-subtask", requestedBy: r.task.reporterName || "TED",
-        tedSubtaskId: taskId, liveUrl: r.site.liveUrl || "",
-      });
-      notify(`📝 TED subtask ${taskId} → *${r.site.businessName}*: ${r.instruction.slice(0, 140)} (needs your approval before merge)`);
-      return json(res, 202, { accepted: true, jobId: job.draftId, taskId, businessName: r.site.businessName });
+      // From here the webhook and the poller share one path, so a request that
+      // arrives both ways cannot be treated two different ways.
+      let out;
+      try { out = await startTedSubtaskRun(taskId, { dryRun: !!body.dryRun }); }
+      catch (e) { return json(res, 409, { error: `could not start a run for ${taskId}: ${e.message}` }); }
+      if (out.dedupe) return json(res, 202, { jobId: out.jobId, dedupe: true, taskId });
+      if (out.dryRun) return json(res, 200, { accepted: true, ...out });
+      return json(res, 202, { accepted: true, jobId: out.jobId, taskId, businessName: out.businessName });
     }
 
     // Inbound email → website change. Any transport that can POST JSON works;
@@ -13661,6 +13766,14 @@ if (require.main === module) {
     setInterval(() => { reauditActiveSite().catch((e) => console.warn("re-audit failed:", e.message)); }, reauditHours * 3600 * 1000);
     console.log(`re-audit scheduled every ${reauditHours}h`);
   }
+  // Picks up subtasks TED's webhook did not tell us about. Set
+  // TED_SUBTASK_POLL_MS=0 to rely on the webhook alone.
+  if (TED_API_TOKEN && TED_SUBTASKS && TED_POLL_MS > 0) {
+    const tick = () => pollTedSubtasks().catch((e) => console.warn("subtask poll failed:", e.message));
+    setInterval(tick, TED_POLL_MS);
+    setTimeout(tick, 15000);   // after boot, once NocoDB and TED are reachable
+    console.log(`TED subtask poll every ${Math.round(TED_POLL_MS / 1000)}s (parent ${TED_PARENT_KEY})`);
+  }
 }
 // One export object, deliberately: a second `module.exports = {...}` further up silently replaces
 // this one, which is a 20-minute debugging session waiting to happen.
@@ -13686,6 +13799,7 @@ module.exports = {
   tedComment, tedUpdateTask, tedAiComment, tedHtml, closeTedTaskIfFinal,
   tedCreateSubtask, tedRevisionParent, tedClientName, tedSubtaskTitle, tedNorm,
   tedResolveSubtaskRequest, tedTaskComments, isEmailSubtask, TED_EMAIL_SUFFIX, TED_AUTOMATION_MARK,
+  tedListSubtasks, startTedSubtaskRun, pollTedSubtasks,
   OUTCOME, OUTCOME_LABEL, resolveFindingOutcomes, replaceInTextNodes, fixBusinessName,
   imageSources, findingsImages, readSeoPages, synthMuSource, pageText,
   fixFavicon, fixSocialImage, fix404, fixCallNow, fixBlvd, fixBlogLinkColor, fixClickable,
