@@ -3787,14 +3787,28 @@ function newRestoreJob(payload) {
     createdAt: new Date().toISOString(), startedAt: null, finishedAt: null,
   };
 }
+// What product-service and the client pool actually store. Detail TEXT is deliberately not in
+// here: the CI watch rewrites it every 10s ("build (8.3):pending" → "build (8.3):pass"), and
+// reporting each of those turned one build into ~74 outbound calls. Everything that matters —
+// which step, its status, the PR, the scores — is covered, so a stage still produces one event
+// when it starts and one when it ends.
+const jobSignature = (job) => [
+  job.status, job.currentStep, (job.steps || []).map((s) => s.status).join(""),
+  job.prUrl || "", job.error || "", job.liveUrl || "",
+  job.before ? job.before.overall : "", job.after ? job.after.overall : "",
+].join("|");
+
 function jobStep(job, i, status, detail) {
   // Cancellation lands at step boundaries: refuse to start a new step if asked to cancel.
   if (status === "running" && job.cancelRequested) throw Object.assign(new Error("cancelled by user"), { cancelled: true });
   job.currentStep = i;
   job.steps[i].status = status;
   if (detail != null) job.steps[i].detail = String(detail).slice(0, 240);
-  saveJobs();
-  postStatus(job);   // report each step transition to G99 (fail-soft)
+  saveJobs();                       // local state always current — the UI polls this
+  const sig = jobSignature(job);
+  if (sig === job._lastReportedSig) return;   // detail-only churn: nothing to report outward
+  job._lastReportedSig = sig;
+  postStatus(job);   // report each real step transition to G99 (fail-soft)
   mirrorPool(job);   // and to the durable client pool (survives redeploys)
 }
 // Slack (or any incoming-webhook) notification — fail-soft, off when unset.
@@ -11924,6 +11938,9 @@ const server = http.createServer(async (req, res) => {
     if (p === "/pr-smoke.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "pr-smoke.js")));
     // Which GitHub credentials this deployment actually has, and whether the App is enough.
     if (p === "/api/gh-auth") {
+      // Capabilities are probed once at boot. When permissions are granted on GitHub mid-run,
+      // ?refresh=1 re-probes instead of forcing a restart (which would kill a running build).
+      if (u.searchParams.get("refresh") === "1") GH_APP_CAPS = null;
       const caps = await ghAppCaps();
       const pat = !!process.env.GH_TOKEN;
       const full = caps.pulls && caps.checks;

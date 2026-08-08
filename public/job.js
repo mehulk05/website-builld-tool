@@ -28,7 +28,13 @@ function brandBlock(j) {
   return `<div class="sub-detail">
     <div class="swatches">${sw(c.primary, "Primary")}${sw(c.secondary, "Secondary")}${sw(c.accent, "Accent")}</div>
     ${fonts ? `<div class="kv">Typography · ${esc(fonts)}</div>` : ""}
-    ${c.brief ? `<details class="brief"><summary>View the full build prompt (${c.brief.length} chars)</summary><div>${esc(c.brief)}</div></details>` : ""}
+    ${c.brief ? `<details class="brief">
+      <summary>View the full build prompt (${c.brief.length} chars)</summary>
+      <div class="briefwrap">
+        <button class="copybtn" data-copy="brief" title="Copy the prompt">${svg("copy", 13)} Copy</button>
+        <div class="brieftext" id="brieftext">${esc(c.brief)}</div>
+      </div>
+    </details>` : ""}
   </div>`;
 }
 // Per-page generation status. While the step is running we use the live global
@@ -483,6 +489,26 @@ function render() {
     d.addEventListener("toggle", () => { if (d.open) OPEN.add(d.dataset.k); else OPEN.delete(d.dataset.k); });
   });
   document.querySelectorAll("[data-act]").forEach((b) => { b.onclick = () => act(b.dataset.act, b); });
+  document.querySelectorAll("[data-copy]").forEach((b) => {
+    b.onclick = async (e) => {
+      // Inside a <summary>-less <details> body, but still guard: a click must not toggle it.
+      e.preventDefault(); e.stopPropagation();
+      const text = (b.parentElement.querySelector(".brieftext") || {}).textContent || "";
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (err) {
+        // clipboard API needs a secure context; fall back to a hidden textarea + execCommand
+        const ta = document.createElement("textarea");
+        ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand("copy"); } catch (e2) { toast("could not copy", true); }
+        ta.remove();
+      }
+      b.classList.add("copied");
+      b.innerHTML = svg("check", 13) + " Copied";
+      setTimeout(() => { b.classList.remove("copied"); b.innerHTML = svg("copy", 13) + " Copy"; }, 1600);
+    };
+  });
   if (TECH_OPEN) loadDiff();
 }
 

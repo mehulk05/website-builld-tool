@@ -106,6 +106,19 @@
     border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-top: 8px;
     max-height: 280px; overflow: auto; background: var(--surface-2);
   }
+  /* The copy button floats over the scroll box, so it stays reachable without scrolling
+     to the end of a 2,500-character prompt. */
+  details.brief .briefwrap { position: relative; }
+  details.brief .briefwrap > div { margin-top: 8px; }
+  .copybtn {
+    position: absolute; top: 16px; right: 10px; z-index: 2;
+    display: inline-flex; align-items: center; gap: 5px;
+    font: inherit; font-size: 11px; font-weight: 700; padding: 4px 9px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--surface); color: var(--ink-2); cursor: pointer;
+    box-shadow: var(--shadow-sm);
+  }
+  .copybtn:hover { color: var(--ink); border-color: var(--accent); }
+  .copybtn.copied { color: var(--good); border-color: var(--good); }
 
   .pages { display: flex; flex-direction: column; gap: 2px; }
   .pg { display: flex; align-items: center; gap: 9px; font-size: 12.5px; padding: 5px 0; }

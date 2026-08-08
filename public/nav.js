@@ -262,6 +262,7 @@
     menu: `<path stroke-linecap="round" stroke-linejoin="round" d="M4 7h16M4 12h16M4 17h16"/>`,
     panel: `<rect x="3" y="4" width="18" height="16" rx="2"/><path stroke-linecap="round" d="M10 4v16"/>`,
     clock: `<circle cx="12" cy="12" r="9"/><path stroke-linecap="round" stroke-linejoin="round" d="M12 7v5l3.5 2"/>`,
+    copy: `<rect x="9" y="9" width="11" height="11" rx="2"/><path stroke-linecap="round" stroke-linejoin="round" d="M5 15H4a1 1 0 01-1-1V4a1 1 0 011-1h10a1 1 0 011 1v1"/>`,
   };
   // svg(name) → a 1em icon; svg(name, 18) → sized.
   const svg = (name, size, sw) =>
