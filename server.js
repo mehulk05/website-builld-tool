@@ -4240,6 +4240,12 @@ async function tedTaskComments(taskId) {
 function tedSkip(message) { const e = new Error(message); e.ignore = true; return e; }
 
 async function tedResolveSubtaskRequest(taskId) {
+  // TED calls two different things a subtask, and only one of them is a task.
+  // GET /api/tasks/<parent>/subtasks shows both: a real sub-task is a Task record
+  // with a plain id (9077 -> 14675), while a checklist row is "sub_1733" and has
+  // no /api/tasks/<id> of its own and no comments to read. A checklist row can
+  // never carry a change request, so say why rather than failing on the fetch.
+  if (/^sub_/i.test(String(taskId))) throw tedSkip(`${taskId} is a checklist row, not a sub-task — it has no comments to act on`);
   const task = await tedFetchJson(`/api/tasks/${taskId}`);
   if (!task.parentId) throw tedSkip(`task ${taskId} is not a subtask`);
   const parent = await tedFetchJson(`/api/tasks/${task.parentId}`);
