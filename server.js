@@ -4240,6 +4240,12 @@ async function tedTaskComments(taskId) {
 function tedSkip(message) { const e = new Error(message); e.ignore = true; return e; }
 
 async function tedResolveSubtaskRequest(taskId) {
+  // TED calls two different things a subtask, and only one of them is a task.
+  // GET /api/tasks/<parent>/subtasks shows both: a real sub-task is a Task record
+  // with a plain id (9077 -> 14675), while a checklist row is "sub_1733" and has
+  // no /api/tasks/<id> of its own and no comments to read. A checklist row can
+  // never carry a change request, so say why rather than failing on the fetch.
+  if (/^sub_/i.test(String(taskId))) throw tedSkip(`${taskId} is a checklist row, not a sub-task — it has no comments to act on`);
   const task = await tedFetchJson(`/api/tasks/${taskId}`);
   if (!task.parentId) throw tedSkip(`task ${taskId} is not a subtask`);
   const parent = await tedFetchJson(`/api/tasks/${task.parentId}`);
@@ -4265,7 +4271,18 @@ async function tedResolveSubtaskRequest(taskId) {
   // Title and description are what the person wrote first; comments are where
   // they add the detail they forgot. All of it is the request.
   const comments = await tedTaskComments(taskId);
-  if (!comments.length) throw tedSkip(`task ${taskId} has no comments yet — nothing to act on`);
+  const description = String(task.description || "").trim();
+
+  // Either half can carry the request. TED's Subtask Activity trigger fires on
+  // creation, when a subtask has a description and cannot yet have a comment;
+  // the comment trigger fires later, when someone adds the detail they left out.
+  // Insisting on a comment would have made the creation path impossible.
+  //
+  // The title alone is not enough: "Website Change" names a subtask without
+  // saying what to change, and building from that would be guessing.
+  if (!description && !comments.length) {
+    throw tedSkip(`task ${taskId} has no description or comments yet — nothing to act on`);
+  }
 
   // The run's own outcome ("Change is live ...") is posted as a comment on this
   // same subtask, and a comment is what triggers this endpoint. Left alone, the
@@ -4279,12 +4296,14 @@ async function tedResolveSubtaskRequest(taskId) {
   // comments to the person who owns it, so this tool posts under a real name —
   // the same name that person uses when they write a genuine request by hand.
   // Matching on the author would ignore the token owner's own requests.
-  const newest = comments.reduce((a, b) => (String(b.createdAt) > String(a.createdAt) ? b : a), comments[0]);
-  if (newest.aiGenerated || newest.text.includes(TED_AUTOMATION_MARK)) {
-    throw tedSkip(`the last comment on ${taskId} was posted by this tool — not a new request`);
+  if (comments.length) {
+    const newest = comments.reduce((a, b) => (String(b.createdAt) > String(a.createdAt) ? b : a), comments[0]);
+    if (newest.aiGenerated || newest.text.includes(TED_AUTOMATION_MARK)) {
+      throw tedSkip(`the last comment on ${taskId} was posted by this tool — not a new request`);
+    }
   }
 
-  const instruction = [task.title, task.description, ...comments.map((c) => c.text)]
+  const instruction = [task.title, description, ...comments.map((c) => c.text)]
     .map((s) => String(s || "").trim()).filter(Boolean).join("\n\n");
   return { task, parent, site, clientName, instruction };
 }
@@ -11940,12 +11959,26 @@ const server = http.createServer(async (req, res) => {
       if (secret && (req.headers["x-webhook-secret"] || "") !== secret) return json(res, 401, { error: "bad webhook secret" });
       let body = {};
       try { body = JSON.parse(await readBody(req) || "{}"); } catch (e) { return json(res, 400, { error: "bad json" }); }
-      const tgt = body.target || {}, trig = body.trigger || {};
-      const taskId = String(body.taskId || tgt.taskId || tgt.id || trig.taskId || trig.id
-        || (body.task && body.task.id) || (body.comment && body.comment.taskId) || body.id || "").trim();
+      // TED wraps task events as { event, timestamp, source, data, subscriptionId }
+      // — the task rides in `data`, which is where the id actually lives. The
+      // flatter shapes are kept behind it because the pre-release webhook sends
+      // trigger/target instead, and a test delivery sends neither.
+      const dat = body.data || {}, tgt = body.target || {}, trig = body.trigger || {};
+      const taskId = String(
+        body.taskId || dat.taskId || dat.id || (dat.task && (dat.task.id || dat.task.taskId))
+        || (dat.comment && dat.comment.taskId) || tgt.taskId || tgt.id || trig.taskId || trig.id
+        || (body.task && body.task.id) || (body.comment && body.comment.taskId) || body.id || ""
+      ).trim();
       if (!taskId) {
         console.warn("ted-subtask webhook: no task id. payload:", JSON.stringify(body).slice(0, 1200));
-        return json(res, 422, { error: "no task id in payload", seen: Object.keys(body) });
+        // Report the nested keys too. The top-level ones alone said only that
+        // everything lives under `data`, which cost a round of testing to learn.
+        return json(res, 422, {
+          error: "no task id in payload",
+          seen: Object.keys(body),
+          dataKeys: dat && typeof dat === "object" ? Object.keys(dat) : null,
+          hint: "expected the task id at data.id, data.taskId or data.task.id",
+        });
       }
       let r;
       // Most events on a TED board are not a revision request, so a refusal is a
