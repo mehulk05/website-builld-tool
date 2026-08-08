@@ -5311,9 +5311,37 @@ async function runJob(job) {
     // behavior (all 4 pages). Remove this block once the design pass is done.
     const DEV_PAGES = (process.env.DEV_PAGES || "off").toLowerCase() === "on"
       ? ["home"] : ["home", "services", "about", "contact"];
-    jobStep(job, 2, "running", `Generating ${DEV_PAGES.length} page${DEV_PAGES.length > 1 ? "s" : ""}…`);
+    // Read the client's OWN pages first and let Gemini turn each real structure into that
+    // page's brief. Without this every client got the same hardcoded 11-section blueprint,
+    // which is why a generated home page looked nothing like theirs. Fail-soft per page: any
+    // page we cannot scan falls back to the blueprint.
+    let siteStruct = null;
+    const existingUrl = job.payload && (job.payload.existingWebsite || job.payload.referenceWebsite);
+    if (existingUrl) {
+      jobStep(job, 2, "running", `Reading the structure of ${String(existingUrl).replace(/^https?:\/\//, "")}…`);
+      try { siteStruct = await scanSiteStructure(existingUrl); } catch (e) { console.error("structure scan failed:", e.message); }
+    }
+    const specs = {};
+    if (siteStruct) {
+      for (const k of DEV_PAGES) {
+        const s = siteStruct.pages[k];
+        if (!s) continue;
+        try { specs[k] = await composeCorePagePrompt(k, s, A, composed, siteStruct); }
+        catch (e) { console.error(`brief for ${k} failed:`, e.message); }
+      }
+      job.structureScan = {
+        site: siteStruct.origin,
+        pages: Object.fromEntries(Object.entries(siteStruct.pages).map(([k, v]) =>
+          [k, { url: v.url, h1: v.h1, flow: v.sectionFlow, sections: v.sections.length, images: v.images }])),
+        composed: Object.keys(specs),
+      };
+      saveJobs();
+    }
+    const scanned = Object.keys(specs).length;
+    jobStep(job, 2, "running", `Generating ${DEV_PAGES.length} page${DEV_PAGES.length > 1 ? "s" : ""}`
+      + (scanned ? ` — ${scanned} brief(s) composed from the client's real site` : " (generic blueprint — site scan unavailable)") + "…");
     const pages = DEV_PAGES.map((k) => ({
-      key: k, prompt: `${composed.brief}\n\n${jobPageSections(k, A)}\n\nReturn one complete, responsive, production-quality HTML page with the SEO requirements applied.`,
+      key: k, prompt: `${composed.brief}\n\n${specs[k] || jobPageSections(k, A)}\n\nReturn one complete, responsive, production-quality HTML page with the SEO requirements applied.`,
     }));
     const gen = await localApi("/api/generate-site", { engine: "", deviceType: "DESKTOP", theme, pages }, 45 * 60 * 1000);
     const ok = (gen.pages || []).filter((x) => x && !x.error);
@@ -6402,6 +6430,200 @@ async function scrapeExistingServiceRefs(existingUrl, services) {
 // Learn the REFERENCE site's service-page design (section order, imagery density,
 // local-SEO heading style) so generated pages mimic what the client loves instead
 // of a fixed outline. Fail-soft → null (composer falls back to a proven structure).
+// ---- existing-site structure scan (core pages) ----------------------------------
+// Service pages have been generated from a scrape of the real page for a while; the four core
+// pages were not — they came from a hardcoded 11-section blueprint, identical for every client.
+// That is why a generated home page looks nothing like the client's own. This reads the real
+// site's section flow so the same scrape → compose → Stitch path can drive the core pages too.
+
+// Section types worth naming. Order matters: the first pattern that matches a block wins, so
+// the more specific signals are listed first.
+const SECTION_KINDS = [
+  ["before-after", /\bbefore\s*(&|and|\/|\s)*\s*after\b|\bgallery of results\b|\btransformation/i],
+  ["testimonials", /\btestimonial|\breview(s)?\b|what (our )?(patients|clients) say|★|\bstar rating/i],
+  ["team", /\bmeet (the|our)\b|\bour team\b|\bproviders?\b|\bstaff\b|\bmd\b|\bnp\b|\brn\b|\bpa-c\b/i],
+  ["services", /\btreatments?\b|\bservices?\b|\bwhat we (do|offer)\b|\bmenu\b/i],
+  ["faq", /\bfaq\b|frequently asked|\bquestions\b/i],
+  ["financing", /\bfinancing\b|\bmembership\b|\bspecials?\b|\bpackages?\b|\bcherry\b|\bafterpay\b|\bcare ?credit\b/i],
+  ["stats", /\byears? of experience\b|\b\d[\d,]*\+?\s*(patients|treatments|clients|procedures)\b/i],
+  ["location", /\bvisit us\b|\bour location\b|\bhours\b|\bdirections\b|\baddress\b/i],
+  ["contact", /\bcontact\b|\bget in touch\b|\bbook (a|an|your)?\s*(consultation|appointment)\b|\bschedule\b/i],
+  ["about", /\babout\b|\bour story\b|\bwhy choose\b|\bwelcome\b|\bmission\b/i],
+  ["cta", /\bready to\b|\bstart your\b|\bbook now\b|\bcall today\b/i],
+];
+const classifySection = (text) => (SECTION_KINDS.find(([, re]) => re.test(text)) || ["content"])[0];
+
+const textOf = (html) => String(html || "")
+  .replace(/<script[\s\S]*?<\/script>/gi, " ")
+  .replace(/<style[\s\S]*?<\/style>/gi, " ")
+  .replace(/<[^>]+>/g, " ")
+  .replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&#\d+;/g, " ")
+  .replace(/\s+/g, " ").trim();
+
+// One page's real structure: the heading flow in DOM order, each tagged with what it seems to
+// be and how image-heavy it is. Deliberately heuristic and fail-soft — this feeds a prompt,
+// it does not need to be a perfect parse.
+async function scanPageStructure(url) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 20000);
+  let html;
+  try {
+    const r = await fetch(url, { redirect: "follow", signal: ctl.signal, headers: { "User-Agent": "Mozilla/5.0 G99Bot" } });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    html = await r.text();
+  } catch (e) { return null; } finally { clearTimeout(timer); }
+
+  const body = html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ");
+  const head = (html.match(/<head[\s\S]*?<\/head>/i) || [""])[0];
+
+  const h1 = textOf((body.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i) || [])[1] || "").slice(0, 140);
+  const title = textOf((head.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || "").slice(0, 140);
+  const metaDesc = ((head.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)/i) || [])[1] || "").slice(0, 200);
+
+  // Nav: the first <nav>/<header> block's links, deduped, short labels only.
+  const navBlock = (body.match(/<nav[\s\S]*?<\/nav>/i) || body.match(/<header[\s\S]*?<\/header>/i) || [""])[0];
+  const nav = [...new Set([...navBlock.matchAll(/<a[^>]*>([\s\S]*?)<\/a>/gi)]
+    .map((m) => textOf(m[1])).filter((t) => t && t.length <= 28))].slice(0, 12);
+
+  // Buttons / CTAs anywhere on the page — the labels tell us the conversion language used.
+  const ctas = [...new Set([...body.matchAll(/<a[^>]*class=["'][^"']*(btn|button|cta)[^"']*["'][^>]*>([\s\S]*?)<\/a>/gi)]
+    .map((m) => textOf(m[2])).filter((t) => t && t.length <= 40))].slice(0, 10);
+
+  // Strip the chrome before looking for sections. Mega-menus are full of h2/h3 headings, so
+  // without this the "section flow" is just the navigation — every heading duplicated (desktop
+  // + mobile menu) and every section reporting zero images.
+  const main = body
+    .replace(/<nav[\s\S]*?<\/nav>/gi, " ")
+    .replace(/<header[\s\S]*?<\/header>/gi, " ")
+    .replace(/<footer[\s\S]*?<\/footer>/gi, " ")
+    .replace(/<ul[^>]+class=["'][^"']*(menu|nav)[^"']*["'][\s\S]*?<\/ul>/gi, " ")
+    .replace(/<div[^>]+class=["'][^"']*(mega-?menu|sub-?menu|off-?canvas|mobile-menu)[^"']*["'][\s\S]*?<\/div>/gi, " ");
+
+  // The section flow: every h1/h2/h3 in DOM order plus the copy that follows it, classified.
+  const headings = [...main.matchAll(/<(h1|h2|h3)[^>]*>([\s\S]*?)<\/\1>/gi)];
+  const sections = [];
+  const seen = new Set();
+  for (let i = 0; i < headings.length && sections.length < 20; i++) {
+    const label = textOf(headings[i][2]);
+    if (!label || label.length > 120) continue;
+    const dedupe = label.toLowerCase();
+    if (seen.has(dedupe)) continue;      // repeated chrome that survived the strip
+    seen.add(dedupe);
+    const from = headings[i].index + headings[i][0].length;
+    const to = i + 1 < headings.length ? headings[i + 1].index : Math.min(main.length, from + 4000);
+    const chunk = main.slice(from, to);
+    // Lazy-loaded sites put the real URL in data-src / srcset, so count those too.
+    const images = (chunk.match(/<img|data-src=|srcset=|background-image/gi) || []).length;
+    sections.push({
+      heading: label,
+      kind: classifySection(label + " " + textOf(chunk).slice(0, 300)),
+      images,
+      copy: textOf(chunk).slice(0, 220),
+    });
+  }
+
+  const footer = (body.match(/<footer[\s\S]*?<\/footer>/i) || [""])[0];
+  return {
+    url, title, h1, metaDesc, nav, ctas,
+    sections,
+    sectionFlow: sections.map((s) => s.kind),
+    images: (body.match(/<img/gi) || []).length,
+    hasForm: /<form/i.test(body),
+    hasMap: /google\.com\/maps|maps\.googleapis|<iframe[^>]+map/i.test(body),
+    hasVideo: /<video|youtube\.com\/embed|player\.vimeo/i.test(body),
+    footerText: textOf(footer).slice(0, 300),
+    wordCount: textOf(body).split(/\s+/).length,
+  };
+}
+
+// Find the client's own home / services / about / contact pages, then scan each one.
+// Nav links are the source: they are what the site itself considers its primary pages.
+async function scanSiteStructure(siteUrl) {
+  if (!siteUrl) return null;
+  let origin;
+  try { origin = new URL(/^https?:\/\//i.test(siteUrl) ? siteUrl : "https://" + siteUrl).origin; }
+  catch (e) { return null; }
+
+  const home = await scanPageStructure(origin + "/");
+  if (!home) return null;
+
+  // Match each core page to a nav entry, falling back to the conventional path.
+  const WANT = {
+    services: { re: /treatment|service|menu|what we do/i, fallback: ["/services/", "/treatments/"] },
+    about: { re: /about|our story|team|meet/i, fallback: ["/about/", "/about-us/", "/team/"] },
+    contact: { re: /contact|book|appointment|schedule|location/i, fallback: ["/contact/", "/contact-us/"] },
+  };
+  let navHrefs = [];
+  try {
+    const r = await fetch(origin + "/", { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 G99Bot" } });
+    const html = await r.text();
+    const navBlock = (html.match(/<nav[\s\S]*?<\/nav>/i) || html.match(/<header[\s\S]*?<\/header>/i) || [""])[0];
+    navHrefs = [...navBlock.matchAll(/<a[^>]+href=["']([^"'#]+)["'][^>]*>([\s\S]*?)<\/a>/gi)]
+      .map((m) => ({ href: m[1], label: textOf(m[2]) }))
+      .filter((x) => x.label && (x.href.startsWith("/") || x.href.startsWith(origin)));
+  } catch (e) { /* nav lookup is best-effort */ }
+
+  const out = { origin, home, pages: { home } };
+  for (const [key, cfg] of Object.entries(WANT)) {
+    const hit = navHrefs.find((x) => cfg.re.test(x.label));
+    const candidates = [hit && (hit.href.startsWith("http") ? hit.href : origin + hit.href), ...cfg.fallback.map((p) => origin + p)]
+      .filter(Boolean);
+    for (const c of candidates) {
+      const s = await scanPageStructure(c);
+      if (s && s.sections.length) { out.pages[key] = s; break; }
+    }
+  }
+  out.scannedAt = new Date().toISOString();
+  return out;
+}
+
+// Gemini turns one scanned page into a generation brief. Same contract as
+// composeServicePagePrompt: nothing about the section flow is hardcoded — it comes from the
+// scrape. The brief keeps the client's real information architecture and improves the
+// EXECUTION; it must not invent sections the client does not have (a home page with invented
+// testimonials and before/after galleries is exactly what made the old output feel generic).
+async function composeCorePagePrompt(key, struct, A, composed, allStruct) {
+  if (!struct) return null;
+  const val = (v) => Array.isArray(v) ? v.map((x) => (x && typeof x === "object" ? (x.name || x.title || "") : String(x))).filter(Boolean).join(", ") : (v == null ? "" : String(v));
+  const flow = struct.sections.map((s, i) =>
+    `${i + 1}. [${s.kind}] "${s.heading}"${s.images ? ` — ${s.images} image(s)` : ""}${s.copy ? ` — copy: ${s.copy.slice(0, 120)}` : ""}`).join("\n");
+
+  const p = [
+    `Write a DESIGN BRIEF (a page-generation prompt) for the ${key.toUpperCase()} page of a medical-aesthetics website. Return ONLY the brief text — no preamble, no markdown fences.`,
+    ``,
+    `THE CLIENT'S CURRENT ${key.toUpperCase()} PAGE (${struct.url}) — this is the structure to follow:`,
+    `Title: ${struct.title}`,
+    `H1: ${struct.h1 || "(none)"}`,
+    struct.metaDesc ? `Meta description: ${struct.metaDesc}` : "",
+    `Primary navigation: ${struct.nav.join(" | ") || "(none found)"}`,
+    `Call-to-action labels they actually use: ${struct.ctas.join(" | ") || "(none found)"}`,
+    `Page signals: ${struct.images} images${struct.hasForm ? ", has a form" : ""}${struct.hasMap ? ", embeds a map" : ""}${struct.hasVideo ? ", has video" : ""}, ~${struct.wordCount} words.`,
+    `SECTION FLOW, in order:`,
+    flow || "(no sections detected)",
+    allStruct && allStruct.pages ? `Their other pages: ${Object.keys(allStruct.pages).filter((k) => k !== key).join(", ")}.` : "",
+    ``,
+    `RULES:`,
+    `- MIRROR the section order and purpose above. Same information architecture, better execution.`,
+    `- Do NOT invent sections they do not have. If there are no testimonials or before/after galleries in the flow, the page must not have them.`,
+    `- Keep their real headings and CTA wording where it works; sharpen it where it is weak. Their CTA language is what their patients respond to.`,
+    `- Where a section has images, the rebuilt section must be equally image-led.`,
+    `- Improve what is objectively weak: visual hierarchy, whitespace, mobile layout, contrast, scannability, and a clear conversion path to "${A.primary_cta || struct.ctas[0] || "Book an appointment"}".`,
+    ``,
+    `PRACTICE FACTS to use as real copy (never placeholders):`,
+    `Business: ${A.business_name || ""}. Location: ${A.location || ""}. Phone: ${A.phone_for_website || ""}.`,
+    A.services_offered ? `Services: ${val(A.services_offered)}.` : "",
+    A.revenue_services ? `Priority/revenue services: ${val(A.revenue_services)}.` : "",
+    A.team_roster ? `Team: ${val(A.team_roster)}.` : "",
+    A.why_patients_choose ? `Why patients choose them: ${val(A.why_patients_choose)}.` : "",
+    A.featured_review ? `A real review: "${val(A.featured_review)}".` : "",
+    ``,
+    `BRAND SYSTEM to obey exactly: primary ${composed.primary}, secondary ${composed.secondary}, accent ${composed.accent}; headings "${composed.headingFont}", body "${composed.bodyFont}".`,
+    `Specify every section in order with concrete copy direction and imagery direction. 300-450 words.`,
+  ].filter((x) => x !== "").join("\n");
+
+  return stripFence(await geminiCall([{ text: p }], { temperature: 0.5, maxOutputTokens: 1600, timeoutMs: 60000 }));
+}
+
 async function scrapeReferenceServiceStructure(refUrl) {
   if (!refUrl) return null;
   try {
