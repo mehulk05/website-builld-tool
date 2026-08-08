@@ -26,3 +26,4 @@ email-outbox.json
 # extension and *.pem would not catch them.
 GH_APP_PRIVATE_KEY
 GH_APP_PRIVATE_KEY.*
+ted-subtasks.json
