@@ -3935,6 +3935,204 @@ async function tedUpdateTask(taskId, fields) {
   } catch (e) { return { ok: false, reason: String(e && e.message || e).slice(0, 140) }; }
 }
 
+// ---- Email request → TED subtask -------------------------------------------
+// An emailed change used to be filed as a comment on one fixed task
+// (TED_REVISIONS_TASK_ID), which meant every client's requests piled onto the
+// task belonging to whoever that id happened to be. Each request now gets its
+// own subtask under THAT client's revision-cycle task, and the outcome comment
+// goes back onto the same subtask, so a request and its result read as a pair.
+//
+// Off with TED_SUBTASKS=off, which restores the single-task behaviour exactly.
+const TED_SUBTASKS = (process.env.TED_SUBTASKS || "on").toLowerCase() !== "off";
+// The parent is identified by template key, not by title or id: titles are
+// edited by hand and ids differ per client. Title is only used to narrow the
+// candidates before confirming the key.
+const TED_PARENT_KEY = process.env.TED_PARENT_KEY || "beta_site.revision_cycle";
+const TED_PARENT_TITLE_RE = /manage.*beta\s*site.*revision/i;
+
+// TED's client names do not always match NocoDB's ("NUVO Aesthetics Clinic
+// (clone)" vs "NUVO Aesthetics Clinic"), so they are compared with the same
+// normalisation the pre-release webhook uses on the way in.
+const tedNorm = (s) => String(s || "").toLowerCase().replace(/\(.*?\)/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+
+async function tedFetchJson(path, init) {
+  const headers = { accept: "application/json", ...(init && init.headers) };
+  if (TED_AUTH_HEADER === "x-api-key") headers["X-Api-Key"] = TED_API_TOKEN;
+  else headers["Authorization"] = "Bearer " + TED_API_TOKEN;
+  const r = await fetch(`${TED_BASE}${path}`, { ...init, headers });
+  // Same trap as everywhere else in this file: TED answers 200 with its Angular
+  // shell both for routes it does not register AND for writes the token is not
+  // permitted to make, so the status alone proves nothing.
+  if (/html/i.test(r.headers.get("content-type") || "")) throw new Error("got the TED web app, not the API (route missing or not permitted)");
+  if (!r.ok) throw new Error(`HTTP ${r.status}: ${(await r.text()).slice(0, 160)}`);
+  return r.json();
+}
+
+// businessName (NocoDB) -> the client name TED files tasks under. Cached: the
+// client list is large and changes far more slowly than requests arrive.
+let TED_CLIENTS = { at: 0, list: [] };
+async function tedClientName(businessName) {
+  if (Date.now() - TED_CLIENTS.at > 600000 || !TED_CLIENTS.list.length) {
+    const d = await tedFetchJson("/api/clients");
+    TED_CLIENTS = { at: Date.now(), list: d.items || d.list || d.data || (Array.isArray(d) ? d : []) };
+  }
+  const want = tedNorm(businessName);
+  const hit = TED_CLIENTS.list.filter((c) => tedNorm(c.name) === want);
+  if (hit.length === 1) return hit[0].name;
+  // Never guess between two clients — filing a request on the wrong client's
+  // board is worse than not filing it at all.
+  throw new Error(hit.length ? `"${businessName}" matches ${hit.length} TED clients` : `no TED client matches "${businessName}"`);
+}
+
+// The client's own revision-cycle task, which the request's subtask hangs off.
+// Cached per client because it is stable for the life of an onboarding.
+const TED_PARENTS = new Map();
+async function tedRevisionParent(businessName) {
+  const cached = TED_PARENTS.get(businessName);
+  if (cached && Date.now() - cached.at < 600000) return cached.id;
+  const client = await tedClientName(businessName);
+  const d = await tedFetchJson(`/api/tasks/all?pageSize=200&client=${encodeURIComponent(client)}`);
+  // The list response strips `automation`, so the key can only be confirmed by
+  // fetching each candidate. Narrowing by title first keeps that to one or two.
+  const candidates = (d.items || []).filter((t) => !t.parentId && TED_PARENT_TITLE_RE.test(t.title || ""));
+  for (const c of candidates) {
+    const full = await tedFetchJson(`/api/tasks/${c.id}`).catch(() => null);
+    if (full && full.automation && full.automation.templateKey === TED_PARENT_KEY) {
+      TED_PARENTS.set(businessName, { id: String(full.id), at: Date.now() });
+      return String(full.id);
+    }
+  }
+  throw new Error(`no ${TED_PARENT_KEY} task for ${client}`);
+}
+
+// A subject line is often "Website changes" or a bare URL, so the title is
+// written from the request itself. Kept short because TED truncates it in list
+// views, and deliberately capped in time — a slow model must not hold up the
+// reply to the person who emailed. Falls back to the subject, then the request.
+async function tedSubtaskTitle(subject, instruction) {
+  const fallback = tedAscii(String(subject || instruction || "Website change request").replace(/\s+/g, " ").trim()).slice(0, 120);
+  try {
+    const out = await aiCall([{ text:
+      `Write a task title for this website change request. One line, max 10 words, imperative ("Update the homepage hero heading"). No quotes, no trailing period, no client name.\n\nSubject: ${subject || "(none)"}\n\nRequest:\n${String(instruction || "").slice(0, 2000)}` }],
+      { temperature: 0.1, maxOutputTokens: 60, timeoutMs: 20000 });
+    const line = tedAscii(stripFence(out).split("\n")[0].replace(/^["'\s]+|["'\s.]+$/g, "")).trim();
+    return line ? line.slice(0, 120) : fallback;
+  } catch (e) {
+    console.warn("TED subtask title fell back to the subject:", e.message);
+    return fallback;
+  }
+}
+
+// Create the subtask and return its id, or null if anything at all went wrong.
+// Fail-soft on purpose: the caller falls back to the old single-task comment, so
+// a TED problem costs us the tidy threading and never the request itself.
+//
+// Known API limits, all confirmed against the live TED API:
+//   * clientName cannot be set on create or update — it comes back "[]", so an
+//     API-made subtask does not appear in client-scoped views yet. Sent anyway,
+//     so this starts working the day TED accepts it.
+//   * priority is silently ignored, and title cannot be changed after create.
+//   * departmentName is dropped on create but does apply on a follow-up PUT.
+async function tedCreateSubtask({ businessName, title, description, dueDate }) {
+  if (!TED_API_TOKEN || !TED_SUBTASKS) return null;
+  try {
+    const parentId = await tedRevisionParent(businessName);
+    const created = await tedFetchJson("/api/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        title: tedAscii(title).slice(0, 120),
+        parentId: Number(parentId),
+        status: "Not Started",
+        clientName: await tedClientName(businessName).catch(() => undefined),
+        departmentName: "Onboarding Engineering",
+        startDate: new Date().toISOString().slice(0, 10),
+        ...(dueDate ? { dueDate } : {}),
+        description: tedAscii(description),
+      }),
+    });
+    if (!created || !created.id) throw new Error("create returned no id");
+    // Department is dropped by create but accepted here, so the task lands on
+    // the right board rather than in nobody's list.
+    await tedFetchJson(`/api/tasks/${created.id}`, {
+      method: "PUT", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ departmentName: "Onboarding Engineering" }),
+    }).catch(() => {});
+    console.log(`TED subtask ${created.id} created under ${parentId} for ${businessName}`);
+    return String(created.id);
+  } catch (e) {
+    console.warn(`TED subtask for ${businessName} not created (${e.message}) — falling back to task ${TED_REVISIONS_TASK_ID}`);
+    return null;
+  }
+}
+
+// Marks a subtask this tool created from an email. Load-bearing, not cosmetic:
+// the email flow posts a comment onto its own new subtask, and that comment is
+// exactly the event the manual path below listens for. Without a way to tell
+// the two apart, every emailed request would immediately start a second run of
+// itself. The suffix is how the manual path knows to stand down.
+const TED_EMAIL_SUFFIX = "(via email)";
+const isEmailSubtask = (title) => String(title || "").trim().toLowerCase().endsWith(TED_EMAIL_SUFFIX);
+
+// Throws rather than returning [] on failure, deliberately. "No comments" is a
+// decision — this request is not ready — and a TED read that merely failed must
+// never be mistaken for it, or a real request is dropped and nothing retries.
+async function tedTaskComments(taskId) {
+  const d = await tedFetchJson(`/api/tasks/${taskId}/comments`);
+  const arr = Array.isArray(d) ? d : (d.items || d.data || d.list || []);
+  return arr.map((c) => String(c.text || c.comment || "")
+    .replace(/<br\s*\/?>/gi, "\n").replace(/<\/(p|div|li)>/gi, "\n").replace(/<[^>]+>/g, "")
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&nbsp;/g, " ")
+    .replace(/[ \t]+/g, " ").trim()).filter(Boolean);
+}
+
+// A subtask someone created by hand in TED, under a client's revision-cycle
+// task, is the same request as an email — just entered somewhere else. This
+// resolves one into everything an edit job needs, or throws with a reason worth
+// reading in a log.
+//
+// The client is taken from the subtask, falling back to its parent. That
+// fallback is not defensive padding: TED's API cannot set clientName on create
+// (it stores "[]"), so any subtask made through the API — including this tool's
+// own — has no client of its own and can only inherit it.
+// "This event is not a revision request" and "TED could not be reached" must not
+// look alike to the caller: the first is answered 200 so TED stops resending it,
+// the second has to fail loudly so it is retried rather than silently dropped.
+// Only the deliberate refusals below are marked ignorable.
+function tedSkip(message) { const e = new Error(message); e.ignore = true; return e; }
+
+async function tedResolveSubtaskRequest(taskId) {
+  const task = await tedFetchJson(`/api/tasks/${taskId}`);
+  if (!task.parentId) throw tedSkip(`task ${taskId} is not a subtask`);
+  const parent = await tedFetchJson(`/api/tasks/${task.parentId}`);
+  const key = parent.automation && parent.automation.templateKey;
+  if (key !== TED_PARENT_KEY) throw tedSkip(`parent ${task.parentId} is ${key || "untemplated"}, not ${TED_PARENT_KEY}`);
+  if (isEmailSubtask(task.title)) throw tedSkip(`"${task.title}" was created from an email and already has a run`);
+
+  const usable = (n) => n && String(n).trim() && String(n).trim() !== "[]";
+  const clientName = usable(task.clientName) ? task.clientName : (usable(parent.clientName) ? parent.clientName : null);
+  if (!clientName) throw tedSkip(`no client on task ${taskId} or its parent`);
+
+  // Same name join the pre-release webhook uses, and refused the same way when
+  // it is not exactly one site: acting on the wrong client's repository is not
+  // a recoverable mistake.
+  const sites = await getWebsites(true);
+  const want = tedNorm(clientName);
+  const exact = sites.filter((s) => tedNorm(s.businessName) === want);
+  const hits = exact.length ? exact : sites.filter((s) => tedNorm(s.businessName).includes(want) || want.includes(tedNorm(s.businessName)));
+  if (hits.length !== 1) throw new Error(hits.length ? `"${clientName}" matches ${hits.length} sites` : `no site matches "${clientName}"`);
+  const site = hits[0];
+  if (!site.githubRepo) throw new Error(`${site.businessName} has no repository in NocoDB`);
+
+  // Title and description are what the person wrote first; comments are where
+  // they add the detail they forgot. All of it is the request.
+  const comments = await tedTaskComments(taskId);
+  if (!comments.length) throw tedSkip(`task ${taskId} has no comments yet — nothing to act on`);
+  const instruction = [task.title, task.description, ...comments]
+    .map((s) => String(s || "").trim()).filter(Boolean).join("\n\n");
+  return { task, parent, site, clientName, instruction };
+}
+
 // The other half of the loop: the request comment says what was asked for, this
 // says how it ended. Both carry the same job id so they read as a pair.
 function tedOutcomeComment(job, outcome) {
@@ -3956,11 +4154,17 @@ function tedOutcomeComment(job, outcome) {
 // show the old page — worse than no screenshot at all.
 function tedPostOutcome(job, outcome) {
   const P = (job && job.payload) || {};
-  // Only requests that arrived by email were announced to TED in the first
-  // place, so only those get an outcome. Same guard queueEmailReply() uses.
-  if (!TED_API_TOKEN || P.source !== "email") return;
+  // Only runs that were announced in TED get an outcome there: one that arrived
+  // by email, or one started from a TED subtask, which is a request waiting on
+  // an answer by definition. A run someone kicked off from the dashboard has no
+  // ticket to answer, and posting it would put it on a task nobody asked.
+  if (!TED_API_TOKEN || (P.source !== "email" && !P.tedSubtaskId)) return;
   const text = tedOutcomeComment(job, outcome);
-  if (!outcome.ok || !TED_SCREENSHOTS || !P.liveUrl) return tedComment(text);
+  // Back onto the subtask this request created, so the outcome sits under the
+  // request it answers. Null when the subtask could not be made (or subtasks are
+  // off), and tedComment then falls back to TED_REVISIONS_TASK_ID as before.
+  const taskId = P.tedSubtaskId || null;
+  if (!outcome.ok || !TED_SCREENSHOTS || !P.liveUrl) return tedComment(text, null, 0, taskId);
   setTimeout(async () => {
     let image = null;
     try {
@@ -3971,7 +4175,7 @@ function tedPostOutcome(job, outcome) {
     // Say so explicitly. The comment still goes out either way, and a picture
     // that is merely absent looks identical to one that was never wanted.
     if (!image) console.warn(`TED outcome for ${job.draftId} posting without a screenshot — both microlink and mShots came back empty`);
-    tedComment(text, image);
+    tedComment(text, image, 0, taskId);
   }, TED_SHOT_DELAY_MS);
 }
 
@@ -11513,6 +11717,77 @@ const server = http.createServer(async (req, res) => {
       return json(res, 202, { jobId: job.draftId, site: site.businessName, tedTaskId: job.payload.tedTaskId || null });
     }
 
+    // A subtask created by hand in TED, under a client's revision-cycle task,
+    // with a comment on it → the same edit job an email would have started.
+    // Sits outside the admin-key gate and carries its own optional secret, like
+    // the other TED webhooks.
+    //
+    // Deliberately tolerant about where the task id sits in the payload: TED's
+    // comment and task events do not share a shape, and the id is the only
+    // field this needs. Everything that decides whether to run — the parent's
+    // template key, the client, whether it is one of ours — is read back from
+    // TED rather than trusted from the payload.
+    if (p === "/api/webhook/ted-subtask" && req.method === "POST") {
+      const secret = (process.env.TED_SUBTASK_WEBHOOK_SECRET || "").trim();
+      if (secret && (req.headers["x-webhook-secret"] || "") !== secret) return json(res, 401, { error: "bad webhook secret" });
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || "{}"); } catch (e) { return json(res, 400, { error: "bad json" }); }
+      const tgt = body.target || {}, trig = body.trigger || {};
+      const taskId = String(body.taskId || tgt.taskId || tgt.id || trig.taskId || trig.id
+        || (body.task && body.task.id) || (body.comment && body.comment.taskId) || body.id || "").trim();
+      if (!taskId) {
+        console.warn("ted-subtask webhook: no task id. payload:", JSON.stringify(body).slice(0, 1200));
+        return json(res, 422, { error: "no task id in payload", seen: Object.keys(body) });
+      }
+      let r;
+      // Most events on a TED board are not a revision request, so a refusal is a
+      // normal outcome: 200, and TED stops resending. A TED failure is not — it
+      // answers 502 so the event is retried instead of vanishing, which is the
+      // difference between "not for us" and "we never saw it".
+      try { r = await tedResolveSubtaskRequest(taskId); }
+      catch (e) {
+        if (e && e.ignore) return json(res, 200, { ignored: true, taskId, reason: e.message });
+        // TED answers a deleted task exactly as it answers an outage — 200 with
+        // the Angular shell — so the response cannot tell them apart. One cheap
+        // probe of a known-good route can: if the rest of TED is answering, the
+        // task itself is gone, and a 502 would have TED retrying an event about
+        // a task that no longer exists until someone noticed.
+        const alive = await tedFetchJson("/api/me").then(() => true).catch(() => false);
+        if (alive) {
+          console.warn(`ted-subtask webhook: task ${taskId} is unreadable but TED is up — treating it as gone`);
+          return json(res, 200, { ignored: true, taskId, reason: `task ${taskId} could not be read (deleted, or not visible to this token)` });
+        }
+        console.warn(`ted-subtask webhook: TED unreachable while reading task ${taskId}:`, e.message);
+        return json(res, 502, { error: `TED lookup failed for task ${taskId}: ${e.message}` });
+      }
+
+      // One run per subtask at a time. A second comment while the first is still
+      // going is more detail on the same request, not a new one.
+      const running = [...JOBS.values()].find((j) => j.type === "edit" && j.payload
+        && String(j.payload.tedSubtaskId) === taskId && (j.status === "queued" || j.status === "running"));
+      if (running) return json(res, 202, { jobId: running.draftId, dedupe: true, taskId });
+
+      let target; try { target = await resolveEditTarget(r.site); }
+      catch (e) { return json(res, 409, { error: `no editable theme for ${r.site.businessName}: ${e.message}` }); }
+      if (body.dryRun) {
+        return json(res, 200, { accepted: true, dryRun: true, taskId, parentId: r.task.parentId,
+          businessName: r.site.businessName, themeSlug: target.themeSlug, instruction: r.instruction });
+      }
+      const job = enqueueEditJob({
+        jobId: "edit-" + Date.now(),
+        siteId: r.site.siteId, businessName: r.site.businessName, githubRepo: r.site.githubRepo,
+        themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
+        prompt: r.instruction, forceApproval: true,
+        // Not "email": there is no thread and nobody to reply to, and the email
+        // reply path keys off that. The subtask id is what makes the outcome
+        // comment land back where the request was made.
+        source: "ted-subtask", requestedBy: r.task.reporterName || "TED",
+        tedSubtaskId: taskId, liveUrl: r.site.liveUrl || "",
+      });
+      notify(`📝 TED subtask ${taskId} → *${r.site.businessName}*: ${r.instruction.slice(0, 140)} (needs your approval before merge)`);
+      return json(res, 202, { accepted: true, jobId: job.draftId, taskId, businessName: r.site.businessName });
+    }
+
     // Inbound email → website change. Any transport that can POST JSON works;
     // it carries its own secret, so it sits outside the admin-key gate.
     // Body: { from, subject, body, messageId?, headers?, dryRun? }
@@ -11594,7 +11869,26 @@ const server = http.createServer(async (req, res) => {
       notify(`📧 Email request from ${addr} → *${site.businessName}*: ${instruction.slice(0, 140)} (needs your approval before merge)`);
       // File it in TED for the delivery team. Only accepted requests reach this
       // line — every decline returned above, and so did the dry run.
-      tedComment(tedRequestComment({ site, addr, subject, instruction, jobId: job.draftId }));
+      //
+      // Its own subtask under this client's revision-cycle task, so requests do
+      // not pile onto one shared task. The id goes onto the job payload, which
+      // is how tedPostOutcome finds its way back to this same subtask when the
+      // change ships — minutes later, from a different call stack.
+      const requestText = tedRequestComment({ site, addr, subject, instruction, jobId: job.draftId });
+      // The suffix marks this as ours so the manual-subtask webhook ignores the
+      // comment posted below — otherwise this request would re-trigger itself.
+      const subtaskId = await tedCreateSubtask({
+        businessName: site.businessName,
+        title: (await tedSubtaskTitle(subject, instruction)).slice(0, 100).trim() + " " + TED_EMAIL_SUFFIX,
+        description: requestText,
+      });
+      if (subtaskId) {
+        job.payload.tedSubtaskId = subtaskId;
+        saveJobs();
+      }
+      // The description already carries the request; this makes the subtask
+      // behave like every other TED thread, where the discussion is in comments.
+      tedComment(requestText, null, 0, subtaskId);
       // Echoing the parsed instruction back is the cheapest guard against a
       // misread: the sender sees what will actually be done before it ships.
       // The first message the requester gets. Deliberately short: they wrote
@@ -13112,6 +13406,8 @@ module.exports = {
   writeRedirectMap, readRedirectMap, fixUrlStructure, findingsInternalLinks, bestRedirectTarget, fixInternalLinks, themeChromePages,
   closeSupersededPerformPrs,
   tedComment, tedUpdateTask, tedAiComment, tedHtml, closeTedTaskIfFinal,
+  tedCreateSubtask, tedRevisionParent, tedClientName, tedSubtaskTitle, tedNorm,
+  tedResolveSubtaskRequest, tedTaskComments, isEmailSubtask, TED_EMAIL_SUFFIX,
   OUTCOME, OUTCOME_LABEL, resolveFindingOutcomes, replaceInTextNodes, fixBusinessName,
   imageSources, findingsImages, readSeoPages, synthMuSource, pageText,
   fixFavicon, fixSocialImage, fix404, fixCallNow, fixBlvd, fixBlogLinkColor, fixClickable,
