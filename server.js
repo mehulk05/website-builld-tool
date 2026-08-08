@@ -4250,13 +4250,17 @@ async function tedAiResult(taskId, html, opts = {}) {
 // (postStatus/mirrorToParent) — that keeps firing unchanged, and product-service's own milestone
 // webhook to TED stays fully functional as the fallback path. This is simply a second, more direct
 // route for the two artifact-heavy events, since this process already holds the real data in memory.
-async function tedPushArtifacts(eventType, { businessId, draftId, mockups, servicePages, siteUrl } = {}) {
+async function tedPushArtifacts(eventType, { businessId, draftId, mockups, servicePages, siteUrl,
+  hubspotDealId, hubspotCompanyId } = {}) {
   if (!TED_API_TOKEN) return { ok: false, error: "TED_API_TOKEN not set" };
   const headers = { "Content-Type": "application/json" };
   if (TED_AUTH_HEADER === "x-api-key") headers["X-Api-Key"] = TED_API_TOKEN;
   else headers["Authorization"] = "Bearer " + TED_API_TOKEN;
   const body = JSON.stringify({
     eventType, businessId, draftId,
+    // companyId is TED's most reliable resolver (unique per client, unlike businessId which repeats
+    // across clone/test businesses) — sent whenever product-service gave it to us at trigger time.
+    dealId: hubspotDealId || null, companyId: hubspotCompanyId || null,
     mockups: (mockups || []).map(m => ({ label: m.label, url: m.url, dataUri: m.dataUri || null, error: m.error || null })),
     servicePages: (servicePages || []).map(p => ({
       name: p.name, slug: p.slug, status: p.status, engine: p.engine, sourceUrl: p.sourceUrl, brief: p.brief,
@@ -5672,6 +5676,10 @@ async function runJob(job) {
           muPath: `web/app/mu-plugins/g99-activate-${slug}.php`,
           answers: A, composed: job.composed, referenceWebsite: onb.referenceWebsite || "",
           existingWebsite: onb.existingWebsite || "",
+          // Carried from the parent build's own payload so this enrich job's artifact push to TED
+          // (screenshots + service pages) can resolve the right client unambiguously.
+          hubspotDealId: (job.payload || {}).hubspotDealId || null,
+          hubspotCompanyId: (job.payload || {}).hubspotCompanyId || null,
         });
         job.enrichJobId = ej.draftId;   // frontend links to the run from this step
         jobStep(job, ENRICH_STEP_IDX, "running", "Queued as its own run — generating service pages…");
@@ -7817,10 +7825,14 @@ async function runEnrichJob(job) {
     // Push the real artifacts straight to TED — fire-and-forget, never blocks completion. This is a
     // second, independent delivery route alongside the G99 status callback below; it does not replace it.
     if (job.businessId) {
-      tedPushArtifacts("MOCKUPS_CAPTURED", { businessId: job.businessId, draftId: job.draftId, mockups: job.mockups })
-        .then(r => console.log(`[ted-push] MOCKUPS_CAPTURED biz=${job.businessId} -> ${JSON.stringify(r).slice(0, 200)}`));
+      const hubspotDealId = P.hubspotDealId || null;
+      const hubspotCompanyId = P.hubspotCompanyId || null;
+      tedPushArtifacts("MOCKUPS_CAPTURED", {
+        businessId: job.businessId, draftId: job.draftId, mockups: job.mockups, hubspotDealId, hubspotCompanyId,
+      }).then(r => console.log(`[ted-push] MOCKUPS_CAPTURED biz=${job.businessId} -> ${JSON.stringify(r).slice(0, 200)}`));
       tedPushArtifacts("SERVICE_PAGES_CREATED", {
         businessId: job.businessId, draftId: job.draftId, servicePages: job.serviceDetail, siteUrl: job.liveUrl,
+        hubspotDealId, hubspotCompanyId,
       }).then(r => console.log(`[ted-push] SERVICE_PAGES_CREATED biz=${job.businessId} -> ${JSON.stringify(r).slice(0, 200)}`));
     }
 
@@ -11643,6 +11655,11 @@ const server = http.createServer(async (req, res) => {
         // the build target from the deal — without these the job used env defaults
         betaSiteUrl, betaSiteRepo, receivedAt, source: "onboarding form",
         brand: confirmedBrand,
+        // HubSpot identity, carried through so this job's own artifact push to TED (screenshots +
+        // service pages) can resolve the right client unambiguously — companyId especially, since
+        // businessId alone is reused across clone/test businesses. See tedPushArtifacts().
+        hubspotDealId: body.hubspotDealId || body.dealId || null,
+        hubspotCompanyId: body.hubspotCompanyId || body.companyId || null,
       });
       console.log(`webhook: ${job.businessName} · repo ${job.repo} · beta ${job.liveUrl}${betaSiteUrl || betaSiteRepo ? "" : " (deal properties missing — using this deployment's defaults)"}`
         + (confirmedBrand ? ` · client-confirmed brand ${confirmedBrand.primaryColor || "?"}/${confirmedBrand.accentColor || "?"} ${confirmedBrand.headingFont || "?"}` : " · no confirmed brand (will derive)"));
