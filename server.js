@@ -3850,6 +3850,15 @@ function tedAscii(s) {
   return String(s || "").replace(/[‘’“”–—… •×]/g, (c) => TED_ASCII[c])
     .replace(/[^\x09\x0a\x0d\x20-\x7e]/g, "");
 }
+
+// Stamped on every comment this tool writes, and the only reliable way for it to
+// recognise its own voice: TED attributes a token's comments to the person who
+// owns it, so the author name cannot separate "the tool said this" from "that
+// person said this". Without it, the outcome comment a run posts is read as the
+// next request and the tool answers itself forever.
+// ASCII on purpose — tedAscii strips anything else on the way out.
+const TED_AUTOMATION_MARK = "[automated: Growth99 Studio]";
+
 // Post as the AI agent rather than as whoever's token this is. TED's /comments/ai
 // endpoint differs from the plain one in three ways that all matter: it wants
 // X-Api-Key rather than a bearer token, it renders HTML rather than plain text,
@@ -3887,7 +3896,11 @@ async function tedAiComment(taskId, text, eventKey) {
 
 function tedComment(text, image = null, attempt = 0, taskId = null) {
   if (!TED_API_TOKEN || !text) return;
+  // Stamped here rather than at each call site so nothing this tool ever posts
+  // can be mistaken for a person's request. Added before the retry recursion so
+  // a retried comment does not collect a second copy.
   text = tedAscii(text);
+  if (!text.includes(TED_AUTOMATION_MARK)) text += `\n\n${TED_AUTOMATION_MARK}`;
   const target = taskId || TED_REVISIONS_TASK_ID;
   const headers = {};
   if (TED_AUTH_HEADER === "x-api-key") headers["X-Api-Key"] = TED_API_TOKEN;
@@ -4091,14 +4104,23 @@ const isEmailSubtask = (title) => String(title || "").trim().toLowerCase().endsW
 // Throws rather than returning [] on failure, deliberately. "No comments" is a
 // decision — this request is not ready — and a TED read that merely failed must
 // never be mistaken for it, or a real request is dropped and nothing retries.
+//
+// Returns the author alongside the text because who wrote the last comment is
+// what stops this tool answering itself; see tedResolveSubtaskRequest.
 async function tedTaskComments(taskId) {
   const d = await tedFetchJson(`/api/tasks/${taskId}/comments`);
   const arr = Array.isArray(d) ? d : (d.items || d.data || d.list || []);
-  return arr.map((c) => String(c.text || c.comment || "")
-    .replace(/<br\s*\/?>/gi, "\n").replace(/<\/(p|div|li)>/gi, "\n").replace(/<[^>]+>/g, "")
-    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&nbsp;/g, " ")
-    .replace(/[ \t]+/g, " ").trim()).filter(Boolean);
+  return arr.map((c) => ({
+    text: String(c.text || c.comment || "")
+      .replace(/<br\s*\/?>/gi, "\n").replace(/<\/(p|div|li)>/gi, "\n").replace(/<[^>]+>/g, "")
+      .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&nbsp;/g, " ")
+      .replace(/[ \t]+/g, " ").trim(),
+    authorName: c.authorName || "",
+    aiGenerated: !!c.aiGenerated,
+    createdAt: c.createdAt || "",
+  })).filter((c) => c.text);
 }
+
 
 // A subtask someone created by hand in TED, under a client's revision-cycle
 // task, is the same request as an email — just entered somewhere else. This
@@ -4142,7 +4164,25 @@ async function tedResolveSubtaskRequest(taskId) {
   // they add the detail they forgot. All of it is the request.
   const comments = await tedTaskComments(taskId);
   if (!comments.length) throw tedSkip(`task ${taskId} has no comments yet — nothing to act on`);
-  const instruction = [task.title, task.description, ...comments]
+
+  // The run's own outcome ("Change is live ...") is posted as a comment on this
+  // same subtask, and a comment is what triggers this endpoint. Left alone, the
+  // tool would answer itself forever: run, report, and treat its own report as
+  // the next request. The email path is spared by its "(via email)" title; a
+  // hand-made subtask has no such mark, so the check is on who spoke last.
+  //
+  // Last comment, not any comment: a person adding more detail after a run has
+  // finished is a new request and must still get through.
+  // Identified by a marker in the text, not by author: TED credits a token's
+  // comments to the person who owns it, so this tool posts under a real name —
+  // the same name that person uses when they write a genuine request by hand.
+  // Matching on the author would ignore the token owner's own requests.
+  const newest = comments.reduce((a, b) => (String(b.createdAt) > String(a.createdAt) ? b : a), comments[0]);
+  if (newest.aiGenerated || newest.text.includes(TED_AUTOMATION_MARK)) {
+    throw tedSkip(`the last comment on ${taskId} was posted by this tool — not a new request`);
+  }
+
+  const instruction = [task.title, task.description, ...comments.map((c) => c.text)]
     .map((s) => String(s || "").trim()).filter(Boolean).join("\n\n");
   return { task, parent, site, clientName, instruction };
 }
@@ -13441,7 +13481,7 @@ module.exports = {
   closeSupersededPerformPrs,
   tedComment, tedUpdateTask, tedAiComment, tedHtml, closeTedTaskIfFinal,
   tedCreateSubtask, tedRevisionParent, tedClientName, tedSubtaskTitle, tedNorm,
-  tedResolveSubtaskRequest, tedTaskComments, isEmailSubtask, TED_EMAIL_SUFFIX,
+  tedResolveSubtaskRequest, tedTaskComments, isEmailSubtask, TED_EMAIL_SUFFIX, TED_AUTOMATION_MARK,
   OUTCOME, OUTCOME_LABEL, resolveFindingOutcomes, replaceInTextNodes, fixBusinessName,
   imageSources, findingsImages, readSeoPages, synthMuSource, pageText,
   fixFavicon, fixSocialImage, fix404, fixCallNow, fixBlvd, fixBlogLinkColor, fixClickable,
