@@ -402,7 +402,17 @@ async function rpc(method, params, notify = false, timeoutMs = 90000) {
     skIdx = (skIdx + i) % Math.max(STITCH_KEYS.length, 1);
     if (notify) return {};
     const parsed = parsePayload(await res.text());
-    if (parsed && parsed.error) throw new Error(`Stitch RPC error: ${JSON.stringify(parsed.error)}`);
+    if (parsed && parsed.error) {
+      const errStr = JSON.stringify(parsed.error);
+      // Tool-level quota errors arrive as HTTP 200 with an error body — rotate keys the same as HTTP 429/403.
+      if (/RESOURCE_EXHAUSTED|quota/i.test(errStr) && i < STITCH_KEYS.length - 1) {
+        lastErr = new Error(`Stitch tool quota on ${method}: ${errStr.slice(0, 300)}`);
+        skIdx = (skIdx + i + 1) % Math.max(STITCH_KEYS.length, 1);
+        console.warn(`Stitch key #${(skIdx + i) % STITCH_KEYS.length + 1} tool-level quota exhausted on ${method} — rotating to next key`);
+        continue;
+      }
+      throw new Error(`Stitch RPC error: ${errStr}`);
+    }
     return parsed ? parsed.result : {};
   }
   throw lastErr || new Error(`Stitch ${method}: no API key configured`);
