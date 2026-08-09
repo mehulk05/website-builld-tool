@@ -263,6 +263,7 @@
     panel: `<rect x="3" y="4" width="18" height="16" rx="2"/><path stroke-linecap="round" d="M10 4v16"/>`,
     clock: `<circle cx="12" cy="12" r="9"/><path stroke-linecap="round" stroke-linejoin="round" d="M12 7v5l3.5 2"/>`,
     copy: `<rect x="9" y="9" width="11" height="11" rx="2"/><path stroke-linecap="round" stroke-linejoin="round" d="M5 15H4a1 1 0 01-1-1V4a1 1 0 011-1h10a1 1 0 011 1v1"/>`,
+    download: `<path stroke-linecap="round" stroke-linejoin="round" d="M12 3v12m0 0l-4-4m4 4l4-4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/>`,
   };
   // svg(name) → a 1em icon; svg(name, 18) → sized.
   const svg = (name, size, sw) =>

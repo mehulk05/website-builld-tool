@@ -4036,6 +4036,18 @@ function normalizeRepo(v) {
   const m = s.match(/^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)/);
   return m ? `${m[1]}/${m[2]}` : "";
 }
+// The zip's internal top-level folder name — the domain the client will actually
+// see, e.g. "betasite.gogroth.com", so unzipping drops a folder named after the
+// site rather than a generic "site".
+function siteFolderName(job) {
+  try {
+    const raw = job.liveUrl || "";
+    const u = new URL(/^https?:\/\//i.test(raw) ? raw : "https://" + raw);
+    if (u.hostname) return u.hostname;
+  } catch (e) { /* fall through */ }
+  return (job.businessName || "beta-site").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "beta-site";
+}
+
 function newJob(payload) {
   return {
     type: "build",
@@ -5981,6 +5993,100 @@ function enqueueRestoreJob(payload) {
   return job;
 }
 
+// Steps 7 ("Theme activation watch"), 8 ("CRO after-audit + comparison") and the
+// auto-enrich queue — factored out of runJob so a build that got everything merged
+// but then failed waiting on the mu-plugin (by far the most common failure here:
+// deploy/activation can lag past the ~10min poll window) can be RETRIED from this
+// point alone, via retryThemeActivationTail(), without re-running Stitch generation,
+// re-opening a PR, or re-running CI.
+async function runThemeActivationTail(job, slug, A) {
+  // 7 — wait for the mu-plugin to activate the theme on the live site
+  jobStep(job, 6, "running", "Waiting for deploy + activation on " + job.liveUrl);
+  let active = false;
+  for (let i = 0; i < 40 && !active; i++) {
+    try { active = (await localApi("/api/theme-live", { url: job.liveUrl, slug })).active; } catch (e) { /* keep polling */ }
+    if (!active) { jobStep(job, 6, "running", `Not active yet (check ${i + 1}/40)…`); await sleep(15000); }
+  }
+  if (!active) throw new Error("theme not detected on live within ~10 min — deploy may be slow; retry this step again");
+  jobStep(job, 6, "done", "Theme active on " + job.liveUrl);
+
+  // 8 — after-audit + comparison + report
+  jobStep(job, 7, "running", "Auditing the new live site…");
+  job.after = await localApi("/api/cro-audit-url", { url: job.liveUrl });
+  job.delta = job.before ? job.after.overall - job.before.overall : null;
+  job.reportUrl = writeComparisonReport(job);
+  await postPrComment(job);
+  jobStep(job, 7, "done", job.before ? `${job.before.overall} → ${job.after.overall} (${job.delta >= 0 ? "+" : ""}${job.delta})` : `New site: ${job.after.overall}/100`);
+
+  try { await syncSiteRegistry(); } catch (e) { /* non-fatal: keep registry current so the new site is editable */ }
+
+  // Auto-enrich: fire a DECOUPLED post-beta job that adds service pages + a
+  // brand guide in its own PR. Fail-soft — the beta is already released, so an
+  // enrichment failure must never mark this build failed.
+  try {
+    if (slug) {
+      const ej = enqueueEnrichJob({
+        jobId: "enrich-" + Date.now(), businessId: job.businessId, parentDraftId: job.draftId, liveUrl: job.liveUrl,
+        siteId: "g99-" + slug, businessName: job.businessName, githubRepo: job.repo,
+        themeSlug: "g99-" + slug, themePath: `web/app/themes/g99-${slug}`,
+        muPath: `web/app/mu-plugins/g99-activate-${slug}.php`,
+        answers: A, composed: job.composed, referenceWebsite: job.referenceWebsite || "",
+        existingWebsite: job.existingWebsite || "",
+        // Carried from the parent build's own payload so this enrich job's artifact push to TED
+        // (screenshots + service pages) can resolve the right client unambiguously.
+        hubspotDealId: (job.payload || {}).hubspotDealId || null,
+        hubspotCompanyId: (job.payload || {}).hubspotCompanyId || null,
+      });
+      job.enrichJobId = ej.draftId;   // frontend links to the run from this step
+      jobStep(job, ENRICH_STEP_IDX, "running", "Queued as its own run — generating service pages…");
+      notify(`✨ Auto-enrich queued for *${job.businessName}* (service pages + brand guide)`);
+    } else {
+      jobStep(job, ENRICH_STEP_IDX, "done", "Skipped — no theme slug");
+    }
+  } catch (e) {
+    console.error("auto-enrich enqueue failed (non-fatal):", e.message);
+    jobStep(job, ENRICH_STEP_IDX, "error", "Could not queue enrichment: " + e.message);
+  }
+
+  job.status = "done";
+  notify(`✅ Beta site *${job.businessName}*: CRO ${job.before ? job.before.overall + "→" + job.after.overall : job.after && job.after.overall} · ${job.prUrl || ""}`);
+}
+
+// Manual retry entry point for the "Theme activation watch" step (and everything
+// after it) on a job that already failed there or later. Does NOT touch Stitch,
+// the PR, or CI — those are assumed already done (slug/prUrl/liveUrl are on the
+// job record). Runs under the same single-concurrency guard as the main queue so
+// it can never race a build that is actively using localApi()/Stitch/Gemini.
+async function retryThemeActivationTail(draftId) {
+  const job = JOBS.get(String(draftId));
+  if (!job) throw new Error("job not found");
+  if (job.type !== "build") throw new Error("only a build job's theme-activation step can be retried this way");
+  if (!job.themeSlug) throw new Error("job has no recorded theme slug (pre-dates this feature, or failed before the WordPress theme + PR step) — cannot retry from here");
+  if (!job.liveUrl) throw new Error("job has no recorded live URL");
+  if (JOB_RUNNING) throw new Error("another build is currently running — try again once it finishes");
+
+  JOB_RUNNING = true;
+  job.status = "running"; job.error = null; job.cancelRequested = false;
+  COST_SINK = job.cost;
+  // Reset step 6 (theme_activation_watch) onward so the UI shows them re-running
+  // rather than still marked "error"/"done" from the previous attempt.
+  for (let i = 6; i < job.steps.length; i++) job.steps[i] = { key: JOB_STEP_KEYS[i], label: JOB_STEPS[i], status: "pending", detail: "" };
+  postStatus(job); mirrorPool(job); saveJobs();
+  try {
+    await runThemeActivationTail(job, job.themeSlug, job.answers || {});
+  } catch (e) {
+    job.error = e.message; job.status = "error";
+    if (job.steps[job.currentStep] && job.steps[job.currentStep].status === "running") { job.steps[job.currentStep].status = "error"; job.steps[job.currentStep].detail = String(e.message).slice(0, 240); }
+    console.error(`job ${job.draftId} retry (theme-activation tail) failed:`, e.message);
+    notify(`❌ Beta site *${job.businessName}* retry failed: ${e.message}`);
+  } finally {
+    job.finishedAt = new Date().toISOString(); saveJobs(); COST_SINK = null;
+    postStatus(job); mirrorPool(job);
+    JOB_RUNNING = false;
+    processJobQueue();   // let any queued build proceed now that this one is done
+  }
+}
+
 async function runJob(job) {
   job.status = "running";
   job.startedAt = new Date().toISOString(); COST_SINK = job.cost;
@@ -6005,6 +6111,10 @@ async function runJob(job) {
     if (P.draftId) onb.draftId = P.draftId;
     fs.writeFileSync(file, JSON.stringify(onb, null, 2));
     const A = onb.answers;
+    // Persisted so a failed run's tail (theme activation watch onward) can be
+    // retried later via retryThemeActivationTail() without re-reading onboarding.json,
+    // which may have moved on to a different client's submission by then.
+    job.answers = A; job.referenceWebsite = onb.referenceWebsite || ""; job.existingWebsite = onb.existingWebsite || "";
 
     // 1 — CRO of the existing site (skippable: no URL = no before-audit).
     if (onb.existingWebsite) {
@@ -6096,6 +6206,15 @@ async function runJob(job) {
     jobStep(job, 3, "running", "Binding site with AI chrome…");
     const bound = await localApi("/api/bind-site", { engine: "", theme });
     job.siteUrl = bound.siteUrl || "/site/";
+    // Snapshot the assembled bundle under this job's own draftId immediately — generated/site/
+    // is a single shared folder that the NEXT build's assemble step will overwrite, so without
+    // this snapshot a later build silently clobbers this one's downloadable copy.
+    try {
+      const snapDir = path.join(GEN, "exports", job.draftId, "site");
+      fs.rmSync(snapDir, { recursive: true, force: true });
+      fs.cpSync(path.join(GEN, "site"), snapDir, { recursive: true });
+      job.zipUrl = `/api/export-zip?dir=${encodeURIComponent(`exports/${job.draftId}/site`)}&name=${encodeURIComponent(siteFolderName(job))}`;
+    } catch (e) { console.warn("site snapshot for zip export failed (non-fatal):", e.message); }
     jobStep(job, 3, "done", `Assembled (${bound.chromeSource || "AI chrome"})`);
 
     // SKIP_PUSH=on: local test mode — stop here, don't push/PR to GitHub.
@@ -6112,6 +6231,7 @@ async function runJob(job) {
     const push = await localApi("/api/push-wordpress", { theme, skipRebind: true, githubRepo: job.repo }, 15 * 60 * 1000);
     job.prUrl = push.prUrl; job.branch = push.branch;
     const slug = ((push.themePath || "").match(/g99-([a-z0-9-]+)\//) || [])[1] || "";
+    job.themeSlug = slug;
     if (!job.prUrl) throw new Error("push succeeded but no PR URL returned");
     jobStep(job, 4, "done", job.prUrl);
 
@@ -6146,56 +6266,10 @@ async function runJob(job) {
     }
     if (!merged) throw new Error("CI watch timed out after ~40 min — " + job.prUrl);
 
-    // 7 — wait for the mu-plugin to activate the theme on the live site
-    jobStep(job, 6, "running", "Waiting for deploy + activation on " + job.liveUrl);
-    let active = false;
-    for (let i = 0; i < 40 && !active; i++) {
-      try { active = (await localApi("/api/theme-live", { url: job.liveUrl, slug })).active; } catch (e) { /* keep polling */ }
-      if (!active) { jobStep(job, 6, "running", `Not active yet (check ${i + 1}/40)…`); await sleep(15000); }
-    }
-    if (!active) throw new Error("theme not detected on live within ~10 min — deploy may be slow; re-run after-audit manually");
-    jobStep(job, 6, "done", "Theme active on " + job.liveUrl);
-
-    // 8 — after-audit + comparison + report
-    jobStep(job, 7, "running", "Auditing the new live site…");
-    job.after = await localApi("/api/cro-audit-url", { url: job.liveUrl });
-    job.delta = job.before ? job.after.overall - job.before.overall : null;
-    job.reportUrl = writeComparisonReport(job);
-    await postPrComment(job);
-    jobStep(job, 7, "done", job.before ? `${job.before.overall} → ${job.after.overall} (${job.delta >= 0 ? "+" : ""}${job.delta})` : `New site: ${job.after.overall}/100`);
-
-    try { await syncSiteRegistry(); } catch (e) { /* non-fatal: keep registry current so the new site is editable */ }
-
-    // Auto-enrich: fire a DECOUPLED post-beta job that adds service pages + a
-    // brand guide in its own PR. Fail-soft — the beta is already released, so an
-    // enrichment failure must never mark this build failed.
-    try {
-      if (slug) {
-        const ej = enqueueEnrichJob({
-          jobId: "enrich-" + Date.now(), businessId: job.businessId, parentDraftId: job.draftId, liveUrl: job.liveUrl,
-          siteId: "g99-" + slug, businessName: job.businessName, githubRepo: job.repo,
-          themeSlug: "g99-" + slug, themePath: `web/app/themes/g99-${slug}`,
-          muPath: `web/app/mu-plugins/g99-activate-${slug}.php`,
-          answers: A, composed: job.composed, referenceWebsite: onb.referenceWebsite || "",
-          existingWebsite: onb.existingWebsite || "",
-          // Carried from the parent build's own payload so this enrich job's artifact push to TED
-          // (screenshots + service pages) can resolve the right client unambiguously.
-          hubspotDealId: (job.payload || {}).hubspotDealId || null,
-          hubspotCompanyId: (job.payload || {}).hubspotCompanyId || null,
-        });
-        job.enrichJobId = ej.draftId;   // frontend links to the run from this step
-        jobStep(job, ENRICH_STEP_IDX, "running", "Queued as its own run — generating service pages…");
-        notify(`✨ Auto-enrich queued for *${job.businessName}* (service pages + brand guide)`);
-      } else {
-        jobStep(job, ENRICH_STEP_IDX, "done", "Skipped — no theme slug");
-      }
-    } catch (e) {
-      console.error("auto-enrich enqueue failed (non-fatal):", e.message);
-      jobStep(job, ENRICH_STEP_IDX, "error", "Could not queue enrichment: " + e.message);
-    }
-
-    job.status = "done";
-    notify(`✅ Beta site *${job.businessName}*: CRO ${job.before ? job.before.overall + "→" + job.after.overall : job.after && job.after.overall} · ${job.prUrl || ""}`);
+    // 7, 8 & auto-enrich — extracted so a job that fails here (most commonly: the
+    // mu-plugin takes longer than ~10min to activate) can be retried from this point
+    // alone via retryThemeActivationTail(), instead of re-running steps 1-6.
+    await runThemeActivationTail(job, slug, A);
   } catch (e) {
     if (e && e.cancelled) { job.status = "cancelled"; }
     else {
@@ -8301,6 +8375,19 @@ async function runEnrichJob(job) {
     r = await runRetry(`gh pr create --repo ${repo} --base main --head "${branch}" --title "${title.replace(/"/g, "'")}" --body "${prBody}"`, tmp);
     job.prUrl = (r.stdout.match(/https:\/\/github\.com\/\S+/) || [""])[0];
     job.branch = branch;
+    // Snapshot the theme + mu-plugin as pushed — `tmp` (the clone) is deleted right below,
+    // and this is the only point where the final files (base pages + new service pages) are
+    // on disk at all, so without this the enrichment's output can never be downloaded again.
+    try {
+      const snapDir = path.join(GEN, "exports", job.draftId);
+      fs.rmSync(snapDir, { recursive: true, force: true });
+      fs.cpSync(themeAbs, path.join(snapDir, "theme"), { recursive: true });
+      if (fs.existsSync(muAbs)) {
+        fs.mkdirSync(path.join(snapDir, "mu-plugin"), { recursive: true });
+        fs.cpSync(muAbs, path.join(snapDir, "mu-plugin", path.basename(muAbs)));
+      }
+      job.zipUrl = `/api/export-zip?dir=${encodeURIComponent(`exports/${job.draftId}`)}&name=${encodeURIComponent(siteFolderName(job))}`;
+    } catch (e) { console.warn("enrich snapshot for zip export failed (non-fatal):", e.message); }
     fs.rmSync(tmp, { recursive: true, force: true });
     if (!job.prUrl) throw new Error("PR create failed: " + r.stderr.slice(-200));
     jobStep(job, 3, "done", job.prUrl);
@@ -12517,6 +12604,20 @@ const server = http.createServer(async (req, res) => {
         : enqueueJob(j.payload).job;
       return json(res, 202, { ok: true, jobId: nj.draftId });
     }
+    // Retry JUST the "Theme activation watch" step (and everything after it —
+    // CRO after-audit, auto-enrich) on a build job, in place, instead of re-running
+    // Stitch/PR/CI. Only makes sense once the PR is already merged (job.themeSlug set).
+    if (p === "/api/job-retry-step" && req.method === "POST") {
+      const { id, step } = JSON.parse(await readBody(req) || "{}");
+      if (step !== "theme_activation_watch") return json(res, 400, { error: "only the theme_activation_watch step supports a scoped retry right now" });
+      const j = JOBS.get(String(id)); if (!j) return json(res, 404, { error: "job not found" });
+      if (j.type !== "build") return json(res, 400, { error: "only a build job's theme-activation step can be retried this way" });
+      if (!j.themeSlug) return json(res, 400, { error: "job has no recorded theme slug — pre-dates this feature, or failed before the WordPress theme + PR step" });
+      if (!j.liveUrl) return json(res, 400, { error: "job has no recorded live URL" });
+      if (JOB_RUNNING) return json(res, 409, { error: "another build is currently running — try again once it finishes" });
+      retryThemeActivationTail(id).catch((e) => console.error("retryThemeActivationTail:", e.message));
+      return json(res, 202, { ok: true });
+    }
     // Approve a job that's paused awaiting human sign-off (per-site approval).
     if (p === "/api/job-approve" && req.method === "POST") {
       const { id } = JSON.parse(await readBody(req) || "{}");
@@ -13922,6 +14023,39 @@ const server = http.createServer(async (req, res) => {
       const f = path.join(GEN, siteM[1], rel);
       if (fs.existsSync(f)) return send(res, 200, MIME[path.extname(f)] || "text/html", fs.readFileSync(f));
       return send(res, 404, "text/html", "<h1>Site not assembled yet</h1>");
+    }
+
+    // General-purpose zip export: any folder under generated/ (guarded against traversal),
+    // packaged inside a zip so the top-level folder INSIDE the zip is `name` — e.g. a job's
+    // snapshot at generated/exports/<draftId>/site becomes betasite.gogroth.com/index.html,
+    // betasite.gogroth.com/style.css, ... when unzipped. Compress-Archive normally flattens
+    // -Path 'dir\*' straight into the zip root, so the folder is staged under a temp parent
+    // named `name` first and THAT is what gets compressed.
+    if (p === "/api/export-zip") {
+      const dirParam = (u.searchParams.get("dir") || "site").replace(/^\/+/, "").replace(/\.\./g, "");
+      const nameParam = (u.searchParams.get("name") || "beta-site").replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 80) || "beta-site";
+      const srcDir = path.resolve(path.join(GEN, dirParam));
+      const genResolved = path.resolve(GEN);
+      if (srcDir !== genResolved && !srcDir.startsWith(genResolved + path.sep)) return json(res, 400, { error: "invalid dir" });
+      if (!fs.existsSync(srcDir) || !fs.statSync(srcDir).isDirectory()) return json(res, 404, { error: "nothing to export at " + dirParam });
+      const stageRoot = path.join(GEN, "_ziptmp", "z" + Date.now() + Math.floor(Math.random() * 1e6));
+      const stageNamed = path.join(stageRoot, nameParam);
+      const zipPath = stageRoot + ".zip";
+      try {
+        fs.mkdirSync(stageNamed, { recursive: true });
+        fs.cpSync(srcDir, stageNamed, { recursive: true });
+        await new Promise((resolve, reject) => {
+          require("child_process").execFile("powershell.exe",
+            ["-NoProfile", "-Command", `Compress-Archive -Path '${stageNamed}' -DestinationPath '${zipPath}' -Force`],
+            (e) => e ? reject(new Error("zip failed: " + e.message)) : resolve());
+        });
+        const buf = fs.readFileSync(zipPath);
+        res.writeHead(200, { "Content-Type": "application/zip", "Content-Disposition": `attachment; filename="${nameParam}.zip"` });
+        return res.end(buf);
+      } finally {
+        try { fs.rmSync(stageRoot, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+        try { fs.rmSync(zipPath, { force: true }); } catch (e) { /* ignore */ }
+      }
     }
 
     if (p === "/export-site") {

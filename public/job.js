@@ -82,12 +82,17 @@ function stepper(j) {
     if (isBuild && i === 1 && s.status !== "pending") extra = brandBlock(j);
     if (isBuild && i === 2 && s.status !== "pending") extra = pageRows(j, s.status === "running");
     extra += stepEvents(j, i, s);
+    // A build most often stalls waiting on the mu-plugin to flip the live theme —
+    // let that one step retry on its own (PR is already merged; no need to
+    // re-run Stitch/CI to try again) instead of forcing a full "Run again".
+    const canRetryStep = isBuild && s.key === "theme_activation_watch" && s.status === "error" && j.status === "error";
     return `
     <div class="jstep ${s.status}">
       <span class="ic">${ic[s.status] || ""}</span>
       <div class="jb">
         <span class="lb">${esc(s.label)}</span>
         ${s.detail ? `<span class="dt"${s.status === "error" ? ' style="color:var(--bad)"' : ""}>${esc(s.detail)}</span>` : ""}
+        ${canRetryStep ? `<button class="btn sm" data-act="retry-step" data-step="theme_activation_watch" style="margin-top:8px">${svg("refresh", 14)}Retry this step</button>` : ""}
         ${extra}
       </div>
     </div>`;
@@ -167,6 +172,9 @@ function actions(j) {
   const b = [];
   if (j.awaitingApproval && !j.approved) b.push(`<button class="btn primary" data-act="approve">${svg("check", 15, 2.2)}Approve &amp; ship</button>`);
   if (j.status === "running" || j.status === "queued") b.push(`<button class="btn danger" data-act="cancel">Cancel</button>`);
+  // A snapshot taken the moment pages were generated/assembled (or service pages were added) —
+  // survives the NEXT build overwriting generated/site/, so nothing gets silently lost between runs.
+  if (j.zipUrl) b.push(`<a class="btn" href="${esc(j.zipUrl)}">${svg("download", 15)}Download ZIP</a>`);
   if (["done", "error", "cancelled"].includes(j.status)) b.push(`<button class="btn" data-act="retry">${svg("refresh", 15)}Run again</button>`);
   b.push(`<div style="position:relative">
     <button class="dots-btn" id="dotsBtn" title="More options">&#8942;</button>
@@ -499,7 +507,7 @@ function render() {
     b.onclick = (e) => {
       if (b.dataset.act === "edit-job") { e.stopPropagation(); closeJobMenu(); openDrawer(); return; }
       if (b.dataset.act === "stitch-key") { e.stopPropagation(); closeJobMenu(); openKeyModal(); return; }
-      act(b.dataset.act, b);
+      act(b.dataset.act, b, b.dataset.step);
     };
   });
   const dotsBtn = $("dotsBtn"), jobMenu = $("jobMenu");
@@ -530,7 +538,7 @@ function render() {
   if (TECH_OPEN) loadDiff();
 }
 
-async function act(kind, btn) {
+async function act(kind, btn, step) {
   // Edit jobs carry the target repo on their payload; build jobs don't, so the
   // row is omitted rather than filled with a placeholder.
   const repo = (JOB.payload && JOB.payload.githubRepo) || null;
@@ -562,6 +570,12 @@ async function act(kind, btn) {
       details: withRepo({ Site: JOB.businessName }),
       confirmLabel: "Run again",
     },
+    "retry-step": {
+      title: "Retry the theme-activation wait?",
+      body: "Re-checks whether the mu-plugin has switched the live theme, then re-runs the after-audit and service-page enrichment. Does NOT re-run Stitch, the pull request, or CI — those are assumed already done.",
+      details: withRepo({ Site: JOB.businessName, "Live URL": JOB.liveUrl }),
+      confirmLabel: "Retry step",
+    },
   }[kind];
 
   if (!(await window.G99.confirm(ASK))) return;
@@ -570,14 +584,21 @@ async function act(kind, btn) {
     approve: ["/api/job-approve", "Approved — merging…"],
     cancel: ["/api/job-cancel", "Cancelling…"],
     retry: ["/api/job-retry", "Retrying — new run started…"],
+    "retry-step": ["/api/job-retry-step", "Retrying theme activation…"],
     resend: ["/api/job-emit-resend", "Resending — watch the delivery panel…"],
   }[kind];
   btn.disabled = true;
   try {
-    const d = await postJSON(cfg[0], { id: ID });
+    const d = await postJSON(cfg[0], { id: ID, ...(step ? { step } : {}) });
     toast(cfg[1]);
     if (d.jobId) setTimeout(() => { location.href = "/job?id=" + encodeURIComponent(d.jobId); }, 700);
-    else load();
+    else {
+      // A step retry flips this same job back to "running" server-side, but the
+      // poll loop may have already stopped (it clears itself once a job settles
+      // into error/done) — restart it so progress shows up without a manual reload.
+      if (kind === "retry-step") { clearInterval(timer); timer = setInterval(load, 3000); }
+      load();
+    }
   } catch (e) { toast("Failed: " + e.message); btn.disabled = false; }
 }
 
@@ -683,10 +704,21 @@ function injectDrawer() {
   $("drawerSave").onclick = saveDrawer;
 }
 
+// Server-side (mapG99Answers, runJob) stores answers as a plain object keyed by
+// question key — {business_name: "...", services_offered: [...]}. Old job records
+// (or a hand-pasted array) may still carry the webhook's original wire shape,
+// [{key, value}], so tolerate both rather than assuming one.
+function toAnswersObject(answers) {
+  if (Array.isArray(answers)) {
+    const o = {};
+    for (const a of answers) { if (a && a.key) o[a.key] = a.value; }
+    return o;
+  }
+  return (answers && typeof answers === "object") ? answers : {};
+}
 function getAnswer(answers, key) {
-  if (!Array.isArray(answers)) return "";
-  const a = answers.find((x) => x.key === key);
-  return a ? (a.value || "") : "";
+  const v = toAnswersObject(answers)[key];
+  return v == null ? "" : (Array.isArray(v) ? JSON.stringify(v) : String(v));
 }
 
 let drawerTab = "fields";
@@ -694,7 +726,7 @@ let drawerTab = "fields";
 function openDrawer() {
   injectDrawer();
   const j = JOB;
-  const answers = (j.payload && j.payload.answers) || [];
+  const answers = toAnswersObject(j.payload && j.payload.answers);
   drawerTab = "fields";
   renderDrawerBody(j, answers);
   $("drawerOverlay").classList.add("open");
@@ -749,9 +781,9 @@ function renderDrawerBody(j, answers) {
       <div id="tabFieldsPane" style="display:${drawerTab === "fields" ? "flex" : "none"};flex-direction:column;gap:10px">${fieldsHtml}</div>
       <div id="tabJsonPane" style="display:${drawerTab === "json" ? "block" : "none"}">
         <div class="dfield">
-          <label>Full answers array (JSON)</label>
+          <label>Full answers object (JSON)</label>
           <textarea id="df_rawJson" rows="18" style="font-family:var(--mono);font-size:11.5px">${rawJson}</textarea>
-          <span class="hint">Edit individual keys above or paste the whole array here</span>
+          <span class="hint">Edit individual keys above or paste the whole object here</span>
         </div>
       </div>
     </div>`;
@@ -926,18 +958,15 @@ function wireChips() {
 
 function currentAnswers() {
   const raw = $("df_rawJson");
-  if (raw) { try { return JSON.parse(raw.value); } catch (e) { return (JOB.payload && JOB.payload.answers) || []; } }
+  if (raw) { try { return toAnswersObject(JSON.parse(raw.value)); } catch (e) { return toAnswersObject(JOB.payload && JOB.payload.answers); } }
   return buildAnswersFromFields();
 }
 
 function buildAnswersFromFields() {
-  const base = JSON.parse(JSON.stringify((JOB.payload && JOB.payload.answers) || []));
+  const base = { ...toAnswersObject(JOB.payload && JOB.payload.answers) };
   // regular inputs / textareas
   document.querySelectorAll("[data-akey]").forEach((el) => {
-    const key = el.dataset.akey;
-    const idx = base.findIndex((x) => x.key === key);
-    if (idx >= 0) base[idx].value = el.value;
-    else if (el.value) base.push({ key, value: el.value });
+    base[el.dataset.akey] = el.value;
   });
   // chip fields — collect text from each .chip span (exclude the × button text)
   ONBOARDING_FIELDS.filter((f) => f.type === "chips").forEach(({ key }) => {
@@ -948,10 +977,7 @@ function buildAnswersFromFields() {
       clone.querySelector(".chip-rm") && clone.querySelector(".chip-rm").remove();
       return clone.textContent.trim();
     }).filter(Boolean);
-    const value = JSON.stringify(chips);
-    const idx = base.findIndex((x) => x.key === key);
-    if (idx >= 0) base[idx].value = value;
-    else base.push({ key, value });
+    base[key] = chips;
   });
   return base;
 }
@@ -977,7 +1003,7 @@ async function saveDrawer() {
   try {
     let answers;
     if (drawerTab === "json") {
-      try { answers = JSON.parse($("df_rawJson").value); }
+      try { answers = toAnswersObject(JSON.parse($("df_rawJson").value)); }
       catch (e) { toast("Invalid JSON — fix it and try again", true); btn.disabled = false; btn.textContent = "Save changes"; return; }
     } else {
       answers = buildAnswersFromFields();
