@@ -12627,15 +12627,23 @@ const server = http.createServer(async (req, res) => {
     }
     // Patch editable fields on a job record: repo, liveUrl, existingWebsite, and answers array.
     if (p === "/api/job-update" && req.method === "POST") {
-      const { id, repo, liveUrl, existingWebsite, answers, stitchKeyOverride } = JSON.parse(await readBody(req) || "{}");
+      const { id, repo, liveUrl, existingWebsite, answers, stitchKeyOverride, andRerun } = JSON.parse(await readBody(req) || "{}");
       const j = JOBS.get(id); if (!j) return json(res, 404, { error: "job not found" });
-      if (repo !== undefined) j.repo = repo || null;
-      if (liveUrl !== undefined) j.liveUrl = liveUrl || null;
-      if (existingWebsite !== undefined) { j.payload = j.payload || {}; j.payload.existingWebsite = existingWebsite || null; }
-      if (answers !== undefined) { j.payload = j.payload || {}; j.payload.answers = answers; }
-      if (stitchKeyOverride !== undefined) { j.payload = j.payload || {}; j.payload.stitchKeyOverride = stitchKeyOverride || null; }
+      j.payload = j.payload || {};
+      // j.repo/j.liveUrl are the CURRENT run's own display fields — but a retry re-enqueues
+      // j.payload wholesale (newJob() reads payload.betaSiteRepo/betaSiteUrl), so without also
+      // writing here, an edited repo/URL is silently dropped the moment "Run again" fires and
+      // the retry quietly rebuilds against the OLD target instead.
+      if (repo !== undefined) { j.repo = repo || null; j.payload.betaSiteRepo = repo || null; }
+      if (liveUrl !== undefined) { j.liveUrl = liveUrl || null; j.payload.betaSiteUrl = liveUrl || null; }
+      if (existingWebsite !== undefined) j.payload.existingWebsite = existingWebsite || null;
+      if (answers !== undefined) j.payload.answers = answers;
+      if (stitchKeyOverride !== undefined) j.payload.stitchKeyOverride = stitchKeyOverride || null;
       saveJobs();
-      return json(res, 200, { ok: true });
+      if (!andRerun) return json(res, 200, { ok: true });
+      if (j.type !== "build") return json(res, 400, { error: "only a build job's data can be saved-and-rerun this way" });
+      const nj = enqueueJob(j.payload).job;
+      return json(res, 202, { ok: true, jobId: nj.draftId });
     }
     // Return Stitch key list for the admin key-picker UI (admin-only route).
     if (p === "/api/stitch-keys" && req.method === "GET") {

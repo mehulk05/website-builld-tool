@@ -694,14 +694,16 @@ function injectDrawer() {
       <div class="drawer-body" id="drawerBody"></div>
       <div class="drawer-foot">
         <button class="btn" id="drawerCancel">Cancel</button>
-        <button class="btn primary" id="drawerSave">Save changes</button>
+        <button class="btn" id="drawerSave">Save changes</button>
+        <button class="btn primary" id="drawerSaveRun" style="display:${JOB && JOB.type === "build" ? "inline-flex" : "none"}">Save &amp; Run</button>
       </div>
     </div>`;
   document.body.appendChild(el);
   $("drawerOverlay").onclick = closeDrawer;
   $("drawerClose").onclick = closeDrawer;
   $("drawerCancel").onclick = closeDrawer;
-  $("drawerSave").onclick = saveDrawer;
+  $("drawerSave").onclick = () => saveDrawer(false);
+  $("drawerSaveRun").onclick = () => saveDrawer(true);
 }
 
 // Server-side (mapG99Answers, runJob) stores answers as a plain object keyed by
@@ -997,30 +999,41 @@ function closeDrawer() {
   $("jobDrawer") && $("jobDrawer").classList.remove("open");
 }
 
-async function saveDrawer() {
-  const btn = $("drawerSave");
-  btn.disabled = true; btn.textContent = "Saving…";
+async function saveDrawer(andRerun) {
+  // Both buttons drive the SAME collection logic — the raw-JSON tab (whichever tab is
+  // active when clicked) is the one source of truth that actually reaches the server;
+  // there is no separate/second JSON box, this textarea IS what a rerun uses.
+  const btn = andRerun ? $("drawerSaveRun") : $("drawerSave");
+  const otherBtn = andRerun ? $("drawerSave") : $("drawerSaveRun");
+  const label = andRerun ? "Save & Run" : "Save changes";
+  btn.disabled = true; otherBtn.disabled = true; btn.textContent = andRerun ? "Starting run…" : "Saving…";
   try {
     let answers;
     if (drawerTab === "json") {
       try { answers = toAnswersObject(JSON.parse($("df_rawJson").value)); }
-      catch (e) { toast("Invalid JSON — fix it and try again", true); btn.disabled = false; btn.textContent = "Save changes"; return; }
+      catch (e) { toast("Invalid JSON — fix it and try again", true); btn.disabled = false; otherBtn.disabled = false; btn.textContent = label; return; }
     } else {
       answers = buildAnswersFromFields();
     }
-    await postJSON("/api/job-update", {
+    const d = await postJSON("/api/job-update", {
       id: ID,
       repo:            $("df_repo").value.trim() || null,
       liveUrl:         $("df_liveUrl").value.trim() || null,
       existingWebsite: $("df_existingUrl").value.trim() || null,
       answers,
+      andRerun: !!andRerun,
     });
+    if (andRerun && d.jobId) {
+      toast("Saved — starting new run…");
+      setTimeout(() => { location.href = "/job?id=" + encodeURIComponent(d.jobId); }, 500);
+      return;
+    }
     toast("Saved ✓");
     closeDrawer();
     load();
   } catch (e) {
     toast("Save failed: " + e.message, true);
-    btn.disabled = false; btn.textContent = "Save changes";
+    btn.disabled = false; otherBtn.disabled = false; btn.textContent = label;
   }
 }
 
