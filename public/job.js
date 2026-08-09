@@ -168,6 +168,13 @@ function actions(j) {
   if (j.awaitingApproval && !j.approved) b.push(`<button class="btn primary" data-act="approve">${svg("check", 15, 2.2)}Approve &amp; ship</button>`);
   if (j.status === "running" || j.status === "queued") b.push(`<button class="btn danger" data-act="cancel">Cancel</button>`);
   if (["done", "error", "cancelled"].includes(j.status)) b.push(`<button class="btn" data-act="retry">${svg("refresh", 15)}Run again</button>`);
+  b.push(`<div style="position:relative">
+    <button class="dots-btn" id="dotsBtn" title="More options">&#8942;</button>
+    <div class="job-menu" id="jobMenu">
+      <button data-act="edit-job">&#9998; Edit job data</button>
+      <button data-act="stitch-key">&#128273; Change Stitch key &amp; re-run</button>
+    </div>
+  </div>`);
   return b.join("");
 }
 
@@ -488,7 +495,18 @@ function render() {
   document.querySelectorAll("details[data-k]").forEach((d) => {
     d.addEventListener("toggle", () => { if (d.open) OPEN.add(d.dataset.k); else OPEN.delete(d.dataset.k); });
   });
-  document.querySelectorAll("[data-act]").forEach((b) => { b.onclick = () => act(b.dataset.act, b); });
+  document.querySelectorAll("[data-act]").forEach((b) => {
+    b.onclick = (e) => {
+      if (b.dataset.act === "edit-job") { e.stopPropagation(); closeJobMenu(); openDrawer(); return; }
+      if (b.dataset.act === "stitch-key") { e.stopPropagation(); closeJobMenu(); openKeyModal(); return; }
+      act(b.dataset.act, b);
+    };
+  });
+  const dotsBtn = $("dotsBtn"), jobMenu = $("jobMenu");
+  if (dotsBtn && jobMenu) {
+    dotsBtn.onclick = (e) => { e.stopPropagation(); jobMenu.classList.toggle("open"); };
+    document.addEventListener("click", closeJobMenu, { once: true });
+  }
   document.querySelectorAll("[data-copy]").forEach((b) => {
     b.onclick = async (e) => {
       // Inside a <summary>-less <details> body, but still guard: a click must not toggle it.
@@ -605,6 +623,379 @@ async function load() {
   const settled = ["done", "error", "cancelled"].includes(JOB.status);
   const childRunning = (JOB.steps || []).some((s) => s.status === "running" || s.status === "pending");
   if (settled && !childRunning) clearInterval(timer);
+}
+
+function closeJobMenu() { const m = $("jobMenu"); if (m) m.classList.remove("open"); }
+
+// ---- Edit drawer ------------------------------------------------------------
+const ONBOARDING_FIELDS = [
+  { key: "business_name",        label: "Business name",       type: "input" },
+  { key: "primary_contact",      label: "Primary contact",     type: "input" },
+  { key: "phone_for_website",    label: "Phone",               type: "input" },
+  { key: "location",             label: "Location",            type: "input" },
+  { key: "services_offered",     label: "Services offered",    type: "chips" },
+  { key: "revenue_services",     label: "Revenue services",    type: "chips" },
+  { key: "team_members",         label: "Team members (JSON)", type: "textarea" },
+  { key: "booking_platform",     label: "Booking platform",    type: "input" },
+  { key: "booking_platform_url", label: "Booking URL",         type: "input" },
+  { key: "featured_review",      label: "Featured review",     type: "textarea" },
+  { key: "site_love_1_url",      label: "Reference site URL",  type: "input" },
+];
+
+// Parse a value that may be a JSON array string or plain comma-list into string[]
+function parseChips(raw) {
+  if (!raw) return [];
+  try { const p = JSON.parse(raw); if (Array.isArray(p)) return p.map(String); } catch (e) { /* not json */ }
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+function chipsHtml(key, chips) {
+  const chipsMarkup = chips.map((c, i) =>
+    `<span class="chip" data-chip-key="${esc(key)}" data-idx="${i}">${esc(c)}<button type="button" class="chip-rm" aria-label="Remove ${esc(c)}">&#10005;</button></span>`
+  ).join("");
+  return `<div class="chips-wrap" id="chips_${esc(key)}">${chipsMarkup}</div>
+    <div class="chip-add-row">
+      <input class="chip-input" id="chipinput_${esc(key)}" type="text" placeholder="Add service…">
+      <button type="button" class="btn sm chip-add-btn" data-chip-target="${esc(key)}">Add</button>
+    </div>`;
+}
+
+function injectDrawer() {
+  if ($("jobDrawer")) return;
+  const el = document.createElement("div");
+  el.innerHTML = `
+    <div class="drawer-overlay" id="drawerOverlay"></div>
+    <div class="drawer" id="jobDrawer" role="dialog" aria-modal="true" aria-label="Edit job data">
+      <div class="drawer-head">
+        <h2>Edit job data</h2>
+        <button id="drawerClose" title="Close">&#10005;</button>
+      </div>
+      <div class="drawer-body" id="drawerBody"></div>
+      <div class="drawer-foot">
+        <button class="btn" id="drawerCancel">Cancel</button>
+        <button class="btn primary" id="drawerSave">Save changes</button>
+      </div>
+    </div>`;
+  document.body.appendChild(el);
+  $("drawerOverlay").onclick = closeDrawer;
+  $("drawerClose").onclick = closeDrawer;
+  $("drawerCancel").onclick = closeDrawer;
+  $("drawerSave").onclick = saveDrawer;
+}
+
+function getAnswer(answers, key) {
+  if (!Array.isArray(answers)) return "";
+  const a = answers.find((x) => x.key === key);
+  return a ? (a.value || "") : "";
+}
+
+let drawerTab = "fields";
+
+function openDrawer() {
+  injectDrawer();
+  const j = JOB;
+  const answers = (j.payload && j.payload.answers) || [];
+  drawerTab = "fields";
+  renderDrawerBody(j, answers);
+  $("drawerOverlay").classList.add("open");
+  $("jobDrawer").classList.add("open");
+}
+
+function renderDrawerBody(j, answers) {
+  const fieldsHtml = ONBOARDING_FIELDS.map(({ key, label, type }) => {
+    const raw = getAnswer(answers, key);
+    if (type === "chips") {
+      const chips = parseChips(raw);
+      return `<div class="dfield">
+        <label>${esc(label)}</label>
+        ${chipsHtml(key, chips)}
+      </div>`;
+    }
+    const val = esc(raw);
+    return `<div class="dfield">
+      <label for="df_${esc(key)}">${esc(label)}</label>
+      ${type === "textarea"
+        ? `<textarea id="df_${esc(key)}" data-akey="${esc(key)}" rows="3">${val}</textarea>`
+        : `<input id="df_${esc(key)}" data-akey="${esc(key)}" type="text" value="${val}">`}
+    </div>`;
+  }).join("");
+
+  const rawJson = esc(JSON.stringify(answers, null, 2));
+
+  $("drawerBody").innerHTML = `
+    <div class="drawer-section">
+      <div class="drawer-section-title">Build targets</div>
+      <div class="dfield">
+        <label for="df_repo">Git repository (owner/repo)</label>
+        <input id="df_repo" type="text" value="${esc(j.repo || "")}" placeholder="e.g. growth99/client-site">
+        <span class="hint">Used for edits, PR creation, and deploys</span>
+      </div>
+      <div class="dfield">
+        <label for="df_liveUrl">Beta / live site URL</label>
+        <input id="df_liveUrl" type="text" value="${esc(j.liveUrl || "")}" placeholder="https://...">
+      </div>
+      <div class="dfield">
+        <label for="df_existingUrl">Existing site URL</label>
+        <input id="df_existingUrl" type="text" value="${esc((j.payload && j.payload.existingWebsite) || "")}" placeholder="https://...">
+        <span class="hint">Used for content grounding and SEO enrichment</span>
+      </div>
+    </div>
+    <div class="drawer-section">
+      <div class="drawer-section-title">Onboarding answers</div>
+      <div class="drawer-tabs">
+        <button id="tabFields" class="${drawerTab === "fields" ? "active" : ""}">Fields</button>
+        <button id="tabJson" class="${drawerTab === "json" ? "active" : ""}">Raw JSON</button>
+      </div>
+      <div id="tabFieldsPane" style="display:${drawerTab === "fields" ? "flex" : "none"};flex-direction:column;gap:10px">${fieldsHtml}</div>
+      <div id="tabJsonPane" style="display:${drawerTab === "json" ? "block" : "none"}">
+        <div class="dfield">
+          <label>Full answers array (JSON)</label>
+          <textarea id="df_rawJson" rows="18" style="font-family:var(--mono);font-size:11.5px">${rawJson}</textarea>
+          <span class="hint">Edit individual keys above or paste the whole array here</span>
+        </div>
+      </div>
+    </div>`;
+
+  $("tabFields").onclick = () => { drawerTab = "fields"; syncJsonToFields(); renderDrawerBody(j, currentAnswers()); };
+  $("tabJson").onclick  = () => { drawerTab = "json";   syncFieldsToJson();  renderDrawerBody(j, currentAnswers()); };
+  wireChips();
+}
+
+// ── Stitch key modal ─────────────────────────────────────────────────────────
+function injectKeyModal() {
+  if ($("keyModalOverlay")) return;
+  const el = document.createElement("div");
+  el.innerHTML = `
+    <div id="keyModalOverlay" class="drawer-overlay"></div>
+    <div id="keyModal" class="drawer" style="max-width:460px">
+      <div class="drawer-head">
+        <span>Stitch API key</span>
+        <button onclick="closeKeyModal()" style="background:none;border:none;cursor:pointer;font-size:18px;line-height:1">&#x2715;</button>
+      </div>
+      <div class="drawer-body" id="keyModalBody" style="gap:14px">
+        <p style="margin:0;font-size:13px;color:var(--text-2)">Select which key to use for the next run. <strong>Auto</strong> lets the server rotate through all env keys normally.</p>
+        <div class="dfield">
+          <label for="km_sel">Key</label>
+          <select id="km_sel">
+            <option value="">Auto (use env keys)</option>
+          </select>
+        </div>
+        <div id="km_customWrap" style="display:none;flex-direction:column;gap:8px">
+          <div class="dfield">
+            <label for="km_customKey">Custom key</label>
+            <input id="km_customKey" type="text" placeholder="Paste your Stitch API key…">
+          </div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <button id="km_validateBtn" style="padding:5px 12px;cursor:pointer;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text)">Validate</button>
+            <span id="km_status" style="font-size:12px"></span>
+          </div>
+        </div>
+      </div>
+      <div class="drawer-foot">
+        <button onclick="closeKeyModal()" style="padding:7px 16px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);cursor:pointer">Cancel</button>
+        <button id="km_saveBtn" style="padding:7px 16px;border:none;border-radius:6px;background:var(--accent,#6366f1);color:#fff;cursor:pointer;font-weight:600">Save &amp; re-run</button>
+      </div>
+    </div>`;
+  document.body.appendChild(el);
+  $("keyModalOverlay").onclick = closeKeyModal;
+}
+
+async function openKeyModal() {
+  injectKeyModal();
+  const j = JOB;
+  const savedOverride = (j.payload && j.payload.stitchKeyOverride) || "";
+  const sel = $("km_sel");
+  const customWrap = $("km_customWrap");
+
+  // Clear and reload key options each open (server may have changed)
+  while (sel.options.length > 1) sel.remove(1);
+  let pooledKeys = [];
+  try {
+    const data = await (await fetch("/api/stitch-keys", { headers: { "x-admin-key": localStorage.getItem("g99AdminKey") || "" } })).json();
+    pooledKeys = data.keys || [];
+    pooledKeys.forEach(({ label, masked, key }) => {
+      const opt = document.createElement("option");
+      opt.value = key;
+      opt.textContent = `${label} · ${masked}`;
+      sel.appendChild(opt);
+    });
+  } catch (e) { /* non-fatal */ }
+  const customOpt = document.createElement("option");
+  customOpt.value = "__custom__";
+  customOpt.textContent = "Custom key…";
+  sel.appendChild(customOpt);
+
+  // Restore saved override
+  if (savedOverride) {
+    const match = pooledKeys.find(k => k.key === savedOverride);
+    if (match) {
+      sel.value = savedOverride;
+    } else {
+      sel.value = "__custom__";
+      customWrap.style.display = "flex";
+      $("km_customKey").value = savedOverride;
+    }
+  } else {
+    sel.value = "";
+    customWrap.style.display = "none";
+  }
+  $("km_status").textContent = "";
+
+  sel.onchange = () => {
+    customWrap.style.display = sel.value === "__custom__" ? "flex" : "none";
+    $("km_status").textContent = "";
+  };
+
+  $("km_validateBtn").onclick = async () => {
+    const key = $("km_customKey").value.trim();
+    if (!key) return;
+    const btn = $("km_validateBtn"), st = $("km_status");
+    btn.disabled = true; st.textContent = "Checking…"; st.style.color = "var(--text-2)";
+    try {
+      const r = await postJSON("/api/stitch-key-validate", { key });
+      st.textContent = r.valid ? "✓ Valid" : ("✗ Invalid" + (r.error ? ` (${r.error})` : ""));
+      st.style.color = r.valid ? "#22c55e" : "#ef4444";
+    } catch (e) { st.textContent = "Error: " + e.message; st.style.color = "#ef4444"; }
+    finally { btn.disabled = false; }
+  };
+
+  $("km_saveBtn").onclick = saveKeyAndRerun;
+
+  $("keyModalOverlay").classList.add("open");
+  $("keyModal").classList.add("open");
+}
+
+function closeKeyModal() {
+  $("keyModalOverlay") && $("keyModalOverlay").classList.remove("open");
+  $("keyModal") && $("keyModal").classList.remove("open");
+}
+
+async function saveKeyAndRerun() {
+  const sel = $("km_sel");
+  let override = null;
+  if (sel.value === "__custom__") {
+    override = $("km_customKey").value.trim() || null;
+  } else if (sel.value !== "") {
+    override = sel.value; // full key from pooled option
+  }
+  // Auto (sel.value === "") → override stays null → server uses env rotation
+
+  const btn = $("km_saveBtn");
+  btn.disabled = true; btn.textContent = "Saving…";
+  try {
+    await postJSON("/api/job-update", { id: ID, stitchKeyOverride: override });
+    toast("Key saved — starting new run…");
+    closeKeyModal();
+    const d = await postJSON("/api/job-retry", { id: ID });
+    if (d.jobId) setTimeout(() => { location.href = "/job?id=" + encodeURIComponent(d.jobId); }, 500);
+    else load();
+  } catch (e) {
+    toast("Failed: " + e.message, true);
+    btn.disabled = false; btn.textContent = "Save & re-run";
+  }
+}
+
+function wireChips() {
+  // Remove chip on × click
+  document.querySelectorAll(".chip-rm").forEach((btn) => {
+    btn.onclick = () => {
+      btn.closest(".chip").remove();
+    };
+  });
+  // Add chip on button click or Enter in input
+  document.querySelectorAll(".chip-add-btn").forEach((btn) => {
+    const key = btn.dataset.chipTarget;
+    const inp = $("chipinput_" + key);
+    const addChip = () => {
+      const val = inp ? inp.value.trim() : "";
+      if (!val) return;
+      const wrap = $("chips_" + key);
+      if (!wrap) return;
+      const span = document.createElement("span");
+      span.className = "chip";
+      span.dataset.chipKey = key;
+      span.innerHTML = `${esc(val)}<button type="button" class="chip-rm" aria-label="Remove ${esc(val)}">&#10005;</button>`;
+      span.querySelector(".chip-rm").onclick = () => span.remove();
+      wrap.appendChild(span);
+      if (inp) inp.value = "";
+    };
+    btn.onclick = addChip;
+    if (inp) inp.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); addChip(); } };
+  });
+}
+
+function currentAnswers() {
+  const raw = $("df_rawJson");
+  if (raw) { try { return JSON.parse(raw.value); } catch (e) { return (JOB.payload && JOB.payload.answers) || []; } }
+  return buildAnswersFromFields();
+}
+
+function buildAnswersFromFields() {
+  const base = JSON.parse(JSON.stringify((JOB.payload && JOB.payload.answers) || []));
+  // regular inputs / textareas
+  document.querySelectorAll("[data-akey]").forEach((el) => {
+    const key = el.dataset.akey;
+    const idx = base.findIndex((x) => x.key === key);
+    if (idx >= 0) base[idx].value = el.value;
+    else if (el.value) base.push({ key, value: el.value });
+  });
+  // chip fields — collect text from each .chip span (exclude the × button text)
+  ONBOARDING_FIELDS.filter((f) => f.type === "chips").forEach(({ key }) => {
+    const wrap = $("chips_" + key);
+    if (!wrap) return;
+    const chips = [...wrap.querySelectorAll(".chip")].map((s) => {
+      const clone = s.cloneNode(true);
+      clone.querySelector(".chip-rm") && clone.querySelector(".chip-rm").remove();
+      return clone.textContent.trim();
+    }).filter(Boolean);
+    const value = JSON.stringify(chips);
+    const idx = base.findIndex((x) => x.key === key);
+    if (idx >= 0) base[idx].value = value;
+    else base.push({ key, value });
+  });
+  return base;
+}
+
+function syncFieldsToJson() {
+  const answers = buildAnswersFromFields();
+  const raw = $("df_rawJson");
+  if (raw) raw.value = JSON.stringify(answers, null, 2);
+}
+
+function syncJsonToFields() {
+  // next renderDrawerBody call will re-read currentAnswers() from the textarea before re-render
+}
+
+function closeDrawer() {
+  $("drawerOverlay") && $("drawerOverlay").classList.remove("open");
+  $("jobDrawer") && $("jobDrawer").classList.remove("open");
+}
+
+async function saveDrawer() {
+  const btn = $("drawerSave");
+  btn.disabled = true; btn.textContent = "Saving…";
+  try {
+    let answers;
+    if (drawerTab === "json") {
+      try { answers = JSON.parse($("df_rawJson").value); }
+      catch (e) { toast("Invalid JSON — fix it and try again", true); btn.disabled = false; btn.textContent = "Save changes"; return; }
+    } else {
+      answers = buildAnswersFromFields();
+    }
+    await postJSON("/api/job-update", {
+      id: ID,
+      repo:            $("df_repo").value.trim() || null,
+      liveUrl:         $("df_liveUrl").value.trim() || null,
+      existingWebsite: $("df_existingUrl").value.trim() || null,
+      answers,
+    });
+    toast("Saved ✓");
+    closeDrawer();
+    load();
+  } catch (e) {
+    toast("Save failed: " + e.message, true);
+    btn.disabled = false; btn.textContent = "Save changes";
+  }
 }
 
 ensureAuth().then((ok) => {

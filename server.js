@@ -179,6 +179,8 @@ const PORT = process.env.PORT || 8793;
 const STITCH_KEYS = String(process.env.STITCH_API_KEY || "").split(",").map(s => s.trim()).filter(Boolean);
 const API_KEY = STITCH_KEYS[0] || "";   // kept for any legacy reference
 let skIdx = 0;
+// Per-job key override: set before calling buildStitchSiteWithKeyRotation, cleared after.
+let STITCH_KEY_OVERRIDE = null;
 const MCP_URL = "https://stitch.googleapis.com/mcp";
 const GEMINI_KEYS = (process.env.GEMINI_KEYS || "").split(",").map(s => s.trim()).filter(Boolean);
 // NocoDB is the source of truth for real websites (name / domain / repo). The
@@ -367,8 +369,10 @@ async function rpc(method, params, notify = false, timeoutMs = 90000) {
   if (!notify) body.id = ++rpcId;
   if (params) body.params = params;
   let lastErr = null;
-  for (let i = 0; i < Math.max(STITCH_KEYS.length, 1); i++) {
-    const key = STITCH_KEYS[(skIdx + i) % Math.max(STITCH_KEYS.length, 1)] || "";
+  // If a per-job key override is active, use only that key (no rotation).
+  const keys = STITCH_KEY_OVERRIDE ? [STITCH_KEY_OVERRIDE] : STITCH_KEYS;
+  for (let i = 0; i < Math.max(keys.length, 1); i++) {
+    const key = STITCH_KEY_OVERRIDE ? STITCH_KEY_OVERRIDE : (keys[(skIdx + i) % Math.max(keys.length, 1)] || "");
     const ac = new AbortController();
     const to = setTimeout(() => ac.abort(), timeoutMs);
     let res;
@@ -912,6 +916,12 @@ async function stitchGenerateInProject(pid, designSystem, prompt, deviceType) {
       if (best) return { screenId: best.id, html: best.html, screenshotUrl: best.scr?.screenshot?.downloadUrl || "" };
       return { screenId: fallback.id, html: "", screenshotUrl: fallback.scr?.screenshot?.downloadUrl || "" };
     } catch (e) {
+      // Quota errors mean the key is exhausted — the projectId belongs to that key's
+      // account and is inaccessible from any other key. Retrying here with the same
+      // projectId on a rotated key will only produce "entity not found". Throw
+      // immediately so buildStitchSiteWithKeyRotation restarts the whole build
+      // (new project + design system + all pages) under the next key.
+      if (/RESOURCE_EXHAUSTED|quota/i.test(e.message)) throw e;
       lastErr = e;
       if (attempt < 5) await sleep(6000 * attempt);   // back off before every retry
     }
@@ -973,6 +983,13 @@ async function buildStitchSite(pages, theme, deviceType) {
 // under key N is not accessible by key N+1 — the entire build (project + design
 // system + all pages) must restart under the new key.
 async function buildStitchSiteWithKeyRotation(pages, theme, deviceType) {
+  // When a per-job key override is active, pin skIdx to that key and skip rotation.
+  if (STITCH_KEY_OVERRIDE) {
+    const idx = STITCH_KEYS.indexOf(STITCH_KEY_OVERRIDE);
+    if (idx >= 0) skIdx = idx;
+    PROJECT = null; SCREENS_MADE = 0; DESIGN_SYSTEM = null; PROTO = "2024-11-05";
+    return await buildStitchSite(pages, theme, deviceType);
+  }
   let lastErr = null;
   const attempts = Math.max(STITCH_KEYS.length, 1);
   for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -8119,8 +8136,9 @@ async function runEnrichJob(job) {
         // export/rebind) — snapshot + restore so the enrich run never clobbers it.
         const metaFile = path.join(GEN, ".stitch-metadata.json");
         const metaBak = fs.existsSync(metaFile) ? fs.readFileSync(metaFile) : null;
+        STITCH_KEY_OVERRIDE = (job.payload && job.payload.stitchKeyOverride) || null;
         try { results = (await buildStitchSiteWithKeyRotation(pages, theme, "DESKTOP")).results; }
-        finally { if (metaBak) fs.writeFileSync(metaFile, metaBak); }
+        finally { STITCH_KEY_OVERRIDE = null; if (metaBak) fs.writeFileSync(metaFile, metaBak); }
       } catch (e) { console.warn("enrich: Stitch generation failed, falling back to Gemini:", e.message.slice(0, 160)); }
       const okStitch = (results || []).filter((r) => r.html);
       job.enrichPlan = { ...(job.enrichPlan || {}), engine: okStitch.length ? "stitch" : "gemini", grounded: refCount, composedBriefs: composedCount, mimicked: refStruct ? refStruct.url : null };
@@ -12506,6 +12524,42 @@ const server = http.createServer(async (req, res) => {
       j.approved = true; saveJobs();
       return json(res, 200, { ok: true });
     }
+    // Patch editable fields on a job record: repo, liveUrl, existingWebsite, and answers array.
+    if (p === "/api/job-update" && req.method === "POST") {
+      const { id, repo, liveUrl, existingWebsite, answers, stitchKeyOverride } = JSON.parse(await readBody(req) || "{}");
+      const j = JOBS.get(id); if (!j) return json(res, 404, { error: "job not found" });
+      if (repo !== undefined) j.repo = repo || null;
+      if (liveUrl !== undefined) j.liveUrl = liveUrl || null;
+      if (existingWebsite !== undefined) { j.payload = j.payload || {}; j.payload.existingWebsite = existingWebsite || null; }
+      if (answers !== undefined) { j.payload = j.payload || {}; j.payload.answers = answers; }
+      if (stitchKeyOverride !== undefined) { j.payload = j.payload || {}; j.payload.stitchKeyOverride = stitchKeyOverride || null; }
+      saveJobs();
+      return json(res, 200, { ok: true });
+    }
+    // Return Stitch key list for the admin key-picker UI (admin-only route).
+    if (p === "/api/stitch-keys" && req.method === "GET") {
+      const keys = STITCH_KEYS.map((k, i) => ({ index: i, label: `Key ${i + 1}`, masked: k.slice(0, 10) + "…" + k.slice(-4), key: k }));
+      return json(res, 200, { keys });
+    }
+    // Validate a Stitch API key by sending a lightweight tools/list MCP call.
+    if (p === "/api/stitch-key-validate" && req.method === "POST") {
+      const { key } = JSON.parse(await readBody(req) || "{}");
+      if (!key) return json(res, 400, { error: "key required" });
+      try {
+        const ac = new AbortController();
+        const to = setTimeout(() => ac.abort(), 15000);
+        let vRes;
+        try {
+          vRes = await fetch(MCP_URL, {
+            method: "POST", signal: ac.signal,
+            headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream", "X-Goog-Api-Key": key, "MCP-Protocol-Version": PROTO },
+            body: JSON.stringify({ jsonrpc: "2.0", method: "tools/list", id: 1 }),
+          });
+        } finally { clearTimeout(to); }
+        if (vRes.status === 401 || vRes.status === 403) return json(res, 200, { valid: false, error: `HTTP ${vRes.status}` });
+        return json(res, 200, { valid: vRes.ok });
+      } catch (e) { return json(res, 200, { valid: false, error: e.message }); }
+    }
     // Toggle per-site require-approval (persisted in the registry).
     if (p === "/api/site-approval" && req.method === "POST") {
       const { siteId, requireApproval } = JSON.parse(await readBody(req) || "{}");
@@ -13366,7 +13420,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === "/api/generate-site" && req.method === "POST") {
-      const { engine, pages, deviceType, theme } = JSON.parse(await readBody(req) || "{}");
+      const { engine, pages, deviceType, theme, stitchKeyOverride } = JSON.parse(await readBody(req) || "{}");
       if (!Array.isArray(pages) || !pages.length) return json(res, 400, { error: "pages[] required" });
       const t0 = Date.now();
       // Give this client its own slice of the curated photo pool (see CURATED_OFFSET
@@ -13424,7 +13478,10 @@ const server = http.createServer(async (req, res) => {
       // Same reasoning as the Gemini branch above: this is the main 4-page
       // build, not just service pages, and it feeds the same splitPage()/
       // buildWpTheme() head-stripping — so it needs the same guard.
-      const built = await buildStitchSiteWithKeyRotation(pages.map(pg => ({ key: pg.key.replace(/[^a-z0-9_-]/gi, ""), prompt: pg.prompt + "\n\n" + designTokensBlock(theme) + STITCH_IMG_CLAUSE + stylingConstraint(theme || {}) })), theme || {}, deviceType);
+      STITCH_KEY_OVERRIDE = stitchKeyOverride || null;
+      let built;
+      try { built = await buildStitchSiteWithKeyRotation(pages.map(pg => ({ key: pg.key.replace(/[^a-z0-9_-]/gi, ""), prompt: pg.prompt + "\n\n" + designTokensBlock(theme) + STITCH_IMG_CLAUSE + stylingConstraint(theme || {}) })), theme || {}, deviceType); }
+      finally { STITCH_KEY_OVERRIDE = null; }
       const out = await Promise.all(built.results.map(async r => {
         if (!r.html) return { pageKey: r.key, engine: "stitch", error: r.error || "no HTML" };
         // Exact, untouched Stitch output, saved BEFORE any of our post-processing —
