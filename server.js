@@ -219,14 +219,6 @@ if (!STITCH_KEYS.length) console.warn("⚠ STITCH_API_KEY not set — Stitch gen
 else if (STITCH_KEYS.length > 1) console.log(`Stitch: ${STITCH_KEYS.length} keys pooled, will rotate on quota exhaustion`);
 if (!NOCODB_TOKEN) console.warn("⚠ NOCODB_TOKEN not set — the All Sites / Edit Sites website list will be empty until it's added to .env.");
 if (!GEMINI_KEYS.length) console.warn("⚠ GEMINI_KEYS not set — all AI features (CRO, prompt, bind, QC) will fail.");
-// Live per-treatment photo search — real variety instead of the fixed ~14-photo
-// curated pool (which has shipped at least one plainly wrong photo — a
-// construction site under "Medical Weight Loss", a t-shirt elsewhere — because
-// a small hardcoded list has no way to catch a mislabeled entry). Optional:
-// unset = every image-replacement path below falls back to the curated pool
-// exactly as before, fail-soft, same pattern as PSI/Browserless.
-const UNSPLASH_ACCESS_KEY = process.env.UNSPLASH_ACCESS_KEY || "";
-if (!UNSPLASH_ACCESS_KEY) console.warn("⚠ UNSPLASH_ACCESS_KEY not set — image replacement falls back to the small curated photo pool (same ~14 photos for every client).");
 let GEMINI_KEY = GEMINI_KEYS[0];                 // kept for legacy call sites
 // Default off gemini-flash-lite-latest: on 2026-07-28 that alias accepted
 // connections and never responded, stalling every AI step until it timed out.
@@ -960,7 +952,12 @@ async function buildStitchSite(pages, theme, deviceType) {
   const results = await Promise.all(pages.map(async (p) => {
     genProg(p.key, "generating");
     try {
-      const out = await stitchGenerateInProject(pid, designSystem, p.prompt, deviceType);
+      let out = await stitchGenerateInProject(pid, designSystem, p.prompt, deviceType);
+      if (out.html && out.screenId) {
+        genProg(p.key, "healing");
+        const healed = await healPage(pid, out.screenId, out.html, p.key);
+        out = { ...out, ...healed };
+      }
       genProg(p.key, out.html ? "post-processing" : "error", out.html ? {} : { error: "no HTML" });
       return { key: p.key, ...out };
     } catch (e) { genProg(p.key, "error", { error: e.message.slice(0, 120) }); return { key: p.key, error: e.message, html: "" }; }
@@ -1145,6 +1142,94 @@ async function stitchRefine(projectId, screenId, comments, deviceType) {
   }
   const pick = best || { id: fallback.id, html: "", scr: fallback.scr };
   return { screenId: pick.id, html: pick.html, screenshotUrl: pick.scr?.screenshot?.downloadUrl || "" };
+}
+
+// ----------------------------------------- Heal loop: detect + fill missing sections
+// Per-page mandatory sections with detection keywords (any match = present).
+const HEAL_SECTIONS = {
+  home: [
+    { n: 1,  name: "Hero",                  kw: ["book online", "book now", "book a consultation", "regenerative", "refined results", "hero", "full-viewport", "cinematic"] },
+    { n: 2,  name: "Intro / Why Us",        kw: ["why patients choose", "patients choose", "intro", "about us", "our story", "our approach", "philosophy"] },
+    { n: 3,  name: "Signature Treatments",  kw: ["signature treat", "featured treat", "revenue service", "highlighted service", "treatment card", "hover card"] },
+    { n: 4,  name: "Service Categories",    kw: ["service categor", "all services", "our services", "treatment categor", "injectables", "neuromodulator", "dermal filler"] },
+    { n: 5,  name: "Stats / Trust Band",    kw: ["patients treated", "years of experience", "5-star", "4.9", "board certified", "trust", "award", "stat"] },
+    { n: 6,  name: "Feature Section",       kw: ["curved image", "arched", "gold border", "feature", "spotlight", "showcase"] },
+    { n: 7,  name: "Providers / Team",      kw: ["provider", "meet our team", "meet the team", "doctor", "nurse", "np-c", "aprn", "credentials", "team member"] },
+    { n: 8,  name: "Testimonial",           kw: ["testimonial", "review", "what our patients", "patient stor", "what clients say", "five stars", "before and after"] },
+    { n: 9,  name: "Membership / Financing",kw: ["member", "financing", "care credit", "alle", "aspire", "payment plan", "loyalty"] },
+    { n: 10, name: "Booking Panel",         kw: ["booking panel", "schedule", "book a consultation", "select a service", "date picker", "book your appointment", "book appointment", "book now", "online booking"] },
+  ],
+  services: [
+    { n: 1,  name: "Hero",          kw: ["our treatments", "our services", "hero", "full-bleed"] },
+    { n: 2,  name: "Categories",    kw: ["injectables", "neuromodulator", "dermal filler", "skin", "laser", "service card"] },
+    { n: 3,  name: "Spotlight",     kw: ["signature", "revenue service", "feature", "spotlight"] },
+    { n: 4,  name: "Financing",     kw: ["financing", "payment", "care credit", "alle", "membership"] },
+    { n: 5,  name: "Booking Panel", kw: ["book", "schedule", "date picker", "select a service"] },
+  ],
+  about: [
+    { n: 1,  name: "Hero",        kw: ["about us", "our story", "who we are", "hero"] },
+    { n: 2,  name: "Practice Story", kw: ["our story", "our practice", "our philosophy", "founded", "dedicated"] },
+    { n: 3,  name: "Team",        kw: ["meet the team", "meet our team", "our providers", "doctor", "nurse", "credentials"] },
+    { n: 4,  name: "Testimonial", kw: ["testimonial", "review", "patient", "five stars", "what clients"] },
+    { n: 5,  name: "Booking Panel", kw: ["book", "schedule", "consultation"] },
+  ],
+  contact: [
+    { n: 1,  name: "Hero",        kw: ["contact us", "get in touch", "reach us", "hero"] },
+    { n: 2,  name: "Consultation Form", kw: ["form", "input", "submit", "your name", "email address", "message"] },
+    { n: 3,  name: "Booking Panel", kw: ["book", "schedule", "date picker", "select a service", "online booking"] },
+    { n: 4,  name: "Location / Map", kw: ["location", "address", "directions", "map", "find us"] },
+  ],
+};
+function detectMissingSections(html, pageKey) {
+  const sections = HEAL_SECTIONS[pageKey] || HEAL_SECTIONS.home;
+  const h = html.toLowerCase();
+  const present = [], missing = [];
+  for (const s of sections) (s.kw.some(k => h.includes(k)) ? present : missing).push(s);
+  return { present, missing, total: sections.length };
+}
+function buildHealPrompt(missing) {
+  return [
+    `This luxury medspa page is MISSING the following mandatory sections — they were not rendered:`,
+    ...missing.map(s => `- Section ${s.n}: ${s.name}`),
+    ``,
+    `ADD each missing section as a full, visually rich band in its correct numeric position. Match the EXISTING page EXACTLY: same background, same accent color, same heading font, same body font, same nav, same footer.`,
+    `Every added section needs real HD professional photography (no gray placeholder boxes), readable text (≥4.5:1 contrast, scrim behind text-over-images), and the same hover / fadeInUp animations used on the rest of the page.`,
+    `KEEP every section that already exists — do NOT remove, reorder, or rewrite existing content. ONLY ADD the listed missing sections.`,
+  ].join("\n");
+}
+async function healPage(pid, screenId, html, pageKey) {
+  let curHtml = html, curScreenId = screenId;
+  const MAX_ROUNDS = 2;
+  for (let round = 1; round <= MAX_ROUNDS; round++) {
+    const { present, missing, total } = detectMissingSections(curHtml, pageKey);
+    const secTags = (curHtml.match(/<section\b/gi) || []).length;
+    console.log(`  heal check [${pageKey}] round ${round}: ${present.length}/${total} sections present (${secTags} <section> tags)`);
+    if (!missing.length) { console.log(`  ✅ [${pageKey}] all sections present`); break; }
+    if (missing.length === total) {
+      console.log(`  ⚠ [${pageKey}] heal skipped — all sections missing (base generate likely failed)`);
+      break;
+    }
+    console.log(`  ↻ [${pageKey}] heal round ${round}: adding ${missing.length} missing: ${missing.map(s => s.name).join(", ")}`);
+    try {
+      const eg = await callTool("edit_screens", { projectId: pid, selectedScreenIds: [curScreenId], prompt: buildHealPrompt(missing), deviceType: "DESKTOP", modelId: "GEMINI_3_FLASH" }, 180000);
+      let eids = collectScreenIds(eg); if (!eids.length) eids = [curScreenId];
+      let best = null;
+      for (let poll = 1; poll <= 8; poll++) {
+        for (const eid of eids) {
+          let scr; try { scr = await getScreen(pid, eid); } catch (e) { continue; }
+          const url = scr?.htmlCode?.downloadUrl || "";
+          if (!url) continue;
+          const h = await (await fetch(url)).text();
+          if (h && h.length > 500) { best = { id: eid, html: h }; break; }
+        }
+        if (best) break;
+        await sleep(3500);
+      }
+      if (best) { curScreenId = best.id; curHtml = best.html; }
+      else { console.warn(`  heal round ${round} [${pageKey}]: no HTML returned, keeping previous`); break; }
+    } catch (e) { console.warn(`  heal round ${round} [${pageKey}] failed: ${e.message.slice(0, 160)}`); break; }
+  }
+  return { screenId: curScreenId, html: curHtml };
 }
 
 // --------------------------------------------- AI bind brain (Gemini now, Claude-swappable)
@@ -1716,92 +1801,16 @@ function seedCuratedPhotos(name) {
 }
 const curatedPhoto = () => CURATED_IMAGES[(CURATED_OFFSET + CURATED_CURSOR++) % CURATED_IMAGES.length];
 
-// Live per-category Unsplash search. Real variety instead of the fixed
-// CURATED_IMAGES pool (14 photos, same for every client, and — per the
-// construction-site photo above — with no way to catch a wrong entry itself).
-// Off (returns null, callers fall back to the curated pool) unless
-// UNSPLASH_ACCESS_KEY is set. Cached per query for the process lifetime — a
-// single page asks for the same category many times over and this must not
-// burn a free-tier ~50 req/hour limit re-fetching the same search.
-// Audited live against the Unsplash API, 2026-08-07 (per-page=20, landscape,
-// content_filter=high), because a query that matches NOTHING fails silently —
-// the caller just falls through to the generic pool, so a "Medical Weight Loss"
-// card quietly got whatever "luxury medical spa clinic treatment" returned (a
-// red-light therapy bed). Search behaves like AND over the terms, so the more
-// words a query has the likelier it is to return zero: "laser skin treatment
-// clinic" and "body contouring medspa treatment" both returned 0 results, while
-// dropping one word made each return 20. Keep these at three words or fewer and
-// re-check with a real API call before changing one.
-//   injectables 9 usable · laser 9 · facial 9 · body 6 · team 20 · interior 4
-// hero is the exception: every rewrite tried ("medical spa interior", "spa
-// clinic interior" → 0 results; "luxury spa interior", "modern spa interior" →
-// 2 usable, and those were chairs and a table). It stays a known-empty query so
-// heroes keep falling back to the hand-vetted CURATED_HERO_IMAGES at w=2400,
-// which is the better picture for a full-bleed band anyway.
-const UNSPLASH_QUERY_BY_CATEGORY = {
-  injectables: "botox filler injection cosmetic clinic",
-  laser: "laser skin treatment",
-  facial: "facial spa treatment skincare",
-  body: "body contouring",
-  team: "medical clinic doctor team portrait",
-  hero: "luxury medspa clinic interior",
-  interior: "modern medical spa interior design",
-};
-const UNSPLASH_CACHE = new Map();   // query -> array of image URLs, or null on failure
-// Unsplash's own search ranking is not trustworthy enough to accept blind —
-// confirmed on a real generation, 2026-08-06: a "luxury medspa clinic
-// interior" style query returned a photo of a SHIRT as its top hit (fashion
-// photography apparently ranks for "clinic"/"treatment"-adjacent terms too).
-// So every candidate is cross-checked against its OWN alt_description/
-// description/tags for an actual medical/spa/beauty term before being
-// accepted — Unsplash's ranking picks the candidate pool, this decides
-// what's actually on-topic. A candidate with no metadata at all is rejected
-// rather than assumed innocent.
-const UNSPLASH_RELEVANCE_TERMS = /\b(medic|clinic|doctor|physician|nurse|dermatolog|skin\w*|spa\b|wellness|beauty|cosmetic|aesthetic|facial|treatment|therap|inject|botox|filler|laser|massage|salon|patient|health)/i;
-async function unsplashSearch(query, count = 20) {
-  if (!UNSPLASH_ACCESS_KEY) return null;
-  const key = query.toLowerCase().trim();
-  if (UNSPLASH_CACHE.has(key)) return UNSPLASH_CACHE.get(key);
-  try {
-    const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), 10000);
-    const url = `https://api.unsplash.com/search/photos?query=${encodeURIComponent(query)}&per_page=${count}&orientation=landscape&content_filter=high`;
-    const r = await fetch(url, { signal: ctl.signal, headers: { Authorization: `Client-ID ${UNSPLASH_ACCESS_KEY}` } });
-    clearTimeout(t);
-    if (!r.ok) { console.warn(`unsplash search "${query}" -> HTTP ${r.status}`); UNSPLASH_CACHE.set(key, null); return null; }
-    const d = await r.json();
-    // Real HD source only — never accept a small original and let CSS stretch
-    // it, same standard qcImageResolution holds Stitch's own images to.
-    const relevant = (d.results || []).filter((ph) => {
-      if ((ph.width || 0) < 1600) return false;
-      const text = [ph.alt_description, ph.description, ...(ph.tags || []).map((tg) => tg.title)].filter(Boolean).join(" ");
-      return UNSPLASH_RELEVANCE_TERMS.test(text);
-    });
-    const urls = relevant.map((ph) => `${ph.urls.raw}&w=1600&q=80&auto=format&fit=crop`);
-    if (!urls.length) {
-      console.warn(`unsplash search "${query}" -> ${(d.results || []).length} result(s), none passed the relevance check`);
-      UNSPLASH_CACHE.set(key, null);
-      return null;
-    }
-    UNSPLASH_CACHE.set(key, urls);
-    return urls;
-  } catch (e) {
-    console.warn(`unsplash search "${query}" failed:`, String(e.message || e).slice(0, 120));
-    UNSPLASH_CACHE.set(key, null);
-    return null;
-  }
-}
-// Generic (no page-text context) HD replacement used by fixImages/
-// qcImageResolution when a broken/low-res image needs swapping and there's
-// nothing to search with beyond "hero or not". Falls back to
-// curatedHero()/curatedPhoto() exactly as before when Unsplash is off/failed.
-async function unsplashOrCurated(isHero) {
-  if (UNSPLASH_ACCESS_KEY) {
-    const results = await unsplashSearch(isHero ? UNSPLASH_QUERY_BY_CATEGORY.hero : "luxury medical spa clinic treatment");
-    if (results && results.length) return results[CURATED_CURSOR++ % results.length];
-  }
+// Generic HD replacement used by fixImages/qcImageResolution when a broken/
+// low-res image needs swapping and there's nothing to search with beyond
+// "hero or not". Live Unsplash search was removed here (it was never
+// configured with a key in practice, so it was dead weight) — this is now
+// just the curated pool, used ONLY for a measured defect (broken/blurry/
+// under-resolution); a good Stitch-generated image is always left alone.
+async function curatedFallback(isHero) {
   return isHero ? curatedHero() : curatedPhoto();
 }
+
 // The text AROUND an <img> — the card's heading and copy — is what says which
 // service the picture is for. The img's own attributes do not: Stitch writes a
 // data-alt describing the picture it invented ("a woman receiving a facial
@@ -1809,6 +1818,9 @@ async function unsplashOrCurated(isHero) {
 // below it. Classifying on attributes alone is exactly how a card titled "Botox"
 // shipped with a facial-mask photo. A window, not the whole document: page-wide
 // matching would label every image with whatever section happened to come first.
+// Pure/no network — kept even without a live caller because it's independently
+// covered by test-design.js and is the building block for any future
+// category-aware curated selection.
 const IMG_CONTEXT_BEFORE = 400, IMG_CONTEXT_AFTER = 1200;
 function imageContext(html, at, len) {
   const before = html.slice(Math.max(0, at - IMG_CONTEXT_BEFORE), at);
@@ -1834,63 +1846,15 @@ function medspaCategory(txt) {
   if (/hero|flagship|banner|welcome|philosophy|about/i.test(t)) return "hero";
   return null;
 }
-// Category-matched live search, falling back to a generic HD photo when no
-// category matches or Unsplash is off.
-async function contextualMedspaPhoto(txt, label) {
-  // The card's own heading decides FIRST, and only falls through to the wider
-  // text when the heading names no category. A card titled "Botox" sitting next
-  // to a data-alt that describes a facial has to read as injectables, and the
-  // combined string can't do that — whichever branch is earlier in the chain
-  // wins regardless of which one the visitor actually reads.
-  //
-  // Not searched as free text ("<label> treatment clinic"): checked live against
-  // the Unsplash API, 2026-08-07 — "Botox treatment clinic" returns 0 results at
-  // all, and "Medical Weight Loss treatment clinic" returns a hair-salon portrait
-  // as its top relevance-passing hit. The fixed per-category queries are the
-  // vetted ones; the label picks the bucket, it does not become the query.
-  const category = medspaCategory(label) || medspaCategory(txt);
-
-  if (category && UNSPLASH_ACCESS_KEY) {
-    const results = await unsplashSearch(UNSPLASH_QUERY_BY_CATEGORY[category]);
-    // Indexed by the label's hash rather than the shared cursor, so one service
-    // shows the SAME photo everywhere it appears (home card, services page, its
-    // own page) instead of a different one per placement. Unlabelled images keep
-    // the rolling cursor, which is what stops a page repeating one photo.
-    if (results && results.length) {
-      return results[label ? fnv1a(label) % results.length : CURATED_CURSOR++ % results.length];
-    }
-  }
-  return unsplashOrCurated(category === "hero");
-}
-// Runs contextualMedspaPhoto over every <img src> in the page — replaces
-// whatever Stitch/Gemini picked with a real, category-matched photo. Async:
-// each image is resolved concurrently, then swapped in — a plain sync
-// .replace() can't await.
-async function sanitizeAllImages(html) {
-  if (!html || !UNSPLASH_ACCESS_KEY) return html;   // off unless a key is configured
-  const src = String(html);
-  const re = /<img\b([^>]*?)\bsrc=["']([^"']+)["']([^>]*?)>/gi;
-  const matches = [...src.matchAll(re)];
-  if (!matches.length) return html;
-  const urls = await Promise.all(matches.map((m) => {
-    const ctx = imageContext(src, m.index, m[0].length);
-    return contextualMedspaPhoto(`${m[1] || ""} ${m[3] || ""} ${ctx.text}`, ctx.label);
-  }));
-  let i = 0;
-  return src.replace(re, (match, p1, srcUrl, p2) => `<img${p1}src="${urls[i++]}"${p2}>`);
-}
 
 // Guarantee no broken images: Stitch sometimes emits session-bound
 // lh3.googleusercontent.com/aida/... URLs that fail in the browser (and even
 // /aida-public/ ones expire). Replace any image that isn't a stable, loading
 // image with a curated topical photo. Deterministic, no LLM needed.
 async function fixImages(html) {
-  // NOTE: the old unconditional sanitizeAllImages() relevance-swap pass was
-  // removed from here on purpose (2026-08-08) — it replaced EVERY image on
-  // EVERY page whenever UNSPLASH_ACCESS_KEY was set, good or bad, which is
-  // exactly the "why did my images change for no reason" complaint. Images
-  // are now only ever replaced for a concrete defect: broken/unreliable URL,
-  // or measurably blurry (see isImageBlurry). A good image is left alone.
+  // Images are only ever replaced for a concrete defect: broken/unreliable URL,
+  // or measurably blurry (see isImageBlurry). A good Stitch-generated image is
+  // always left alone — this never blanket-swaps a page's photography.
   const urls = [...new Set((html.match(/https:\/\/lh3\.googleusercontent\.com\/[A-Za-z0-9_\-\/=]+/g) || []))];
   if (!urls.length) return html;
   for (const u of urls) {
@@ -1909,7 +1873,7 @@ async function fixImages(html) {
       if (blurry) { replace = true; reason = `blurry(var=${variance.toFixed(1)}<${BLUR_VARIANCE_THRESHOLD})`; }
       else console.log(`  img OK, keeping: ${u.slice(40, 56)}… sharpness=${variance != null ? variance.toFixed(1) : "n/a" + (error ? ` (${error})` : "")}`);
     }
-    if (replace) { const c = await unsplashOrCurated(false); html = html.split(u).join(c); console.log(`  img replaced (${reason}): ${u.slice(40, 56)}… -> ${UNSPLASH_ACCESS_KEY ? "unsplash/curated" : "curated"}`); }
+    if (replace) { const c = await curatedFallback(false); html = html.split(u).join(c); console.log(`  img replaced (${reason}): ${u.slice(40, 56)}… -> curated`); }
   }
   return html;
 }
@@ -2437,7 +2401,7 @@ async function qcImageResolution(html, minWidth = 1000) {
       // unreadable header ≠ broken image (some CDNs refuse ranged reads), so only
       // replace when we positively measured it as too small
       if (d) {
-        const repl = await unsplashOrCurated(isHero);
+        const repl = await curatedFallback(isHero);
         html = html.split(u).join(repl);
         row.action = `replaced (${d.w}px < ${need}px${isHero ? ", hero" : ""})`; swapped++;
       } else {
