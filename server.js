@@ -1010,20 +1010,32 @@ function parsePromptIntoBatches(prompt, expectedSections, batchSize = 4) {
     sections.push(currentSection);
   }
 
+  // Cap the number of Stitch calls: never more than MAX_BATCHES. For many sections
+  // we grow the batch size instead of adding batches (bounds time, cost and crash surface).
+  const MAX_BATCHES = 4;
+  const size = Math.max(batchSize, Math.ceil(sections.length / MAX_BATCHES));
   const batches = [];
-  for (let i = 0; i < sections.length; i += batchSize) {
-    const batchSecs = sections.slice(i, i + batchSize);
-    let batchPrompt = prefix;
-    batchPrompt += `${structureTitle.replace(/\d+ CONTENT SECTIONS/, `${batchSecs.length} CONTENT SECTIONS`)}\n`;
-    if (navLine) batchPrompt += `${navLine}\n`;
-    batchPrompt += batchSecs.map(s => s.content).join('\n') + '\n';
-    if (footerLines.length) batchPrompt += footerLines.join('\n');
-
-    batches.push({
-      batchIndex: batches.length + 1,
-      sectionNums: batchSecs.map(s => s.num),
-      prompt: batchPrompt
-    });
+  for (let i = 0; i < sections.length; i += size) {
+    const batchSecs = sections.slice(i, i + size);
+    const isFirst = batches.length === 0;
+    let batchPrompt;
+    if (isFirst) {
+      // Batch 1 = the full page shell: head, nav, hero + its sections, footer.
+      batchPrompt = prefix
+        + `${structureTitle.replace(/\d+ CONTENT SECTIONS/, `${batchSecs.length} CONTENT SECTIONS`)}\n`
+        + (navLine ? `${navLine}\n` : '')
+        + batchSecs.map(s => s.content).join('\n') + '\n'
+        + (footerLines.length ? footerLines.join('\n') : '');
+    } else {
+      // Continuation batches = ONLY their sections, no chrome, matching the shell.
+      // This is what fixes the "Frankenstein" seams: no duplicate nav/hero/footer to merge.
+      batchPrompt = prefix
+        + `### CONTINUATION — these are MIDDLE sections of the SAME page already being built.\n`
+        + `Output ONLY the following ${batchSecs.length} sections, each as a top-level <section> element. Do NOT output <head>, nav/header, a hero, or a footer — those already exist on the page. Use the EXACT same colours, fonts, component styles, spacing and motion as the rest of the site so these drop in seamlessly.\n\n`
+        + `### SECTIONS\n`
+        + batchSecs.map(s => s.content).join('\n') + '\n';
+    }
+    batches.push({ batchIndex: batches.length + 1, sectionNums: batchSecs.map(s => s.num), prompt: batchPrompt });
   }
 
   return batches;
@@ -1041,63 +1053,62 @@ function extractMainContent(html) {
   return html.slice(startIdx, endIdx);
 }
 
+// Pull just the SECTION content out of a batch's HTML — <main> body if present,
+// else all <section> blocks, else the body minus chrome/scripts.
+function batchSections(html) {
+  const m = html.match(/<main[^>]*>([\s\S]*?)<\/main>/i);
+  if (m) return m[1].trim();
+  const secs = html.match(/<section[\s\S]*?<\/section>/gi);
+  if (secs && secs.length) return secs.join('\n');
+  const body = (html.match(/<body[^>]*>([\s\S]*?)<\/body>/i) || [null, html])[1];
+  return String(body)
+    .replace(/<header\b[\s\S]*?<\/header>/gi, '')
+    .replace(/<nav\b[\s\S]*?<\/nav>/gi, '')
+    .replace(/<footer\b[\s\S]*?<\/footer>/gi, '')
+    .replace(/<script\b[\s\S]*?<\/script>/gi, '')
+    .trim();
+}
+// Merge: keep batch 1's full shell (head, nav, styles, footer, scripts), and place
+// EVERY batch's section content into its <main> (or before the footer). Continuation
+// batches contributed only sections, so there's no duplicate nav/hero/footer to fight.
 function combineBatches(batches) {
-  if (batches.length === 0) return '';
-  let finalHtml = batches[0].html;
-
-  let combinedSections = extractMainContent(finalHtml);
-  for (let i = 1; i < batches.length; i++) {
-    combinedSections += '\n' + extractMainContent(batches[i].html);
-  }
-
-  const mainMatch = finalHtml.match(/<main[^>]*>([\s\S]*?)<\/main>/i);
-  if (mainMatch) {
-    finalHtml = finalHtml.replace(mainMatch[1], () => combinedSections);
-  }
-
-  for (let i = 1; i < batches.length; i++) {
-    const html = batches[i].html;
-    const scripts = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)];
-    const scriptBlocks = scripts.map(m => m[0]).join('\n');
-    
-    const bodyMatch = html.match(/<\/main>([\s\S]*?)<\/body>/i);
-    if (bodyMatch) {
-      let extra = bodyMatch[1];
-      extra = extra.replace(/<footer\b[\s\S]*?<\/footer>/gi, '');
-      extra = extra.replace(/<script\b[\s\S]*?<\/script>/gi, '');
-      if (extra.trim() || scriptBlocks.trim()) {
-        finalHtml = finalHtml.replace('</body>', () => extra + '\n' + scriptBlocks + '\n</body>');
-      }
-    }
-  }
-
-  return finalHtml;
+  if (!batches.length) return '';
+  const base = batches[0].html;
+  const all = batches.map((b) => batchSections(b.html)).filter((s) => s && s.length).join('\n\n');
+  const mainMatch = base.match(/<main[^>]*>([\s\S]*?)<\/main>/i);
+  if (mainMatch) return base.replace(mainMatch[1], () => '\n' + all + '\n');
+  // No <main>: base already holds batch-1 sections in <body>; append the rest before the footer.
+  const rest = batches.slice(1).map((b) => batchSections(b.html)).filter(Boolean).join('\n\n');
+  if (!rest) return base;
+  if (/<footer\b/i.test(base)) return base.replace(/<footer\b/i, () => rest + '\n<footer');
+  return base.replace(/<\/body>/i, () => rest + '\n</body>');
 }
 
 async function generatePageInBatches(pid, designSystem, prompt, expectedSections, pageKey, deviceType) {
   const batches = parsePromptIntoBatches(prompt, expectedSections, 4);
-  if (!batches.length) {
+  if (batches.length <= 1) {
     return await stitchGenerateInProject(pid, designSystem, prompt, deviceType);
   }
-
-  console.log(`stitch: splitting generation for ${pageKey} into ${batches.length} batches`);
+  console.log(`stitch: splitting ${pageKey} into ${batches.length} batches`);
   const results = [];
   for (const batch of batches) {
-    console.log(`stitch: building ${pageKey} batch ${batch.batchIndex}/${batches.length} (sections: ${batch.sectionNums.join(', ')})`);
-    genProg(pageKey, "building", { detail: `Generating batch ${batch.batchIndex}/${batches.length}...` });
-    const res = await stitchGenerateInProject(pid, designSystem, batch.prompt, deviceType);
-    if (!res.html) {
-      throw new Error(`Batch ${batch.batchIndex} of ${pageKey} generated no HTML`);
+    genProg(pageKey, "building", { detail: `Batch ${batch.batchIndex}/${batches.length} (sections ${batch.sectionNums.join(', ')})` });
+    // Retry a batch once; if it still fails, SKIP it rather than killing the whole
+    // page. A missing middle batch loses a few sections — far better than a crash.
+    let res = null;
+    for (let attempt = 1; attempt <= 2 && !(res && res.html); attempt++) {
+      try { res = await stitchGenerateInProject(pid, designSystem, batch.prompt, deviceType); }
+      catch (e) { console.warn(`stitch: ${pageKey} batch ${batch.batchIndex} attempt ${attempt} failed: ${e.message.slice(0, 120)}`); res = null; if (attempt < 2) await sleep(5000); }
     }
-    results.push(res);
+    if (res && res.html) { results.push(res); console.log(`stitch: ${pageKey} batch ${batch.batchIndex} ok (${res.html.length}b)`); }
+    else console.warn(`stitch: ${pageKey} batch ${batch.batchIndex} produced no HTML after retry — skipping`);
   }
-
-  const combinedHtml = combineBatches(results);
-  return {
-    screenId: results[0].screenId,
-    html: combinedHtml,
-    screenshotUrl: results[0].screenshotUrl
-  };
+  // Every batch failed → fall back to a single full-page generation.
+  if (!results.length) {
+    console.warn(`stitch: all batches failed for ${pageKey} — falling back to single generation`);
+    return await stitchGenerateInProject(pid, designSystem, prompt, deviceType);
+  }
+  return { screenId: results[0].screenId, html: combineBatches(results), screenshotUrl: results[0].screenshotUrl };
 }
 
 async function buildStitchSite(pages, theme, deviceType, siteStructure) {
@@ -1152,14 +1163,22 @@ async function buildStitchSite(pages, theme, deviceType, siteStructure) {
         }
       }
       console.log(`[genOne] (${p.key}) final expectedSections:`, Array.isArray(expectedSections) ? `Array(${expectedSections.length})` : expectedSections);
+      // Batched generation (6 sequential Stitch calls per page) is OFF by default —
+      // it was slow, quota-heavy and crashed mid-run. One clean Stitch generation is
+      // fast and reliable. Set BATCH=on to re-enable the batched path.
       let out;
-      if (p.key === "home" && expectedSections && expectedSections.length > 5) {
+      const BATCH_ON = /^(1|on|true|yes)$/i.test(process.env.BATCH || "");
+      if (BATCH_ON && p.key === "home" && expectedSections && expectedSections.length > 5) {
         out = await generatePageInBatches(pid, designSystem, p.prompt, expectedSections, p.key, deviceType);
       } else {
         out = await stitchGenerateInProject(pid, designSystem, p.prompt, deviceType);
       }
       
-      if (out.html && out.screenId) {
+      // Healing is OFF by default (set HEAL=on to re-enable). It was making pages
+      // WORSE: edit_screens on Stitch is flaky (errors), and it validated against a
+      // section list that didn't match the page — so it churned without adding value.
+      // A single clean Stitch generation was consistently better.
+      if (out.html && out.screenId && /^(1|on|true|yes)$/i.test(process.env.HEAL || "")) {
         genProg(p.key, "validating");                  // auditing the built page vs expected sections
         const healed = await healPage(pid, out.screenId, out.html, p.key,
           expectedSections,
@@ -2302,17 +2321,33 @@ function extractFontFamilies(html) {
   return declared;
 }
 // Dominant non-neutral hexes, most frequent first — the site's real palette.
+// Gutenberg's STOCK palette slugs — present on every WordPress site regardless of
+// brand. A hex whose CSS variable is one of these is theme scaffolding, not the
+// brand (this is what surfaced #720eec vivid-purple / #f78da7 pale-pink as "brand").
+const WP_DEFAULT_SLUGS = /--wp--preset--color--(black|white|cyan-bluish-gray|pale-pink|pale-cyan-blue|vivid-red|luminous-vivid-orange|luminous-vivid-amber|light-green-cyan|vivid-green-cyan|vivid-cyan-blue|vivid-purple|contrast|base|foreground|background)\s*:\s*$/i;
+// Score a colour by HOW it is used, not how often it appears. A hex applied to
+// buttons/links/nav/headings is a brand colour; a hex living only in a preset
+// variable, a gradient stop, a shadow, or an SVG icon is noise.
 function extractPalette(html) {
-  const count = {};
-  for (const m of String(html).matchAll(/#([0-9a-fA-F]{6})\b/g)) {
+  const s = String(html);
+  const score = {};
+  const BRAND_CTX = /(btn|button|\bcta\b|nav\b|header|\blink\b|\ba\b|h[1-4]\b|primary|accent|brand|hero|\.wp-block-button)/i;
+  const re = /#([0-9a-fA-F]{6})\b/g; let m;
+  while ((m = re.exec(s))) {
     const hex = "#" + m[1].toUpperCase();
     const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
     const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
-    const nearWhite = mx > 244 && mn > 238, nearBlack = mx < 18;
-    if (nearWhite || nearBlack) continue;                 // page ground, not brand
-    count[hex] = (count[hex] || 0) + 1;
+    if ((mx > 244 && mn > 238) || mx < 18) continue;      // near-white / near-black = page ground
+    const before = s.slice(Math.max(0, m.index - 90), m.index).toLowerCase();
+    if (WP_DEFAULT_SLUGS.test(before)) continue;          // Gutenberg stock palette → skip entirely
+    let w = 1;
+    if (/(?:^|[;{\s])(color|background|background-color|border|border-color|fill|stroke)\s*:\s*$/.test(before)) w = 3;   // direct paint
+    else if (/(color|background|border|fill|stroke)\s*:\s*[^;{}]*$/.test(before)) w = 2;                                  // gradient stop / value list
+    else if (/--[\w-]*\s*:\s*$/.test(before)) w = 1;      // a custom var (could be brand: keep, low weight)
+    if (BRAND_CTX.test(before)) w += 2;                   // used on a brand element
+    score[hex] = (score[hex] || 0) + w;
   }
-  return Object.entries(count).sort((a, b) => b[1] - a[1]).map(([h]) => h);
+  return Object.entries(score).sort((a, b) => b[1] - a[1]).map(([h]) => h);
 }
 // Some reference sites' "real font" is a self-hosted/Typekit/custom font that
 // doesn't exist on Google Fonts at all — confirmed on ruma.com: "Editor Note"
@@ -6291,71 +6326,40 @@ function mdCroBrief(cro) {
 
 // The fixed markdown skeleton the model must emit. {{...}} = fill from INPUTS;
 // everything else is copied verbatim so the mandatory safety blocks can't drift.
-const HOME_MD_SKELETON = `### SYSTEM ROLE & GOAL
-You are a Lead UI/UX Engineer. Build a responsive, single-page website for "{{business_name}}" using HTML5 with embedded CSS and minimal inline vanilla JavaScript.
+const HOME_MD_SKELETON = `### GOAL
+Build a responsive single-page website for "{{business_name}}" — HTML5 with embedded CSS and minimal inline vanilla JS. Match the look, colour scheme and typography of the client's existing site at {{reference_url}} (same palette and fonts, just cleaner and higher-converting). Do NOT invent a new brand palette.
 
-### VISUAL REFERENCE
-Design inspiration/reference: {{reference_url}} — {{one sentence describing that reference's look and the section-rhythm/imagery treatment to replicate}}.
+### RULES
+- Readable text everywhere (WCAG AA): dark text on light sections; light text only over a dark image/scrim. Never light-on-light.
+- Every image is a real, in-focus HD photo relevant to a medspa; no empty/placeholder boxes; gradient scrim behind any text-over-image.
+- Sticky header (logo + nav links + CTA) with a solid/blurred background so it stays readable; a full footer at the bottom. Build header + footer as reusable blocks reused verbatim on every page.
+- No external JS libraries; minimal inline JS only for the sticky nav + on-scroll reveals. Complete production HTML — no placeholders, no TODOs, no truncation; write every section in full.
 
-### DESIGN SYSTEM & TOKENS
-Background: {{background name}} ({{background hex}})
-Accent & Borders: {{accent name}} ({{accent hex}})
-Primary Text: {{primary text hex}} (>=4.5:1 contrast against the background)
-Typography: '{{heading font}}' for headings, '{{body font}}' for body & UI. Load BOTH via Google Fonts (<link> to fonts.googleapis.com). If a font is unavailable, substitute the nearest Google Font.
-Signature shape: {{one signature container/shape treatment inferred from the reference, e.g. arched border-radius on feature images}}.
-Atmosphere: {{whitespace/alignment/aesthetic in one line}}.
-
-### TEXT READABILITY & CONTRAST (MANDATORY)
-- EVERY piece of text must be readable against whatever is behind it — >=4.5:1 (WCAG AA) body, >=3:1 large headings.
-- Light text on dark sections, dark ink on light/cream sections. Never light-on-light or dark-on-dark.
-- Text over ANY photo/hero MUST sit on a gradient or solid scrim so it stays legible — never bare text on a busy image.
-- The accent colour is for borders, labels and CTAs only — never long body paragraphs (it fails contrast).
-
-### IMAGERY (HD, NO BLUR, NO EMPTY PLACEHOLDERS)
-- CRITICAL: every image slot MUST contain a REAL, loaded photo with a valid working src. No empty/gray/dashed placeholders, no "image here" text.
-- Only sharp, in-focus, high-resolution professional photography; hero/full-width images >=1600px so they never blur full-bleed.
-- Subjects relevant to a medical-aesthetics / medspa clinic: luxury clinic interiors, skincare, injectables, wellness, clinicians.
-- Each image is a clean photograph only — no text/logos/UI baked in. Apply a subtle gradient overlay behind text-over-image. Use object-fit: cover.
-
-### ANIMATIONS (Embedded CSS + minimal inline JS)
-- Keyframes: @keyframes fadeInUp, @keyframes float, @keyframes pulseGlow.
-- Card hover translateY(-8px) scale(1.02) + accent border glow. Persistent CTA uses pulseGlow.
-- Sticky navbar transparent -> solid backdrop-blur on scroll (small inline scroll listener). On-scroll reveal via a small inline IntersectionObserver.
-
-### HEADER & FOOTER (MANDATORY — consistent, high-contrast, reused on every page)
-- A sticky top NAV/header is MANDATORY: logo left, nav links, and the accent CTA on the right.
-- The header MUST stay readable at EVERY scroll position: give it a solid or backdrop-blurred background (never fully transparent over pale hero imagery), so the logo, links and CTA keep >=4.5:1 contrast against whatever scrolls under it. This is the #1 header bug to avoid.
-- A full FOOTER is MANDATORY at the very bottom of the page (business name, address, phone, quick links, legal, oversized low-opacity wordmark). Never omit the footer.
-- Build the header and footer as self-contained, reusable blocks — the EXACT same header and footer must appear on every other page of this site.
+### DESIGN QUALITY (concrete values, not vague prose — this is what stops it looking basic)
+- Components + states: primary button rounded-lg px-6 py-3, solid accent bg, hover darken + translateY(-2px); cards rounded-xl with a 1px hairline border (~8% ink), p-6, hover lifts (-translate-y-1) with a soft shadow; inputs 1px border + a visible focus ring in the accent.
+- Depth: shadows only on cards/hover (shadow-sm resting -> shadow-lg on hover) — never a flat, borderless page.
+- Layout rhythm: section padding py-20 md:py-28, content max-width ~1200px; ALTERNATE section backgrounds (white / tinted / one full-bleed image band); use asymmetric splits (60/40), NOT identical 3-card rows every section; strong hierarchy — large display H1, small uppercase eyebrow labels in the accent colour.
+- Motion (inline CSS/JS only): on-scroll fade + 12px slide-up reveal via IntersectionObserver, 500ms ease, stagger siblings ~60ms; hover transitions 180ms ease; sticky nav fades transparent -> solid on scroll. Respect prefers-reduced-motion.
+- Don't: no 3 identical white sections in a row, no gradient text, no emoji icons, no cramped spacing, no unstyled default buttons.
 
 ### STRUCTURE ({{N}} CONTENT SECTIONS MANDATORY, plus Nav + Footer)
-Nav: Logo, nav links, persistent accent CTA [{{primary_cta}}].
-{{one numbered entry PER scanned section (in order), each with this client's REAL content — services, providers, reviews from the inputs — plus the specific CRO fix that section should address. Never invent reviews/ratings/credentials the inputs don't provide.}}
-Footer: oversized low-opacity "{{business_name}}" watermark, address, contact, legal links.
-Constraint: No external JS libraries/frameworks. Minimal INLINE vanilla JS only for the sticky-navbar scroll state and on-scroll reveals. Output full production HTML with embedded CSS + minimal inline JS.
-STRICTLY No placeholders, No TODO comments, No "content here" stubs, No truncated/abbreviated code. Every section fully written in a single pass.`;
+Nav: Logo, nav links, CTA [{{primary_cta}}].
+{{one numbered entry PER scanned section (in order), each with this client's REAL content — services, providers, reviews from the inputs — and the CRO fix it addresses. Never invent reviews/ratings/credentials.}}
+Footer: {{business_name}}, address, contact, quick links.`;
 
-const INTERIOR_MD_SKELETON = `### SYSTEM ROLE & GOAL
-You are a Lead UI/UX Engineer. Build the "{{page}}" page for "{{business_name}}" as a responsive HTML5 page with embedded CSS and minimal inline vanilla JS.
+const INTERIOR_MD_SKELETON = `### GOAL
+Build the "{{page}}" page for "{{business_name}}" — HTML5, embedded CSS, minimal inline vanilla JS.
 
-### CONSISTENCY WITH HOME (MANDATORY — do NOT re-invent the design)
-- This page is part of the SAME site as the already-built home page. Reuse EXACTLY: the same nav, the same footer, the same fonts ('{{heading font}}' / '{{body font}}'), the same palette (background {{background hex}}, accent {{accent hex}}, text {{primary text hex}}), the same button/card component styles, and the same fadeInUp/float/pulseGlow animations and sticky-navbar behaviour as the home page.
-- The HEADER and FOOTER must be byte-for-byte the SAME structure and content as the home page — same links, same logo, same CTA, same layout. Do not redesign or reorder them.
-- The header MUST stay readable at every scroll position on THIS page's background too: solid/blurred header background, logo + links + CTA at >=4.5:1 contrast. Include the full footer at the bottom.
-- Do NOT restate or redesign the design system. Match the home page's look pixel-for-pixel; only the page's CONTENT differs.
-- Reference: the home page build prompt is provided below.
+### CONSISTENCY WITH HOME (MANDATORY)
+Reuse the home page's EXACT header, footer, nav, colours, fonts, components and animations — the header + footer must be byte-for-byte identical to home. Only the page CONTENT differs. The home page prompt is provided below for reference.
 
-### TEXT READABILITY & CONTRAST (MANDATORY)
-- >=4.5:1 body / >=3:1 headings; light text on dark, dark ink on light; scrim behind all text-over-image; accent never used for body copy.
-
-### IMAGERY (HD, NO BLUR, NO EMPTY PLACEHOLDERS)
-- Every image slot is a real, loaded, in-focus HD photo (>=1600px for full-width) relevant to a medspa clinic; clean photos only; gradient overlay behind text; object-fit: cover. No placeholders.
+### RULES
+Readable text (WCAG AA, no light-on-light); real HD medspa images, no placeholders; full footer at bottom; no external JS libraries; complete production HTML, no truncation.
 
 ### STRUCTURE ({{N}} CONTENT SECTIONS MANDATORY, plus the shared Nav + Footer)
-Nav: same as home. Persistent accent CTA [{{primary_cta}}].
-{{one numbered entry PER scanned section for THIS page (in order), each with the client's real content and the relevant CRO fix. Never invent proof the inputs don't provide.}}
-Footer: same as home.
-Constraint: No external JS libraries. Minimal inline vanilla JS only. Full production HTML, no placeholders, no truncation.`;
+Nav: same as home. CTA [{{primary_cta}}].
+{{one numbered entry PER scanned section for THIS page (in order), each with the client's real content. Never invent proof the inputs don't provide.}}
+Footer: same as home.`;
 
 async function composeBuildPromptMd(ctx) {
   const { page, A, cro, theme, referenceUrl, siteStruct, homePromptRef } = ctx;
@@ -6371,8 +6375,7 @@ async function composeBuildPromptMd(ctx) {
     ``,
     `## INPUTS`,
     `Business: ${A.business_name} — ${A.practice_type || "med spa"} in ${A.location || "(location n/a)"}. Phone ${A.phone_for_website || "(n/a)"}. Primary CTA "${A.primary_cta || "Book Online"}". Booking platform: ${A.booking_platform || "(n/a)"}.`,
-    `Design reference site to emulate: ${referenceUrl || "(none — infer a tasteful luxury-medspa look)"}.`,
-    `Brand tokens — background ${theme.primary}, secondary ${theme.secondary}, accent ${theme.accent}; heading font "${theme.headingFont}", body font "${theme.bodyFont}".`,
+    `Existing site to match (its own look/colours/fonts): ${referenceUrl || "(none — infer a tasteful light medspa look)"}. Reuse THAT site's colour scheme and typography — the DESIGN SYSTEM/TOKENS block should describe the existing site's palette (bg ${theme.primary}, text ${theme.secondary}, accent ${theme.accent}; fonts ${theme.headingFont}/${theme.bodyFont}) as the site's own, not a newly invented brand.`,
     `Services offered: ${mdVal(A.services_offered) || "(n/a)"}. Revenue/priority services: ${mdVal(A.revenue_services) || "(n/a)"}. Team: ${mdVal(A.team_roster) || "(n/a)"}. Provided review: ${A.featured_review || "(none provided)"}. Financing: ${mdVal(A.financing_offered) || "(none)"}.`,
     `CRO audit of the existing site (apply these fixes on this page): ${mdCroBrief(cro)}`,
     scanned
@@ -14022,6 +14025,15 @@ const server = http.createServer(async (req, res) => {
               if (!roles.isLight && !textLight) { obj.secondaryModelPick = obj.secondary; obj.secondary = "#F4F4F4"; }
               obj.bgCorrected = `css-palette (site is ${roles.isLight ? "light" : "dark"}; model picked ${obj.primaryModelPick})`;
               console.log(`compose: background corrected from CSS palette → ${obj.primary} (was ${obj.primaryModelPick})`);
+            }
+            // Body text should be a NEUTRAL dark on a light site — not a saturated
+            // near-black hue (Gemini sometimes returns e.g. #020381 navy). Colour is
+            // the accent's job; body copy stays charcoal.
+            if (roles.isLight && (hexSat(obj.secondary) > 0.45 || hexLum(obj.secondary) > 0.55)) {
+              obj.secondaryModelPick = obj.secondaryModelPick || obj.secondary; obj.secondary = "#1F1F1F";
+            }
+            if (!roles.isLight && (hexSat(obj.secondary) > 0.45 || hexLum(obj.secondary) < 0.5)) {
+              obj.secondaryModelPick = obj.secondaryModelPick || obj.secondary; obj.secondary = "#F3F3F3";
             }
             // If Gemini invented an off-brand accent (low saturation / neutral) but the
             // site has a clearly saturated brand hue, prefer the real one.
