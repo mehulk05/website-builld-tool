@@ -505,7 +505,7 @@ async function generateWithRetry(prompt, deviceType) {
       const pid = await ensureInit();
       const args = { projectId: pid, prompt, deviceType: (deviceType || "DESKTOP").toUpperCase(), modelId: "GEMINI_3_FLASH" };
       if (DESIGN_SYSTEM) args.designSystem = DESIGN_SYSTEM;
-      const gen = await callTool("generate_screen_from_text", args);
+      const gen = await callTool("generate_screen_from_text", args, 180000);
       const ids = collectScreenIds(gen);
       if (!ids.length) throw new Error("Stitch returned no screen");
       SCREENS_MADE += ids.length;
@@ -927,7 +927,180 @@ async function stitchGenerateInProject(pid, designSystem, prompt, deviceType) {
 let GEN_PROGRESS = { phase: "idle", pages: {} };
 function genProg(key, status, extra) { GEN_PROGRESS.pages[key] = { status, ...(extra || {}), ts: Date.now() }; }
 
-async function buildStitchSite(pages, theme, deviceType) {
+function parseExpectedSectionsFromPrompt(prompt) {
+  const structureIdx = prompt.indexOf('### STRUCTURE');
+  if (structureIdx === -1) return null;
+
+  const lines = prompt.slice(structureIdx).split('\n');
+  const expected = [];
+  let inSections = false;
+
+  for (const line of lines) {
+    if (line.trim().startsWith('Nav:')) {
+      inSections = true;
+      continue;
+    }
+    if (inSections) {
+      const match = line.match(/^(\d+)\.\s*([^—\-\:]+)(?:[—\-\:](.*))?/);
+      if (match) {
+        expected.push({
+          n: parseInt(match[1]),
+          name: match[2].trim(),
+          purpose: (match[3] || '').trim()
+        });
+      } else if (line.trim().startsWith('Footer:') || line.trim().startsWith('Constraint:')) {
+        inSections = false;
+      }
+    }
+  }
+  return expected.length ? expected : null;
+}
+
+function parsePromptIntoBatches(prompt, expectedSections, batchSize = 4) {
+  const structureIdx = prompt.indexOf('### STRUCTURE');
+  if (structureIdx === -1) return [];
+
+  const prefix = prompt.slice(0, structureIdx);
+  const structureBody = prompt.slice(structureIdx);
+
+  const lines = structureBody.split('\n');
+  const sections = [];
+  let currentSection = null;
+  let navLine = '';
+  let footerLines = [];
+  let structureTitle = '';
+
+  let inSections = false;
+  for (const line of lines) {
+    if (line.startsWith('### STRUCTURE')) {
+      structureTitle = line;
+      continue;
+    }
+    if (line.trim().startsWith('Nav:')) {
+      navLine = line;
+      inSections = true;
+      continue;
+    }
+    if (inSections) {
+      const match = line.match(/^(\d+)\.\s*(.*)/);
+      if (match) {
+        if (currentSection) {
+          sections.push(currentSection);
+        }
+        currentSection = {
+          num: parseInt(match[1]),
+          title: match[2],
+          content: line
+        };
+      } else if (line.trim().startsWith('Footer:') || line.trim().startsWith('Constraint:')) {
+        inSections = false;
+        footerLines.push(line);
+      } else {
+        if (currentSection) {
+          currentSection.content += '\n' + line;
+        } else if (!navLine) {
+          structureTitle += '\n' + line;
+        }
+      }
+    } else {
+      footerLines.push(line);
+    }
+  }
+  if (currentSection) {
+    sections.push(currentSection);
+  }
+
+  const batches = [];
+  for (let i = 0; i < sections.length; i += batchSize) {
+    const batchSecs = sections.slice(i, i + batchSize);
+    let batchPrompt = prefix;
+    batchPrompt += `${structureTitle.replace(/\d+ CONTENT SECTIONS/, `${batchSecs.length} CONTENT SECTIONS`)}\n`;
+    if (navLine) batchPrompt += `${navLine}\n`;
+    batchPrompt += batchSecs.map(s => s.content).join('\n') + '\n';
+    if (footerLines.length) batchPrompt += footerLines.join('\n');
+
+    batches.push({
+      batchIndex: batches.length + 1,
+      sectionNums: batchSecs.map(s => s.num),
+      prompt: batchPrompt
+    });
+  }
+
+  return batches;
+}
+
+function extractMainContent(html) {
+  const startMatch = html.match(/<main[^>]*>/i);
+  if (!startMatch) {
+    const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+    return bodyMatch ? bodyMatch[1] : html;
+  }
+  const startIdx = startMatch.index + startMatch[0].length;
+  const endIdx = html.indexOf('</main>', startIdx);
+  if (endIdx === -1) return html.slice(startIdx);
+  return html.slice(startIdx, endIdx);
+}
+
+function combineBatches(batches) {
+  if (batches.length === 0) return '';
+  let finalHtml = batches[0].html;
+
+  let combinedSections = extractMainContent(finalHtml);
+  for (let i = 1; i < batches.length; i++) {
+    combinedSections += '\n' + extractMainContent(batches[i].html);
+  }
+
+  const mainMatch = finalHtml.match(/<main[^>]*>([\s\S]*?)<\/main>/i);
+  if (mainMatch) {
+    finalHtml = finalHtml.replace(mainMatch[1], () => combinedSections);
+  }
+
+  for (let i = 1; i < batches.length; i++) {
+    const html = batches[i].html;
+    const scripts = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)];
+    const scriptBlocks = scripts.map(m => m[0]).join('\n');
+    
+    const bodyMatch = html.match(/<\/main>([\s\S]*?)<\/body>/i);
+    if (bodyMatch) {
+      let extra = bodyMatch[1];
+      extra = extra.replace(/<footer\b[\s\S]*?<\/footer>/gi, '');
+      extra = extra.replace(/<script\b[\s\S]*?<\/script>/gi, '');
+      if (extra.trim() || scriptBlocks.trim()) {
+        finalHtml = finalHtml.replace('</body>', () => extra + '\n' + scriptBlocks + '\n</body>');
+      }
+    }
+  }
+
+  return finalHtml;
+}
+
+async function generatePageInBatches(pid, designSystem, prompt, expectedSections, pageKey, deviceType) {
+  const batches = parsePromptIntoBatches(prompt, expectedSections, 4);
+  if (!batches.length) {
+    return await stitchGenerateInProject(pid, designSystem, prompt, deviceType);
+  }
+
+  console.log(`stitch: splitting generation for ${pageKey} into ${batches.length} batches`);
+  const results = [];
+  for (const batch of batches) {
+    console.log(`stitch: building ${pageKey} batch ${batch.batchIndex}/${batches.length} (sections: ${batch.sectionNums.join(', ')})`);
+    genProg(pageKey, "building", { detail: `Generating batch ${batch.batchIndex}/${batches.length}...` });
+    const res = await stitchGenerateInProject(pid, designSystem, batch.prompt, deviceType);
+    if (!res.html) {
+      throw new Error(`Batch ${batch.batchIndex} of ${pageKey} generated no HTML`);
+    }
+    results.push(res);
+  }
+
+  const combinedHtml = combineBatches(results);
+  return {
+    screenId: results[0].screenId,
+    html: combinedHtml,
+    screenshotUrl: results[0].screenshotUrl
+  };
+}
+
+async function buildStitchSite(pages, theme, deviceType, siteStructure) {
   GEN_PROGRESS = { phase: "starting", pages: {} };
   pages.forEach(p => genProg(p.key, "queued"));
   const init = await rpc("initialize", { protocolVersion: PROTO, capabilities: {}, clientInfo: { name: "g99-tool", version: "0.2" } });
@@ -948,20 +1121,74 @@ async function buildStitchSite(pages, theme, deviceType) {
   try { designSystem = await createDesignSystemForSite(pid, theme); console.log("design system:", designSystem); }
   catch (e) { console.warn("design system creation failed (continuing without):", e.message.slice(0, 120)); }
 
+  // Fetch the reference/existing site's home page section structure ONCE before
+  // generating — used by healPage to audit the new home page against real expectations.
+  // theme.referenceUrl is set by the caller (runJob passes job.referenceWebsite || job.existingWebsite).
+  GEN_PROGRESS.phase = "scanning-reference";
+  let homeExpectedSections = null;
+  const refUrl = theme.referenceUrl || "";
+  if (refUrl) {
+    homeExpectedSections = await extractExpectedSections(refUrl);
+    if (homeExpectedSections) {
+      console.log(`reference sections (${homeExpectedSections.length}): ${homeExpectedSections.map(s => s.name).join(", ")}`);
+    }
+  }
+
   GEN_PROGRESS.phase = "generating";
-  const results = await Promise.all(pages.map(async (p) => {
-    genProg(p.key, "generating");
+  // Generate ONE page: build → validate/heal → finalize. Emits fine-grained live
+  // phases per page (R4) and captures the heal detail (R2/R3).
+  const genOne = async (p) => {
+    genProg(p.key, "building");                        // sent to Stitch, page being built
     try {
-      let out = await stitchGenerateInProject(pid, designSystem, p.prompt, deviceType);
+      let expectedSections = parseExpectedSectionsFromPrompt(p.prompt);
+      console.log(`[genOne] (${p.key}) parseExpectedSectionsFromPrompt:`, Array.isArray(expectedSections) ? `Array(${expectedSections.length})` : expectedSections);
+      if (!Array.isArray(expectedSections) || !expectedSections.length) {
+        if (p.key === "home") {
+          expectedSections = homeExpectedSections;
+          console.log(`[genOne] (${p.key}) fell back to homeExpectedSections:`, Array.isArray(expectedSections) ? `Array(${expectedSections.length})` : expectedSections);
+        } else {
+          expectedSections = null;
+          console.log(`[genOne] (${p.key}) no prompt structure and not home, using keyword fallback`);
+        }
+      }
+      console.log(`[genOne] (${p.key}) final expectedSections:`, Array.isArray(expectedSections) ? `Array(${expectedSections.length})` : expectedSections);
+      let out;
+      if (p.key === "home" && expectedSections && expectedSections.length > 5) {
+        out = await generatePageInBatches(pid, designSystem, p.prompt, expectedSections, p.key, deviceType);
+      } else {
+        out = await stitchGenerateInProject(pid, designSystem, p.prompt, deviceType);
+      }
+      
       if (out.html && out.screenId) {
-        genProg(p.key, "healing");
-        const healed = await healPage(pid, out.screenId, out.html, p.key);
+        genProg(p.key, "validating");                  // auditing the built page vs expected sections
+        const healed = await healPage(pid, out.screenId, out.html, p.key,
+          expectedSections,
+          (d) => genProg(p.key, (d.rounds || []).some((r) => r.action === "healing") ? "healing" : "validating", { healDetail: d }));
         out = { ...out, ...healed };
       }
-      genProg(p.key, out.html ? "post-processing" : "error", out.html ? {} : { error: "no HTML" });
+      genProg(p.key, out.html ? "post-processing" : "error", out.html ? { healDetail: out.healDetail || null } : { error: "no HTML" });
       return { key: p.key, ...out };
     } catch (e) { genProg(p.key, "error", { error: e.message.slice(0, 120) }); return { key: p.key, error: e.message, html: "" }; }
-  }));
+  };
+
+  // R8: HOME first — it must fully build + validate + heal before the others start,
+  // because header/footer/front-page all derive from home and the interior prompts
+  // reference it. Only after home succeeds do we fan out the rest in parallel.
+  const homePage = pages.find((p) => p.key === "home");
+  const restPages = pages.filter((p) => p.key !== "home");
+  let results = [];
+  if (homePage) {
+    console.log("stitch: building HOME first (sequential) …");
+    const homeRes = await genOne(homePage);
+    results.push(homeRes);
+    if (!homeRes.html) console.warn("stitch: HOME produced no HTML — interior pages will still attempt, but the theme derives from home");
+    if (restPages.length) {
+      console.log(`stitch: HOME done — fanning out ${restPages.length} interior page(s) …`);
+      results.push(...await Promise.all(restPages.map(genOne)));
+    }
+  } else {
+    results = await Promise.all(pages.map(genOne));
+  }
   const meta = { projectId: pid, designSystem, screens: {} };
   results.forEach(r => { if (r.screenId) meta.screens[r.key] = r.screenId; });
   results.forEach(r => { if (r.error) console.warn(`stitch page "${r.key}" failed:`, String(r.error).slice(0, 240)); });
@@ -979,13 +1206,13 @@ async function buildStitchSite(pages, theme, deviceType) {
 // Each Stitch API key belongs to a separate Google account, so a project created
 // under key N is not accessible by key N+1 — the entire build (project + design
 // system + all pages) must restart under the new key.
-async function buildStitchSiteWithKeyRotation(pages, theme, deviceType) {
+async function buildStitchSiteWithKeyRotation(pages, theme, deviceType, siteStructure) {
   // When a per-job key override is active, pin skIdx to that key and skip rotation.
   if (STITCH_KEY_OVERRIDE) {
     const idx = STITCH_KEYS.indexOf(STITCH_KEY_OVERRIDE);
     if (idx >= 0) skIdx = idx;
     PROJECT = null; SCREENS_MADE = 0; DESIGN_SYSTEM = null; PROTO = "2024-11-05";
-    return await buildStitchSite(pages, theme, deviceType);
+    return await buildStitchSite(pages, theme, deviceType, siteStructure);
   }
   let lastErr = null;
   const attempts = Math.max(STITCH_KEYS.length, 1);
@@ -994,7 +1221,7 @@ async function buildStitchSiteWithKeyRotation(pages, theme, deviceType) {
       // Reset Stitch MCP session so ensureInit() (called inside generateWithRetry)
       // creates a brand-new project under the current skIdx key.
       PROJECT = null; SCREENS_MADE = 0; DESIGN_SYSTEM = null; PROTO = "2024-11-05";
-      return await buildStitchSite(pages, theme, deviceType);
+      return await buildStitchSite(pages, theme, deviceType, siteStructure);
     } catch (e) {
       lastErr = e;
       const isQuota = /RESOURCE_EXHAUSTED|quota/i.test(e.message);
@@ -1145,71 +1372,163 @@ async function stitchRefine(projectId, screenId, comments, deviceType) {
 }
 
 // ----------------------------------------- Heal loop: detect + fill missing sections
-// Per-page mandatory sections with detection keywords (any match = present).
-const HEAL_SECTIONS = {
-  home: [
-    { n: 1,  name: "Hero",                  kw: ["book online", "book now", "book a consultation", "regenerative", "refined results", "hero", "full-viewport", "cinematic"] },
-    { n: 2,  name: "Intro / Why Us",        kw: ["why patients choose", "patients choose", "intro", "about us", "our story", "our approach", "philosophy"] },
-    { n: 3,  name: "Signature Treatments",  kw: ["signature treat", "featured treat", "revenue service", "highlighted service", "treatment card", "hover card"] },
-    { n: 4,  name: "Service Categories",    kw: ["service categor", "all services", "our services", "treatment categor", "injectables", "neuromodulator", "dermal filler"] },
-    { n: 5,  name: "Stats / Trust Band",    kw: ["patients treated", "years of experience", "5-star", "4.9", "board certified", "trust", "award", "stat"] },
-    { n: 6,  name: "Feature Section",       kw: ["curved image", "arched", "gold border", "feature", "spotlight", "showcase"] },
-    { n: 7,  name: "Providers / Team",      kw: ["provider", "meet our team", "meet the team", "doctor", "nurse", "np-c", "aprn", "credentials", "team member"] },
-    { n: 8,  name: "Testimonial",           kw: ["testimonial", "review", "what our patients", "patient stor", "what clients say", "five stars", "before and after"] },
-    { n: 9,  name: "Membership / Financing",kw: ["member", "financing", "care credit", "alle", "aspire", "payment plan", "loyalty"] },
-    { n: 10, name: "Booking Panel",         kw: ["booking panel", "schedule", "book a consultation", "select a service", "date picker", "book your appointment", "book appointment", "book now", "online booking"] },
-  ],
+//
+// HOME PAGE — 2-step Gemini flow (client-agnostic, no hardcoded sections):
+//   Step 1: extractExpectedSections(refUrl) — fetch reference site home HTML,
+//           Gemini extracts [{n,name,purpose}] — the "what should be there" list.
+//   Step 2: geminiAuditAgainstExpected(html, expected) — audit new page HTML
+//           against that list, get back present/missing JSON.
+//   Called at most 2 rounds — never loops infinitely.
+//
+// OTHER PAGES (services/about/contact) — lightweight keyword scan (fast, free).
+
+// Step 1: fetch reference/existing site home page and ask Gemini to extract its
+// section structure. Returns [{n, name, purpose}] or null on any failure.
+async function extractExpectedSections(refUrl) {
+  if (!refUrl) return null;
+  let homeUrl = refUrl;
+  try { homeUrl = new URL(refUrl).origin + "/"; } catch (e) { /* keep as-is */ }
+  try {
+    console.log(`  extractExpectedSections: scanning ${homeUrl}`);
+    const r = await fetch(homeUrl, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 G99Bot" }, signal: AbortSignal.timeout(15000) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const pageText = (await r.text())
+      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[\s\S]*?<\/style>/gi, "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s{2,}/g, " ")
+      .slice(0, 8000);
+    const prompt = [
+      `Analyze the text content of this medspa homepage and list every distinct content section in order.`,
+      `For each section provide: a short name (2-5 words) and one sentence describing its purpose/content.`,
+      `Return ONLY a JSON array — no markdown, no commentary:`,
+      `[{"n":1,"name":"Hero","purpose":"Full-viewport headline with CTA button"},{"n":2,"name":"Services Overview","purpose":"Grid of treatment categories with images"},...]`,
+      ``,
+      `Page text:`,
+      pageText,
+    ].join("\n");
+    const raw = await geminiCall([{ text: prompt }], { temperature: 0.1, maxOutputTokens: 1000, timeoutMs: 30000 });
+    const match = raw.match(/\[[\s\S]*\]/);
+    if (!match) throw new Error("no JSON array");
+    const sections = JSON.parse(match[0]);
+    if (!Array.isArray(sections) || sections.length < 2) throw new Error("too few sections");
+    console.log(`  extractExpectedSections: ${sections.length} sections found on ${homeUrl}`);
+    return sections;
+  } catch (e) {
+    console.warn(`  extractExpectedSections failed (${e.message.slice(0, 100)})`);
+    return null;
+  }
+}
+
+// Step 2: given the expected section list, audit the new generated home page HTML.
+// Returns {present, missing, total, source} — same shape as detectMissingSections.
+async function geminiAuditAgainstExpected(html, expectedSections) {
+  const pageText = html
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .slice(0, 30000);
+  const sectionList = expectedSections.map(s => `${s.n}. ${s.name}${s.purpose ? " — " + s.purpose : ""}`).join("\n");
+  const prompt = [
+    `You are auditing a newly generated medspa page against a required section checklist.`,
+    ``,
+    `REQUIRED SECTIONS:`,
+    sectionList,
+    ``,
+    `Check the generated page text below. For each required section, mark present:true if the page`,
+    `contains meaningful content serving that section's purpose (heading wording may differ — judge by content, not exact words).`,
+    `Mark present:false if the section is absent or has only a placeholder/stub.`,
+    ``,
+    `Return ONLY a JSON array — no markdown, no commentary:`,
+    `[{"n":1,"name":"Hero","present":true},{"n":2,"name":"Services Overview","present":false},...]`,
+    ``,
+    `Generated page text:`,
+    pageText,
+  ].join("\n");
+  try {
+    const raw = await geminiCall([{ text: prompt }], { temperature: 0.1, maxOutputTokens: 2000, timeoutMs: 30000 });
+    const match = raw.match(/\[[\s\S]*\]/);
+    if (!match) throw new Error("no JSON array");
+    const sections = JSON.parse(match[0]);
+    const present = sections.filter(s => s.present);
+    const missing = sections.filter(s => !s.present);
+    return { present, missing, total: sections.length, source: "gemini" };
+  } catch (e) {
+    console.warn(`  geminiAuditAgainstExpected failed (${e.message.slice(0, 80)}), using keyword fallback`);
+    return null;
+  }
+}
+
+// Keyword-based fallback for non-home pages (services/about/contact).
+const HEAL_SECTIONS_FALLBACK = {
   services: [
-    { n: 1,  name: "Hero",          kw: ["our treatments", "our services", "hero", "full-bleed"] },
-    { n: 2,  name: "Categories",    kw: ["injectables", "neuromodulator", "dermal filler", "skin", "laser", "service card"] },
-    { n: 3,  name: "Spotlight",     kw: ["signature", "revenue service", "feature", "spotlight"] },
-    { n: 4,  name: "Financing",     kw: ["financing", "payment", "care credit", "alle", "membership"] },
-    { n: 5,  name: "Booking Panel", kw: ["book", "schedule", "date picker", "select a service"] },
+    { n: 1, name: "Hero",          kw: ["our treatments", "our services", "hero"] },
+    { n: 2, name: "Categories",    kw: ["injectables", "neuromodulator", "dermal filler", "skin", "laser"] },
+    { n: 3, name: "Spotlight",     kw: ["signature", "featured", "spotlight"] },
+    { n: 4, name: "Financing",     kw: ["financing", "payment", "care credit", "alle", "membership"] },
+    { n: 5, name: "Booking Panel", kw: ["book", "schedule", "date picker"] },
   ],
   about: [
-    { n: 1,  name: "Hero",        kw: ["about us", "our story", "who we are", "hero"] },
-    { n: 2,  name: "Practice Story", kw: ["our story", "our practice", "our philosophy", "founded", "dedicated"] },
-    { n: 3,  name: "Team",        kw: ["meet the team", "meet our team", "our providers", "doctor", "nurse", "credentials"] },
-    { n: 4,  name: "Testimonial", kw: ["testimonial", "review", "patient", "five stars", "what clients"] },
-    { n: 5,  name: "Booking Panel", kw: ["book", "schedule", "consultation"] },
+    { n: 1, name: "Hero",           kw: ["about us", "our story", "who we are"] },
+    { n: 2, name: "Practice Story", kw: ["our story", "our practice", "philosophy", "founded", "dedicated"] },
+    { n: 3, name: "Team",           kw: ["meet the team", "our providers", "doctor", "nurse", "credentials"] },
+    { n: 4, name: "Testimonial",    kw: ["testimonial", "review", "patient"] },
+    { n: 5, name: "Booking Panel",  kw: ["book", "schedule", "consultation"] },
   ],
   contact: [
-    { n: 1,  name: "Hero",        kw: ["contact us", "get in touch", "reach us", "hero"] },
-    { n: 2,  name: "Consultation Form", kw: ["form", "input", "submit", "your name", "email address", "message"] },
-    { n: 3,  name: "Booking Panel", kw: ["book", "schedule", "date picker", "select a service", "online booking"] },
-    { n: 4,  name: "Location / Map", kw: ["location", "address", "directions", "map", "find us"] },
+    { n: 1, name: "Hero",               kw: ["contact us", "get in touch", "reach us"] },
+    { n: 2, name: "Consultation Form",  kw: ["form", "input", "submit", "your name", "email"] },
+    { n: 3, name: "Booking Panel",      kw: ["book", "schedule", "date picker", "online booking"] },
+    { n: 4, name: "Location / Map",     kw: ["location", "address", "directions", "map"] },
   ],
 };
-function detectMissingSections(html, pageKey) {
-  const sections = HEAL_SECTIONS[pageKey] || HEAL_SECTIONS.home;
+function keywordDetect(html, pageKey) {
+  const sections = HEAL_SECTIONS_FALLBACK[pageKey] || [];
+  if (!sections.length) return { present: [], missing: [], total: 0, source: "keyword" };
   const h = html.toLowerCase();
   const present = [], missing = [];
   for (const s of sections) (s.kw.some(k => h.includes(k)) ? present : missing).push(s);
-  return { present, missing, total: sections.length };
+  return { present, missing, total: sections.length, source: "keyword" };
 }
+
 function buildHealPrompt(missing) {
   return [
     `This luxury medspa page is MISSING the following mandatory sections — they were not rendered:`,
-    ...missing.map(s => `- Section ${s.n}: ${s.name}`),
+    ...missing.map(s => `- Section ${s.n}: ${s.name}${s.purpose ? " (" + s.purpose + ")" : ""}`),
     ``,
     `ADD each missing section as a full, visually rich band in its correct numeric position. Match the EXISTING page EXACTLY: same background, same accent color, same heading font, same body font, same nav, same footer.`,
     `Every added section needs real HD professional photography (no gray placeholder boxes), readable text (≥4.5:1 contrast, scrim behind text-over-images), and the same hover / fadeInUp animations used on the rest of the page.`,
     `KEEP every section that already exists — do NOT remove, reorder, or rewrite existing content. ONLY ADD the listed missing sections.`,
   ].join("\n");
 }
-async function healPage(pid, screenId, html, pageKey) {
+
+// Main heal function. expectedSections is pre-fetched from the reference site
+// (only passed for home page). Max 2 rounds — never loops beyond that.
+async function healPage(pid, screenId, html, pageKey, expectedSections, onDetail) {
   let curHtml = html, curScreenId = screenId;
   const MAX_ROUNDS = 2;
+  // detail is surfaced to the UI (R2/R3): what the audit expected, what was present/missing,
+  // and what each heal round did.
+  const detail = { source: null, expected: (expectedSections || []).map((s) => s.name), present: [], missing: [], sectionTags: 0, rounds: [] };
+  const emit = () => { try { if (onDetail) onDetail({ ...detail }); } catch (e) { /* ignore */ } };
   for (let round = 1; round <= MAX_ROUNDS; round++) {
-    const { present, missing, total } = detectMissingSections(curHtml, pageKey);
-    const secTags = (curHtml.match(/<section\b/gi) || []).length;
-    console.log(`  heal check [${pageKey}] round ${round}: ${present.length}/${total} sections present (${secTags} <section> tags)`);
-    if (!missing.length) { console.log(`  ✅ [${pageKey}] all sections present`); break; }
-    if (missing.length === total) {
-      console.log(`  ⚠ [${pageKey}] heal skipped — all sections missing (base generate likely failed)`);
-      break;
+    // Audit against expected sections if available, otherwise keyword scan fallback
+    let audit = null;
+    if (expectedSections && expectedSections.length) {
+      audit = await geminiAuditAgainstExpected(curHtml, expectedSections);
     }
-    console.log(`  ↻ [${pageKey}] heal round ${round}: adding ${missing.length} missing: ${missing.map(s => s.name).join(", ")}`);
+    if (!audit) audit = keywordDetect(curHtml, pageKey);
+
+    const { present, missing, total, source } = audit;
+    const secTags = (curHtml.match(/<section\b/gi) || []).length;
+    detail.source = source; detail.present = present.map((s) => s.name); detail.missing = missing.map((s) => s.name); detail.sectionTags = secTags;
+    console.log(`  heal check [${pageKey}] round ${round} (${source}): ${present.length}/${total} present (${secTags} <section> tags)`);
+    if (!missing.length) { console.log(`  ✅ [${pageKey}] all sections present`); detail.rounds.push({ n: round, action: "all-present", missing: [] }); emit(); break; }
+    if (missing.length === total) { console.log(`  ⚠ [${pageKey}] all sections missing — skipping heal (base generate failed)`); detail.rounds.push({ n: round, action: "skip-base-failed", missing: missing.map((s) => s.name) }); emit(); break; }
+    console.log(`  ↻ [${pageKey}] heal round ${round}: adding ${missing.length} missing → ${missing.map((s) => s.name).join(", ")}`);
+    const roundRec = { n: round, action: "healing", missing: missing.map((s) => s.name) };
+    detail.rounds.push(roundRec); emit();
     try {
       const eg = await callTool("edit_screens", { projectId: pid, selectedScreenIds: [curScreenId], prompt: buildHealPrompt(missing), deviceType: "DESKTOP", modelId: "GEMINI_3_FLASH" }, 180000);
       let eids = collectScreenIds(eg); if (!eids.length) eids = [curScreenId];
@@ -1225,11 +1544,12 @@ async function healPage(pid, screenId, html, pageKey) {
         if (best) break;
         await sleep(3500);
       }
-      if (best) { curScreenId = best.id; curHtml = best.html; }
-      else { console.warn(`  heal round ${round} [${pageKey}]: no HTML returned, keeping previous`); break; }
-    } catch (e) { console.warn(`  heal round ${round} [${pageKey}] failed: ${e.message.slice(0, 160)}`); break; }
+      if (best) { curScreenId = best.id; curHtml = best.html; roundRec.action = "added"; roundRec.added = roundRec.missing; }
+      else { console.warn(`  heal round ${round} [${pageKey}]: no HTML returned, keeping previous`); roundRec.action = "no-html"; emit(); break; }
+    } catch (e) { console.warn(`  heal round ${round} [${pageKey}] failed: ${e.message.slice(0, 160)}`); roundRec.action = "error"; roundRec.error = e.message.slice(0, 120); emit(); break; }
+    emit();
   }
-  return { screenId: curScreenId, html: curHtml };
+  return { screenId: curScreenId, html: curHtml, healDetail: detail };
 }
 
 // --------------------------------------------- AI bind brain (Gemini now, Claude-swappable)
@@ -2092,6 +2412,21 @@ function assignPaletteRoles(pal) {
   const secondary = info.find((x) => x.hex !== primary.hex && x.hex !== accent.hex) || accent;
   return { primary: primary.hex, secondary: secondary.hex, accent: accent.hex };
 }
+// Background-aware roles from the CSS palette (used to CORRECT compose when the
+// screenshot analyzer fails and Gemini's luxury bias forces a dark background on
+// a light-background brand). primary here = BACKGROUND (the site's real surface),
+// which is the opposite axis from assignPaletteRoles' darkest-is-primary.
+function hexLum(hex) { const h = String(hex).replace("#", ""); if (h.length < 6) return 0; const r = parseInt(h.slice(0, 2), 16), g = parseInt(h.slice(2, 4), 16), b = parseInt(h.slice(4, 6), 16); return (0.299 * r + 0.587 * g + 0.114 * b) / 255; }
+function hexSat(hex) { const h = String(hex).replace("#", ""); if (h.length < 6) return 0; const r = parseInt(h.slice(0, 2), 16), g = parseInt(h.slice(2, 4), 16), b = parseInt(h.slice(4, 6), 16); const mx = Math.max(r, g, b), mn = Math.min(r, g, b); return mx ? (mx - mn) / mx : 0; }
+function paletteBgRoles(pal) {
+  const valid = (pal || []).filter((h) => /^#[0-9a-fA-F]{6}$/.test(h));
+  if (!valid.length) return null;
+  const light = valid.filter((h) => hexLum(h) > 0.85);
+  const bg = (light.length ? light : valid).slice().sort((a, b) => hexLum(b) - hexLum(a))[0];
+  const text = valid.slice().sort((a, b) => hexLum(a) - hexLum(b))[0];
+  const accent = valid.filter((h) => hexSat(h) > 0.25 && hexLum(h) > 0.12 && hexLum(h) < 0.9).sort((a, b) => hexSat(b) - hexSat(a))[0] || null;
+  return { bg, text, accent, isLight: hexLum(bg) > 0.6 };
+}
 function readThemeBrand(themeDir) {
   try {
     let html = "";
@@ -2176,6 +2511,54 @@ const escapeRe = (s) => String(s || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 // footer at all even though it appeared elsewhere on the page. Same lesson as
 // enforceArbitraryColors/enforceBrandFonts above: asking is not enough for an
 // exact fact in an exact spot — rewrite it after the fact instead.
+// R6/R9: make the header + footer identical across every page. Stitch generates
+// each page independently, so its header drifts page to page — we copy HOME's
+// header/footer onto the others deterministically. Function replacers are used so
+// a `$` inside the markup can't be read as a replacement-pattern token.
+function extractChrome(html) {
+  const s = String(html);
+  const header = (s.match(/<header\b[\s\S]*?<\/header>/i) || s.match(/<nav\b[\s\S]*?<\/nav>/i) || [""])[0];
+  const footer = (s.match(/<footer\b[\s\S]*?<\/footer>/i) || [""])[0];
+  return { header, footer };
+}
+function applyChrome(html, header, footer) {
+  let out = String(html);
+  if (header) {
+    if (/<header\b[\s\S]*?<\/header>/i.test(out)) out = out.replace(/<header\b[\s\S]*?<\/header>/i, () => header);
+    else if (/<nav\b[\s\S]*?<\/nav>/i.test(out)) out = out.replace(/<nav\b[\s\S]*?<\/nav>/i, () => header);
+    else if (/<body[^>]*>/i.test(out)) out = out.replace(/(<body[^>]*>)/i, (m) => m + header);
+    else out = header + out;
+  }
+  if (footer) {
+    if (/<footer\b[\s\S]*?<\/footer>/i.test(out)) out = out.replace(/<footer\b[\s\S]*?<\/footer>/i, () => footer);
+    else if (/<\/body>/i.test(out)) out = out.replace(/<\/body>/i, () => footer + "</body>");
+    else out = out + footer;
+  }
+  return out;
+}
+// R7: guarantee a footer. If Stitch omitted one (it sometimes does on the home
+// page, which then strips through to an empty footer.php for the whole theme),
+// inject a branded footer from the onboarding facts, styled to the brand.
+function ensureFooter(html, theme) {
+  if (/<footer\b/i.test(String(html))) return html;
+  const esch = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  let A = {}; try { A = JSON.parse(fs.readFileSync(path.join(DIR, "onboarding.json"), "utf8")).answers || {}; } catch (e) { /* ignore */ }
+  const t = theme || {};
+  const bg = t.secondary || t.primary || "#161312";
+  const ink = t.bodyTextColor || "#F4F2EE";
+  const accent = t.accent || "#C5A059";
+  const biz = A.business_name || "", loc = A.location || "", ph = A.phone_for_website || "", cta = A.primary_cta || "Book Online";
+  const foot = `<footer style="background:${esch(bg)};color:${esch(ink)};padding:64px 24px 40px;text-align:center;font-family:sans-serif;position:relative;overflow:hidden">
+    <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:15vw;font-weight:800;opacity:.05;white-space:nowrap;pointer-events:none">${esch(biz)}</div>
+    <div style="position:relative;z-index:1">
+      <div style="font-size:24px;font-weight:700;letter-spacing:.02em;margin-bottom:12px">${esch(biz)}</div>
+      <div style="opacity:.85;font-size:14px;line-height:1.9">${esch(loc)}${loc && ph ? " &middot; " : ""}${esch(ph)}</div>
+      <div style="margin-top:18px"><a href="contact.html" style="display:inline-block;background:${esch(accent)};color:#111;padding:12px 26px;border-radius:6px;text-decoration:none;font-weight:700">${esch(cta)}</a></div>
+      <div style="margin-top:22px;opacity:.55;font-size:12px">&copy; ${esch(biz)} &middot; All rights reserved</div>
+    </div>
+  </footer>`;
+  return /<\/body>/i.test(html) ? html.replace(/<\/body>/i, foot + "</body>") : html + foot;
+}
 function enforceFooterFacts(html) {
   const m = String(html).match(/<footer\b[\s\S]*?<\/footer>/i);
   if (!m) return html;
@@ -5878,6 +6261,133 @@ function mapG99Answers(list) {
 // footer before classifying sections (so it never shows up "in the flow").
 const FOOTER_DIRECTIVE = (A) =>
   `FOOTER (required): ${A.business_name || "the business"}, full address "${A.location || "(address)"}", phone as a tel: link "${A.phone_for_website || ""}", and a legal/policy row (Privacy Policy · Terms · Accessibility).`;
+// ============================================================================
+// Gemini-authored MD build prompts (MD_PROMPT plan). Nothing about a page —
+// tokens, sections, copy — is hardcoded: Gemini derives it all from CRO +
+// onboarding + the scanned existing-site sections. Only the FORMAT is fixed.
+// Behind MD_PROMPT=on so it can be A/B'd against the legacy hardcoded path.
+// ============================================================================
+const MD_PROMPT_ON = /^(1|on|true|yes)$/i.test(process.env.MD_PROMPT || "");
+
+function mdVal(v) {
+  if (Array.isArray(v)) return v.map((x) => (x && typeof x === "object") ? [x.name, x.role, x.title].filter(Boolean).join(", ") : String(x)).filter(Boolean).join("; ");
+  return v == null ? "" : String(v);
+}
+function mdScannedSections(siteStruct, key) {
+  const p = siteStruct && siteStruct.pages && siteStruct.pages[key];
+  const secs = p && Array.isArray(p.sections) ? p.sections : null;
+  if (!secs || !secs.length) return null;
+  return secs.map((s, i) => `${i + 1}. ${typeof s === "string" ? s : (s.name || s.heading || s.title || ("Section " + (i + 1)))}${s && s.purpose ? " — " + s.purpose : ""}`).join("\n");
+}
+function mdCroBrief(cro) {
+  if (!cro) return "No prior audit available.";
+  const s = cro.summary || {};
+  return [
+    `Existing site scored ${cro.overall}/100.`,
+    s.weaknesses && s.weaknesses.length ? "Weaknesses to fix: " + s.weaknesses.join(" · ") : "",
+    s.topRecommendations && s.topRecommendations.length ? "Top recommendations to apply: " + s.topRecommendations.join(" · ") : "",
+  ].filter(Boolean).join("\n");
+}
+
+// The fixed markdown skeleton the model must emit. {{...}} = fill from INPUTS;
+// everything else is copied verbatim so the mandatory safety blocks can't drift.
+const HOME_MD_SKELETON = `### SYSTEM ROLE & GOAL
+You are a Lead UI/UX Engineer. Build a responsive, single-page website for "{{business_name}}" using HTML5 with embedded CSS and minimal inline vanilla JavaScript.
+
+### VISUAL REFERENCE
+Design inspiration/reference: {{reference_url}} — {{one sentence describing that reference's look and the section-rhythm/imagery treatment to replicate}}.
+
+### DESIGN SYSTEM & TOKENS
+Background: {{background name}} ({{background hex}})
+Accent & Borders: {{accent name}} ({{accent hex}})
+Primary Text: {{primary text hex}} (>=4.5:1 contrast against the background)
+Typography: '{{heading font}}' for headings, '{{body font}}' for body & UI. Load BOTH via Google Fonts (<link> to fonts.googleapis.com). If a font is unavailable, substitute the nearest Google Font.
+Signature shape: {{one signature container/shape treatment inferred from the reference, e.g. arched border-radius on feature images}}.
+Atmosphere: {{whitespace/alignment/aesthetic in one line}}.
+
+### TEXT READABILITY & CONTRAST (MANDATORY)
+- EVERY piece of text must be readable against whatever is behind it — >=4.5:1 (WCAG AA) body, >=3:1 large headings.
+- Light text on dark sections, dark ink on light/cream sections. Never light-on-light or dark-on-dark.
+- Text over ANY photo/hero MUST sit on a gradient or solid scrim so it stays legible — never bare text on a busy image.
+- The accent colour is for borders, labels and CTAs only — never long body paragraphs (it fails contrast).
+
+### IMAGERY (HD, NO BLUR, NO EMPTY PLACEHOLDERS)
+- CRITICAL: every image slot MUST contain a REAL, loaded photo with a valid working src. No empty/gray/dashed placeholders, no "image here" text.
+- Only sharp, in-focus, high-resolution professional photography; hero/full-width images >=1600px so they never blur full-bleed.
+- Subjects relevant to a medical-aesthetics / medspa clinic: luxury clinic interiors, skincare, injectables, wellness, clinicians.
+- Each image is a clean photograph only — no text/logos/UI baked in. Apply a subtle gradient overlay behind text-over-image. Use object-fit: cover.
+
+### ANIMATIONS (Embedded CSS + minimal inline JS)
+- Keyframes: @keyframes fadeInUp, @keyframes float, @keyframes pulseGlow.
+- Card hover translateY(-8px) scale(1.02) + accent border glow. Persistent CTA uses pulseGlow.
+- Sticky navbar transparent -> solid backdrop-blur on scroll (small inline scroll listener). On-scroll reveal via a small inline IntersectionObserver.
+
+### HEADER & FOOTER (MANDATORY — consistent, high-contrast, reused on every page)
+- A sticky top NAV/header is MANDATORY: logo left, nav links, and the accent CTA on the right.
+- The header MUST stay readable at EVERY scroll position: give it a solid or backdrop-blurred background (never fully transparent over pale hero imagery), so the logo, links and CTA keep >=4.5:1 contrast against whatever scrolls under it. This is the #1 header bug to avoid.
+- A full FOOTER is MANDATORY at the very bottom of the page (business name, address, phone, quick links, legal, oversized low-opacity wordmark). Never omit the footer.
+- Build the header and footer as self-contained, reusable blocks — the EXACT same header and footer must appear on every other page of this site.
+
+### STRUCTURE ({{N}} CONTENT SECTIONS MANDATORY, plus Nav + Footer)
+Nav: Logo, nav links, persistent accent CTA [{{primary_cta}}].
+{{one numbered entry PER scanned section (in order), each with this client's REAL content — services, providers, reviews from the inputs — plus the specific CRO fix that section should address. Never invent reviews/ratings/credentials the inputs don't provide.}}
+Footer: oversized low-opacity "{{business_name}}" watermark, address, contact, legal links.
+Constraint: No external JS libraries/frameworks. Minimal INLINE vanilla JS only for the sticky-navbar scroll state and on-scroll reveals. Output full production HTML with embedded CSS + minimal inline JS.
+STRICTLY No placeholders, No TODO comments, No "content here" stubs, No truncated/abbreviated code. Every section fully written in a single pass.`;
+
+const INTERIOR_MD_SKELETON = `### SYSTEM ROLE & GOAL
+You are a Lead UI/UX Engineer. Build the "{{page}}" page for "{{business_name}}" as a responsive HTML5 page with embedded CSS and minimal inline vanilla JS.
+
+### CONSISTENCY WITH HOME (MANDATORY — do NOT re-invent the design)
+- This page is part of the SAME site as the already-built home page. Reuse EXACTLY: the same nav, the same footer, the same fonts ('{{heading font}}' / '{{body font}}'), the same palette (background {{background hex}}, accent {{accent hex}}, text {{primary text hex}}), the same button/card component styles, and the same fadeInUp/float/pulseGlow animations and sticky-navbar behaviour as the home page.
+- The HEADER and FOOTER must be byte-for-byte the SAME structure and content as the home page — same links, same logo, same CTA, same layout. Do not redesign or reorder them.
+- The header MUST stay readable at every scroll position on THIS page's background too: solid/blurred header background, logo + links + CTA at >=4.5:1 contrast. Include the full footer at the bottom.
+- Do NOT restate or redesign the design system. Match the home page's look pixel-for-pixel; only the page's CONTENT differs.
+- Reference: the home page build prompt is provided below.
+
+### TEXT READABILITY & CONTRAST (MANDATORY)
+- >=4.5:1 body / >=3:1 headings; light text on dark, dark ink on light; scrim behind all text-over-image; accent never used for body copy.
+
+### IMAGERY (HD, NO BLUR, NO EMPTY PLACEHOLDERS)
+- Every image slot is a real, loaded, in-focus HD photo (>=1600px for full-width) relevant to a medspa clinic; clean photos only; gradient overlay behind text; object-fit: cover. No placeholders.
+
+### STRUCTURE ({{N}} CONTENT SECTIONS MANDATORY, plus the shared Nav + Footer)
+Nav: same as home. Persistent accent CTA [{{primary_cta}}].
+{{one numbered entry PER scanned section for THIS page (in order), each with the client's real content and the relevant CRO fix. Never invent proof the inputs don't provide.}}
+Footer: same as home.
+Constraint: No external JS libraries. Minimal inline vanilla JS only. Full production HTML, no placeholders, no truncation.`;
+
+async function composeBuildPromptMd(ctx) {
+  const { page, A, cro, theme, referenceUrl, siteStruct, homePromptRef } = ctx;
+  const isHome = page === "home";
+  const scanned = mdScannedSections(siteStruct, page);
+  const skeleton = isHome ? HOME_MD_SKELETON : INTERIOR_MD_SKELETON;
+
+  const instruction = [
+    `You are a senior prompt engineer. Write a website-build prompt for the "${page}" page of "${A.business_name}" that another AI (Stitch) will use to generate ONE production HTML page.`,
+    `OUTPUT ONLY the finished build prompt, following the SKELETON below EXACTLY: replace every {{...}} placeholder using the INPUTS, and copy all non-placeholder text verbatim (the mandatory blocks must not be reworded). Do NOT wrap in code fences, do NOT add commentary before or after.`,
+    `Derive every value from the INPUTS. NEVER invent reviews, ratings, awards, or credentials the inputs do not provide — if a proof point is missing, use an honest placeholder ("Reviews coming soon") instead of a fake one.`,
+    isHome ? `` : `INTERIOR page: do not re-derive the design system — match the HOME page (provided below) exactly.`,
+    ``,
+    `## INPUTS`,
+    `Business: ${A.business_name} — ${A.practice_type || "med spa"} in ${A.location || "(location n/a)"}. Phone ${A.phone_for_website || "(n/a)"}. Primary CTA "${A.primary_cta || "Book Online"}". Booking platform: ${A.booking_platform || "(n/a)"}.`,
+    `Design reference site to emulate: ${referenceUrl || "(none — infer a tasteful luxury-medspa look)"}.`,
+    `Brand tokens — background ${theme.primary}, secondary ${theme.secondary}, accent ${theme.accent}; heading font "${theme.headingFont}", body font "${theme.bodyFont}".`,
+    `Services offered: ${mdVal(A.services_offered) || "(n/a)"}. Revenue/priority services: ${mdVal(A.revenue_services) || "(n/a)"}. Team: ${mdVal(A.team_roster) || "(n/a)"}. Provided review: ${A.featured_review || "(none provided)"}. Financing: ${mdVal(A.financing_offered) || "(none)"}.`,
+    `CRO audit of the existing site (apply these fixes on this page): ${mdCroBrief(cro)}`,
+    scanned
+      ? `SCANNED sections on the client's REAL "${page}" page — the STRUCTURE must contain exactly one numbered entry per section, in this order:\n${scanned}`
+      : `No scan was available for the "${page}" page — infer a sensible, non-redundant section list for a luxury medspa ${page} page (aim for 6-11 sections on home, fewer on interior pages).`,
+    homePromptRef ? `\nHOME PAGE BUILD PROMPT (reference — reuse its tokens/nav/footer/animations, do NOT restate the full design system):\n"""\n${String(homePromptRef).slice(0, 4500)}\n"""` : ``,
+    ``,
+    `## SKELETON (fill {{...}}, keep the rest verbatim):`,
+    skeleton,
+  ].filter((x) => x !== null && x !== undefined).join("\n");
+
+  const md = await geminiCall([{ text: instruction }], { temperature: 0.5, maxOutputTokens: 4200, timeoutMs: 70000 });
+  return String(md || "").replace(/^```[a-z]*\n?|\n?```$/gi, "").trim();
+}
+
 function jobPageSections(key, A) {
   const val2 = (v) => Array.isArray(v) ? v.map((x) => (x && typeof x === "object") ? [x.name, x.title].filter(Boolean).join(" — ") + (x.bio ? ": " + x.bio : "") : String(x)).join(Array.isArray(v) && v.some((x) => x && typeof x === "object") ? "; " : ", ") : (v == null ? "" : String(v));
   const featured = val2(A.revenue_services), providers = val2(A.team_roster), services = val2(A.services_offered);
@@ -6098,7 +6608,7 @@ async function runJob(job) {
     // only the most recent submission, so a job that waited in the queue would otherwise compose against
     // a different client's brand.
     const composed = await localApi("/api/compose-brand", { brand: (job.payload || {}).brand || null });
-    const theme = { displayName: A.business_name, primary: composed.primary, secondary: composed.secondary, accent: composed.accent, headingFont: composed.headingFont, bodyFont: composed.bodyFont };
+    const theme = { displayName: A.business_name, primary: composed.primary, secondary: composed.secondary, accent: composed.accent, headingFont: composed.headingFont, bodyFont: composed.bodyFont, referenceUrl: job.referenceWebsite || job.existingWebsite || "" };
     job.composed = { primary: composed.primary, secondary: composed.secondary, accent: composed.accent, headingFont: composed.headingFont, bodyFont: composed.bodyFont, brief: composed.brief || "" };
     jobStep(job, 1, "done", `Palette ${composed.primary}/${composed.accent} · ${composed.headingFont}`
       + (composed.brandSource ? " · client-confirmed" : ""));
@@ -6127,12 +6637,16 @@ async function runJob(job) {
     }
     const specs = {};
     if (siteStruct) {
-      for (const k of DEV_PAGES) {
-        const s = siteStruct.pages[k];
-        if (!s) continue;
-        try { specs[k] = await composeCorePagePrompt(k, s, A, composed, siteStruct); }
-        catch (e) { console.error(`brief for ${k} failed:`, e.message); }
+      // Legacy blueprint briefs are only needed when NOT using the MD-prompt path.
+      if (!MD_PROMPT_ON) {
+        for (const k of DEV_PAGES) {
+          const s = siteStruct.pages[k];
+          if (!s) continue;
+          try { specs[k] = await composeCorePagePrompt(k, s, A, composed, siteStruct); }
+          catch (e) { console.error(`brief for ${k} failed:`, e.message); }
+        }
       }
+      // structureScan is ALWAYS captured (R2 needs it regardless of the prompt path).
       job.structureScan = {
         site: siteStruct.origin,
         pages: Object.fromEntries(Object.entries(siteStruct.pages).map(([k, v]) =>
@@ -6142,19 +6656,59 @@ async function runJob(job) {
       saveJobs();
     }
     const scanned = Object.keys(specs).length;
+    const SEO_TAIL = "\n\nReturn one complete, responsive, production-quality HTML page with the SEO requirements applied.";
+    let pages;
+    if (MD_PROMPT_ON) {
+      // Gemini writes each page's build prompt in the fixed MD contract, from CRO +
+      // onboarding + scanned sections. Home first (establishes the design system);
+      // services/about/contact reference the home prompt for consistency.
+      jobStep(job, 2, "running", "Gemini is writing the build prompt for each page…");
+      job.pagePrompts = {};
+      const ctxBase = { A, cro: job.before, theme, referenceUrl: theme.referenceUrl, siteStruct };
+      try {
+        const homeMd = await composeBuildPromptMd({ ...ctxBase, page: "home" });
+        job.pagePrompts.home = homeMd;
+        console.log(`\n===== BUILD PROMPT [home] (${homeMd.length} chars) =====\n${homeMd}\n${"=".repeat(52)}\n`);
+        pages = [{ key: "home", prompt: homeMd + SEO_TAIL }];
+        for (const k of DEV_PAGES.filter((x) => x !== "home")) {
+          const md = await composeBuildPromptMd({ ...ctxBase, page: k, homePromptRef: homeMd });
+          job.pagePrompts[k] = md;
+          console.log(`\n===== BUILD PROMPT [${k}] (${md.length} chars) =====\n${md}\n${"=".repeat(52)}\n`);
+          pages.push({ key: k, prompt: md + SEO_TAIL });
+        }
+        saveJobs();
+      } catch (e) {
+        console.error("MD prompt build failed, falling back to hardcoded blueprint:", e.message);
+        job.pagePrompts = null;
+        pages = DEV_PAGES.map((k) => ({ key: k, prompt: `${composed.brief}\n\n${specs[k] || jobPageSections(k, A)}${SEO_TAIL}` }));
+      }
+    } else {
+      pages = DEV_PAGES.map((k) => ({ key: k, prompt: `${composed.brief}\n\n${specs[k] || jobPageSections(k, A)}${SEO_TAIL}` }));
+    }
     jobStep(job, 2, "running", `Generating ${DEV_PAGES.length} page${DEV_PAGES.length > 1 ? "s" : ""}`
-      + (scanned ? ` — ${scanned} brief(s) composed from the client's real site` : " (generic blueprint — site scan unavailable)") + "…");
-    const pages = DEV_PAGES.map((k) => ({
-      key: k, prompt: `${composed.brief}\n\n${specs[k] || jobPageSections(k, A)}\n\nReturn one complete, responsive, production-quality HTML page with the SEO requirements applied.`,
-    }));
-    const gen = await localApi("/api/generate-site", { engine: "", deviceType: "DESKTOP", theme, pages }, 45 * 60 * 1000);
+      + (MD_PROMPT_ON && job.pagePrompts ? " — Gemini-authored MD prompts (logged)"
+        : scanned ? ` — ${scanned} brief(s) composed from the client's real site` : " (generic blueprint — site scan unavailable)") + "…");
+    // Forward the per-job custom Stitch key (set via the "Change Stitch key & re-run" modal)
+    // — without this the override sat on job.payload but never reached the generation call.
+    const stitchKeyOverride = (job.payload && job.payload.stitchKeyOverride) || undefined;
+    const gen = await localApi("/api/generate-site", { engine: "", deviceType: "DESKTOP", theme, pages, stitchKeyOverride, siteStructure: job.structureScan }, 45 * 60 * 1000);
     const ok = (gen.pages || []).filter((x) => x && !x.error);
-    // Snapshot final per-page result onto the job so completed cards still show it.
+    // Snapshot final per-page result onto the job so completed cards still show it,
+    // plus the audit/heal detail (R2/R3) and the scanned existing-page sections (R2).
     job.pages = {};
+    job.pageDetail = job.pageDetail || {};
     for (const pr of (gen.pages || [])) {
       const k = pr.pageKey || pr.page;
-      if (k) job.pages[k] = { status: pr.error ? "error" : "done", bytes: pr.htmlBytes || 0, error: pr.error || "" };
+      if (!k) continue;
+      job.pages[k] = { status: pr.error ? "error" : "done", bytes: pr.htmlBytes || 0, error: pr.error || "" };
+      const scan = (job.structureScan && job.structureScan.pages && job.structureScan.pages[k]) || null;
+      job.pageDetail[k] = {
+        prompt: (job.pagePrompts && job.pagePrompts[k]) || null,
+        existing: scan ? { url: scan.url, h1: scan.h1, sectionCount: scan.sections, sections: scan.flow || [] } : null,
+        heal: pr.healDetail || null,
+      };
     }
+    saveJobs();
     if (!ok.length) throw new Error("Stitch generated 0 pages: " + (((gen.pages || [])[0] || {}).error || "no output"));
     // HOME is mandatory: buildWpTheme derives front-page.php AND the shared
     // header.php/footer.php from it, so a failed home ships a theme with an empty
@@ -13398,7 +13952,7 @@ const server = http.createServer(async (req, res) => {
         `- Layout style: ${analysis.layoutStyle}. Imagery style: ${analysis.imageryStyle}.`,
         `- Mood: ${(analysis.mood || []).join(", ")}. Signature elements: ${(analysis.signatureElements || []).join("; ")}.`,
         `REFINE these colors into a clean, WCAG-accessible, premium palette (keep the brand feel, fix contrast/harmony).`,
-      ].join("\n") : `No existing site to analyze — CHOOSE a clean, tasteful, on-brand palette and type system for this business.`;
+      ].join("\n") : `No existing site to analyze — CHOOSE a clean, tasteful, on-brand palette and type system for this business. Default to a LIGHT (white / near-white) background with dark readable text and one vivid brand accent — most medspa brands are light; only go dark if the brand is explicitly dark. Never ship low-contrast text.`;
 
       const croBlock = cro ? [
         `CURRENT SITE CRO AUDIT — overall ${cro.overall}/100 (vision ${cro.vision?.score}, ux ${cro.ux?.score}, cro ${cro.cro?.score}, content ${cro.content?.score}). The NEW site MUST fix these:`,
@@ -13422,8 +13976,12 @@ const server = http.createServer(async (req, res) => {
               // type system to a single flat weight. Ask for a real pairing instead.
               : `\n== TYPOGRAPHY RULE ==\nThat site's one VERIFIED, Google-Fonts-loadable font is "${siteBrand.bodyFont}" — set "bodyFont" to it exactly. Its real heading/display font is a custom or self-hosted face not available on Google Fonts, so it cannot be reused. Choose your OWN distinctive Google Fonts DISPLAY/serif family for "headingFont" that pairs well with ${siteBrand.bodyFont} and fits a luxury medical-aesthetics brand — heading and body must be two DIFFERENT families, never the same one twice.`)
           : "",
-        `\n== OUTPUT ==\nReturn ONLY minified JSON with these keys:`,
-        `{"primary":"#hex","secondary":"#hex","accent":"#hex","headingFont":"a Google serif display font name","bodyFont":"a clean Google sans font name","imageryDirection":"2-3 sentences of concrete photographic art direction","brief":"a DETAILED, multi-paragraph art-direction + build brief (250-400 words) written as concrete design directives: overall look & feel, layout sophistication and section rhythm, typographic system, color usage, component styling, the specific imagery to use per section, and the exact CRO fixes this new site must implement based on the audit above. Be specific, not vague."}`,
+        `\n== OUTPUT ==\nReturn ONLY minified JSON with these keys. THE THREE COLOR ROLES ARE STRICT — assign them by role, not by luxury convention:`,
+        `- "primary" = the site's main BACKGROUND / surface color. FAITHFULLY match the real site's background (analyzed background: ${(analysis && analysis.backgroundColor) || "unknown"}). If the brand is light/white, KEEP it light (#FFFFFF or a near-white) — do NOT convert a light, white-background brand into a dark/black theme. Use a dark background ONLY if the real brand is genuinely dark.`,
+        `- "secondary" = the main TEXT / ink color for body copy and most headings — a neutral dark on a light site (near-charcoal), or a light ink on a dark site. It MUST hit >=4.5:1 contrast against "primary".`,
+        `- "accent" = the ONE vivid brand / CTA color — the signature hue the site actually uses on buttons, links and highlights (e.g. analyzed accent ${(analysis && analysis.accentColor) || "the brand hue"}). This is the real brand color; do NOT replace it with a neutral beige/tan just to look "luxury".`,
+        `Sanity check before returning: primary vs secondary must pass 4.5:1, and a light-background brand must stay light.`,
+        `{"primary":"#hex","secondary":"#hex","accent":"#hex","headingFont":"a Google display/serif font name","bodyFont":"a clean Google sans font name","imageryDirection":"2-3 sentences of concrete photographic art direction","brief":"a DETAILED, multi-paragraph art-direction + build brief (250-400 words) written as concrete design directives: overall look & feel, layout sophistication and section rhythm, typographic system, color usage (state which color is background, which is text, which is accent), component styling, the specific imagery to use per section, and the exact CRO fixes this new site must implement based on the audit above. Be specific, not vague."}`,
       ].join("\n");
       try {
         const t = await geminiCall([{ text: prompt }], { temperature: 0.6, maxOutputTokens: 4000 });
@@ -13446,6 +14004,32 @@ const server = http.createServer(async (req, res) => {
           obj.siteFonts = siteBrand.fonts.slice(0, 4);
         } else { obj.fontSource = "model"; }
         obj.usedAnalysis = !!analysis; obj.usedCro = !!cro;
+        // BACKGROUND correction from the reliable CSS palette. The screenshot analyzer
+        // fails on some sites (ruma/enchanted), and Gemini's "luxury" bias then forces a
+        // dark background on a light-background brand. The site's real CSS palette is the
+        // authoritative signal — if its background lightness disagrees with what Gemini
+        // chose for "primary" (our background token), trust the site.
+        if (siteBrand && siteBrand.palette && siteBrand.palette.length) {
+          const roles = paletteBgRoles(siteBrand.palette);
+          if (roles && roles.bg) {
+            const geminiLight = hexLum(obj.primary) > 0.6;
+            if (roles.isLight !== geminiLight) {
+              obj.primaryModelPick = obj.primary;
+              obj.primary = roles.isLight ? (hexLum(roles.bg) > 0.92 ? "#FFFFFF" : roles.bg) : roles.bg;
+              // keep body text readable against the corrected background
+              const textLight = hexLum(obj.secondary) > 0.6;
+              if (roles.isLight && textLight) { obj.secondaryModelPick = obj.secondary; obj.secondary = (roles.text && hexLum(roles.text) < 0.4) ? roles.text : "#1A1A1A"; }
+              if (!roles.isLight && !textLight) { obj.secondaryModelPick = obj.secondary; obj.secondary = "#F4F4F4"; }
+              obj.bgCorrected = `css-palette (site is ${roles.isLight ? "light" : "dark"}; model picked ${obj.primaryModelPick})`;
+              console.log(`compose: background corrected from CSS palette → ${obj.primary} (was ${obj.primaryModelPick})`);
+            }
+            // If Gemini invented an off-brand accent (low saturation / neutral) but the
+            // site has a clearly saturated brand hue, prefer the real one.
+            if (roles.accent && hexSat(obj.accent) < 0.2 && hexSat(roles.accent) > 0.3) {
+              obj.accentModelPick = obj.accent; obj.accent = roles.accent;
+            }
+          }
+        }
         // Last word goes to the client. Everything above is inference — a screenshot read, a font scan,
         // a model's taste — and all of it is overridden by tokens the client looked at and approved.
         // Applied per-field so a partial confirmation (say colours but no readable fonts) still keeps
@@ -13493,7 +14077,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === "/api/generate-site" && req.method === "POST") {
-      const { engine, pages, deviceType, theme, stitchKeyOverride } = JSON.parse(await readBody(req) || "{}");
+      const { engine, pages, deviceType, theme, stitchKeyOverride, siteStructure } = JSON.parse(await readBody(req) || "{}");
       if (!Array.isArray(pages) || !pages.length) return json(res, 400, { error: "pages[] required" });
       const t0 = Date.now();
       // Give this client its own slice of the curated photo pool (see CURATED_OFFSET
@@ -13553,26 +14137,41 @@ const server = http.createServer(async (req, res) => {
       // buildWpTheme() head-stripping — so it needs the same guard.
       STITCH_KEY_OVERRIDE = stitchKeyOverride || null;
       let built;
-      try { built = await buildStitchSiteWithKeyRotation(pages.map(pg => ({ key: pg.key.replace(/[^a-z0-9_-]/gi, ""), prompt: pg.prompt + "\n\n" + designTokensBlock(theme) + STITCH_IMG_CLAUSE + stylingConstraint(theme || {}) })), theme || {}, deviceType); }
+      // Pass referenceUrl on theme so buildStitchSite can scan it for home-page expected sections.
+      const themeWithRef = { ...(theme || {}), referenceUrl: (theme && (theme.referenceUrl || theme.referenceWebsite)) || "" };
+      try { built = await buildStitchSiteWithKeyRotation(pages.map(pg => ({ key: pg.key.replace(/[^a-z0-9_-]/gi, ""), prompt: pg.prompt + "\n\n" + designTokensBlock(theme) + STITCH_IMG_CLAUSE + stylingConstraint(theme || {}) })), themeWithRef, deviceType, siteStructure); }
       finally { STITCH_KEY_OVERRIDE = null; }
-      const out = await Promise.all(built.results.map(async r => {
-        if (!r.html) return { pageKey: r.key, engine: "stitch", error: r.error || "no HTML" };
-        // Exact, untouched Stitch output, saved BEFORE any of our post-processing —
-        // so "does the shipped page match what Stitch gave" can be answered by a
-        // diff instead of a guess. Debug-only artifact, never read by the pipeline.
-        try { fs.writeFileSync(path.join(GEN, r.key + ".stitch-raw.html"), r.html); } catch (e) { /* debug-only, non-fatal */ }
-        let html = clampViewportHeights(enforceBrandFonts(r.html, theme));  // pin brand type; bound vh heroes
-        html = enforceArbitraryColors(html, theme);  // named tailwind-config colors die when <head> is stripped
+      // Phase 1: post-process each page's HTML in memory (don't write yet).
+      const processed = await Promise.all(built.results.map(async r => {
+        if (!r.html) return { key: r.key, error: r.error || "no HTML", healDetail: r.healDetail || null };
+        try { fs.writeFileSync(path.join(GEN, r.key + ".stitch-raw.html"), r.html); } catch (e) { /* debug-only */ }
+        let html = clampViewportHeights(enforceBrandFonts(r.html, theme));
+        html = enforceArbitraryColors(html, theme);
         html = sharpenStitchImages(html);
-        html = await fixImages(html);                // replace broken/expiring image URLs with stable photos
-        html = await qcStitchImages(html);          // swap any text-baked images for clean photos
+        html = await fixImages(html);
+        html = await qcStitchImages(html);
         html = seoEnhance(html, r.key);
         html = injectCanonicalNav(html, theme || {});
+        html = ensureFooter(html, theme || {});     // R7: never ship a page with no footer
         html = enforceFooterFacts(html);
-        fs.writeFileSync(path.join(GEN, r.key + ".html"), html);
-        genProg(r.key, "done", { bytes: html.length });
-        return { page: r.key, pageKey: r.key, engine: "stitch", htmlBytes: html.length, previewUrl: `/preview/${r.key}`, exportUrl: `/export/${r.key}`, screenshotUrl: r.screenshotUrl || "" };
+        return { key: r.key, html, screenshotUrl: r.screenshotUrl || "", healDetail: r.healDetail || null };
       }));
+      // Phase 2 (R6/R9): make the header + footer IDENTICAL on every page by copying HOME's
+      // onto the others — deterministic, so Stitch's per-page header variance can't leak through.
+      const homeP = processed.find(pp => pp.key === "home" && pp.html);
+      if (homeP) {
+        const { header, footer } = extractChrome(homeP.html);
+        for (const pp of processed) {
+          if (pp.key !== "home" && pp.html && (header || footer)) pp.html = applyChrome(pp.html, header, footer);
+        }
+      }
+      // Phase 3: write files + build the response.
+      const out = processed.map(pp => {
+        if (pp.error) return { pageKey: pp.key, engine: "stitch", error: pp.error };
+        fs.writeFileSync(path.join(GEN, pp.key + ".html"), pp.html);
+        genProg(pp.key, "done", { bytes: pp.html.length });
+        return { page: pp.key, pageKey: pp.key, engine: "stitch", htmlBytes: pp.html.length, previewUrl: `/preview/${pp.key}`, exportUrl: `/export/${pp.key}`, screenshotUrl: pp.screenshotUrl || "", healDetail: pp.healDetail || null };
+      });
       GEN_PROGRESS.phase = "done";
       return json(res, 200, { engine: "stitch", projectId: built.projectId, designSystem: built.designSystem, pages: out, seconds: ((Date.now() - t0) / 1000).toFixed(1) });
     }
@@ -14077,7 +14676,36 @@ const server = http.createServer(async (req, res) => {
     json(res, 500, { error: e.message });
   }
 });
-if (require.main === module) {
+// One-shot preview of the Gemini-authored MD build prompts (MD_PROMPT plan demo).
+// PREVIEW_PROMPT=1 [PREVIEW_DRAFT=<id>] node server.js  → prints home + about prompts and exits.
+if (require.main === module && process.env.PREVIEW_PROMPT) {
+  (async () => {
+    const jobs = JSON.parse(fs.readFileSync(JOBS_FILE, "utf8"));
+    const j = jobs.find((x) => x.draftId === (process.env.PREVIEW_DRAFT || "81")) || jobs.find((x) => (x.composed || {}).brief);
+    const A = (j.payload && j.payload.answers) || j.answers;
+    const c = j.composed || {};
+    const theme = { primary: c.primary, secondary: c.secondary, accent: c.accent, headingFont: c.headingFont, bodyFont: c.bodyFont, referenceUrl: j.referenceWebsite || (j.payload || {}).referenceWebsite || "" };
+    const existing = j.existingWebsite || (j.payload || {}).existingWebsite || "";
+    let siteStruct = null;
+    try { if (existing) siteStruct = await scanSiteStructure(existing); } catch (e) { console.error("scan failed:", e.message); }
+    const base = { A, cro: j.before, theme, referenceUrl: theme.referenceUrl, siteStruct };
+    const home = await composeBuildPromptMd({ ...base, page: "home" });
+    console.log("\n################## HOME PAGE PROMPT ##################\n" + home);
+    if (process.env.PREVIEW_GENERATE) {
+      console.log("\n>>> Sending HOME prompt to Stitch…");
+      const t0 = Date.now();
+      const g = await generate(home + "\n\nReturn one complete, responsive, production-quality HTML page.", "DESKTOP");
+      const outFile = path.join(GEN, "preview-home.html");
+      try { fs.writeFileSync(outFile, g.html || ""); } catch (e) { /* ignore */ }
+      console.log(`>>> Stitch done in ${Math.round((Date.now() - t0) / 1000)}s — html=${(g.html || "").length} bytes, screenshot=${g.screenshotUrl || "(none)"}, saved=${outFile}`);
+      process.exit(0);
+    }
+    const about = await composeBuildPromptMd({ ...base, page: "about", homePromptRef: home });
+    console.log("\n\n################## ABOUT PAGE PROMPT (references home) ##################\n" + about);
+    process.exit(0);
+  })().catch((e) => { console.error("preview failed:", e); process.exit(1); });
+}
+if (require.main === module && !process.env.PREVIEW_PROMPT) {
   server.listen(PORT, () => console.log(`G99 Website Build Tool → http://localhost:${PORT}`));
   // Scheduled re-audit (off unless REAUDIT_HOURS > 0, to avoid burning quota).
   const reauditHours = parseFloat(process.env.REAUDIT_HOURS || "0");

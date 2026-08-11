@@ -25,36 +25,57 @@ function brandBlock(j) {
   if (!c) return "";
   const sw = (hex, label) => hex ? `<span class="sw"><i style="background:${esc(hex)}"></i><b>${esc(label)}</b><code>${esc(hex)}</code></span>` : "";
   const fonts = [c.headingFont, c.bodyFont].filter(Boolean).join(" + ");
+  // The per-page MD prompts (shown under "Generate pages") supersede this single
+  // brand brief, so we no longer surface it here — just the palette + fonts.
   return `<div class="sub-detail">
     <div class="swatches">${sw(c.primary, "Primary")}${sw(c.secondary, "Secondary")}${sw(c.accent, "Accent")}</div>
     ${fonts ? `<div class="kv">Typography · ${esc(fonts)}</div>` : ""}
-    ${c.brief ? `<details class="brief">
-      <summary>View the full build prompt (${c.brief.length} chars)</summary>
-      <div class="briefwrap">
-        <button class="copybtn" data-copy="brief" title="Copy the prompt">${svg("copy", 13)} Copy</button>
-        <div class="brieftext" id="brieftext">${esc(c.brief)}</div>
-      </div>
-    </details>` : ""}
   </div>`;
 }
 // Per-page generation status. While the step is running we use the live global
 // progress (queued → generating → post-processing → done); once finished we use
 // the job's own snapshot so the breakdown survives a reload.
 const PAGE_ORDER = [["home", "Home"], ["services", "Services"], ["about", "About"], ["contact", "Contact"]];
-const PG_TXT = { queued: "queued", generating: "generating…", "post-processing": "optimising images / SEO…", done: "", error: "" };
+// Live sub-stages emitted by the runner (build → validate → heal → finalize).
+const PG_TXT = { queued: "queued", building: "building (Stitch)…", generating: "building (Stitch)…", validating: "validating sections…", healing: "healing…", "post-processing": "finalizing…", done: "", error: "" };
+// One expandable row per page, UNDER the "Generate pages (Stitch)" step: live
+// sub-stage on the right; expand for the existing-page section analysis (R2),
+// the heal rounds (R3) and that page's Gemini-authored MD prompt — all in one place.
 function pageRows(j, live) {
-  const src = live && GENPROG && GENPROG.pages && Object.keys(GENPROG.pages).length ? GENPROG.pages : (j.pages || {});
-  const keys = Object.keys(src);
+  const liveSrc = live && GENPROG && GENPROG.pages && Object.keys(GENPROG.pages).length ? GENPROG.pages : null;
+  const snap = j.pages || {};
+  const detail = j.pageDetail || {};
+  const prompts = j.pagePrompts || {};
+  const keys = [...new Set([...(liveSrc ? Object.keys(liveSrc) : []), ...Object.keys(snap), ...Object.keys(prompts)])];
   if (!keys.length) return "";
   const order = PAGE_ORDER.filter(([k]) => keys.includes(k)).concat(keys.filter((k) => !PAGE_ORDER.some(([p]) => p === k)).map((k) => [k, k]));
-  return `<div class="sub-detail"><div class="pages">${order.map(([k, label]) => {
-    const st = src[k] || {};
-    const status = st.status || "queued";
-    const right = status === "done" ? (st.bytes ? (st.bytes / 1024).toFixed(1) + " KB" : "done")
-      : status === "error" ? (st.error || "failed") : (PG_TXT[status] || status);
+  const secPill = (s) => `<span style="display:inline-block;background:var(--line-2);color:var(--ink-3);border-radius:5px;padding:1px 7px;margin:2px 3px 0 0;font-size:11px">${esc(typeof s === "string" ? s : (s.name || s.title || ""))}</span>`;
+  const rows = order.map(([k, label]) => {
+    const lv = liveSrc && liveSrc[k] ? liveSrc[k] : null;
+    const st = snap[k] || {};
+    const status = (lv && lv.status) || st.status || "queued";
+    const heal = (lv && lv.healDetail) || (detail[k] && detail[k].heal) || null;
+    const ex = detail[k] && detail[k].existing;
+    const prompt = prompts[k];
+    const missNow = heal && (heal.missing || []).length ? ` · adding: ${heal.missing.join(", ")}` : "";
+    const right = status === "done" ? (st.bytes ? (st.bytes / 1024).toFixed(1) + " KB" : "built")
+      : status === "error" ? (st.error || "failed") : (PG_TXT[status] || status) + missNow;
     const dot = status === "done" ? "done" : status === "error" ? "error" : status === "queued" ? "queued" : "running";
-    return `<div class="pg ${status}"><span class="dot ${dot}"></span><span class="pgn">${esc(label)}</span><span class="pgs">${esc(right)}</span></div>`;
-  }).join("")}</div></div>`;
+    const rowInner = `<span class="dot ${dot}"></span><span class="pgn">${esc(label)}</span><span class="pgs">${esc(right)}</span>`;
+    const bodyBits = [
+      ex ? `<div style="margin:2px 0"><b>Existing page</b> — ${ex.sectionCount || (ex.sections || []).length || 0} sections${ex.h1 ? ` · H1 “${esc(String(ex.h1).slice(0, 50))}”` : ""}${(ex.sections || []).length ? `<div style="margin-top:4px">${ex.sections.map(secPill).join("")}</div>` : ""}</div>` : "",
+      heal ? `<div style="margin:6px 0 2px"><b>Validation</b> — ${(heal.present || []).length} present · ${(heal.missing || []).length} missing${(heal.rounds || []).length ? `<div style="margin-top:2px;color:var(--muted)">healing: ${heal.rounds.map((r) => `round ${r.n} — ${esc(r.action)}${(r.missing || []).length ? " (" + r.missing.join(", ") + ")" : ""}`).join(" · ")}</div>` : ""}</div>` : "",
+      prompt ? `<details class="brief" data-k="ppr-${esc(k)}"${OPEN.has("ppr-" + k) ? " open" : ""} style="margin-top:6px"><summary>Build prompt sent to Stitch (${prompt.length} chars)</summary><div class="brieftext" style="white-space:pre-wrap;font-family:var(--mono);font-size:11.5px;max-height:340px;overflow:auto;background:var(--bg-2);border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:6px">${esc(prompt)}</div></details>` : "",
+    ].filter(Boolean).join("");
+    if (!bodyBits) return `<div class="pg ${status}">${rowInner}</div>`;
+    const chev = `<svg class="chev" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>`;
+    const toggle = `<span class="pgtoggle">${chev}</span>`;
+    return `<details class="pgx" data-k="pg-${esc(k)}"${OPEN.has("pg-" + k) ? " open" : ""}>
+      <summary class="pg ${status}" style="cursor:pointer" title="Click to see this page's prompt, analysis and healing">${rowInner}${toggle}</summary>
+      <div style="padding:6px 0 10px 22px;font-size:12.5px;color:var(--ink-2)">${bodyBits}</div>
+    </details>`;
+  }).join("");
+  return `<div class="sub-detail"><div class="pages">${rows}</div></div>`;
 }
 // What left the building at this step: the callback posted to product-service, and any ledger event
 // that callback wrote for TED. Rendered on the step itself, because "kaunsa event kab nikla" is a
@@ -637,7 +658,20 @@ async function load() {
     try { GENPROG = await getJSON("/api/generate-progress"); } catch (e) { /* keep last */ }
   }
   document.title = "Growth99 · " + JOB.businessName;
+  // The 3s poll re-renders the whole panel, which recreates the scrollable prompt
+  // bodies and would jump them back to the top. Snapshot each open accordion's
+  // scroll position (keyed by its data-k) and restore it after the re-render.
+  const scroll = {};
+  document.querySelectorAll("details[data-k]").forEach((d) => {
+    const body = d.querySelector(".brieftext, pre");
+    if (body && body.scrollTop > 0) scroll[d.dataset.k] = body.scrollTop;
+  });
   render();
+  Object.keys(scroll).forEach((k) => {
+    const d = document.querySelector('details[data-k="' + (window.CSS && CSS.escape ? CSS.escape(k) : k) + '"]');
+    const body = d && d.querySelector(".brieftext, pre");
+    if (body) body.scrollTop = scroll[k];
+  });
   // Keep polling while anything can still change. A build can be "done" while its
   // enrichment run is still going (that step mirrors it), so don't stop on status
   // alone — otherwise the page goes stale and needs a manual refresh.
