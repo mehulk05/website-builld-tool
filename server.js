@@ -26,6 +26,11 @@ const DIR = __dirname;
 // Prefer a local ./bin (deploy build step drops the gh binary there).
 if (fs.existsSync(path.join(DIR, "bin"))) process.env.PATH = path.join(DIR, "bin") + path.delimiter + process.env.PATH;
 
+// Keep the process alive on flaky async errors — a single failed network/RPC call
+// (Stitch, fetch) must never take down the server that serves every /view/ snapshot.
+process.on("unhandledRejection", (r) => console.error("[unhandledRejection]", (r && r.stack) || r));
+process.on("uncaughtException", (e) => console.error("[uncaughtException]", (e && e.stack) || e));
+
 const WP_REPO = process.env.WP_REPO || "G99agency/prodteam.gogroth.com";
 
 // ---- GitHub auth ---------------------------------------------------------------
@@ -6429,6 +6434,172 @@ async function retryThemeActivationTail(draftId) {
   }
 }
 
+// ============================================================================
+// CLONE-AND-RESKIN MODE (CLONE_MODE=on) — step 1
+// Instead of asking Stitch to invent a page, start from a complete, real design
+// TEMPLATE in reference_sites/ and re-skin it to the CLIENT's brand by editing
+// the template's CSS :root variables (colours + fonts) with the palette/fonts we
+// already extract from the client's existing site (job.composed). Also swaps the
+// logo/business name. Content rewrite + layout changes are LATER steps.
+// ============================================================================
+const REF_DIR = path.join(DIR, "reference_sites");
+
+// Pick the reference template file. Explicit name wins; else the first *.html.
+function pickReferenceTemplate(name) {
+  const safe = name ? String(name).replace(/[^a-z0-9._-]/gi, "") : "";
+  if (safe) {
+    const f = path.join(REF_DIR, safe.endsWith(".html") ? safe : safe + ".html");
+    if (fs.existsSync(f)) return { file: f, html: fs.readFileSync(f, "utf8") };
+  }
+  const files = fs.existsSync(REF_DIR) ? fs.readdirSync(REF_DIR).filter((x) => /\.html?$/i.test(x)).sort() : [];
+  if (!files.length) throw new Error(`no reference template found in ${REF_DIR}`);
+  const file = path.join(REF_DIR, files[0]);
+  return { file, html: fs.readFileSync(file, "utf8") };
+}
+
+// Overwrite one CSS custom-property value inside the template's <style> block.
+function setCssVar(html, name, val) {
+  if (!val) return html;
+  return html.replace(new RegExp("(--" + name + "\\s*:\\s*)([^;]+)(;)", "i"), "$1" + val + "$3");
+}
+
+// Relative luminance 0..1 of a #hex colour (perceptual, for light/dark decisions).
+function hexLum(hex) {
+  const m = String(hex || "").match(/^#?([0-9a-f]{6})$/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+}
+
+// Re-skin the template: map the CLIENT's extracted brand onto the template's
+// :root variables + Google-Fonts link. Structural neutrals (secondary-bg, dark-bg,
+// muted-text, border) are left as the template's proven values in step 1 — only the
+// page background, the brand accent, the heading text colour and the two fonts move
+// to the client. brand = { primary(bg), secondary(text), accent, headingFont, bodyFont }.
+function reskinTemplateBrand(html, brand) {
+  let out = html;
+  // Accent + fonts are ALWAYS safe to apply — they don't affect readability.
+  out = setCssVar(out, "gold-accent", brand.accent);
+  out = setCssVar(out, "gold-light", brand.accent);
+  if (brand.headingFont) out = setCssVar(out, "font-serif", `'${brand.headingFont}', serif`);
+  if (brand.bodyFont) out = setCssVar(out, "font-sans", `'${brand.bodyFont}', sans-serif`);
+
+  // Background/text: only move them when the client's palette is CONFIDENTLY light.
+  // The template is a light design; forcing a dark or wrongly-extracted "primary"
+  // onto --primary-bg (while muted-text stays dark) makes text invisible. So:
+  //  - client bg light  → use it as --primary-bg, keep the template's dark text.
+  //  - client bg dark/unknown → keep the template's proven light base untouched.
+  const bgLum = hexLum(brand.primary);
+  if (bgLum !== null && bgLum >= 0.75) {
+    out = setCssVar(out, "primary-bg", brand.primary);
+  } else {
+    console.log(`  reskin: client primary ${brand.primary} (lum ${bgLum === null ? "?" : bgLum.toFixed(2)}) is not clearly light — keeping template's light background for readability`);
+  }
+  // Only adopt the client's text colour if it is genuinely dark (readable on light bg).
+  const txtLum = hexLum(brand.secondary);
+  if (txtLum !== null && txtLum <= 0.35) out = setCssVar(out, "dark-accent", brand.secondary);
+
+  // Rewrite the Google-Fonts request so the client's families actually load. The
+  // template loads fonts via `@import url('…css2?…')` inside <style> (not a <link>),
+  // so handle both forms.
+  const fams = [brand.headingFont, brand.bodyFont].filter(Boolean).map((f) => f.trim().replace(/\s+/g, "+"));
+  if (fams.length) {
+    const uniq = [...new Set(fams)].map((f) => `family=${f}:wght@300;400;500;600;700`).join("&");
+    const cssUrl = `https://fonts.googleapis.com/css2?${uniq}&display=swap`;
+    if (/@import\s+url\(\s*['"]?https:\/\/fonts\.googleapis\.com\/css2\?[^)]*\)/i.test(out)) {
+      out = out.replace(/@import\s+url\(\s*['"]?https:\/\/fonts\.googleapis\.com\/css2\?[^)]*\)/i, `@import url('${cssUrl}')`);
+    } else if (/<link[^>]*css2\?[^>]*>/i.test(out)) {
+      out = out.replace(/<link[^>]*css2\?[^>]*>/i, `<link href="${cssUrl}" rel="stylesheet">`);
+    } else {
+      out = out.replace(/<\/head>/i, `<link href="${cssUrl}" rel="stylesheet">\n</head>`);
+    }
+  }
+  return out;
+}
+
+// Swap the template's logo + brand name for the client's. If onboarding has a logo
+// URL, point the logo <img> at it; otherwise replace the logo <img> with a text
+// wordmark. Also replace the template's literal brand name ("RUMA Medical"/"RUMA").
+function swapTemplateLogo(html, A) {
+  let out = html;
+  const biz = A.business_name || "Your Practice";
+  const logoUrl = A.logo_url || A.logo || A.brand_logo || "";
+  out = out.replace(/(<a[^>]*class="logo"[^>]*>)([\s\S]*?)(<\/a>)/i, (m, open, inner, close) => {
+    if (logoUrl) {
+      const swapped = inner.replace(/(<img[^>]*\bsrc=")[^"]*("[^>]*>)/i, `$1${logoUrl}$2`)
+        .replace(/(<img[^>]*\balt=")[^"]*(")/i, `$1${biz} logo$2`);
+      return open + (/\<img/i.test(swapped) ? swapped : `<img src="${logoUrl}" alt="${biz} logo">`) + close;
+    }
+    return `${open}<span class="logo-wordmark" style="font-family:var(--font-serif);font-size:1.5rem;font-weight:600;color:var(--dark-accent);letter-spacing:.02em">${biz}</span>${close}`;
+  });
+  // Replace literal template brand tokens anywhere they leak into copy.
+  out = out.replace(/RUMA\s+Medical/gi, biz).replace(/\bRUMA\b/g, biz);
+  return out;
+}
+
+// Step 2: rewrite the template's VISIBLE TEXT to the client, keeping the exact
+// layout, classes, CSS, scripts and image URLs. Only the <body> is sent to Gemini
+// (the <head>/<style> stay byte-identical), and a guard falls back to the input if
+// the model truncates or mangles it — so re-contenting can only improve the page.
+async function recontentTemplate(html, A) {
+  const bodyOpen = html.search(/<body[^>]*>/i);
+  if (bodyOpen < 0) return html;
+  const innerStart = html.indexOf(">", bodyOpen) + 1;
+  const innerEnd = html.lastIndexOf("</body>");
+  if (innerEnd <= innerStart) return html;
+  const pre = html.slice(0, innerStart), inner = html.slice(innerStart, innerEnd), post = html.slice(innerEnd);
+
+  let services = A.services_offered;
+  if (typeof services === "string") { try { services = JSON.parse(services); } catch (e) { services = [services]; } }
+  services = Array.isArray(services) ? services : [];
+
+  const facts = [
+    `Business name: ${A.business_name || ""}`,
+    `Type: ${A.practice_type || "medical spa"}`,
+    `Location: ${A.location || ""}`,
+    `Services offered: ${services.join(", ") || "aesthetic treatments"}`,
+    `Tagline / hero: ${A.hero_headline || ""}`,
+    `Why patients choose us: ${A.why_patients_choose || ""}`,
+    `Featured review: ${A.featured_review || ""}`,
+    `Primary CTA text: ${A.primary_cta || "Book Now"}`,
+    `Phone: ${A.phone_for_website || ""}`,
+  ].join("\n");
+
+  const prompt = [
+    "You are re-theming a FINISHED medical-spa web page for a DIFFERENT client. Below is the page's <body> HTML.",
+    "Return the SAME body HTML with ONLY the human-visible TEXT rewritten to describe the new client. Absolute rules:",
+    "- Do NOT add, remove, reorder, or restructure any element. Same number of sections, cards, list items, providers, testimonials.",
+    "- Keep EVERY tag, class, id, style attribute, data-* attribute, href and <img src> EXACTLY as-is. Do not touch <script>.",
+    "- Change only the text between tags (headings, paragraphs, labels, button text, nav labels, footer text), the phone number, and image alt text.",
+    "- Rewrite service/specialty names and copy to the new client's real services; write plausible, truthful medspa copy where a fact is missing. Keep testimonial structure but you may adapt the quote to the client's featured review.",
+    "- Output ONLY the body HTML. No markdown fences, no commentary.",
+    "",
+    "NEW CLIENT FACTS:",
+    facts,
+    "",
+    "BODY HTML:",
+    inner,
+  ].join("\n");
+
+  let raw;
+  try { raw = await geminiCall([{ text: prompt }], { temperature: 0.45, maxOutputTokens: 32000, timeoutMs: 150000 }); }
+  catch (e) { console.warn("  recontent: gemini failed, keeping reskinned template:", e.message.slice(0, 120)); return html; }
+  let out = String(raw || "").trim().replace(/^```(?:html)?\s*/i, "").replace(/```\s*$/i, "").trim();
+
+  // Guard: must be real HTML of comparable size and keep the images/sections, else
+  // keep the reskinned original (re-contenting can only help, never shrink/break).
+  const secIn = (inner.match(/<section\b/gi) || []).length, secOut = (out.match(/<section\b/gi) || []).length;
+  const imgIn = (inner.match(/<img\b/gi) || []).length, imgOut = (out.match(/<img\b/gi) || []).length;
+  const ok = out.length >= inner.length * 0.6 && secOut >= secIn && imgOut >= imgIn && /<\/(section|footer|div)>/i.test(out);
+  if (!ok) {
+    console.warn(`  recontent: rejected (len ${out.length}/${inner.length}, sec ${secIn}->${secOut}, img ${imgIn}->${imgOut}) — keeping reskinned template`);
+    return html;
+  }
+  console.log(`  recontent: applied (sec ${secOut}, img ${imgOut}, ${out.length} body bytes)`);
+  return pre + out + post;
+}
+
 async function runJob(job) {
   job.status = "running";
   job.startedAt = new Date().toISOString(); COST_SINK = job.cost;
@@ -6480,6 +6651,36 @@ async function runJob(job) {
     job.composed = { primary: composed.primary, secondary: composed.secondary, accent: composed.accent, headingFont: composed.headingFont, bodyFont: composed.bodyFont, brief: composed.brief || "" };
     jobStep(job, 1, "done", `Palette ${composed.primary}/${composed.accent} · ${composed.headingFont}`
       + (composed.brandSource ? " · client-confirmed" : ""));
+
+    // ---- CLONE_MODE (step 1): clone a reference template + apply the client's
+    // brand by editing its CSS variables, then serve. Short-circuits the whole
+    // Stitch/assemble pipeline (content + layout rewrites are later steps).
+    if (/^(1|on|true|yes)$/i.test(process.env.CLONE_MODE || "")) {
+      jobStep(job, 2, "running", "Cloning reference template + applying client brand (CSS)…");
+      const ref = pickReferenceTemplate(process.env.CLONE_TEMPLATE || (job.payload && job.payload.referenceTemplate));
+      const brand = { primary: composed.primary, secondary: composed.secondary, accent: composed.accent, headingFont: composed.headingFont, bodyFont: composed.bodyFont };
+      let html = reskinTemplateBrand(ref.html, brand);
+      html = swapTemplateLogo(html, A);
+      // Step 2: rewrite the section content to the client (skippable with CLONE_CONTENT=off).
+      if (!/^(0|off|false|no)$/i.test(process.env.CLONE_CONTENT || "on")) {
+        jobStep(job, 2, "running", "Rewriting section content to the client (Gemini)…");
+        try { html = await recontentTemplate(html, A); } catch (e) { console.warn("recontent failed, shipping reskinned template:", e.message); }
+      }
+      const siteDir = path.join(GEN, "site");
+      fs.mkdirSync(siteDir, { recursive: true });
+      fs.writeFileSync(path.join(siteDir, "index.html"), html);
+      fs.writeFileSync(path.join(GEN, "home.html"), html);
+      job.pages = { home: { status: "done", bytes: html.length, error: "" } };
+      jobStep(job, 2, "done", `Cloned ${path.basename(ref.file)} · brand bg ${brand.primary} / accent ${brand.accent} / ${brand.headingFont}+${brand.bodyFont}`);
+      // Snapshot to the per-draft view URL (no PR — this is a local design test).
+      const snapDir = path.join(GEN, "exports", job.draftId, "site");
+      try { fs.rmSync(snapDir, { recursive: true, force: true }); fs.cpSync(siteDir, snapDir, { recursive: true }); } catch (e) { console.warn("clone snapshot failed:", e.message); }
+      job.siteUrl = `/view/${encodeURIComponent(job.draftId)}/`;
+      jobStep(job, 3, "done", `Assembled (clone of ${path.basename(ref.file)})`);
+      job.status = "done";
+      console.log(`  CLONE_MODE done → ${job.siteUrl}  (template ${path.basename(ref.file)}, brand ${brand.primary}/${brand.accent})`);
+      return;
+    }
 
     // 3 — generate all pages with Stitch
     // TEMPORARY (design-quality dev cycle, DESIGN_QUALITY_PLAN.md): while iterating
@@ -14755,6 +14956,18 @@ const server = http.createServer(async (req, res) => {
       const { engine } = JSON.parse(await readBody(req) || "{}");
       const out = assembleSite(engine === "gemini" ? "gemini" : "");
       return json(res, 200, out);
+    }
+
+    // Per-draft build snapshot: each finished build is copied to
+    // generated/exports/<draftId>/site/, so back-to-back builds never overwrite
+    // each other in the shared /site/ bundle. e.g. /view/<draftId>/ , /view/<draftId>/about.html
+    const viewM = p.match(/^\/view\/([a-z0-9_-]+)(?:\/(.*))?$/i);
+    if (viewM) {
+      const draftId = viewM[1].replace(/[^a-z0-9_-]/gi, "");
+      const rel = (viewM[2] || "index.html").replace(/[^a-z0-9._-]/gi, "") || "index.html";
+      const f = path.join(GEN, "exports", draftId, "site", rel);
+      if (fs.existsSync(f)) return send(res, 200, MIME[path.extname(f)] || "text/html", fs.readFileSync(f));
+      return send(res, 404, "text/html", `<h1>No build snapshot for draft ${escHtml(draftId)}</h1><p>It may not have finished assembling yet.</p>`);
     }
 
     const siteM = p.match(/^\/(site(?:-gemini)?)(?:\/(.*))?$/);

@@ -1,15 +1,30 @@
 {
-  "draftId": "home-only-proof-1",
-  "businessId": 999999,
+  "draftId": "clone4-1786522331",
+  "businessId": null,
   "template": "WEBSITE",
-  "receivedAt": "2026-08-12T05:21:59.861Z",
-  "betaSiteUrl": "https://prodteam.gogroth.com/",
-  "betaSiteRepo": "G99agency/prodteam.gogroth.com",
+  "receivedAt": "2026-08-12T08:12:11.959Z",
+  "betaSiteUrl": "",
+  "betaSiteRepo": "",
   "referenceWebsite": "",
-  "existingWebsite": "https://nuvoaestheticsclinic.com",
+  "existingWebsite": "https://prettypleaseaesthetics.com",
   "confirmedBrand": null,
   "logoUrl": null,
   "answers": {
-    "business_name": "NUVO Aesthetics Clinic (clone)"
+    "business_name": "Pretty Please Aesthetics",
+    "practice_type": "Med spa",
+    "location": "Roseville & Sacramento, CA",
+    "services_offered": [
+      "Botox",
+      "Dermal Fillers",
+      "Lip Filler",
+      "Microneedling",
+      "Facials",
+      "Chemical Peels"
+    ],
+    "hero_headline": "Look like yourself, refreshed",
+    "why_patients_choose": "Natural-looking results from experienced, caring injectors in a relaxed space.",
+    "featured_review": "Absolutely love this place � natural results and the staff make you feel so comfortable.",
+    "primary_cta": "Book Now",
+    "phone_for_website": "(916) 555-0123"
   }
 }
