@@ -13293,23 +13293,29 @@ const server = http.createServer(async (req, res) => {
       // This route mints a credential: the ?g99r= link is the entire authority to
       // change a live client site. Unlike the read-only mockup webhook above, it
       // refuses outright when no secret is configured rather than running open.
+      // Optional, like every other TED webhook here. It was briefly required, on
+      // the grounds that this route mints a link that can edit a live client
+      // site — but the link is never in the response, only in the TED comment, so
+      // an unauthenticated caller cannot come away holding one. What it could do
+      // is put one junk comment on a task, and the duplicate guard below stops
+      // even a second. That is not worth being the one route in this file that
+      // refuses to run out of the box, especially next to /api/webhook/pre-release,
+      // which opens and merges pull requests with its secret unset.
       const secret = (process.env.TED_REVIEW_WEBHOOK_SECRET || "").trim();
-      if (!secret) {
-        console.warn("ted-content-review: refused — TED_REVIEW_WEBHOOK_SECRET is not set");
-        return json(res, 503, { error: "TED_REVIEW_WEBHOOK_SECRET is not set on this deployment" });
-      }
-      // TED's "Secret Auth" tab sends X-TED-Webhook-Secret; a header added by hand
-      // on the Parameter/Headers tab is whatever was typed there, and the rest of
-      // this tool's webhooks use X-Webhook-Secret. Accept all of them: which tab
-      // someone filled in is not worth a silent 401 on every delivery.
-      const sent = String(req.headers["x-ted-webhook-secret"] || req.headers["x-webhook-secret"]
-        || req.headers["x-ted-secret"]
-        || String(req.headers["authorization"] || "").replace(/^Bearer\s+/i, "")).trim();
-      if (sent !== secret) {
-        // Which header arrived is the one thing that makes a 401 here debuggable;
-        // the value never goes near the log.
-        console.warn(`ted-content-review: bad secret (headers seen: ${Object.keys(req.headers).filter((h) => /secret|auth/i.test(h)).join(", ") || "none"})`);
-        return json(res, 401, { error: "bad webhook secret" });
+      if (secret) {
+        // TED's "Secret Auth" tab sends X-TED-Webhook-Secret; a header added by
+        // hand on the Parameter/Headers tab is whatever was typed there, and the
+        // rest of this tool's webhooks use X-Webhook-Secret. Accept all of them:
+        // which tab someone filled in is not worth a silent 401 on every delivery.
+        const sent = String(req.headers["x-ted-webhook-secret"] || req.headers["x-webhook-secret"]
+          || req.headers["x-ted-secret"]
+          || String(req.headers["authorization"] || "").replace(/^Bearer\s+/i, "")).trim();
+        if (sent !== secret) {
+          // Which header arrived is the one thing that makes a 401 here
+          // debuggable; the value never goes near the log.
+          console.warn(`ted-content-review: bad secret (headers seen: ${Object.keys(req.headers).filter((h) => /secret|auth/i.test(h)).join(", ") || "none"})`);
+          return json(res, 401, { error: "bad webhook secret" });
+        }
       }
 
       let body = {};
