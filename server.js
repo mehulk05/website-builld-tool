@@ -4828,10 +4828,22 @@ function tedReviewOutcomeComment(job, outcome) {
   // out of this list — listing it under both headings would tell the reviewer
   // their correction shipped and did not, in the same comment.
   const blocked = new Set(refusals.map((r) => r.n));
+  // "->", not an arrow character: tedAscii strips anything outside ASCII on the
+  // way out, which silently turned '"Medical Wellness" -> "Injectables"' into
+  // two quoted phrases sitting next to each other with nothing between them.
+  //
+  // Numbered rather than bulleted, and each side clipped, because TED collapses
+  // the newlines: as one run-on paragraph "1. ... 2. ..." still reads, and a
+  // replaced paragraph quoted in full drowns the rest of the comment.
+  const clip = (s) => {
+    const t = String(s || "").replace(/\s+/g, " ").trim();
+    return t.length > 90 ? t.slice(0, 87) + "..." : t;
+  };
   const changed = (wo.changes || [])
-    .filter((_, i) => !blocked.has(i + 1))
-    .map((c) => `- "${c.replaces}" ${String.fromCharCode(8594)} "${c.literal}"`);
-  const refused = refusals.map((r) => `- ${r.reason}`);
+    .map((c, i) => ({ c, n: i + 1 }))
+    .filter((x) => !blocked.has(x.n))
+    .map((x, i) => `${i + 1}. "${clip(x.c.replaces)}" -> "${clip(x.c.literal)}"`);
+  const refused = refusals.map((r, i) => `${i + 1}. ${clip(r.reason)}`);
   const page = P.reviewPath && P.reviewPath !== "/" ? P.reviewPath : "the home page";
   // null marks a line that is not wanted; "" is a blank line that is. Filtering
   // on "" alone would strip the paragraph breaks along with the absent lines.
@@ -4841,7 +4853,9 @@ function tedReviewOutcomeComment(job, outcome) {
       : `Content corrections could not be applied on ${page}.`,
     "",
     `Requested by: ${P.requestedBy || "Content Team"}`,
-    `Site: ${P.businessName || "site"}${P.liveUrl ? " " + String.fromCharCode(183) + " " + P.liveUrl : ""}`,
+    // ASCII separator for the same reason as the arrow above: a middot is
+    // stripped on the way out and leaves a bare double space behind it.
+    `Site: ${P.businessName || "site"}${P.liveUrl ? " - " + P.liveUrl : ""}`,
     job.prUrl ? `Pull request: ${job.prUrl}` : null,
     changed.length ? "" : null,
     changed.length ? (outcome.ok ? "Changed:" : "Requested:") : null,
@@ -4866,6 +4880,11 @@ function tedPostOutcome(job, outcome) {
   // answer, and posting it would put it on a task nobody asked.
   if (!TED_API_TOKEN || (P.source !== "email" && !P.tedSubtaskId && !P.tedTaskId)) return;
   const text = P.tedTaskId ? tedReviewOutcomeComment(job, outcome) : tedOutcomeComment(job, outcome);
+  // A content-review outcome goes out as text only. The capture services are
+  // shared and cache by URL, so the picture that came back was routinely of
+  // another client's beta site — worse than no picture at all on a comment
+  // whose whole job is to say precisely what changed. The words already say it.
+  if (P.tedTaskId) return tedComment(text, null, 0, P.tedTaskId);
   // Back onto the thread this request came from: the subtask the email flow
   // created, or the task the review link was posted on. Null when the subtask
   // could not be made (or subtasks are off), and tedComment then falls back to
@@ -13789,9 +13808,21 @@ const server = http.createServer(async (req, res) => {
       if (!job || !job.payload || job.payload.reviewSig !== reviewSig(u.searchParams.get("t"))) {
         return json(res, 404, { ok: false, error: "unknown job" });
       }
+      // Step progress, so the widget can count instead of showing one frozen
+      // "Applying..." for the two or three minutes this takes. A run that says
+      // nothing for that long is indistinguishable from one that has died.
+      const steps = Array.isArray(job.steps) ? job.steps : [];
+      const doneCount = steps.filter((s) => s && s.status === "done").length;
+      const running = steps.find((s) => s && s.status === "running");
       return json(res, 200, {
         ok: true, status: job.status,
         error: job.status === "error" ? String(job.error || "").slice(0, 200) : "",
+        steps: steps.length ? {
+          done: doneCount, total: steps.length,
+          // The step being worked on, or the last one finished — never blank
+          // while there is still something to report.
+          label: (running && running.label) || (steps[doneCount - 1] && steps[doneCount - 1].label) || "",
+        } : null,
         // What the run declined to do and why. Without this the reviewer is told
         // "live" while one of their corrections was quietly dropped.
         refused: (job.reviewRefused || []).map((r) => r.reason),

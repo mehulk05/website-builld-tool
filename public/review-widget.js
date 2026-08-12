@@ -255,7 +255,7 @@
       if (!d || !d.ok) return status("That could not be sent.", (d && d.error) || "Try again in a moment.");
       queue = [];
       paintLaunch();
-      status("Applying " + batch.length + " change" + (batch.length > 1 ? "s" : "") + "…",
+      status("Implementing now — 0/7",
         "Usually live within a couple of minutes. You can carry on reviewing other pages.");
       watch(d.jobId);
     }).catch(function () {
@@ -266,20 +266,39 @@
   function watch(jobId) {
     if (poll) clearInterval(poll);
     var tries = 0;
+    // Consecutive answers we could not read. A blip on one poll means nothing —
+    // the next one is 4s away — but a job the tool cannot find will never
+    // resolve, and the old code read that as "keep waiting" and left the panel
+    // on "Applying..." forever. It happens for real: the tool's job list does
+    // not survive a redeploy, so a run in flight when one lands is unfindable.
+    var misses = 0;
     poll = setInterval(function () {
-      if (++tries > 90) return clearInterval(poll);
+      if (++tries > 150) {
+        clearInterval(poll);
+        return status("Still working on it.", "This is taking longer than usual. Reload the page in a few minutes to see if it landed.");
+      }
       api("/status", "job=" + encodeURIComponent(jobId)).then(function (d) {
-        if (!d || !d.ok) return;
+        if (!d || !d.ok) {
+          if (++misses < 4) return;
+          clearInterval(poll);
+          return status("Could not follow this change.", "It may still be applying. Reload the page in a minute to see if it landed.");
+        }
+        misses = 0;
         if (d.status === "done") {
           clearInterval(poll);
           if (d.dryRun) status("Dry run — captured, nothing applied.", "The build tool is in dry-run mode, so no change was made to the site.");
-          else status("Your changes are live.", "Reload the page to see them.", d.refused);
+          else status("Your changes are live.", "Refresh the page to see them.", d.refused);
         } else if (d.status === "error" || d.status === "cancelled") {
           clearInterval(poll);
           status("That change could not be completed.", d.error || "A developer has been notified.", d.refused);
+        } else if (d.steps && d.steps.total) {
+          // Counting beats a frozen "Applying...": the reviewer can see it move.
+          status("Implementing now — " + d.steps.done + "/" + d.steps.total, d.steps.label || "");
         }
-      }).catch(function () {});
-    }, 10000);
+      }).catch(function () {
+        if (++misses >= 4) { clearInterval(poll); status("Could not follow this change.", "It may still be applying. Reload the page in a minute to see if it landed."); }
+      });
+    }, 4000);
   }
 
   // ---- go ------------------------------------------------------------------
