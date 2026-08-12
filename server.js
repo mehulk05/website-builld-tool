@@ -3720,6 +3720,12 @@ async function findWebsite(siteId) {
 // .gitkeep placeholder and any dotfiles; accepts any theme name, not just g99-*.
 async function listRepoThemes(repo) {
   const r = await sh(`gh api "repos/${repo}/contents/web/app/themes?ref=main" --jq ".[]|select(.type==\\"dir\\")|.name"`);
+  // gh writes its error body to stdout, not stderr, so a repository that does
+  // not exist comes back as the single line {"message":"Not Found",...}. Read
+  // without this check it is one plausible-looking theme name, and the caller
+  // that treats a lone theme as unambiguous builds a path out of it. An empty
+  // list is what "could not read the themes" already means to every caller.
+  if (r.code !== 0) return [];
   return (r.stdout || "").split("\n").map(s => s.trim()).filter(s => s && !s.startsWith("."));
 }
 // Which theme in the website's repo an edit should target: prefer the theme the
@@ -4308,20 +4314,140 @@ async function tedFetchJson(path, init) {
   return r.json();
 }
 
-// businessName (NocoDB) -> the client name TED files tasks under. Cached: the
-// client list is large and changes far more slowly than requests arrive.
+// The whole client list. Cached: it is large and changes far more slowly than
+// requests arrive.
 let TED_CLIENTS = { at: 0, list: [] };
-async function tedClientName(businessName) {
+async function tedClients() {
   if (Date.now() - TED_CLIENTS.at > 600000 || !TED_CLIENTS.list.length) {
     const d = await tedFetchJson("/api/clients");
     TED_CLIENTS = { at: Date.now(), list: d.items || d.list || d.data || (Array.isArray(d) ? d : []) };
   }
+  return TED_CLIENTS.list;
+}
+
+// businessName (NocoDB) -> the client name TED files tasks under.
+async function tedClientName(businessName) {
+  const list = await tedClients();
   const want = tedNorm(businessName);
-  const hit = TED_CLIENTS.list.filter((c) => tedNorm(c.name) === want);
+  const hit = list.filter((c) => tedNorm(c.name) === want);
   if (hit.length === 1) return hit[0].name;
   // Never guess between two clients — filing a request on the wrong client's
   // board is worse than not filing it at all.
   throw new Error(hit.length ? `"${businessName}" matches ${hit.length} TED clients` : `no TED client matches "${businessName}"`);
+}
+
+// ---- TED as the source for a client's beta site ------------------------------
+// A beta site is created in TED, so TED knows its URL and repository first-hand.
+// Matching a client name against a NocoDB row was only ever a way of asking that
+// question indirectly, and /api/clients/{id}/info now answers it directly:
+// betaSiteUrl and githubRepo, keyed by client id.
+//
+// It is a preference rather than a switch, and TED's answer is verified before
+// it is used. Both halves of that were earned on 2026-08-11: coverage was 1 of
+// 148 clients (the fields are written when the beta_site.env task completes, and
+// nothing was backfilled), and that one populated row was wrong — it named
+// nuvoaestheticsclinic.gogroth.com, a repository that does not exist and a host
+// that does not serve, where the client actually builds on the shared
+// prodteam.gogroth.com. Preferring TED blindly would have swapped a working
+// repository for a 404.
+//
+// So: ask TED, use its answer only when the repository it names resolves, and
+// let NocoDB answer for everyone else. Each client starts resolving from TED the
+// moment TED has a usable answer for it, with no deploy or flag day on either
+// side, and a wrong row in TED costs a log line rather than a failed run.
+
+// clientName (+ hubspotId when the caller has one) -> TED's numeric client id.
+// null rather than a throw: not finding the client is the normal case today.
+async function tedClientIdFor(clientName, hubspotId) {
+  const list = await tedClients();
+  // hubspotId is the stronger key — it is unique per client, while names repeat
+  // across clones ("... (clone)", "... v2 (clone)").
+  if (hubspotId) {
+    const byDeal = list.filter((c) => String(c.hubspotId || "") === String(hubspotId));
+    if (byDeal.length === 1) return String(byDeal[0].id);
+  }
+  const want = tedNorm(clientName);
+  const exact = list.filter((c) => tedNorm(c.name) === want);
+  return exact.length === 1 ? String(exact[0].id) : null;   // never guess between two
+}
+
+// What TED holds for a client, or null. Never throws: TED being unreachable has
+// to leave the NocoDB path behaving exactly as it did before.
+async function tedSiteFields(clientName, hubspotId) {
+  if (!TED_API_TOKEN) return null;
+  try {
+    const id = await tedClientIdFor(clientName, hubspotId);
+    if (!id) return null;
+    const info = await tedGetClientInfo(id);
+    if (!info || !info.githubRepo) return null;
+    return {
+      clientId: id,
+      // TED stores the repository as "Owner/Repo" already, which is the form
+      // this file uses everywhere; parseRepoSlug is tolerated for the day it
+      // starts storing full URLs instead.
+      githubRepo: parseRepoSlug(info.githubRepo) || String(info.githubRepo).trim(),
+      betaSiteUrl: String(info.betaSiteUrl || "").trim(),
+    };
+  } catch (e) { return null; }
+}
+
+// The check that makes TED-first safe. A repository with no themes in it cannot
+// be edited, so it is the same question resolveEditTarget() asks next — asked
+// one step earlier, where there is still a NocoDB row to fall back to.
+async function tedRepoUsable(repo) {
+  if (!repo) return false;
+  const themes = await listRepoThemes(repo).catch(() => []);
+  return themes.length > 0;
+}
+
+// A site already identified by other means, with TED's repository and beta URL
+// preferred over it when TED has a usable pair. Returns the original object
+// untouched in every other case, so callers keep every field they expect
+// (siteId, existingSiteUrl, rowId) regardless of which source won.
+async function withTedFields(site, hubspotId) {
+  const ted = await tedSiteFields(site.businessName, hubspotId);
+  if (!ted) return site;
+  const sameRepo = ted.githubRepo === site.githubRepo;
+  const sameUrl = !ted.betaSiteUrl || ted.betaSiteUrl === site.liveUrl;
+  if (sameRepo && sameUrl) return site;                       // nothing to prefer
+  if (!(await tedRepoUsable(ted.githubRepo))) {
+    console.warn(`ted: ignoring ${site.businessName} -> ${ted.githubRepo} (repository does not resolve) — keeping ${site.githubRepo || "no repo"} from NocoDB`);
+    return site;
+  }
+  console.log(`ted: ${site.businessName} resolved from TED client ${ted.clientId} (${ted.githubRepo}${ted.betaSiteUrl ? ", " + ted.betaSiteUrl : ""})`);
+  return { ...site, githubRepo: ted.githubRepo, liveUrl: ted.betaSiteUrl || site.liveUrl, tedClientId: ted.clientId, resolvedFrom: "ted" };
+}
+
+// One site for a TED client name, TED first and NocoDB behind it. The NocoDB
+// half is the join this tool has always used and is refused the same way when it
+// is not exactly one site: acting on the wrong client's repository is not a
+// recoverable mistake.
+async function resolveClientSite(clientName, hubspotId) {
+  const sites = await getWebsites(true);
+  const want = tedNorm(clientName);
+  const exact = sites.filter((s) => tedNorm(s.businessName) === want);
+  const hits = exact.length ? exact : sites.filter((s) => tedNorm(s.businessName).includes(want) || want.includes(tedNorm(s.businessName)));
+  const nocoHit = hits.length === 1 ? hits[0] : null;
+
+  if (nocoHit) {
+    const site = await withTedFields(nocoHit, hubspotId);
+    if (!site.githubRepo) throw new Error(`${site.businessName} has no repository in NocoDB`);
+    return site;
+  }
+
+  // No NocoDB row — the case TED is here to fix. A client that only exists in
+  // TED is workable as long as TED names a repository that resolves; the siteId
+  // is synthesised so per-site state (approvals, job dedupe) still has a key.
+  const ted = await tedSiteFields(clientName, hubspotId);
+  if (ted && await tedRepoUsable(ted.githubRepo)) {
+    console.log(`ted: ${clientName} has no NocoDB row — resolved entirely from TED client ${ted.clientId} (${ted.githubRepo})`);
+    return {
+      siteId: `ted-${ted.clientId}`, rowId: null, businessName: clientName,
+      liveUrl: ted.betaSiteUrl, existingSiteUrl: "", repoUrl: `https://github.com/${ted.githubRepo}`,
+      githubRepo: ted.githubRepo, tedClientId: ted.clientId, resolvedFrom: "ted",
+    };
+  }
+  throw new Error(hits.length ? `"${clientName}" matches ${hits.length} sites` : `no site matches "${clientName}"`);
 }
 
 // The client's own revision-cycle task, which the request's subtask hangs off.
@@ -4468,16 +4594,10 @@ async function tedResolveSubtaskRequest(taskId) {
   const clientName = usable(task.clientName) ? task.clientName : (usable(parent.clientName) ? parent.clientName : null);
   if (!clientName) throw tedSkip(`no client on task ${taskId} or its parent`);
 
-  // Same name join the pre-release webhook uses, and refused the same way when
-  // it is not exactly one site: acting on the wrong client's repository is not
-  // a recoverable mistake.
-  const sites = await getWebsites(true);
-  const want = tedNorm(clientName);
-  const exact = sites.filter((s) => tedNorm(s.businessName) === want);
-  const hits = exact.length ? exact : sites.filter((s) => tedNorm(s.businessName).includes(want) || want.includes(tedNorm(s.businessName)));
-  if (hits.length !== 1) throw new Error(hits.length ? `"${clientName}" matches ${hits.length} sites` : `no site matches "${clientName}"`);
-  const site = hits[0];
-  if (!site.githubRepo) throw new Error(`${site.businessName} has no repository in NocoDB`);
+  // TED first, the NocoDB name join behind it — see resolveClientSite. The
+  // hubspotId travels with the task and identifies the client far more reliably
+  // than its name, which repeats across clones.
+  const site = await resolveClientSite(clientName, task.hubspotId || parent.hubspotId || "");
 
   // Title and description are what the person wrote first; comments are where
   // they add the detail they forgot. All of it is the request.
@@ -4769,6 +4889,221 @@ async function tedPushArtifacts(eventType, { businessId, draftId, mockups, servi
     if (!r.ok) return { ok: false, error: `HTTP ${r.status}`, payload };
     return { ok: true, payload };
   } catch (e) { return { ok: false, error: String(e.message || e) }; }
+}
+
+// ---- Content review sessions -------------------------------------------------
+// A content editor reviews the beta site itself and corrects the copy in place;
+// the widget that lets them do it lives in review-plugin.js and renders only
+// inside a session minted here.
+//
+// The token is the whole security model, so it is worth being explicit about
+// what it is: an HMAC over {siteId, themeSlug, reviewer, expiry}. It is minted
+// by an authenticated caller, spent once in a URL, and thereafter held only on
+// the WordPress side. Nothing about the reviewer is trusted from the browser —
+// the name shown in the widget comes back out of the token, not off the page.
+const { reviewPluginSource } = require("./review-plugin.js");
+const REVIEW_SECRET = process.env.REVIEW_SECRET || process.env.WEBHOOK_SECRET || process.env.ADMIN_PASSWORD || "";
+const REVIEW_TTL_MIN = Number(process.env.REVIEW_TTL_MIN || 120);
+const REVIEW_PLUGIN_PATH = "web/app/mu-plugins/g99-content-review.php";
+
+const reviewSign = (body) => crypto.createHmac("sha256", REVIEW_SECRET).update(body).digest("base64url");
+
+function mintReviewToken({ siteId, themeSlug, reviewer, email, dept, minutes }) {
+  if (!REVIEW_SECRET) throw new Error("REVIEW_SECRET not set (falls back to WEBHOOK_SECRET or ADMIN_PASSWORD) — cannot mint review links");
+  const exp = Date.now() + Math.max(5, Number(minutes) || REVIEW_TTL_MIN) * 60000;
+  const body = Buffer.from(JSON.stringify({ v: 1, siteId, themeSlug, reviewer, email: email || "", dept: dept || "", exp })).toString("base64url");
+  return { token: `${body}.${reviewSign(body)}`, exp };
+}
+
+// Returns the payload or null. Never throws and never explains which half
+// failed: a caller holding a bad token learns only that it is not usable.
+function verifyReviewToken(token) {
+  const [body, sig] = String(token || "").split(".");
+  if (!body || !sig || !REVIEW_SECRET) return null;
+  const want = reviewSign(body);
+  if (sig.length !== want.length) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(want))) return null;
+  let d = null;
+  try { d = JSON.parse(Buffer.from(body, "base64url").toString("utf8")); } catch (e) { return null; }
+  if (!d || !d.exp || Date.now() > d.exp) return null;
+  return d;
+}
+
+// Which job belongs to which session, without keeping the token itself around.
+const reviewSig = (token) => crypto.createHash("sha256").update(String(token)).digest("hex").slice(0, 16);
+
+// WordPress texturises quotes and dashes on the way out, so the sentence a
+// reviewer selected on screen ("don't") is often not the sentence in the
+// template ("don't"). Without these the swap silently matches nothing and the
+// change is reported as done-but-not-found. Ordered most to least likely.
+// Both directions, because the source can be either. wptexturize() turns a
+// straight quote in the template into a curly one on screen, so the text a
+// reviewer copies is usually the curly form of a straight source — but the copy
+// is AI-written and Gemini emits curly punctuation into the template often
+// enough that the reverse happens too. Entity spellings are included because a
+// template may hold &#039; where the page shows an apostrophe.
+function reviewTextVariants(s) {
+  const src = String(s);
+  const out = new Set();
+  const straight = src
+    .replace(/[‘’]/g, "'").replace(/[“”]/g, '"')
+    .replace(/—/g, "--").replace(/–/g, "-").replace(/…/g, "...");
+  const curly = straight
+    .replace(/'/g, "’").replace(/--/g, "—").replace(/\.\.\./g, "…")
+    .replace(/"([^"]*)"/g, "“$1”");
+  for (const form of [straight, curly]) {
+    out.add(form);
+    out.add(form.replace(/&/g, "&amp;"));
+    out.add(form.replace(/'/g, "&#039;"));
+    out.add(form.replace(/'/g, "&#39;"));
+    out.add(form.replace(/’/g, "&#8217;"));
+  }
+  out.delete(src);
+  return [...out].filter(Boolean);
+}
+
+// Everything a review run needs, taken from the token alone. The token is signed
+// and already carries the siteId and the theme it was minted against, and the
+// paths below are the same formula resolveEditTarget() uses — so a correction can
+// still be applied when NocoDB or GitHub cannot be reached, which on a laptop
+// (or a dropped VPN) is often. No repository, so it is only enough for a local
+// run; a live one still needs the real row.
+function reviewTargetFromToken(d) {
+  const slug = String(d.themeSlug || "");
+  const bare = slug.replace(/^g99-/, "");
+  return {
+    site: { siteId: d.siteId, businessName: d.siteId, githubRepo: "", liveUrl: "" },
+    target: {
+      themeSlug: slug,
+      themePath: `web/app/themes/${slug}`,
+      muPath: slug.startsWith("g99-") ? `web/app/mu-plugins/g99-activate-${bare}.php` : "",
+    },
+  };
+}
+
+// One site row + its theme paths, by siteId or by business name. Reads the cache
+// first: a reviewer submitting six corrections should not force six full NocoDB
+// refreshes, and the list changes far more slowly than batches arrive.
+async function resolveReviewSite(idOrName) {
+  const want = String(idOrName || "").trim();
+  if (!want) throw new Error("siteId or businessName required");
+  let sites = await getWebsites(false).catch(() => []);
+  if (!sites.some((s) => s.siteId === want || tedNorm(s.businessName) === tedNorm(want))) sites = await getWebsites(true);
+  const hits = sites.filter((s) => s.siteId === want)
+    .concat(sites.filter((s) => tedNorm(s.businessName) === tedNorm(want)));
+  const site = hits[0];
+  if (!site) throw new Error(`no site matches "${want}"`);
+  if (!site.githubRepo) throw new Error(`${site.businessName} has no repository in NocoDB`);
+  const target = await resolveEditTarget(site);
+  return { site, target };
+}
+
+// A batch from the widget becomes a work order with the exact pairs already in
+// it, so buildWorkOrder() — and the model behind it — is never asked to infer
+// what "change X to Y" meant. applyTextSwaps() settles every item in code.
+function reviewWorkOrder(changes, { reviewer, pagePath }) {
+  const items = changes.slice(0, 40).map((c) => ({
+    what: `Replace "${String(c.original).slice(0, 70)}" with "${String(c.replacement).slice(0, 70)}"`,
+    where: pagePath,
+    replaces: String(c.original),
+    literal: String(c.replacement),
+    variants: reviewTextVariants(c.original),
+  }));
+  return {
+    summary: `${items.length} content correction${items.length > 1 ? "s" : ""} from ${reviewer} on ${pagePath}`,
+    changes: items, constraints: [], unclear: [],
+  };
+}
+
+// Where a correction made on one page is allowed to land, most specific first.
+// A reviewer looking at the homepage means the homepage: the fact that the same
+// sentence also sits in five other templates is not permission to rewrite them.
+// Shared chrome is a second tier rather than a peer, so a footer edit still
+// works while a body edit can never reach the footer by accident.
+function reviewSwapTiers(pagePath, muSrc, themePath) {
+  const slug = String(pagePath || "/").replace(/^\/+|\/+$/g, "").split("/")[0].toLowerCase();
+  let template = "front-page.php";
+  if (slug) {
+    const hit = readMuPages(muSrc).find((p) => String(p.slug).toLowerCase() === slug);
+    template = (hit && hit.template) || `page-${slug}.php`;
+  }
+  return [
+    [`${themePath}/${template}`],
+    [`${themePath}/header.php`, `${themePath}/footer.php`],
+  ];
+}
+
+// Apply a review batch straight into a local working tree, with no git at all.
+// This is what makes a laptop dry run mean something: the corrections land in
+// the same checkout a local WordPress is serving, so the reviewer types a change,
+// refreshes, and sees it — while nothing is cloned, pushed, merged or deployed.
+//
+// It deliberately runs the SAME applyTextSwaps options a live job runs, so a
+// change that is refused here is refused in production for the same reason. A
+// rehearsal that is more permissive than the real thing teaches nothing.
+function applyReviewLocally(root, target, pagePath, workOrder) {
+  const themeAbs = path.join(root, target.themePath);
+  if (!fs.existsSync(themeAbs)) throw new Error(`REVIEW_LOCAL_REPO has no ${target.themePath}`);
+  const files = fs.readdirSync(themeAbs).filter((f) => /\.php$/i.test(f))
+    .map((f) => ({ rel: `${target.themePath}/${f}`, content: fs.readFileSync(path.join(themeAbs, f), "utf8") }));
+  let muSrc = "";
+  if (target.muPath && fs.existsSync(path.join(root, target.muPath))) {
+    muSrc = fs.readFileSync(path.join(root, target.muPath), "utf8");
+    files.push({ rel: target.muPath, content: muSrc });
+  }
+  const refused = [];
+  const applied = applyTextSwaps(workOrder, files, root, {
+    tiers: reviewSwapTiers(pagePath, muSrc, target.themePath),
+    maxHits: 5, visibleOnly: true, wordSafe: true, refused,
+  });
+  // Same rule as a live run: anything the swap could not place is reported, never
+  // guessed at by a model.
+  workOrder.changes.forEach((c, i) => {
+    if (applied.some((a) => a.n === i + 1) || refused.some((r) => r.n === i + 1)) return;
+    refused.push({
+      n: i + 1, what: c.what, hits: 0,
+      reason: `"${String(c.replaces).slice(0, 60)}" could not be matched exactly on ${pagePath} — if it runs across a line break, change one line at a time.`,
+    });
+  });
+  return { applied, refused };
+}
+
+// Install the review plugin into a site's repository. One-time per repo, and
+// deliberately PR-only: this adds a file that runs on every request of a client
+// site, which is a thing a person should look at once before it ships.
+async function installReviewPlugin(site, toolUrl) {
+  const repo = site.githubRepo;
+  const tmp = path.join(os.tmpdir(), "g99review-" + Date.now());
+  try {
+    let r = await sh(`gh repo clone ${repo} "${tmp}" -- --depth 1`);
+    const cloneUrl = await ghCloneUrl(repo);
+    if (r.code) r = await sh(`git clone --depth 1 "${cloneUrl}" "${tmp}"`);
+    if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
+    if (/x-access-token:/.test(cloneUrl)) await sh(`git remote set-url origin "${cloneUrl}"`, tmp);
+
+    const abs = path.join(tmp, REVIEW_PLUGIN_PATH);
+    const existed = fs.existsSync(abs);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, reviewPluginSource(toolUrl));
+
+    const branch = `g99/content-review-${Date.now()}`;
+    await sh(`git checkout -b "${branch}"`, tmp);
+    await sh(`git add -A "${REVIEW_PLUGIN_PATH}"`, tmp);
+    r = await sh(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "${existed ? "Update" : "Add"} the content-review plugin"`, tmp);
+    if (r.code) return { ok: true, upToDate: true, prUrl: null };   // identical file already in main
+    r = await sh(`git push -u origin "${branch}"`, tmp);
+    if (r.code) throw new Error("push failed: " + r.stderr.slice(-200));
+    const body = `Adds the in-page content-review widget for content editors.\\n\\n`
+      + `Renders nothing unless the visitor arrived through a signed review link, holds no secret, `
+      + `and posts only to this site (which forwards to the build tool server-side).\\n\\n`
+      + `Delete ${REVIEW_PLUGIN_PATH} to switch it off.`;
+    r = await sh(`gh pr create --repo ${repo} --base main --head "${branch}" --title "${existed ? "Update" : "Add"} content-review plugin" --body "${body}"`, tmp);
+    const prUrl = (r.stdout.match(/https:\/\/github\.com\/\S+/) || [""])[0];
+    if (!prUrl) throw new Error("PR create failed: " + r.stderr.slice(-200));
+    return { ok: true, prUrl, branch };
+  } finally {
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) { /* temp dir */ }
+  }
 }
 
 // Pick ONE service page to audit when the caller didn't name one. Real service pages usually live
@@ -6451,17 +6786,129 @@ function workOrderText(wo) {
 // nearby paragraph from "After 30" to "After 40", which nobody asked for.
 // Doing these in code means the diff can only contain what was requested.
 // Returns the items it resolved; those never reach the planner at all.
-function applyTextSwaps(workOrder, files, rootAbs) {
+// Marks every byte that is markup or PHP rather than visible content: inside a
+// tag (so attribute values like alt="..." and content="...") or inside <?php ?>.
+//
+// This exists because of a real dry run. A reviewer selected the word "focused"
+// on the homepage and asked for it to become something else. Matched blindly,
+// that hit eleven places across six templates — SEO meta descriptions, image alt
+// text, a hyphenated word mid-token, and four pages they were not even looking
+// at — and would then have auto-merged. A reviewer selects what they can SEE, so
+// only what is visible may be edited.
+function visibleMask(s) {
+  const m = new Uint8Array(s.length);
+  let i = 0;
+  while (i < s.length) {
+    if (s.startsWith("<?", i)) {
+      const end = s.indexOf("?>", i);
+      const stop = end === -1 ? s.length : end + 2;
+      m.fill(1, i, stop); i = stop; continue;
+    }
+    if (s[i] === "<") {
+      const end = s.indexOf(">", i);
+      const stop = end === -1 ? s.length : end + 1;
+      m.fill(1, i, stop); i = stop; continue;
+    }
+    i++;
+  }
+  return m;
+}
+// Occurrences of `find` that lie wholly in visible content. A span that starts
+// outside a tag and ends inside one is not a clean piece of text either, so the
+// whole run has to be clear.
+//
+// `wordSafe` additionally drops matches that are part of a longer word:
+// "focused" inside "comfort-focused", or "treatment" inside "treatments". The
+// reviewer selected a word, not a fragment of one, and replacing the fragment
+// leaves mangled text behind.
+function visibleHits(content, find, wordSafe) {
+  const mask = visibleMask(content);
+  const word = /[A-Za-z0-9]/;
+  const out = [];
+  let i = content.indexOf(find);
+  while (i !== -1) {
+    let clear = true;
+    for (let k = i; k < i + find.length; k++) if (mask[k]) { clear = false; break; }
+    if (clear && wordSafe) {
+      const before = i > 0 ? content[i - 1] : "";
+      const after = content[i + find.length] || "";
+      if ((word.test(find[0]) && word.test(before)) || (word.test(find[find.length - 1]) && word.test(after))) clear = false;
+    }
+    if (clear) out.push(i);
+    i = content.indexOf(find, i + 1);
+  }
+  return out;
+}
+
+// `variants` (optional) are other spellings of the SAME original text to try when
+// the literal one is not in the file — WordPress texturises quotes and dashes on
+// output, so text copied off the rendered page routinely differs from the
+// template it came from. First form that matches in a given file wins; a file
+// that matches none is left alone.
+//
+// `opts` turns on the content-review safety rules; with none of it passed this
+// behaves exactly as it always did, which is what the email path relies on.
+//   tiers      — file groups to try in order (the page's own template, then the
+//                shared header/footer). The FIRST tier with a match wins and no
+//                other tier is touched, so editing the homepage cannot rewrite
+//                the about page.
+//   maxHits    — refuse a change that matches more places than this. A single
+//                word must be unique (1) to be safe at all; a phrase may repeat.
+//   visibleOnly — ignore matches in markup, attributes and PHP.
+//   refused    — array the caller passes in to collect what was declined and why.
+function applyTextSwaps(workOrder, files, rootAbs, opts) {
+  const O = opts || {};
   const done = [];
+  const byRel = new Map(files.map((f) => [f.rel, f]));
+  const groups = O.tiers ? O.tiers.map((t) => t.map((rel) => byRel.get(rel)).filter(Boolean)) : [files];
+
   workOrder.changes.forEach((c, i) => {
     if (!c.replaces || !c.literal || c.replaces === c.literal) return;
+    const forms = [c.replaces, ...(Array.isArray(c.variants) ? c.variants : [])];
+    // One word is inherently ambiguous — "focused" is a word, not a place. It may
+    // only be changed where it occurs exactly once.
+    const oneWord = !/\s/.test(c.replaces.trim());
+    const ceiling = O.maxHits ? (oneWord ? 1 : O.maxHits) : Infinity;
+
+    let chosen = null;
+    for (const group of groups) {
+      const found = [];
+      for (const f of group) {
+        const form = forms.find((s) => s && f.content.includes(s));
+        if (!form) continue;
+        const at = O.visibleOnly ? visibleHits(f.content, form, O.wordSafe) : null;
+        const count = O.visibleOnly ? at.length : f.content.split(form).length - 1;
+        if (count) found.push({ f, form, at, count });
+      }
+      if (found.length) { chosen = found; break; }   // first tier that has it wins
+    }
+    if (!chosen) return;                              // not here: the planner may still try
+
+    const total = chosen.reduce((n, x) => n + x.count, 0);
+    if (total > ceiling) {
+      if (O.refused) {
+        O.refused.push({
+          n: i + 1, what: c.what, replaces: c.replaces, literal: c.literal, hits: total,
+          reason: oneWord
+            ? `"${c.replaces}" appears ${total} times on this page — a single word can only be changed where it is unique. Select the whole phrase around it.`
+            : `"${c.replaces}" appears ${total} times — too many places to change safely in one go.`,
+        });
+      }
+      return;
+    }
+
     const touched = [];
-    for (const f of files) {
-      const parts = f.content.split(c.replaces);
-      if (parts.length < 2) continue;
-      f.content = parts.join(c.literal);     // keep the in-memory copy in step
+    for (const { f, form, at, count } of chosen) {
+      if (O.visibleOnly) {
+        // Right to left, so earlier offsets stay valid as the string changes.
+        let s = f.content;
+        for (let k = at.length - 1; k >= 0; k--) s = s.slice(0, at[k]) + c.literal + s.slice(at[k] + form.length);
+        f.content = s;
+      } else {
+        f.content = f.content.split(form).join(c.literal);
+      }
       fs.writeFileSync(path.join(rootAbs, f.rel), f.content);
-      touched.push({ rel: f.rel, count: parts.length - 1 });
+      touched.push({ rel: f.rel, count });
     }
     if (touched.length) done.push({ n: i + 1, what: c.what, replaces: c.replaces, literal: c.literal, files: touched });
   });
@@ -6739,10 +7186,59 @@ async function verifyWork(workOrder, diff, ai, request) {
   return { results, missed: missed.length, total: results.length, done: results.filter((r) => r.done === true).length };
 }
 
+// A content-review run against a local checkout. Deliberately its own function
+// rather than a flag inside runEditJob: that one clones into a temp directory and
+// deletes it on the way out, and pointing `tmp` at a real working tree would have
+// it rm -rf someone's repository the first time a run failed.
+//
+// Same guardrails as a live run, no git at all: the swap is written straight into
+// the checkout a local WordPress is serving, so the reviewer refreshes and sees it.
+async function runLocalReviewEdit(job) {
+  const P = job.payload;
+  const root = P.localApply;
+  try {
+    jobStep(job, 0, "done", "Local checkout — nothing to clone");
+    jobStep(job, 1, "running", "Reading the corrections…");
+    const wo = P.workOrder;
+    jobStep(job, 1, "done", `${wo.changes.length} exact correction(s) from ${P.requestedBy || "a reviewer"}`);
+
+    jobStep(job, 2, "running", "Applying to " + P.reviewPath + "…");
+    const out = applyReviewLocally(root, { themePath: P.themePath, muPath: P.muPath }, P.reviewPath, wo);
+    job.textSwaps = out.applied;
+    job.reviewRefused = out.refused;
+    job.editSummary = out.applied.length ? swapsText(out.applied) : "nothing applied";
+    job.editSummaryEmail = job.editSummary;
+    jobStep(job, 2, "done", out.applied.length
+      ? `${out.applied.length} change(s) written${out.refused.length ? ` · ${out.refused.length} refused` : ""}`
+      : `nothing applied · ${out.refused.length} refused`);
+
+    jobStep(job, 3, "done", out.applied.length ? "Exact swaps — verified as written" : "Nothing to check");
+    jobStep(job, 4, "done", "Local run — no pull request");
+    jobStep(job, 5, "done", "Local run — no CI, no merge");
+    jobStep(job, 6, "done", out.applied.length ? "Live on the local site — refresh to see it" : "No change made");
+
+    job.status = out.applied.length ? "done" : "error";
+    if (!out.applied.length) job.error = out.refused.map((r) => r.reason).join("\n") || "nothing matched";
+    notify(`✍️ Content review (local) — *${P.businessName}* ${P.reviewPath}: ${out.applied.length} applied`
+      + (out.refused.length ? `, ${out.refused.length} refused` : ""));
+  } catch (e) {
+    job.error = e.message; job.status = "error";
+    if (job.steps[job.currentStep] && job.steps[job.currentStep].status === "running") {
+      job.steps[job.currentStep].status = "error";
+      job.steps[job.currentStep].detail = String(e.message).slice(0, 240);
+    }
+    console.error(`local review job ${job.draftId} failed:`, e.message);
+  } finally {
+    job.finishedAt = new Date().toISOString(); saveJobs(); COST_SINK = null;
+  }
+}
+
 async function runEditJob(job) {
   job.status = "running";
   job.startedAt = new Date().toISOString(); COST_SINK = job.cost;
   const P = job.payload;                 // {siteId, themeSlug, themePath, muPath, githubRepo, businessName, prompt}
+  // Local content-review runs never reach the git machinery below.
+  if (P.localApply) return runLocalReviewEdit(job);
   const repo = P.githubRepo || WP_REPO;
   const tmp = path.join(os.tmpdir(), "g99edit-" + Date.now());
   const run = async (cmd, cwd) => sh(cmd, cwd);
@@ -6799,9 +7295,15 @@ async function runEditJob(job) {
     // Understand the ask before working out where it lands. A failure here is
     // not fatal — the run continues on the raw request, exactly as it did
     // before this step existed.
-    let workOrder = null;
-    try { workOrder = await buildWorkOrder(P.prompt, { businessName: P.businessName }, ai); }
-    catch (e) { console.warn(`edit job ${job.draftId}: work order failed, using the raw request —`, e.message); }
+    // A caller that already knows the exact pairs supplies the work order itself
+    // and the model is never asked to infer one. The content-review widget is the
+    // case this exists for: it captured the original text off the page, so there
+    // is nothing to interpret and interpreting it could only introduce error.
+    let workOrder = P.workOrder || null;
+    if (!workOrder) {
+      try { workOrder = await buildWorkOrder(P.prompt, { businessName: P.businessName }, ai); }
+      catch (e) { console.warn(`edit job ${job.draftId}: work order failed, using the raw request —`, e.message); }
+    }
     job.workOrder = workOrder;
     if (workOrder) {
       jobStep(job, 1, "running", `${workOrder.changes.length} change(s) understood${workOrder.unclear.length ? `, ${workOrder.unclear.length} too vague to action` : ""} — locating them…`);
@@ -6811,10 +7313,38 @@ async function runEditJob(job) {
     // Straight text swaps are settled here, in code. Whatever they resolve is
     // removed from the brief, so the model never sees it and cannot embellish
     // it. Only what is left needs judgement.
-    const swaps = workOrder ? applyTextSwaps(workOrder, source, tmp) : [];
+    // A correction typed on a page carries safety rules an emailed request does
+    // not: it may only touch that page (then shared chrome), only visible text,
+    // and only where the target is unambiguous. See applyTextSwaps.
+    const reviewRefused = [];
+    const swapOpts = P.reviewPath ? {
+      tiers: reviewSwapTiers(P.reviewPath, (source.find((f) => f.rel === P.muPath) || {}).content, P.themePath),
+      maxHits: 5, visibleOnly: true, wordSafe: true, refused: reviewRefused,
+    } : undefined;
+    const swaps = workOrder ? applyTextSwaps(workOrder, source, tmp, swapOpts) : [];
     job.textSwaps = swaps;
     const swapped = new Set(swaps.map((s) => s.n));
-    const forAi = workOrder ? { ...workOrder, changes: workOrder.changes.filter((c, i) => !swapped.has(i + 1)) } : null;
+
+    // Nothing from a review reaches the planner. These runs merge themselves, so
+    // "the swap could not find it, let a model try" would hand a client's live
+    // site to a guess — the exact risk the exact-pair design exists to remove.
+    // If it cannot be matched character-for-character on the page it was typed
+    // on, it is reported back rather than approximated.
+    if (P.reviewPath && workOrder) {
+      workOrder.changes.forEach((c, i) => {
+        if (swapped.has(i + 1) || reviewRefused.some((r) => r.n === i + 1)) return;
+        reviewRefused.push({
+          n: i + 1, what: c.what, replaces: c.replaces, literal: c.literal, hits: 0,
+          reason: `"${String(c.replaces).slice(0, 60)}" could not be matched exactly on ${P.reviewPath} — if it runs across a line break, change one line at a time.`,
+        });
+      });
+    }
+    job.reviewRefused = reviewRefused;
+    const blocked = new Set(reviewRefused.map((r) => r.n));
+    const forAi = workOrder ? { ...workOrder, changes: workOrder.changes.filter((c, i) => !swapped.has(i + 1) && !blocked.has(i + 1)) } : null;
+    if (reviewRefused.length && !swaps.length && forAi && !forAi.changes.length) {
+      throw new Error("Nothing could be applied safely:\n" + reviewRefused.map((r) => "- " + r.reason).join("\n"));
+    }
     if (swaps.length) {
       ({ manifest, source } = scanTheme());     // re-read: the files just changed
       jobStep(job, 1, "running", `${swaps.length} exact text change(s) made directly · ${forAi.changes.length} left to plan`);
@@ -6879,7 +7409,14 @@ async function runEditJob(job) {
       return (await run(`git --no-pager diff --cached --unified=1 -- ${paths}`, tmp)).stdout || "";
     };
     let check = null;
-    try {
+    // Nothing for a model to confirm when a model did nothing. Every item was an
+    // exact pair the caller supplied, and applyTextSwaps already reported which
+    // files each one landed in — asking Gemini to re-read the diff would only be
+    // a slower, less certain version of a fact we already hold.
+    const allSwapped = !!P.workOrder && !plan.files.length && swaps.length === workOrder.changes.length;
+    if (allSwapped) {
+      jobStep(job, 3, "done", `${swaps.length} exact swap(s) verified in the diff`);
+    } else try {
       check = await verifyWork(workOrder, await stagedDiff(), ai, P.prompt);
       // One retry, for the items the diff shows no evidence of. A second miss
       // is reported rather than retried again: past one attempt this stops
@@ -6914,9 +7451,11 @@ async function runEditJob(job) {
     }
     job.verification = check;
     saveJobs();
-    jobStep(job, 3, "done", check
-      ? `${check.done} of ${check.total} confirmed${check.missed ? ` · ${check.missed} not done` : ""}${job.retried ? " (after a retry)" : ""}`
-      : "Nothing checkable — skipped");
+    if (!allSwapped) {
+      jobStep(job, 3, "done", check
+        ? `${check.done} of ${check.total} confirmed${check.missed ? ` · ${check.missed} not done` : ""}${job.retried ? " (after a retry)" : ""}`
+        : "Nothing checkable — skipped");
+    }
 
     // 5 — push + PR
     jobStep(job, 4, "running", "Pushing + opening PR…");
@@ -6971,7 +7510,8 @@ async function runEditJob(job) {
     // Anything skipped has to be said out loud — otherwise "done" reads as "all
     // of it done". Two ways an item can be missing: too vague to attempt, or
     // attempted and not found in the diff afterwards.
-    const skipped = (job.workOrder && job.workOrder.unclear) || [];
+    const skipped = ((job.workOrder && job.workOrder.unclear) || [])
+      .concat((job.reviewRefused || []).map((r) => r.reason));
     const notDone = check ? check.results.filter((r2) => r2.done !== true) : [];
     // The second and final message. One line saying what shipped, then the
     // site. No pull request link: internal plumbing, and merged by now anyway.
@@ -12367,6 +12907,180 @@ const server = http.createServer(async (req, res) => {
       return json(res, 202, { jobId: job.draftId, site: site.businessName, tedTaskId: job.payload.tedTaskId || null });
     }
 
+    // ---- content review -----------------------------------------------------
+    // Mint a review link for one person on one site. Under /api/ rather than
+    // /api/webhook/, so it sits behind the admin key: creating a session is the
+    // one privileged act in this whole feature, and everything downstream — who
+    // the reviewer is, which site they may touch — is decided here and then
+    // carried in the token's signature.
+    if (p === "/api/review/mint" && req.method === "POST") {
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || "{}"); } catch (e) { return json(res, 400, { error: "bad json" }); }
+      const reviewer = String(body.reviewer || "").trim();
+      if (!reviewer) return json(res, 400, { error: "reviewer name required — it is shown in the widget and recorded on the change" });
+      try {
+        const { site, target } = await resolveReviewSite(body.site || body.siteId || body.businessName);
+        const { token, exp } = mintReviewToken({
+          siteId: site.siteId, themeSlug: target.themeSlug, reviewer,
+          email: body.email, dept: body.dept || "Content", minutes: body.minutes,
+        });
+        if (!/^https?:\/\//i.test(site.liveUrl || "")) throw new Error(`${site.businessName} has no beta site URL in NocoDB — there is nowhere to send the reviewer`);
+        const link = new URL(site.liveUrl);
+        link.searchParams.set("g99r", token);
+        return json(res, 200, {
+          ok: true, url: link.toString(), expiresAt: new Date(exp).toISOString(),
+          siteId: site.siteId, businessName: site.businessName, themeSlug: target.themeSlug, reviewer,
+        });
+      } catch (e) { return json(res, 400, { error: String(e.message || e) }); }
+    }
+
+    // Put the review plugin into a site's repository (PR only — a file that runs
+    // on every request of a client site gets looked at once by a person).
+    if (p === "/api/review/install" && req.method === "POST") {
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || "{}"); } catch (e) { return json(res, 400, { error: "bad json" }); }
+      try {
+        const { site } = await resolveReviewSite(body.site || body.siteId || body.businessName);
+        const out = await installReviewPlugin(site, G99_TOOL_PUBLIC_URL);
+        return json(res, 200, { ...out, businessName: site.businessName, repo: site.githubRepo, path: REVIEW_PLUGIN_PATH });
+      } catch (e) { return json(res, 400, { error: String(e.message || e) }); }
+    }
+
+    // Called by the beta site, server-side, to redeem a link. Outside the admin
+    // gate because the token IS the credential. Answers only what the widget has
+    // to render — never the email, the site's repository or anything else.
+    if (p === "/api/webhook/review/verify") {
+      const d = verifyReviewToken(u.searchParams.get("t"));
+      if (!d) return json(res, 200, { ok: false });
+      return json(res, 200, { ok: true, reviewer: d.reviewer, siteId: d.siteId, themeSlug: d.themeSlug, exp: d.exp });
+    }
+
+    // A batch of exact text corrections from the widget, forwarded by the site.
+    if (p === "/api/webhook/review/feedback" && req.method === "POST") {
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || "{}"); } catch (e) { return json(res, 400, { error: "bad json" }); }
+      const d = verifyReviewToken(body.token);
+      if (!d) return json(res, 401, { ok: false, error: "this review session has expired — ask for a fresh link" });
+
+      // Several beta sites share one WordPress install and differ only by which
+      // theme is active. Without this check a session minted for one client
+      // could write corrections into another client's theme — silently, because
+      // the text would match there too.
+      const active = String(body.activeTheme || "").trim();
+      if (!active || active !== d.themeSlug) {
+        console.warn(`review: refused a batch for ${d.siteId} — session theme ${d.themeSlug}, site is serving ${active || "nothing"}`);
+        return json(res, 409, { ok: false, error: "this site is not serving the theme this review link was made for" });
+      }
+
+      const changes = (Array.isArray(body.changes) ? body.changes : [])
+        .map((c) => ({ original: String((c && c.original) || ""), replacement: String((c && c.replacement) || "") }))
+        .filter((c) => c.original && c.replacement && c.original !== c.replacement)
+        .slice(0, 40);
+      if (!changes.length) return json(res, 400, { ok: false, error: "no usable changes in this batch" });
+
+      const sig = reviewSig(body.token);
+      const inFlight = [...JOBS.values()].filter((j) => j.type === "edit" && j.payload
+        && j.payload.reviewSig === sig && (j.status === "queued" || j.status === "running"));
+      if (inFlight.length >= 3) return json(res, 429, { ok: false, error: "three of your batches are still being applied — give them a moment" });
+
+      try {
+        const localRoot0 = (process.env.REVIEW_LOCAL_REPO || "").trim();
+        let site, target;
+        if (localRoot0) {
+          // A local run touches no repository, so it asks the network for
+          // nothing: the token already names the site and the theme, and that
+          // theme was just checked against the stylesheet the site is actually
+          // serving. Anything else here would make a laptop rehearsal wait out a
+          // 15s NocoDB timeout on every submission — which is exactly what made
+          // WordPress give up at 20s and report "could not reach the build tool".
+          ({ site, target } = reviewTargetFromToken(d));
+          const cached = await getWebsites(false).catch(() => []);
+          const known = cached.find((s) => s.siteId === d.siteId);
+          if (known) site = { ...site, businessName: known.businessName, liveUrl: known.liveUrl || "" };
+        } else if (String(process.env.REVIEW_LIVE || "").toLowerCase() !== "on") {
+          // Publishing to a client repository is opt-in, explicitly. It used to be
+          // the fallback whenever REVIEW_LOCAL_REPO was absent, which meant a
+          // restart that forgot one variable silently turned a local rehearsal
+          // into a pull request that auto-merged to a real site. It did exactly
+          // that once. A missing setting must refuse, not ship.
+          console.warn(`review: refused — neither REVIEW_LOCAL_REPO nor REVIEW_LIVE=on is set (${changes.length} correction(s) from ${d.reviewer} on ${pagePath})`);
+          return json(res, 409, {
+            ok: false,
+            error: "this build tool is not set up to publish changes — nothing was applied. Ask an engineer to start it in local or live mode.",
+          });
+        } else {
+          try {
+            ({ site, target } = await resolveReviewSite(d.siteId));
+          } catch (e) {
+            console.warn("review: site lookup failed —", e.message);
+            return json(res, 503, { ok: false, error: "could not reach the site directory just now — try again in a moment" });
+          }
+        }
+        const pagePath = String(body.path || "/").slice(0, 200);
+        const workOrder = reviewWorkOrder(changes, { reviewer: d.reviewer, pagePath });
+
+        // Three modes, most cautious first:
+        //   REVIEW_DRY_RUN=on with no local checkout — log the work order, do
+        //     nothing, create no job. For proving the plumbing.
+        //   REVIEW_LOCAL_REPO=<path> — a REAL job, visible in Activity, that
+        //     writes into that checkout and touches no repository. This is the
+        //     rehearsal worth doing: the job system, the guardrails and the
+        //     result on the page are all genuine, only git is absent.
+        //   neither — the live run: clone, PR, CI, auto-merge, deploy.
+        const localRoot = (process.env.REVIEW_LOCAL_REPO || "").trim();
+        if (!localRoot && String(process.env.REVIEW_DRY_RUN || "").toLowerCase() === "on") {
+          console.log(`[review dry-run] ${site.businessName} ${pagePath} — ${changes.length} change(s) by ${d.reviewer}:\n`
+            + workOrder.changes.map((c, i) => `  ${i + 1}. "${c.replaces}" -> "${c.literal}" (${c.variants.length} variant spellings)`).join("\n"));
+          return json(res, 200, { ok: true, jobId: "dry-run-" + Date.now(), changes: changes.length, dryRun: true });
+        }
+
+        const job = enqueueEditJob({
+          localApply: localRoot || null,
+          jobId: "edit-" + Date.now(),
+          siteId: site.siteId, businessName: site.businessName, githubRepo: site.githubRepo,
+          themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
+          // The prompt is only ever read by humans here — the PR body, Slack, the
+          // job page. The work order is what the run actually acts on.
+          prompt: `Content review by ${d.reviewer} on ${pagePath}:\n`
+            + changes.map((c, i) => `${i + 1}. "${c.original}" → "${c.replacement}"`).join("\n"),
+          workOrder,
+          // Exact pairs on a beta site, applied in code with no model involved.
+          // Holding these for approval would make the loop slower than the email
+          // it replaces, for a change that cannot surprise us.
+          forceApproval: false,
+          source: "content-review", requestedBy: d.reviewer, reviewSig: sig,
+          reviewPath: pagePath, liveUrl: site.liveUrl || "",
+        });
+        notify(`✍️ Content review — *${site.businessName}* · ${changes.length} correction(s) from ${d.reviewer} on ${pagePath}`);
+        return json(res, 200, { ok: true, jobId: job.draftId, changes: changes.length });
+      } catch (e) {
+        console.warn("review feedback failed:", e.message);
+        return json(res, 500, { ok: false, error: "the change could not be queued" });
+      }
+    }
+
+    // Progress for the widget, scoped to the session that created the job.
+    if (p === "/api/webhook/review/status") {
+      const d = verifyReviewToken(u.searchParams.get("t"));
+      if (!d) return json(res, 401, { ok: false, error: "expired" });
+      // A dry run has no job to report on, and leaving the widget spinning on
+      // "Applying…" for a change that will never be applied is a lie the person
+      // reviewing has no way to see through.
+      const wanted = String(u.searchParams.get("job") || "");
+      if (/^dry-run-/.test(wanted)) return json(res, 200, { ok: true, status: "done", dryRun: true });
+      const job = JOBS.get(wanted);
+      if (!job || !job.payload || job.payload.reviewSig !== reviewSig(u.searchParams.get("t"))) {
+        return json(res, 404, { ok: false, error: "unknown job" });
+      }
+      return json(res, 200, {
+        ok: true, status: job.status,
+        error: job.status === "error" ? String(job.error || "").slice(0, 200) : "",
+        // What the run declined to do and why. Without this the reviewer is told
+        // "live" while one of their corrections was quietly dropped.
+        refused: (job.reviewRefused || []).map((r) => r.reason),
+      });
+    }
+
     // A subtask created by hand in TED, under a client's revision-cycle task,
     // with a comment on it → the same edit job an email would have started.
     // Sits outside the admin-key gate and carries its own optional secret, like
@@ -12489,7 +13203,11 @@ const server = http.createServer(async (req, res) => {
       }
       if (!hit) return reject("could not tell which website this is about", null,
         "I could not tell which website this is about.\n\nReply with the domain, for example prodteam.gogroth.com, and what you would like changed, and I will pick it up.");
-      const site = hit.site;
+      // The email named the site; TED gets the last word on which repository and
+      // beta URL that site actually has, whenever it has a usable answer. An
+      // email carries no client id, so the match itself still comes from the
+      // NocoDB list above — only the fields are preferred from TED.
+      const site = await withTedFields(hit.site, "").catch(() => hit.site);
       if (!site.githubRepo) return reject(`${site.businessName} has no repository set in NocoDB`, { siteId: site.siteId },
         `${site.businessName} is not fully set up in Studio yet — it has no repository configured — so I cannot make changes to it. Someone will need to add that first.`);
 
@@ -14129,6 +14847,18 @@ const server = http.createServer(async (req, res) => {
 });
 if (require.main === module) {
   server.listen(PORT, () => console.log(`G99 Website Build Tool → http://localhost:${PORT}`));
+  // Say which mode content review is in, at boot, every time. The one thing that
+  // must never be ambiguous is whether a reviewer's correction ends up in a local
+  // checkout or in a pull request against a client's repository.
+  {
+    const localRepo = (process.env.REVIEW_LOCAL_REPO || "").trim();
+    const live = String(process.env.REVIEW_LIVE || "").toLowerCase() === "on";
+    console.log(localRepo
+      ? `content review: LOCAL — corrections written to ${localRepo}; nothing is cloned, pushed or merged`
+      : live
+        ? "content review: LIVE — corrections open a pull request and auto-merge to the client repository"
+        : "content review: OFF — submissions are refused (set REVIEW_LOCAL_REPO for a local run, or REVIEW_LIVE=on to publish)");
+  }
   // Scheduled re-audit (off unless REAUDIT_HOURS > 0, to avoid burning quota).
   const reauditHours = parseFloat(process.env.REAUDIT_HOURS || "0");
   if (reauditHours > 0) {
@@ -14167,6 +14897,7 @@ module.exports = {
   closeSupersededPerformPrs,
   tedComment, tedUpdateTask, tedAiComment, tedHtml, closeTedTaskIfFinal,
   tedCreateSubtask, tedRevisionParent, tedClientName, tedSubtaskTitle, tedNorm,
+  tedClients, tedClientIdFor, tedSiteFields, tedRepoUsable, withTedFields, resolveClientSite,
   tedResolveSubtaskRequest, tedTaskComments, isEmailSubtask, TED_EMAIL_SUFFIX, TED_AUTOMATION_MARK,
   tedListSubtasks, startTedSubtaskRun, pollTedSubtasks,
   OUTCOME, OUTCOME_LABEL, resolveFindingOutcomes, replaceInTextNodes, fixBusinessName,
