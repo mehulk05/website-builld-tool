@@ -260,16 +260,6 @@ input::placeholder, textarea::placeholder { color: var(--muted); }
 }
 .seg button.on, .seg button[aria-pressed="true"] { background: var(--surface); color: var(--ink); box-shadow: var(--shadow-sm); }
 
-/* expandable per-page rows (job detail): a clear "Show prompt" text affordance + chevron */
-.pgx > summary { list-style: none; align-items: center; }
-.pgx > summary::-webkit-details-marker { display: none; }
-.pgx > summary .pgtoggle { margin-left: auto; display: inline-flex; align-items: center; gap: 3px; color: var(--accent); font-weight: 600; font-size: 12px; white-space: nowrap; }
-.pgx > summary .pgtoggle::before { content: "Show prompt"; }
-.pgx[open] > summary .pgtoggle::before { content: "Hide prompt"; }
-.pgx > summary:hover .pgtoggle { text-decoration: underline; }
-.pgx > summary .chev { flex: none; color: var(--accent); transition: transform .15s ease; }
-.pgx[open] > summary .chev { transform: rotate(90deg); }
-
 /* ---- shared stepper (build + edit job progress) ---- */
 .steps { display: flex; flex-direction: column; }
 .jstep { display: grid; grid-template-columns: 26px 1fr; column-gap: 13px; position: relative; padding-bottom: 16px; }
