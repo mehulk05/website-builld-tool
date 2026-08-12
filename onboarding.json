@@ -1,33 +1,29 @@
 {
-  "draftId": "logs-1786526277",
+  "draftId": "reveal3-1786528205",
   "businessId": null,
   "template": "WEBSITE",
-  "receivedAt": "2026-08-12T09:17:57.336Z",
+  "receivedAt": "2026-08-12T09:50:05.508Z",
   "betaSiteUrl": "",
   "betaSiteRepo": "",
   "referenceWebsite": "",
-  "existingWebsite": "https://prettypleaseaesthetics.com",
+  "existingWebsite": "https://nuvoaestheticsclinic.com",
   "confirmedBrand": null,
   "logoUrl": null,
   "answers": {
-    "business_name": "Pretty Please Aesthetics",
-    "location": "Roseville & Sacramento, CA",
-    "logo": "https://placehold.co/240x64/C59A7A/ffffff?text=Pretty+Please",
+    "business_name": "NUVO Aesthetics Clinic",
     "services_offered": [
       "Botox",
-      "Dermal Fillers",
-      "Microneedling",
-      "Facials"
+      "Fillers",
+      "Microneedling"
     ],
-    "primary_cta": "Book Now",
     "team_roster": [
       {
-        "name": "Kate Cunningham Jeffrey",
-        "role": "PA-C, Lead Injector"
+        "name": "Jeannine Fair",
+        "role": "Medical Director"
       },
       {
-        "name": "Peter V. Hull",
-        "role": "MD, Medical Director"
+        "name": "Olivia Burton",
+        "role": "Nurse Practitioner"
       }
     ]
   }

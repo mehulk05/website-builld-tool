@@ -6620,7 +6620,12 @@ function parseTeamRoster(A) {
 // card node can't be located, the page is returned unchanged (keep what we had).
 function applyTeamRoster(html, team) {
   if (!team.length) return html;
-  const cardRe = /<div class="provider-card[^"]*"[^>]*>\s*<div class="provider-img-wrap">[\s\S]*?<\/div>\s*<div class="provider-info">[\s\S]*?<\/div>\s*<\/div>/gi;
+  // A provider-card is: <div card><div img-wrap>…</div><div info><h4>…</h4>
+  // <div role>…</div></div></div> — THREE closing </div> after the info opens
+  // (role, info, card). The regex MUST consume all three, or each rebuilt card
+  // loses its wrapper close, the cards nest inside one another, and the grid
+  // collapses to a single narrow column (the reported bug).
+  const cardRe = /<div class="provider-card[^"]*"[^>]*>\s*<div class="provider-img-wrap">[\s\S]*?<\/div>\s*<div class="provider-info">[\s\S]*?<\/div>\s*<\/div>\s*<\/div>/gi;
   const cards = html.match(cardRe);
   if (!cards || !cards.length) { console.warn("  team: provider-card node not found — leaving providers as-is"); return html; }
   const tpl = cards[0];
@@ -6641,6 +6646,44 @@ function applyTeamRoster(html, team) {
   let done = false;
   const out = html.replace(cardRe, () => { if (!done) { done = true; return newCards; } return ""; });
   console.log(`  team: rebuilt providers grid to ${team.length} member(s) from onboarding`);
+  return out;
+}
+
+// Harden the template's own inline JS so a single null reference can't blank the
+// whole page. The ruma template's script opens with
+//   document.getElementById('year').textContent = new Date().getFullYear();
+// and the content rewrite can drop the footer's <span id="year">, so that line
+// throws and EVERYTHING after it — including the .reveal IntersectionObserver that
+// animates opacity 0→1 — never runs, leaving every section invisible. We (1) make
+// any getElementById(...).textContent/.innerHTML assignment null-safe, and (2) add
+// an independent failsafe that reveals any still-hidden .reveal element after load.
+function hardenCloneJs(html) {
+  let out = html;
+  // 1) null-safe: getElementById('x').textContent = Y;  →  var _e=getElementById('x'); if(_e) _e.textContent = Y;
+  out = out.replace(/document\.getElementById\((['"])([^'"]+)\1\)\.(textContent|innerHTML)\s*=\s*([^;]+);/gi,
+    (m, q, id, prop, val) => `var _g99el=document.getElementById(${q}${id}${q}); if(_g99el){ _g99el.${prop} = ${val}; }`);
+  // 2) failsafe reveal — forces every .reveal element visible via INLINE
+  //    !important (which always wins over the stylesheet), so content can never
+  //    be stranded at opacity:0 no matter what: a script error, the observer
+  //    script not being present on a page (WordPress only ships it on front-page),
+  //    dynamically-loaded nodes, or a browser that never advances the transition.
+  //    The normal IntersectionObserver still runs first and plays the scroll
+  //    animation where it works; this just guarantees the end state.
+  const failsafe = `<script>(function(){
+    function reveal(el){ el.style.setProperty('transition','none','important'); el.style.setProperty('opacity','1','important'); el.style.setProperty('transform','none','important'); el.classList.add('active','visible'); }
+    function sweep(){ try{ var n=document.querySelectorAll('.reveal'); for(var i=0;i<n.length;i++) reveal(n[i]); }catch(e){} }
+    // Give the scroll animation a moment to play, then guarantee visibility.
+    if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',function(){setTimeout(sweep,2000);}); else setTimeout(sweep,2000);
+    window.addEventListener('load',function(){setTimeout(sweep,2500);});
+    // Catch any nodes added later (dynamic content) that start hidden.
+    try{ new MutationObserver(function(){setTimeout(sweep,300);}).observe(document.documentElement,{childList:true,subtree:true}); }catch(e){}
+  })();</script>`;
+  // Inject INSIDE the <footer> so it survives splitPage() into footer.php, which
+  // WordPress includes on EVERY page — otherwise the failsafe would only ship on
+  // front-page.php and inner pages' header/footer .reveal elements stay hidden.
+  if (/<\/footer>/i.test(out)) out = out.replace(/<\/footer>/i, failsafe + "\n</footer>");
+  else if (/<\/body>/i.test(out)) out = out.replace(/<\/body>/i, failsafe + "\n</body>");
+  else out += failsafe;
   return out;
 }
 
@@ -6805,6 +6848,11 @@ async function runJob(job) {
         clog(`5/6 layout variant: ${variant.idx} (${variant.name})${forcedVariant != null && forcedVariant !== "" ? " [forced]" : " [seeded from business name]"}`);
         jobStep(job, 2, "running", `5/6 Layout variant: ${variant.name}…`);
       } else { clog(`5/6 layout variation SKIPPED (CLONE_LAYOUT=off)`); }
+
+      // Harden the template's inline JS so a null element can't blank the page
+      // (null-safe getElementById + a .reveal failsafe so opacity 0→1 always happens).
+      html = hardenCloneJs(html);
+      clog(`    JS hardened (null-safe getElementById + reveal failsafe)`);
 
       // --- 6/6 write bundle + per-draft snapshot ---
       const siteDir = path.join(GEN, "site");
