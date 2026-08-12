@@ -4814,21 +4814,63 @@ function tedOutcomeComment(job, outcome) {
   ].filter((l, i) => l !== "" || i === 3).join("\n");
 }
 
+// A content-review run answers a person who typed the old and new words
+// themselves, so the outcome is written as the pairs they typed rather than as
+// the model's summary of them. What was refused is listed as prominently as
+// what shipped: someone told "done" while one of their corrections was silently
+// dropped will not find out until a client does.
+function tedReviewOutcomeComment(job, outcome) {
+  const P = (job && job.payload) || {};
+  const wo = P.workOrder || {};
+  const refusals = job.reviewRefused || [];
+  // A refused correction is not a changed one. reviewRefused carries the 1-based
+  // index of the item it refused, which is the only reliable way to take it back
+  // out of this list — listing it under both headings would tell the reviewer
+  // their correction shipped and did not, in the same comment.
+  const blocked = new Set(refusals.map((r) => r.n));
+  const changed = (wo.changes || [])
+    .filter((_, i) => !blocked.has(i + 1))
+    .map((c) => `- "${c.replaces}" ${String.fromCharCode(8594)} "${c.literal}"`);
+  const refused = refusals.map((r) => `- ${r.reason}`);
+  const page = P.reviewPath && P.reviewPath !== "/" ? P.reviewPath : "the home page";
+  // null marks a line that is not wanted; "" is a blank line that is. Filtering
+  // on "" alone would strip the paragraph breaks along with the absent lines.
+  return [
+    outcome.ok && changed.length ? `Content corrections are live on ${page}.`
+      : outcome.ok ? `No corrections were applied on ${page}.`
+      : `Content corrections could not be applied on ${page}.`,
+    "",
+    `Requested by: ${P.requestedBy || "Content Team"}`,
+    `Site: ${P.businessName || "site"}${P.liveUrl ? " " + String.fromCharCode(183) + " " + P.liveUrl : ""}`,
+    job.prUrl ? `Pull request: ${job.prUrl}` : null,
+    changed.length ? "" : null,
+    changed.length ? (outcome.ok ? "Changed:" : "Requested:") : null,
+    ...changed,
+    refused.length ? "" : null,
+    refused.length ? "Not applied:" : null,
+    ...refused,
+    !outcome.ok && outcome.detail ? "" : null,
+    !outcome.ok && outcome.detail ? outcome.detail : null,
+  ].filter((l) => l !== null).join("\n");
+}
+
 // Fired after a job finishes, never awaited by it. The wait exists because the
 // deploy lands a moment after the merge and a screenshot taken immediately would
 // show the old page — worse than no screenshot at all.
 function tedPostOutcome(job, outcome) {
   const P = (job && job.payload) || {};
   // Only runs that were announced in TED get an outcome there: one that arrived
-  // by email, or one started from a TED subtask, which is a request waiting on
-  // an answer by definition. A run someone kicked off from the dashboard has no
-  // ticket to answer, and posting it would put it on a task nobody asked.
-  if (!TED_API_TOKEN || (P.source !== "email" && !P.tedSubtaskId)) return;
-  const text = tedOutcomeComment(job, outcome);
-  // Back onto the subtask this request created, so the outcome sits under the
-  // request it answers. Null when the subtask could not be made (or subtasks are
-  // off), and tedComment then falls back to TED_REVISIONS_TASK_ID as before.
-  const taskId = P.tedSubtaskId || null;
+  // by email, one started from a TED subtask, or a content-review correction
+  // made through a link this tool posted on a task — each is a request waiting
+  // on an answer. A run someone kicked off from the dashboard has no ticket to
+  // answer, and posting it would put it on a task nobody asked.
+  if (!TED_API_TOKEN || (P.source !== "email" && !P.tedSubtaskId && !P.tedTaskId)) return;
+  const text = P.tedTaskId ? tedReviewOutcomeComment(job, outcome) : tedOutcomeComment(job, outcome);
+  // Back onto the thread this request came from: the subtask the email flow
+  // created, or the task the review link was posted on. Null when the subtask
+  // could not be made (or subtasks are off), and tedComment then falls back to
+  // TED_REVISIONS_TASK_ID as before.
+  const taskId = P.tedSubtaskId || P.tedTaskId || null;
   if (!outcome.ok || !TED_SCREENSHOTS || !P.liveUrl) return tedComment(text, null, 0, taskId);
   setTimeout(async () => {
     let image = null;
@@ -4957,10 +4999,18 @@ const TED_REVIEW_MARK = "[content-review link]";
 
 const reviewSign = (body) => crypto.createHmac("sha256", REVIEW_SECRET).update(body).digest("base64url");
 
-function mintReviewToken({ siteId, themeSlug, reviewer, email, dept, minutes }) {
+// taskId is the TED task this link was posted on, when it came from one. It
+// rides in the token because that is the only thing that survives the trip: the
+// link sits in a comment for days, and the correction that comes back has no
+// other way to say which thread it is answering. A link minted by hand has no
+// task and simply carries none.
+function mintReviewToken({ siteId, themeSlug, reviewer, email, dept, minutes, taskId }) {
   if (!REVIEW_SECRET) throw new Error("REVIEW_SECRET not set (falls back to WEBHOOK_SECRET or ADMIN_PASSWORD) — cannot mint review links");
   const exp = Date.now() + Math.max(5, Number(minutes) || REVIEW_TTL_MIN) * 60000;
-  const body = Buffer.from(JSON.stringify({ v: 1, siteId, themeSlug, reviewer, email: email || "", dept: dept || "", exp })).toString("base64url");
+  const body = Buffer.from(JSON.stringify({
+    v: 1, siteId, themeSlug, reviewer, email: email || "", dept: dept || "", exp,
+    ...(taskId ? { taskId: String(taskId) } : {}),
+  })).toString("base64url");
   return { token: `${body}.${reviewSign(body)}`, exp };
 }
 
@@ -5097,6 +5147,8 @@ async function tedPostReviewLink({ clientId, clientName, hubspotId, taskId, revi
   const { token, exp } = mintReviewToken({
     siteId: site.siteId, themeSlug: target.themeSlug,
     reviewer: reviewer || "Content Team", dept: "Content", minutes: TED_REVIEW_TTL_MIN,
+    // So the correction reports back onto this same task rather than vanishing.
+    taskId,
   });
   const link = new URL(site.liveUrl);
   link.searchParams.set("g99r", token);
@@ -13711,6 +13763,10 @@ const server = http.createServer(async (req, res) => {
           forceApproval: false,
           source: "content-review", requestedBy: d.reviewer, reviewSig: sig,
           reviewPath: pagePath, liveUrl: site.liveUrl || "",
+          // The task the link was posted on, carried out of the token. Present
+          // only for a link that came from TED, so a hand-minted one still
+          // reports nowhere rather than onto somebody else's thread.
+          tedTaskId: d.taskId || null,
         });
         notify(`✍️ Content review — *${site.businessName}* · ${changes.length} correction(s) from ${d.reviewer} on ${pagePath}`);
         return json(res, 200, { ok: true, jobId: job.draftId, changes: changes.length });
