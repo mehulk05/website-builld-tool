@@ -6020,32 +6020,39 @@ async function runThemeActivationTail(job, slug, A) {
 
   try { await syncSiteRegistry(); } catch (e) { /* non-fatal: keep registry current so the new site is editable */ }
 
-  // Auto-enrich: fire a DECOUPLED post-beta job that adds service pages + a
-  // brand guide in its own PR. Fail-soft — the beta is already released, so an
-  // enrichment failure must never mark this build failed.
+  // Home-only artifacts: the automatic service-page (enrich) job is removed. Instead, as soon as the
+  // home page is live, we push the SAME two artifacts the enrich job used to send — the home
+  // screenshot (→ TED mockup task) and the home content (→ TED content task) — so onboarding is
+  // driven off home-page creation, not service pages. Fail-soft: the beta is already released, so a
+  // screenshot or push failure must never mark this build failed.
   try {
-    if (slug) {
-      const ej = enqueueEnrichJob({
-        jobId: "enrich-" + Date.now(), businessId: job.businessId, parentDraftId: job.draftId, liveUrl: job.liveUrl,
-        siteId: "g99-" + slug, businessName: job.businessName, githubRepo: job.repo,
-        themeSlug: "g99-" + slug, themePath: `web/app/themes/g99-${slug}`,
-        muPath: `web/app/mu-plugins/g99-activate-${slug}.php`,
-        answers: A, composed: job.composed, referenceWebsite: job.referenceWebsite || "",
-        existingWebsite: job.existingWebsite || "",
-        // Carried from the parent build's own payload so this enrich job's artifact push to TED
-        // (screenshots + service pages) can resolve the right client unambiguously.
-        hubspotDealId: (job.payload || {}).hubspotDealId || null,
-        hubspotCompanyId: (job.payload || {}).hubspotCompanyId || null,
-      });
-      job.enrichJobId = ej.draftId;   // frontend links to the run from this step
-      jobStep(job, ENRICH_STEP_IDX, "running", "Queued as its own run — generating service pages…");
-      notify(`✨ Auto-enrich queued for *${job.businessName}* (service pages + brand guide)`);
-    } else {
-      jobStep(job, ENRICH_STEP_IDX, "done", "Skipped — no theme slug");
+    jobStep(job, ENRICH_STEP_IDX, "running", "Capturing home mockup + sending content to TED…");
+    let homeMockup = null;
+    try {
+      homeMockup = await captureMockup("Home", String(job.liveUrl).replace(/\/+$/, "") + "/");
+    } catch (e) { /* never block completion on a screenshot */ }
+    job.mockups = homeMockup ? [homeMockup] : [];
+    saveJobs();
+
+    if (job.businessId) {
+      const hubspotDealId = (job.payload || {}).hubspotDealId || null;
+      const hubspotCompanyId = (job.payload || {}).hubspotCompanyId || null;
+      // Content-task payload: a single "Home" page entry whose brief is the composed home content.
+      const homePages = [{
+        name: "Home", slug: "home", status: "done", engine: "stitch",
+        sourceUrl: job.liveUrl, brief: String(job.homeContent || "").slice(0, 3000),
+      }];
+      tedPushArtifacts("MOCKUPS_CAPTURED", {
+        businessId: job.businessId, draftId: job.draftId, mockups: job.mockups, hubspotDealId, hubspotCompanyId,
+      }).then(r => console.log(`[ted-push] MOCKUPS_CAPTURED biz=${job.businessId} -> ${JSON.stringify(r).slice(0, 200)}`));
+      tedPushArtifacts("SERVICE_PAGES_CREATED", {
+        businessId: job.businessId, draftId: job.draftId, servicePages: homePages, siteUrl: job.liveUrl, hubspotDealId, hubspotCompanyId,
+      }).then(r => console.log(`[ted-push] SERVICE_PAGES_CREATED biz=${job.businessId} -> ${JSON.stringify(r).slice(0, 200)}`));
     }
+    jobStep(job, ENRICH_STEP_IDX, "done", job.mockups.length ? "Home mockup + content sent to TED" : "Home content sent (mockup unavailable)");
   } catch (e) {
-    console.error("auto-enrich enqueue failed (non-fatal):", e.message);
-    jobStep(job, ENRICH_STEP_IDX, "error", "Could not queue enrichment: " + e.message);
+    console.error("home artifact push failed (non-fatal):", e.message);
+    jobStep(job, ENRICH_STEP_IDX, "error", "Could not send home artifacts: " + e.message);
   }
 
   job.status = "done";
@@ -6148,7 +6155,9 @@ async function runJob(job) {
     // only, legacy shortcut) | a comma list e.g. "home,about" for a scoped
     // local test run of exactly those pages.
     const DEV_PAGES_RAW = (process.env.DEV_PAGES || "off").toLowerCase();
-    const DEV_PAGES = DEV_PAGES_RAW === "off" ? ["home", "services", "about", "contact"]
+    // Home-only build: for now we generate ONLY the home page — no about/contact/service pages.
+    // The default ("off") is home-only; an explicit comma list still lets a scoped run request more.
+    const DEV_PAGES = DEV_PAGES_RAW === "off" ? ["home"]
       : DEV_PAGES_RAW === "on" ? ["home"]
       : DEV_PAGES_RAW.split(",").map((s) => s.trim()).filter(Boolean);
     // Read the client's OWN pages first and let Gemini turn each real structure into that
@@ -6201,6 +6210,11 @@ async function runJob(job) {
         ") — the theme's header/footer/front page all derive from home, so the build was stopped rather than ship a homepage with no content or navigation. Re-run to retry.");
     }
     jobStep(job, 2, "done", `${ok.length}/${(gen.pages || []).length} pages generated`);
+
+    // Home content for the TED content-task push (done later in runThemeActivationTail, once the site
+    // is live). Prefer the composed home brief (from the client's real structure); fall back to the
+    // overall composed brief so the content txt is never empty.
+    job.homeContent = (specs && specs.home) || (composed && composed.brief) || "";
 
     // 4 — assemble into one coherent site
     jobStep(job, 3, "running", "Binding site with AI chrome…");
