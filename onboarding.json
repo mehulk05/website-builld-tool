@@ -1,8 +1,8 @@
 {
-  "draftId": "reveal3-1786528205",
+  "draftId": "hover-1786530193",
   "businessId": null,
   "template": "WEBSITE",
-  "receivedAt": "2026-08-12T09:50:05.508Z",
+  "receivedAt": "2026-08-12T10:23:13.304Z",
   "betaSiteUrl": "",
   "betaSiteRepo": "",
   "referenceWebsite": "",
@@ -13,18 +13,7 @@
     "business_name": "NUVO Aesthetics Clinic",
     "services_offered": [
       "Botox",
-      "Fillers",
-      "Microneedling"
-    ],
-    "team_roster": [
-      {
-        "name": "Jeannine Fair",
-        "role": "Medical Director"
-      },
-      {
-        "name": "Olivia Burton",
-        "role": "Nurse Practitioner"
-      }
+      "Fillers"
     ]
   }
 }

@@ -6589,6 +6589,20 @@ function hexLum(hex) {
   return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
 }
 
+// Darken a #hex colour (keeping its hue) until its luminance is <= target — used to
+// derive a readable version of a too-light brand accent for text on a light bg.
+function darkenToLum(hex, target) {
+  const m = String(hex || "").match(/^#?([0-9a-f]{6})$/i);
+  if (!m) return hex;
+  let n = parseInt(m[1], 16);
+  let r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  for (let k = 0; k < 50; k++) {
+    if ((0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 <= target) break;
+    r = Math.round(r * 0.92); g = Math.round(g * 0.92); b = Math.round(b * 0.92);
+  }
+  return "#" + [r, g, b].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
 // Re-skin the template: map the CLIENT's extracted brand onto the template's
 // :root variables + Google-Fonts link. Structural neutrals (secondary-bg, dark-bg,
 // muted-text, border) are left as the template's proven values in step 1 — only the
@@ -6632,6 +6646,27 @@ function reskinTemplateBrand(html, brand) {
       out = out.replace(/<\/head>/i, `<link href="${cssUrl}" rel="stylesheet">\n</head>`);
     }
   }
+
+  // Contrast remediation — the template colours eyebrow labels with the accent and
+  // puts WHITE text on accent-filled buttons. When the client's accent is light
+  // (common for medspa golds/tans, e.g. #C8A27A), both become nearly invisible.
+  //  - eyebrows: use a darkened version of the accent so it stays on-brand but reads
+  //    on a light background.
+  //  - accent-filled buttons: flip the button text to dark when the accent is light.
+  const accent = brand.accent || "#C8A27A";
+  const aLum = hexLum(accent);
+  const eyebrowColor = (aLum !== null && aLum > 0.42) ? darkenToLum(accent, 0.32) : accent;
+  const onAccentText = (aLum !== null && aLum > 0.5) ? "#1A1A1A" : "#FFFFFF";
+  // Button text must track the button's OWN background per state:
+  //  - resting accent-filled buttons (.btn-gold) + hovers that turn the bg to the
+  //    ACCENT (.btn:hover, .btn-light:hover) → text = onAccentText (dark if accent light).
+  //  - .btn-gold:hover turns the bg to the DARK accent → text must be WHITE, not dark
+  //    (otherwise dark-on-dark, the reported "text gone on hover" bug).
+  const remediation = `\n/* g99 contrast remediation */\n`
+    + `.eyebrow,.testimonials-section .eyebrow{color:${eyebrowColor} !important;}\n`
+    + `.btn-gold,.btn:hover,.btn-light:hover{color:${onAccentText} !important;}\n`
+    + `.btn-gold:hover{color:#FFFFFF !important;}\n`;
+  if (/<\/style>/i.test(out)) out = out.replace(/<\/style>/i, remediation + "</style>");
   return out;
 }
 
@@ -6648,10 +6683,20 @@ function swapTemplateLogo(html, A) {
         .replace(/(<img[^>]*\balt=")[^"]*(")/i, `$1${biz} logo$2`);
       return open + (/\<img/i.test(swapped) ? swapped : `<img src="${logoUrl}" alt="${biz} logo">`) + close;
     }
-    return `${open}<span class="logo-wordmark" style="font-family:var(--font-serif);font-size:1.5rem;font-weight:600;color:var(--dark-accent);letter-spacing:.02em">${biz}</span>${close}`;
+    // Length-aware font size + single line so a long business name doesn't wrap to
+    // two lines and squeeze the nav (the reported header distortion). The template's
+    // real logo is a 38px-tall image, so the wordmark must stay compact too.
+    const len = biz.length;
+    const fontSize = len > 30 ? "0.95rem" : len > 24 ? "1.1rem" : len > 18 ? "1.25rem" : "1.5rem";
+    return `${open}<span class="logo-wordmark" style="font-family:var(--font-serif);font-size:${fontSize};font-weight:600;color:var(--dark-accent);letter-spacing:.02em;white-space:nowrap;line-height:1.1;display:inline-block">${biz}</span>${close}`;
   });
   // Replace literal template brand tokens anywhere they leak into copy.
   out = out.replace(/RUMA\s+Medical/gi, biz).replace(/\bRUMA\b/g, biz);
+  // Harden the nav so the logo can never wrap or crush the links: logo stays on one
+  // line and shrinks if needed; nav links never wrap their label+caret. Appended to
+  // the template <style> so it wins.
+  const navGuard = `\n/* g99 header guard */\n.logo{flex-shrink:1;min-width:0;overflow:hidden}\n.logo-wordmark{max-width:100%;overflow:hidden;text-overflow:ellipsis}\n.nav-links{flex-shrink:0;flex-wrap:nowrap}\n.nav-link{white-space:nowrap}\n`;
+  if (/<\/style>/i.test(out)) out = out.replace(/<\/style>/i, navGuard + "</style>");
   return out;
 }
 
