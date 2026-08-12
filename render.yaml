@@ -64,6 +64,13 @@ services:
       # mShots, which needs no key and has no quota.
       - key: MICROLINK_API_KEY
         sync: false          # set in dashboard only if you buy a microlink plan
+      # Pre-release mobile screenshots. Without it that step reports
+      # "BROWSERLESS_TOKEN is not configured" and the run has no mobile evidence
+      # to show, which is most of what a pre-release pass is for.
+      - key: BROWSERLESS_TOKEN
+        sync: false          # set in dashboard
+      - key: BROWSERLESS_URL
+        value: https://production-sfo.browserless.io   # private-fleet accounts use their own URL
       # Where build progress is reported back to Growth99 (dev). The G99 admin dashboard reads this
       # persisted status, so without it a build's outcome is never recorded on the platform side.
       # NOTE: this is the API-GATEWAY path. The gateway maps /publicv2/** -> public-api /api/public/v2/**;
