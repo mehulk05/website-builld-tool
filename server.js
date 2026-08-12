@@ -6538,6 +6538,112 @@ function swapTemplateLogo(html, A) {
   return out;
 }
 
+// Step 3: deterministic layout/design VARIATION so clients don't all ship an
+// identical clone. Each variant is a block of CSS OVERRIDES appended after the
+// template's <style> (higher specificity / later = wins). They only restyle —
+// no DOM restructure, and background swaps stay light↔light so contrast is never
+// broken. The variant is seeded from the business name → stable per client,
+// different across clients. Force one with CLONE_VARIANT=0..3.
+const LAYOUT_VARIANTS = [
+  { name: "classic", css: "" },
+  {
+    name: "airy-centered",
+    css: [
+      ".hero-grid{grid-template-columns:1fr !important;text-align:center;gap:36px;max-width:860px;margin-left:auto;margin-right:auto}",
+      ".hero-content{align-items:center}",
+      ".section-padding{padding-top:120px !important;padding-bottom:120px !important}",
+      ".specialty-card,.provider-card,.specialty-card-img img,.provider-img-wrap img,.hero img{border-radius:20px}",
+      ".eyebrow{letter-spacing:.28em;text-transform:uppercase}",
+      ".container{max-width:1240px}",
+    ].join("\n"),
+  },
+  {
+    name: "sharp-editorial",
+    css: [
+      ".specialty-card,.provider-card,.specialty-card-img img,.provider-img-wrap img,.hero img,.pill,.btn,button,.cta-button{border-radius:0 !important}",
+      ".hero-grid{grid-template-columns:1.15fr .85fr;gap:80px}",
+      ".section-padding{padding-top:96px !important;padding-bottom:96px !important}",
+      ".eyebrow{letter-spacing:.32em;text-transform:uppercase;font-weight:600}",
+      "h1,h2{letter-spacing:-.01em}",
+      ".specialties-strip{background:var(--primary-bg) !important}",   /* light→light, safe */
+    ].join("\n"),
+  },
+  {
+    name: "warm-asymmetric",
+    css: [
+      ".hero-grid{grid-template-columns:.85fr 1.15fr;gap:72px}",
+      ".section-padding{padding-top:112px !important;padding-bottom:112px !important}",
+      ".specialty-card,.provider-card{border-radius:24px}",
+      ".specialty-card-img img,.provider-img-wrap img,.hero img{border-radius:24px}",
+      ".container{max-width:1180px}",
+      ".eyebrow{color:var(--gold-accent);letter-spacing:.24em;text-transform:uppercase}",
+      ".testimonials-section{background:var(--secondary-bg) !important}",   /* light→light, safe */
+    ].join("\n"),
+  },
+];
+
+function pickLayoutVariant(seedStr, forced) {
+  if (forced !== undefined && forced !== null && forced !== "") {
+    const i = parseInt(forced, 10);
+    if (Number.isInteger(i) && i >= 0 && i < LAYOUT_VARIANTS.length) return { idx: i, ...LAYOUT_VARIANTS[i] };
+  }
+  let hash = 0;
+  for (const ch of String(seedStr || "x")) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
+  const idx = hash % LAYOUT_VARIANTS.length;
+  return { idx, ...LAYOUT_VARIANTS[idx] };
+}
+
+// Append the chosen variant's CSS overrides just before </style> so they win.
+function applyLayoutVariant(html, variant) {
+  if (!variant || !variant.css) return html;
+  const block = `\n/* g99 layout variant: ${variant.name} */\n${variant.css}\n`;
+  if (/<\/style>/i.test(html)) return html.replace(/<\/style>/i, block + "</style>");
+  return html.replace(/<\/head>/i, `<style>${block}</style>\n</head>`);
+}
+
+// Parse the onboarding team roster into [{name, role, image?}]. Accepts an array
+// of objects, an array of "Name - Role" strings, or a JSON string of either.
+function parseTeamRoster(A) {
+  let t = A.team_roster != null ? A.team_roster : (A.team_members != null ? A.team_members : (A.providers != null ? A.providers : A.team));
+  if (typeof t === "string") { try { t = JSON.parse(t); } catch (e) { t = t.split(/\n|;/); } }
+  if (!Array.isArray(t)) return [];
+  return t.map((m) => {
+    if (m && typeof m === "object") return { name: m.name || m.full_name || "", role: m.role || m.title || m.position || m.credentials || "", image: m.image || m.photo || m.headshot || "" };
+    const s = String(m || "").trim(); if (!s) return null;
+    const parts = s.split(/\s+[-–—|]\s+|,\s+/); return { name: (parts[0] || "").trim(), role: (parts.slice(1).join(", ") || "").trim(), image: "" };
+  }).filter((m) => m && m.name);
+}
+
+// Step 3.5: rebuild the providers grid to EXACTLY the onboarding team (add/remove
+// card nodes to match), filling real names + roles. Only the provider-card node is
+// cloned/removed — all other structure/CSS is untouched. Guarded: if the template's
+// card node can't be located, the page is returned unchanged (keep what we had).
+function applyTeamRoster(html, team) {
+  if (!team.length) return html;
+  const cardRe = /<div class="provider-card[^"]*"[^>]*>\s*<div class="provider-img-wrap">[\s\S]*?<\/div>\s*<div class="provider-info">[\s\S]*?<\/div>\s*<\/div>/gi;
+  const cards = html.match(cardRe);
+  if (!cards || !cards.length) { console.warn("  team: provider-card node not found — leaving providers as-is"); return html; }
+  const tpl = cards[0];
+  // Reuse the template's own headshots as per-card fallbacks so cards don't all
+  // share one photo when onboarding has no team images (client photos = later step).
+  const tplImgs = cards.map((c) => (c.match(/<img[^>]*\bsrc="([^"]*)"/i) || [])[1]).filter(Boolean);
+  const fill = (m, i) => {
+    let c = tpl;
+    c = c.replace(/(<h4[^>]*>)[\s\S]*?(<\/h4>)/i, `$1${escHtml(m.name)}$2`);
+    c = c.replace(/(<div class="role"[^>]*>)[\s\S]*?(<\/div>)/i, `$1${escHtml(m.role || "")}$2`);
+    c = c.replace(/(<img[^>]*\balt=")[^"]*(")/i, `$1${escHtml(m.name)}$2`);
+    const src = m.image || tplImgs[i % (tplImgs.length || 1)] || "";
+    if (src) c = c.replace(/(<img[^>]*\bsrc=")[^"]*(")/i, `$1${src}$2`);
+    return c;
+  };
+  const newCards = team.map(fill).join("\n");
+  // Replace the first card with the full new set; delete the remaining template cards.
+  let done = false;
+  const out = html.replace(cardRe, () => { if (!done) { done = true; return newCards; } return ""; });
+  console.log(`  team: rebuilt providers grid to ${team.length} member(s) from onboarding`);
+  return out;
+}
+
 // Step 2: rewrite the template's VISIBLE TEXT to the client, keeping the exact
 // layout, classes, CSS, scripts and image URLs. Only the <body> is sent to Gemini
 // (the <head>/<style> stay byte-identical), and a guard falls back to the input if
@@ -6656,32 +6762,72 @@ async function runJob(job) {
     // brand by editing its CSS variables, then serve. Short-circuits the whole
     // Stitch/assemble pipeline (content + layout rewrites are later steps).
     if (/^(1|on|true|yes)$/i.test(process.env.CLONE_MODE || "")) {
-      jobStep(job, 2, "running", "Cloning reference template + applying client brand (CSS)…");
+      const clog = (msg) => console.log(`[clone ${job.draftId}] ${msg}`);
+      clog(`▶ CLONE_MODE build started for "${A.business_name || "client"}"`);
+
+      // --- 1/6 pick reference template ---
       const ref = pickReferenceTemplate(process.env.CLONE_TEMPLATE || (job.payload && job.payload.referenceTemplate));
+      clog(`1/6 reference template: ${path.basename(ref.file)} (${ref.html.length} bytes)`);
+      jobStep(job, 2, "running", `1/6 Cloning template ${path.basename(ref.file)}…`);
+
+      // --- 2/6 re-skin CSS (brand colours + fonts) + logo ---
       const brand = { primary: composed.primary, secondary: composed.secondary, accent: composed.accent, headingFont: composed.headingFont, bodyFont: composed.bodyFont };
+      clog(`2/6 re-skin CSS → bg ${brand.primary}, accent ${brand.accent}, fonts ${brand.headingFont}+${brand.bodyFont}`);
+      jobStep(job, 2, "running", "2/6 Applying client brand (CSS colours + fonts)…");
       let html = reskinTemplateBrand(ref.html, brand);
+      const logoUsed = (A.logo || A.logo_url || A.brand_logo) ? "image from onboarding" : "text wordmark (no logo in onboarding)";
+      clog(`    logo: ${logoUsed}`);
       html = swapTemplateLogo(html, A);
-      // Step 2: rewrite the section content to the client (skippable with CLONE_CONTENT=off).
+
+      // --- 3/6 rewrite body content to the client (Gemini) ---
       if (!/^(0|off|false|no)$/i.test(process.env.CLONE_CONTENT || "on")) {
-        jobStep(job, 2, "running", "Rewriting section content to the client (Gemini)…");
-        try { html = await recontentTemplate(html, A); } catch (e) { console.warn("recontent failed, shipping reskinned template:", e.message); }
-      }
+        clog(`3/6 rewriting body content to client (Gemini)…`);
+        jobStep(job, 2, "running", "3/6 Rewriting section content to the client (Gemini)…");
+        const t0 = Date.now();
+        try { html = await recontentTemplate(html, A); clog(`3/6 content rewrite done (${((Date.now() - t0) / 1000).toFixed(1)}s)`); }
+        catch (e) { clog(`3/6 content rewrite FAILED (${e.message.slice(0, 100)}) — shipping reskinned template`); }
+      } else { clog(`3/6 content rewrite SKIPPED (CLONE_CONTENT=off)`); }
+
+      // --- 4/6 place onboarding team (names + roles) ---
+      const team = parseTeamRoster(A);
+      if (team.length) {
+        clog(`4/6 placing ${team.length} team member(s) from onboarding: ${team.map((m) => m.name).join(", ")}`);
+        jobStep(job, 2, "running", `4/6 Placing ${team.length} team member(s) from onboarding…`);
+        html = applyTeamRoster(html, team);
+      } else { clog(`4/6 team roster: none in onboarding — leaving template providers`); }
+
+      // --- 5/6 layout/design variation ---
+      let variant = { idx: 0, name: "classic" };
+      if (!/^(0|off|false|no)$/i.test(process.env.CLONE_LAYOUT || "on")) {
+        const forcedVariant = (job.payload && job.payload.cloneVariant != null) ? job.payload.cloneVariant : process.env.CLONE_VARIANT;
+        variant = pickLayoutVariant(A.business_name || job.draftId, forcedVariant);
+        html = applyLayoutVariant(html, variant);
+        clog(`5/6 layout variant: ${variant.idx} (${variant.name})${forcedVariant != null && forcedVariant !== "" ? " [forced]" : " [seeded from business name]"}`);
+        jobStep(job, 2, "running", `5/6 Layout variant: ${variant.name}…`);
+      } else { clog(`5/6 layout variation SKIPPED (CLONE_LAYOUT=off)`); }
+
+      // --- 6/6 write bundle + per-draft snapshot ---
       const siteDir = path.join(GEN, "site");
       fs.mkdirSync(siteDir, { recursive: true });
       fs.writeFileSync(path.join(siteDir, "index.html"), html);
       fs.writeFileSync(path.join(GEN, "home.html"), html);
       job.pages = { home: { status: "done", bytes: html.length, error: "" } };
       jobStep(job, 2, "done", `Cloned ${path.basename(ref.file)} · brand bg ${brand.primary} / accent ${brand.accent} / ${brand.headingFont}+${brand.bodyFont}`);
-      // Snapshot to the per-draft view URL (no PR — this is a local design test).
       const snapDir = path.join(GEN, "exports", job.draftId, "site");
       try { fs.rmSync(snapDir, { recursive: true, force: true }); fs.cpSync(siteDir, snapDir, { recursive: true }); } catch (e) { console.warn("clone snapshot failed:", e.message); }
       job.siteUrl = `/view/${encodeURIComponent(job.draftId)}/`;
-      jobStep(job, 3, "done", `Assembled (clone of ${path.basename(ref.file)})`);
-      job.status = "done";
-      console.log(`  CLONE_MODE done → ${job.siteUrl}  (template ${path.basename(ref.file)}, brand ${brand.primary}/${brand.accent})`);
-      return;
+      jobStep(job, 3, "done", `Assembled (clone of ${path.basename(ref.file)} · layout: ${variant.name})`);
+      clog(`6/6 assembled ${html.length} bytes → preview ${job.siteUrl}`);
+      const willPush = (process.env.SKIP_PUSH || "off").toLowerCase() !== "on";
+      clog(willPush ? `▶ SKIP_PUSH off → continuing to WordPress theme build + PR…` : `■ SKIP_PUSH=on → stopping at preview (no WordPress PR)`);
+      // Fall through to the shared SKIP_PUSH check + WordPress theme/PR path below —
+      // the clone's GEN/site/index.html is what buildWpTheme reads.
     }
 
+    // The Stitch generation + AI-chrome assembly below is ONLY for the normal path;
+    // clone mode already produced GEN/site/ above and jumps straight to the PR path.
+    const isCloneBuild = /^(1|on|true|yes)$/i.test(process.env.CLONE_MODE || "");
+    if (!isCloneBuild) {
     // 3 — generate all pages with Stitch
     // TEMPORARY (design-quality dev cycle, DESIGN_QUALITY_PLAN.md): while iterating
     // on the generation prompt, DEV_PAGES=on cuts a build to home only — 1 Stitch
@@ -6766,6 +6912,7 @@ async function runJob(job) {
       job.zipUrl = `/api/export-zip?dir=${encodeURIComponent(`exports/${job.draftId}/site`)}&name=${encodeURIComponent(siteFolderName(job))}`;
     } catch (e) { console.warn("site snapshot for zip export failed (non-fatal):", e.message); }
     jobStep(job, 3, "done", `Assembled (${bound.chromeSource || "AI chrome"})`);
+    } // end !isCloneBuild — clone mode skips Stitch generation + AI-chrome assembly
 
     // SKIP_PUSH=on: local test mode — stop here, don't push/PR to GitHub.
     // Assembled /site/ is already on disk for review in the browser. The
@@ -14742,6 +14889,12 @@ const server = http.createServer(async (req, res) => {
         logoUrl: onb.logoUrl || a.logo_file || a.logo || null,
         businessId: onb.businessId || null,
       });
+      // dryRun: build the theme to disk and return the file list WITHOUT cloning/
+      // pushing/opening a PR — lets us verify the WordPress output locally without
+      // touching the target repo.
+      if (body.dryRun) {
+        return json(res, 200, { dryRun: true, slug, themeDir: built.themeDir, files: built.files, prUrl: null });
+      }
       const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");   // YYYYMMDDHHMMSS
       const uniq = Date.now().toString(36).slice(-4);                              // avoid same-second collisions
       let branch = (body.branch || `g99/beta-theme-${slug}-${stamp}-${uniq}`).replace(/[^a-zA-Z0-9._\/\-]/g, "");

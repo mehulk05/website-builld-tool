@@ -1,8 +1,8 @@
 {
-  "draftId": "clone4-1786522331",
+  "draftId": "logs-1786526277",
   "businessId": null,
   "template": "WEBSITE",
-  "receivedAt": "2026-08-12T08:12:11.959Z",
+  "receivedAt": "2026-08-12T09:17:57.336Z",
   "betaSiteUrl": "",
   "betaSiteRepo": "",
   "referenceWebsite": "",
@@ -11,20 +11,24 @@
   "logoUrl": null,
   "answers": {
     "business_name": "Pretty Please Aesthetics",
-    "practice_type": "Med spa",
     "location": "Roseville & Sacramento, CA",
+    "logo": "https://placehold.co/240x64/C59A7A/ffffff?text=Pretty+Please",
     "services_offered": [
       "Botox",
       "Dermal Fillers",
-      "Lip Filler",
       "Microneedling",
-      "Facials",
-      "Chemical Peels"
+      "Facials"
     ],
-    "hero_headline": "Look like yourself, refreshed",
-    "why_patients_choose": "Natural-looking results from experienced, caring injectors in a relaxed space.",
-    "featured_review": "Absolutely love this place � natural results and the staff make you feel so comfortable.",
     "primary_cta": "Book Now",
-    "phone_for_website": "(916) 555-0123"
+    "team_roster": [
+      {
+        "name": "Kate Cunningham Jeffrey",
+        "role": "PA-C, Lead Injector"
+      },
+      {
+        "name": "Peter V. Hull",
+        "role": "MD, Medical Director"
+      }
+    ]
   }
 }
