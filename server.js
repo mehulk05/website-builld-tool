@@ -3733,6 +3733,16 @@ async function listRepoThemes(repo) {
   if (r.code !== 0) return [];
   return (r.stdout || "").split("\n").map(s => s.trim()).filter(s => s && !s.startsWith("."));
 }
+// Does one file exist on main? One contents call, no clone. Returns null rather
+// than false when the repository itself could not be read, so a caller can tell
+// "the file is missing" apart from "GitHub did not answer" — they warrant
+// different things to say to the person reading the result.
+async function repoFileExists(repo, filePath) {
+  if (!repo) return null;
+  const r = await sh(`gh api "repos/${repo}/contents/${filePath}?ref=main" --jq ".name"`);
+  if (r.code === 0) return true;
+  return /Not Found/i.test(r.stdout + r.stderr) ? false : null;
+}
 // Which theme in the website's repo an edit should target: prefer the theme the
 // live domain is actually serving (and that exists in the repo); else the sole
 // theme in the repo; else a clear error. A g99-* theme also carries its
@@ -4396,6 +4406,28 @@ async function tedSiteFields(clientName, hubspotId) {
   } catch (e) { return null; }
 }
 
+// A site built entirely from TED's own record of a client, by id. No NocoDB, and
+// no name matching — an id from a webhook payload is exact, where a name has to
+// be fuzzily matched and can land on a clone ("... v2 (clone)") or on nothing.
+//
+// siteId is synthesised as ted-<id> so per-site state still has a key, and
+// resolveReviewSite() knows how to read that form back — which is what lets a
+// review link minted for a TED-only client still be redeemable when the writer
+// clicks it days later.
+async function tedClientSite(clientId, fallbackName) {
+  const info = await tedGetClientInfo(clientId);
+  if (!info) throw new Error(`TED has no client ${clientId} (or the token cannot see it)`);
+  const repo = parseRepoSlug(info.githubRepo || "") || String(info.githubRepo || "").trim();
+  if (!repo) throw new Error(`TED client ${clientId} has no GitHub repository set`);
+  return {
+    siteId: `ted-${clientId}`, rowId: null,
+    businessName: String(info.name || info.clientName || info.businessName || fallbackName || `TED client ${clientId}`).trim(),
+    liveUrl: String(info.betaSiteUrl || "").trim(), existingSiteUrl: "",
+    repoUrl: `https://github.com/${repo}`, githubRepo: repo,
+    tedClientId: String(clientId), resolvedFrom: "ted",
+  };
+}
+
 // The check that makes TED-first safe. A repository with no themes in it cannot
 // be edited, so it is the same question resolveEditTarget() asks next — asked
 // one step earlier, where there is still a NocoDB row to fall back to.
@@ -4911,6 +4943,18 @@ const REVIEW_SECRET = process.env.REVIEW_SECRET || process.env.WEBHOOK_SECRET ||
 const REVIEW_TTL_MIN = Number(process.env.REVIEW_TTL_MIN || 120);
 const REVIEW_PLUGIN_PATH = "web/app/mu-plugins/g99-content-review.php";
 
+// A link minted by hand is spent within the hour — someone asked for it and is
+// waiting. One posted into a TED task is read whenever that task comes up the
+// queue, which is days, so it gets its own budget rather than the 2h default
+// that would leave a dead link in the thread by the next morning.
+const TED_REVIEW_TRIGGER_KEY = (process.env.TED_REVIEW_TRIGGER_KEY || "content.create").trim();
+const TED_REVIEW_TARGET_KEY = (process.env.TED_REVIEW_TARGET_KEY || "content.finalize").trim();
+const TED_REVIEW_TTL_MIN = Number(process.env.TED_REVIEW_TTL_MIN || 10080);   // 7 days
+// Stamped in the comment so a re-delivery can be recognised by reading the task
+// back, rather than by remembering — Render restarts, and TED's "all events"
+// scope means the same completion can arrive more than once.
+const TED_REVIEW_MARK = "[content-review link]";
+
 const reviewSign = (body) => crypto.createHmac("sha256", REVIEW_SECRET).update(body).digest("base64url");
 
 function mintReviewToken({ siteId, themeSlug, reviewer, email, dept, minutes }) {
@@ -4992,6 +5036,15 @@ function reviewTargetFromToken(d) {
 async function resolveReviewSite(idOrName) {
   const want = String(idOrName || "").trim();
   if (!want) throw new Error("siteId or businessName required");
+  // ted-<id> is a client TED knows and NocoDB does not. This is the redemption
+  // half of tedClientSite(): without it a link minted for such a client would
+  // mint cleanly and then fail when the writer finally clicked Apply — the worst
+  // possible place to discover it, days later and in front of the reviewer.
+  const tedId = (want.match(/^ted-(\d+)$/i) || [])[1];
+  if (tedId) {
+    const site = await tedClientSite(tedId);
+    return { site, target: await resolveEditTarget(site) };
+  }
   let sites = await getWebsites(false).catch(() => []);
   if (!sites.some((s) => s.siteId === want || tedNorm(s.businessName) === tedNorm(want))) sites = await getWebsites(true);
   const hits = sites.filter((s) => s.siteId === want)
@@ -5001,6 +5054,70 @@ async function resolveReviewSite(idOrName) {
   if (!site.githubRepo) throw new Error(`${site.businessName} has no repository in NocoDB`);
   const target = await resolveEditTarget(site);
   return { site, target };
+}
+
+// ============================================================ Content Review link -> TED task
+// When the upstream content task closes, the content team's next move is to read
+// the copy on the beta site. This puts the door to it in the task they will open
+// to do that, so nobody has to ask an engineer to mint a link by hand.
+//
+// Posts onto the task itself, never a subtask: per the 2026-08-10 standup the
+// content flow does not get subtasks. Returns a reason string when it declines,
+// so the caller can say why in a log rather than failing silently.
+async function tedPostReviewLink({ clientId, clientName, hubspotId, taskId, reviewer }) {
+  // TED sends the client id on the event, and TED can hold the repository and
+  // beta URL against that id — an exact key, where a name has to be fuzzily
+  // matched and can land on a clone of the right client. So the id is tried
+  // first.
+  //
+  // But those two fields are filled in for almost no client today (2 of 148 as
+  // of 2026-08-12), so TED failing to answer is the ordinary case, not the
+  // exception. It falls through to the name lookup rather than refusing, and
+  // every client that already worked keeps working. Each one starts resolving
+  // from TED the day someone fills its record in, with no deploy either side.
+  let site = null;
+  if (clientId) {
+    site = await tedClientSite(clientId, clientName).catch((e) => {
+      console.log(`ted-content-review: TED client ${clientId} not usable (${e.message}) — falling back to the site list`);
+      return null;
+    });
+  }
+  if (!site) {
+    if (!clientName) throw new Error(`TED client ${clientId} has no beta site or repository, and the event carried no client name to fall back to`);
+    site = await resolveClientSite(clientName, hubspotId);
+  }
+  if (!/^https?:\/\//i.test(site.liveUrl || "")) throw new Error(`${site.businessName} has no beta site URL — there is nowhere to send the reviewer`);
+  const target = await resolveEditTarget(site);
+
+  // The widget only renders where the plugin is installed. A link into a site
+  // without it looks identical to a working one until someone clicks it and
+  // finds nothing, so say so in the comment rather than letting them discover it.
+  const installed = await repoFileExists(site.githubRepo, REVIEW_PLUGIN_PATH).catch(() => null);
+
+  const { token, exp } = mintReviewToken({
+    siteId: site.siteId, themeSlug: target.themeSlug,
+    reviewer: reviewer || "Content Team", dept: "Content", minutes: TED_REVIEW_TTL_MIN,
+  });
+  const link = new URL(site.liveUrl);
+  link.searchParams.set("g99r", token);
+
+  const text = [
+    `Content Review is open for ${site.businessName}.`,
+    "",
+    link.toString(),
+    "",
+    "Open that link on the beta site, select any sentence you want changed, type the",
+    "replacement and click Apply. The correction goes live on the site by itself —",
+    "there is nothing to hand back to engineering.",
+    "",
+    `Link expires ${new Date(exp).toISOString().slice(0, 10)}. Ask for a fresh one after that.`,
+    installed === false ? "\nHeads up: the review plugin is not in this site's repository yet, so the box may not appear. Tell engineering and it takes one PR." : "",
+    "",
+    TED_REVIEW_MARK,
+  ].filter((l, i) => l !== "" || i > 0).join("\n");
+
+  tedComment(text, null, 0, String(taskId));
+  return { site, link: link.toString(), exp, pluginInstalled: installed };
 }
 
 // A batch from the widget becomes a work order with the exact pairs already in
@@ -13160,6 +13277,103 @@ const server = http.createServer(async (req, res) => {
         targetTaskId, targetTemplateKey: wantKey,
       });
       return json(res, 202, { ok: true, jobId: job.draftId, status: job.status, targetTaskId });
+    }
+
+    // TED: the upstream content task closed -> post a Content Review link on the
+    // finalize task, so the content team opens the beta site from the task they
+    // were going to work in anyway.
+    //
+    // Same payload shape as the mockup.create webhook above, but not the same
+    // route: that one is hardcoded to one key pair and answers 200/ignored for
+    // everything else, so pointing this at it would look wired and do nothing.
+    //
+    // Deliberately its own key pair in env — the content chain has been renamed
+    // once already, and a rename should be a config change, not a deploy.
+    if (p === "/api/webhook/ted-content-review" && req.method === "POST") {
+      // This route mints a credential: the ?g99r= link is the entire authority to
+      // change a live client site. Unlike the read-only mockup webhook above, it
+      // refuses outright when no secret is configured rather than running open.
+      const secret = (process.env.TED_REVIEW_WEBHOOK_SECRET || "").trim();
+      if (!secret) {
+        console.warn("ted-content-review: refused — TED_REVIEW_WEBHOOK_SECRET is not set");
+        return json(res, 503, { error: "TED_REVIEW_WEBHOOK_SECRET is not set on this deployment" });
+      }
+      // TED's "Secret Auth" tab sends X-TED-Webhook-Secret; a header added by hand
+      // on the Parameter/Headers tab is whatever was typed there, and the rest of
+      // this tool's webhooks use X-Webhook-Secret. Accept all of them: which tab
+      // someone filled in is not worth a silent 401 on every delivery.
+      const sent = String(req.headers["x-ted-webhook-secret"] || req.headers["x-webhook-secret"]
+        || req.headers["x-ted-secret"]
+        || String(req.headers["authorization"] || "").replace(/^Bearer\s+/i, "")).trim();
+      if (sent !== secret) {
+        // Which header arrived is the one thing that makes a 401 here debuggable;
+        // the value never goes near the log.
+        console.warn(`ted-content-review: bad secret (headers seen: ${Object.keys(req.headers).filter((h) => /secret|auth/i.test(h)).join(", ") || "none"})`);
+        return json(res, 401, { error: "bad webhook secret" });
+      }
+
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || "{}"); } catch (e) { return json(res, 400, { error: "bad json" }); }
+      const trig = body.trigger || {}, tgt = body.target || {};
+
+      // The webhook may be left on "all events", which fires on every comment and
+      // edit too. Everything below is a normal refusal answered 200, so TED stops
+      // resending what was never ours to act on.
+      if (body.event && body.event !== "TASK_STATUS_CHANGED") return json(res, 200, { ok: true, ignored: `event ${body.event}` });
+      if (trig.templateKey && trig.templateKey !== TED_REVIEW_TRIGGER_KEY) {
+        return json(res, 200, { ok: true, ignored: `trigger ${trig.templateKey} is not ${TED_REVIEW_TRIGGER_KEY}` });
+      }
+      if (String(trig.status || "").toLowerCase() !== "completed") {
+        return json(res, 200, { ok: true, ignored: `status ${trig.status} is not Completed` });
+      }
+      const targetTaskId = tgt.id || tgt.taskId || null;
+      if (!targetTaskId || (tgt.templateKey && tgt.templateKey !== TED_REVIEW_TARGET_KEY)) {
+        return json(res, 200, { ok: true, ignored: `no ${TED_REVIEW_TARGET_KEY} target (target=${targetTaskId}, key=${tgt.templateKey})` });
+      }
+      // The id is what this actually runs on; the name is a label for the log and
+      // a fallback for an event that carries no id. Either one is enough.
+      const clientId = String(trig.clientId || trig.client_id || body.clientId || "").trim();
+      const clientName = String(trig.clientName || trig.client || body.clientName || "").trim();
+      if (!clientId && !clientName) {
+        console.warn("ted-content-review: no client on the event. payload:", JSON.stringify(body).slice(0, 1200));
+        return json(res, 422, { error: "no client id or name in payload", hint: "expected trigger.clientId" });
+      }
+
+      // Re-delivery guard. Read back rather than remembered: this deployment
+      // restarts, and a link posted twice sends two people to edit the same page
+      // under two sessions. Only a read that succeeded can prove absence — a TED
+      // failure here must not be mistaken for "no link yet".
+      let existing;
+      try { existing = await tedTaskComments(targetTaskId); }
+      catch (e) { return json(res, 502, { error: `could not read task ${targetTaskId}: ${e.message}` }); }
+      if (existing.some((c) => c.text.includes(TED_REVIEW_MARK))) {
+        return json(res, 200, { ok: true, ignored: "a review link is already on this task", targetTaskId });
+      }
+
+      try {
+        const out = await tedPostReviewLink({
+          clientId, clientName, hubspotId: trig.hubspotCompanyId || trig.companyId || "",
+          taskId: targetTaskId,
+          // Nobody is on the other end of a webhook. The name rides in the token
+          // and is stamped on every correction, so it says what is true: the
+          // content team, whoever from it opens the link.
+          reviewer: "Content Team",
+        });
+        notify(`🔗 Content Review link posted for *${out.site.businessName}* on ${TED_REVIEW_TARGET_KEY} task ${targetTaskId}`
+          + (out.pluginInstalled === false ? " — but the review plugin is not in that repo yet" : ""));
+        return json(res, 200, { ok: true, targetTaskId, businessName: out.site.businessName, expiresAt: new Date(out.exp).toISOString() });
+      } catch (e) {
+        // An ambiguous client or a site with no beta URL is a refusal, not an
+        // outage: 200 so TED stops retrying, loud in Slack so a person fixes it.
+        // Nothing is posted to the task — a comment saying we could not make a
+        // link is worse than the task simply not having one.
+        // An event may carry only an id, and a warning that names nothing is not
+        // worth reading — say whichever of the two actually arrived.
+        const who = clientName || `TED client ${clientId}`;
+        console.warn(`ted-content-review: no link for "${who}" —`, e.message);
+        notify(`⚠️ Content Review link not posted for *${who}* (${TED_REVIEW_TARGET_KEY} task ${targetTaskId}): ${e.message}`);
+        return json(res, 200, { ok: false, ignored: e.message, targetTaskId });
+      }
     }
 
     if (p === "/api/webhook/onboarding-submitted" && req.method === "POST") {
