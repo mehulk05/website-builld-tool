@@ -4948,7 +4948,7 @@ const REVIEW_PLUGIN_PATH = "web/app/mu-plugins/g99-content-review.php";
 // queue, which is days, so it gets its own budget rather than the 2h default
 // that would leave a dead link in the thread by the next morning.
 const TED_REVIEW_TRIGGER_KEY = (process.env.TED_REVIEW_TRIGGER_KEY || "content.create").trim();
-const TED_REVIEW_TARGET_KEY = (process.env.TED_REVIEW_TARGET_KEY || "content.finalize").trim();
+const TED_REVIEW_TARGET_KEY = (process.env.TED_REVIEW_TARGET_KEY || "content.approval").trim();
 const TED_REVIEW_TTL_MIN = Number(process.env.TED_REVIEW_TTL_MIN || 10080);   // 7 days
 // Stamped in the comment so a re-delivery can be recognised by reading the task
 // back, rather than by remembering — Render restarts, and TED's "all events"
@@ -13280,7 +13280,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     // TED: the upstream content task closed -> post a Content Review link on the
-    // finalize task, so the content team opens the beta site from the task they
+    // approval task, so the content team opens the beta site from the task they
     // were going to work in anyway.
     //
     // Same payload shape as the mockup.create webhook above, but not the same

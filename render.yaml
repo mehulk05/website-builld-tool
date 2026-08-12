@@ -37,8 +37,9 @@ services:
         value: "60000"       # wait for the deploy to land before screenshotting
       - key: TED_SCREENSHOTS
         value: "on"          # off = outcome comments without the image
-      # Content Review link posted onto the finalize task when the upstream
-      # content task closes. REQUIRED for /api/webhook/ted-content-review — that
+      # Content Review link posted onto the content-approval task when the
+      # upstream content task closes.
+      # REQUIRED for /api/webhook/ted-content-review — that
       # route refuses to run without it, because the link it mints can edit a
       # live client site. Must match the secret set on the TED webhook.
       - key: TED_REVIEW_WEBHOOK_SECRET
@@ -46,7 +47,7 @@ services:
       - key: TED_REVIEW_TRIGGER_KEY
         value: content.create      # the task whose completion posts the link
       - key: TED_REVIEW_TARGET_KEY
-        value: content.finalize    # the task the link is posted on
+        value: content.approval    # the task the link is posted on
       - key: TED_REVIEW_TTL_MIN
         value: "10080"       # 7 days — it waits in a task, unlike a hand-minted link
       # The link only posts corrections if this deployment is allowed to publish
