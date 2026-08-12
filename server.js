@@ -4422,7 +4422,12 @@ async function tedClientSite(clientId, fallbackName) {
   return {
     siteId: `ted-${clientId}`, rowId: null,
     businessName: String(info.name || info.clientName || info.businessName || fallbackName || `TED client ${clientId}`).trim(),
-    liveUrl: String(info.betaSiteUrl || "").trim(), existingSiteUrl: "",
+    // betaSiteUrl is the site we build and edit; liveSiteUrl is the client's
+    // existing public site, which is what NocoDB's "Live Site" column held and
+    // what the pre-release comparison reads. Keeping them distinct here is what
+    // lets a caller stop consulting NocoDB for either.
+    liveUrl: String(info.betaSiteUrl || "").trim(),
+    existingSiteUrl: String(info.liveSiteUrl || "").trim(),
     repoUrl: `https://github.com/${repo}`, githubRepo: repo,
     tedClientId: String(clientId), resolvedFrom: "ted",
   };
@@ -13589,13 +13594,14 @@ const server = http.createServer(async (req, res) => {
         }
         return "";
       };
+      const clientId = dig("clientId", "client_id");
       const clientName = dig("clientName", "client_name", "client", "customerName", "businessName");
       const templateKey = dig("templateKey", "template_key", "taskTemplateKey");
       const status = dig("status", "taskStatus", "newStatus");
       const targetTask = tgt.id || tgt.taskId || dig("targetTaskId", "id");
-      if (!clientName) {
-        console.warn("pre-release webhook: no client name. payload:", JSON.stringify(body).slice(0, 1200));
-        return json(res, 422, { error: "no client name in payload", seen: Object.keys(body), hint: "expected trigger.clientName" });
+      if (!clientId && !clientName) {
+        console.warn("pre-release webhook: no client on the event. payload:", JSON.stringify(body).slice(0, 1200));
+        return json(res, 422, { error: "no client id or name in payload", seen: Object.keys(body), hint: "expected trigger.clientId" });
       }
       // TED's UI offers "All Events", which would fire this on every comment and
       // edit. Default to the pre-release template key so a mis-set webhook cannot
@@ -13609,20 +13615,41 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ignored: true, reason: `status ${status} is not ${wantStatus}` });
       }
 
-      let sites; try { sites = await getWebsites(true); } catch (e) { return json(res, 502, { error: "NocoDB lookup failed: " + e.message }); }
-      const norm = (s) => String(s || "").toLowerCase().replace(/\(.*?\)/g, "").replace(/[^a-z0-9]+/g, " ").trim();
-      const want = norm(clientName);
-      const exact = sites.filter((s) => norm(s.businessName) === want);
-      const loose = exact.length ? exact : sites.filter((s) => norm(s.businessName).includes(want) || want.includes(norm(s.businessName)));
-      if (loose.length !== 1) {
-        return json(res, 409, {
-          error: loose.length ? `"${clientName}" matches ${loose.length} sites` : `no NocoDB site matches "${clientName}"`,
-          candidates: loose.map((s) => s.businessName).slice(0, 5),
+      // TED's own record for the id on the event, ahead of the name lookup below.
+      // The name path is not merely less precise here, it is unsafe: TED sends
+      // "NUVO Aesthetics Clinic v2 (clone)", NocoDB holds "NUVO Aesthetics
+      // Clinic", and the loose match links them confidently to a row pointing at
+      // an entirely different repository and domain. This run clones, audits and
+      // auto-merges, so a confident wrong answer is the worst possible one.
+      let site = null;
+      if (clientId) {
+        site = await tedClientSite(clientId, clientName).catch((e) => {
+          console.log(`pre-release: TED client ${clientId} not usable (${e.message}) — falling back to the site list`);
+          return null;
         });
       }
-      const site = loose[0];
-      if (!site.githubRepo) return json(res, 409, { error: site.businessName + " has no repository set in NocoDB" });
-      if (!site.liveUrl) return json(res, 409, { error: site.businessName + " has no Domain set in NocoDB" });
+      if (site && !site.liveUrl) {
+        console.log(`pre-release: TED client ${clientId} has no beta site URL — falling back to the site list`);
+        site = null;
+      }
+      if (!site) {
+        if (!clientName) return json(res, 409, { error: `TED client ${clientId} has no usable repository or beta site, and the event carried no client name to fall back to` });
+        let sites; try { sites = await getWebsites(true); } catch (e) { return json(res, 502, { error: "NocoDB lookup failed: " + e.message }); }
+        const norm = (s) => String(s || "").toLowerCase().replace(/\(.*?\)/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+        const want = norm(clientName);
+        const exact = sites.filter((s) => norm(s.businessName) === want);
+        const loose = exact.length ? exact : sites.filter((s) => norm(s.businessName).includes(want) || want.includes(norm(s.businessName)));
+        if (loose.length !== 1) {
+          return json(res, 409, {
+            error: loose.length ? `"${clientName}" matches ${loose.length} sites` : `no NocoDB site matches "${clientName}"`,
+            candidates: loose.map((s) => s.businessName).slice(0, 5),
+          });
+        }
+        site = loose[0];
+        if (!site.githubRepo) return json(res, 409, { error: site.businessName + " has no repository set in NocoDB" });
+        if (!site.liveUrl) return json(res, 409, { error: site.businessName + " has no Domain set in NocoDB" });
+      }
+      console.log(`pre-release: ${site.businessName} resolved from ${site.resolvedFrom === "ted" ? "TED client " + site.tedClientId : "the site list"} — ${site.githubRepo} / ${site.liveUrl}`);
       let target; try { target = await resolveEditTarget(site); } catch (e) { return json(res, 409, { error: e.message }); }
       const running = [...JOBS.values()].find((j) => j.type === "perform-pr"
         && (j.status === "queued" || j.status === "running") && j.payload && j.payload.siteId === site.siteId);
