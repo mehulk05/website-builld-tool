@@ -198,6 +198,12 @@ const NOCODB_TABLE = process.env.NOCODB_TABLE || "mp8nfno2six11yi";
 // until TED_API_TOKEN is set, so nothing changes for a deployment without one.
 const TED_BASE = (process.env.TED_BASE || "https://ted.growth99.com").replace(/\/$/, "");
 const TED_API_TOKEN = process.env.TED_API_TOKEN || "";
+// SSO handoff: a browser that's logged out here gets bounced to TED's login page (nav.js), and a
+// browser arriving back from a successful TED login carries a signed ticket instead of retyping
+// ADMIN_PASSWORD. Same shared-secret-HMAC shape as REVIEW_SECRET below, just keyed by email+expiry.
+// Unset on either side = the old plain password gate, unchanged.
+const TED_SSO_SECRET = process.env.TED_SSO_SECRET || "";
+const TED_LOGIN_URL = (process.env.TED_LOGIN_URL || "").replace(/\/$/, "");
 // The one task every email request is filed against, until we look the right
 // task up per client. Env-overridable so moving it is not a code change.
 const TED_REVISIONS_TASK_ID = process.env.TED_REVISIONS_TASK_ID || "9078";
@@ -5145,6 +5151,24 @@ const TED_REVIEW_TTL_MIN = Number(process.env.TED_REVIEW_TTL_MIN || 10080);   //
 const TED_REVIEW_MARK = "[content-review link]";
 
 const reviewSign = (body) => crypto.createHmac("sha256", REVIEW_SECRET).update(body).digest("base64url");
+
+// Verifies a TED SSO ticket: base64url(JSON {email,name,photo,exp}) + "." + HMAC-SHA256 of that JSON
+// string, signed with TED_SSO_SECRET (must equal TED backend's build.tool.sso.secret). Returns the
+// claims on success, or null on any failure — expired, bad signature, malformed, or secret unset.
+function verifyTedSsoTicket(token) {
+  if (!TED_SSO_SECRET || !token) return null;
+  const parts = String(token).split(".");
+  if (parts.length !== 2) return null;
+  const [payloadB64, sig] = parts;
+  let payload;
+  try { payload = Buffer.from(payloadB64, "base64url").toString("utf8"); } catch (e) { return null; }
+  const expected = crypto.createHmac("sha256", TED_SSO_SECRET).update(payload).digest("base64url");
+  if (sig !== expected) return null;
+  let claims;
+  try { claims = JSON.parse(payload); } catch (e) { return null; }
+  if (!claims || !claims.email || !Number.isFinite(claims.exp) || Date.now() / 1000 > claims.exp) return null;
+  return claims;
+}
 
 // taskId is the TED task this link was posted on, when it came from one. It
 // rides in the token because that is the only thing that survives the trip: the
@@ -13665,11 +13689,23 @@ const server = http.createServer(async (req, res) => {
     // /api/auth-check itself is exempt only for health checks WITHOUT a key;
     // with a key present it validates it (the frontend uses this to log in).
     const ADMIN = process.env.ADMIN_PASSWORD || "";
+    // Ticket redemption itself must be reachable with NO key — that is the entire point of it: a
+    // browser that just proved itself to TED has no ADMIN_PASSWORD yet, that's what this hands back.
+    if (p === "/api/sso-exchange") {
+      const claims = verifyTedSsoTicket(u.searchParams.get("token") || "");
+      if (!claims) return json(res, 401, { ok: false, error: "invalid or expired ticket" });
+      return json(res, 200, {
+        ok: true, adminKey: ADMIN,
+        email: claims.email, name: claims.name || "", photo: claims.photo || "",
+      });
+    }
     if (p === "/api/auth-check") {
       const supplied = req.headers["x-admin-key"] || "";
-      if (ADMIN && supplied && supplied !== ADMIN) return json(res, 401, { error: "unauthorized" });
-      if (ADMIN && !supplied && req.headers["x-login"] === "1") return json(res, 401, { error: "unauthorized" });
-      return json(res, 200, { ok: true, gated: !!ADMIN });
+      // tedLoginUrl rides on every response (success or 401) so nav.js always knows whether to
+      // redirect to TED or fall back to the in-page password prompt — never just one branch.
+      if (ADMIN && supplied && supplied !== ADMIN) return json(res, 401, { error: "unauthorized", tedLoginUrl: TED_LOGIN_URL || null });
+      if (ADMIN && !supplied && req.headers["x-login"] === "1") return json(res, 401, { error: "unauthorized", tedLoginUrl: TED_LOGIN_URL || null });
+      return json(res, 200, { ok: true, gated: !!ADMIN, tedLoginUrl: TED_LOGIN_URL || null });
     }
     if (ADMIN && p.startsWith("/api/") && !p.startsWith("/api/webhook/") && (req.headers["x-admin-key"] || "") !== ADMIN) {
       return json(res, 401, { error: "unauthorized" }); // /api/webhook/* carries its own secret check
