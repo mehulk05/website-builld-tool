@@ -2,7 +2,7 @@
 // what's in flight and what recently landed. Polls while anything is live.
 "use strict";
 
-const { esc, avatarColor, initials, relTime, getJSON, postJSON, toast, ensureAuth,
+const { esc, avatarColor, initials, relTime, getJSON, postJSON, toast, ensureAuth, svg,
         jobState, jobProgress, jobCost, jobStepLabel, isActiveJob, emitHops,
         confirm: confirmAction } = window.G99;
 
@@ -11,6 +11,40 @@ const $ = (id) => document.getElementById(id);
 let JOBS = [], FILTER = "all", QUERY = "", timer;
 const PAGE = 30;
 let shownCount = PAGE;
+// Which rows have their task breakdown open. A Set survives the re-render every
+// poll does (4-10s) — without it, expanding a row would collapse itself on the
+// next tick.
+const EXPANDED = new Set();
+function toggleExpand(id) { EXPANDED.has(id) ? EXPANDED.delete(id) : EXPANDED.add(id); render(); }
+
+// The same per-step stepper the run detail page uses (same CSS classes, from the
+// shared theme.css), so a job's task breakdown reads as one dashboard whether
+// you're looking at it from Activity or from the run itself — not two different
+// UIs for the same data.
+function taskBreakdown(j) {
+  const ic = {
+    done: svg("check", 12, 3),
+    running: `<span class="spin" style="margin:0;width:12px;height:12px;border-color:var(--accent);border-top-color:transparent"></span>`,
+    error: svg("close", 12, 3), pending: "",
+  };
+  const steps = j.steps || [];
+  if (!steps.length) return `<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line-2);font-size:12.5px;color:var(--muted)">No task detail recorded for this run.</div>`;
+  return `<div class="steps" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line-2)">${steps.map((s) => `
+    <div class="jstep ${s.status}">
+      <span class="ic">${ic[s.status] || ""}</span>
+      <div class="jb">
+        <span class="lb">${esc(s.label)}</span>
+        ${s.detail ? `<span class="dt"${s.status === "error" ? ' style="color:var(--bad)"' : ""}>${esc(s.detail)}</span>` : ""}
+      </div>
+    </div>`).join("")}
+  </div>`;
+}
+function taskToggle(j) {
+  const open = EXPANDED.has(j.draftId);
+  return `<button class="btn sm" data-toggle="${esc(j.draftId)}" style="margin-right:8px" aria-expanded="${open}" title="Show task-by-task progress">
+    <span style="display:inline-flex;transform:rotate(${open ? 90 : 0}deg);transition:transform .14s">${svg("chevron", 12, 2.4)}</span> Tasks
+  </button>`;
+}
 
 // isActiveJob guards against a stale awaitingApproval flag on a run that has
 // already ended — a finished job can't be waiting for you.
@@ -63,6 +97,7 @@ function activeRow(j) {
       ${(j.status === "running" || j.status === "queued") && !j.cancelRequested ? `<button class="btn danger sm" data-cancel="${esc(j.draftId)}" data-name="${esc(j.businessName)}">Stop</button>` : ""}
       ${j.cancelRequested && j.status === "running" ? `<span class="pill bad">Stopping…</span>` : ""}
       ${emitBadge(j)}
+      ${taskToggle(j)}
       <span class="pill ${st.cls}">${esc(st.label)}</span>
     </div>
     <div class="mt">
@@ -70,22 +105,31 @@ function activeRow(j) {
       <span class="eta">${pct}%</span>
       <span class="cost">${esc(jobCost(j))}</span>
     </div>
+    ${EXPANDED.has(j.draftId) ? taskBreakdown(j) : ""}
   </a>`;
 }
 
 function doneRow(j) {
   const st = jobState(j);
   const sub = j.type === "build" ? "Generated & deployed" : j.type === "enrich" ? "Service pages + brand guide" : j.type === "pre-release" ? "Mobile release check" : j.prUrl ? "Change shipped" : "Run ended";
-  return `<a class="run compact" href="/job?id=${encodeURIComponent(j.draftId)}">
-    <span class="ava" style="background:${avatarColor(j.businessName)}">${esc(initials(j.businessName))}</span>
-    <div style="flex:1;min-width:0;margin-left:12px">
-      <div class="nm trunc">${esc(title(j))}</div>
-      <div class="sub trunc">${esc(j.businessName)} · ${esc(sub)} · ${esc(relTime(j.finishedAt || j.createdAt))}</div>
-      ${clientMeta(j)}
+  // flex-direction:column (inline, beats the .compact class's row default) so the
+  // expanded task breakdown lands as a full-width block under the row instead of
+  // squeezing in as another flex item beside the pills.
+  return `<a class="run compact" href="/job?id=${encodeURIComponent(j.draftId)}" style="flex-direction:column;align-items:stretch">
+    <div style="display:flex;align-items:center;width:100%">
+      <span class="ava" style="background:${avatarColor(j.businessName)}">${esc(initials(j.businessName))}</span>
+      <div style="flex:1;min-width:0;margin-left:12px">
+        <div class="nm trunc">${esc(title(j))}</div>
+        <div class="sub trunc">${esc(j.businessName)} · ${esc(sub)} · ${esc(relTime(j.finishedAt || j.createdAt))}</div>
+        ${clientMeta(j)}
+      </div>
+      ${emitBadge(j)}
+      ${j.delta != null ? `<span class="pill ${j.delta >= 0 ? "good" : "bad"}" style="margin-right:8px">CRO ${j.delta >= 0 ? "+" : ""}${j.delta}</span>` : ""}
+      ${taskToggle(j)}
+      ${j.reportUrl ? `<button class="btn sm" data-report="${esc(j.reportUrl)}" style="margin-right:8px" title="Open the run report">Report</button>` : ""}
+      <span class="pill ${st.cls}">${esc(st.label)}</span>
     </div>
-    ${emitBadge(j)}
-    ${j.delta != null ? `<span class="pill ${j.delta >= 0 ? "good" : "bad"}" style="margin-right:8px">CRO ${j.delta >= 0 ? "+" : ""}${j.delta}</span>` : ""}
-    <span class="pill ${st.cls}">${esc(st.label)}</span>
+    ${EXPANDED.has(j.draftId) ? taskBreakdown(j) : ""}
   </a>`;
 }
 
@@ -150,6 +194,19 @@ $("filters").onclick = (e) => {
 };
 $("search").oninput = (e) => { QUERY = e.target.value.toLowerCase().trim(); shownCount = PAGE; render(); };
 
+// Tasks toggle — same handler on both lists, delegated (rows re-render on every
+// poll for active jobs, so a listener bound to a row would be lost on the next tick).
+function bindTaskToggle(container) {
+  container.addEventListener("click", (e) => {
+    const t = e.target.closest("[data-toggle]");
+    if (!t) return;
+    e.preventDefault(); e.stopPropagation();
+    toggleExpand(t.dataset.toggle);
+  });
+}
+bindTaskToggle($("active"));
+bindTaskToggle($("done"));
+
 // Stop button on active rows (delegated — rows re-render on every poll). The row
 // itself is a link, so swallow the navigation before cancelling.
 $("active").addEventListener("click", async (e) => {
@@ -166,6 +223,15 @@ $("active").addEventListener("click", async (e) => {
   b.disabled = true;
   try { await postJSON("/api/job-cancel", { id: b.dataset.cancel }); toast("Stopping — the run ends at the next step boundary."); load(); }
   catch (err) { b.disabled = false; toast("Could not stop: " + err.message); }
+});
+
+// Report button on completed rows — opens the run's report directly instead of
+// following the row into the full job detail page.
+$("done").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-report]");
+  if (!b) return;
+  e.preventDefault(); e.stopPropagation();
+  window.open(b.dataset.report, "_blank", "noopener");
 });
 
 ensureAuth().then((ok) => {

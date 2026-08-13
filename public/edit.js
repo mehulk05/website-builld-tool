@@ -26,6 +26,19 @@ let COLLAPSED = localStorage.getItem("g99chatCollapsed") === "1";
 let MODEL = localStorage.getItem("g99editModel") || "gemini";
 let MODELS = [];
 let poll;
+// Files staged via the "+" button, not yet sent. [{filename, mime, dataBase64, kind, isImage, previewUrl}]
+let ATTACH = [];
+const ATTACH_MAX_BYTES = 10 * 1024 * 1024;
+// Maps a browser-reported MIME type to the "kind" the server also derives independently from the
+// file's actual bytes (see detectAttachmentKind in server.js) — this is only used for the instant
+// client-side check and preview; the server never trusts it.
+const ATTACH_KIND = {
+  "image/png": "image", "image/jpeg": "image", "image/jpg": "image", "image/gif": "image", "image/webp": "image",
+  "application/pdf": "pdf",
+  "application/json": "json",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+};
+const ATTACH_ACCEPT = "image/png,image/jpeg,image/jpg,image/gif,image/webp,application/pdf,application/json,.json,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx";
 
 const threadKey = () => "g99thread:" + (SITE ? SITE.siteId : "none");
 
@@ -238,7 +251,13 @@ function renderThread() {
   const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
   el.innerHTML = THREAD.map((m) => {
     if (m.role === "user") {
-      return `<div class="msg user"><div class="col"><div class="bubble">${esc(m.text)}</div></div></div>`;
+      const atts = m.attachments || [];
+      const thumbs = atts.length
+        ? `<div class="msg-thumbs">${atts.map((a) => a.kind === "image"
+            ? `<img src="${esc(a.url)}" alt="${esc(a.filename || "attached image")}">`
+            : `<span class="msg-filechip">${svg("file", 12)}${esc(a.filename)}</span>`).join("")}</div>`
+        : "";
+      return `<div class="msg user"><div class="col">${thumbs}<div class="bubble">${esc(m.text)}</div></div></div>`;
     }
     return `<div class="msg"><div class="col">
       <div class="say">${esc(m.text)}</div>
@@ -287,7 +306,10 @@ function render() {
         <div class="composer">
           <div class="chips" id="chips">${PRESETS.map((p, i) =>
             `<button class="chip" data-p="${i}"><svg style="width:12px;height:12px" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="${p[1]}"/></svg>${esc(p[0])}</button>`).join("")}</div>
+          <div class="attach-strip" id="attachStrip"></div>
           <div class="box">
+            <button type="button" class="iconbtn ghost" id="attachBtn" title="Attach a file (image, PDF, JSON or Word)" aria-label="Attach a file">${svg("plus", 16, 2.2)}</button>
+            <input type="file" id="fileInput" accept="${ATTACH_ACCEPT}" multiple style="display:none">
             <textarea id="input" rows="1" placeholder="Describe a change — e.g. make the hero headline bolder"></textarea>
             <button class="iconbtn" id="send" title="Ship this change">${svg("arrow", 16, 2.2)}</button>
           </div>
@@ -323,6 +345,20 @@ function wire() {
   input.oninput = () => { input.style.height = "auto"; input.style.height = Math.min(120, input.scrollHeight) + "px"; };
   input.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } };
   $("send").onclick = send;
+  $("attachBtn").onclick = () => $("fileInput").click();
+  $("fileInput").onchange = async (e) => {
+    const files = [...e.target.files];
+    e.target.value = "";   // lets the same file be picked again later
+    for (const f of files) await addAttachment(f);
+  };
+  $("attachStrip").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-i]");
+    if (!b) return;
+    const i = +b.dataset.i;
+    if (ATTACH[i].previewUrl) URL.revokeObjectURL(ATTACH[i].previewUrl);
+    ATTACH.splice(i, 1);
+    renderAttach();
+  });
   $("chips").onclick = (e) => {
     const b = e.target.closest("[data-p]");
     if (!b) return;
@@ -374,6 +410,53 @@ function wire() {
   });
 }
 
+// ------------------------------------------------------------------ attachments
+// Read client-side (FileReader → base64), previewed instantly via an object URL
+// (images only — a PDF/JSON/Word chip just gets a file icon), and only actually
+// uploaded to the server once the message is sent — picking a file and then not
+// sending should cost nothing.
+async function addAttachment(file) {
+  // Some OS file pickers report a .json file as text/plain rather than application/json —
+  // the extension is the fallback for exactly that case. The server re-derives the kind
+  // from the actual bytes regardless, so a wrong guess here only affects the chip's icon.
+  const kind = ATTACH_KIND[file.type] || (/\.json$/i.test(file.name) ? "json" : null) || (/\.docx$/i.test(file.name) ? "docx" : null);
+  if (!kind) {
+    // Old Word/Excel/PowerPoint (.doc/.xls/.ppt) is a different, much older binary format than the
+    // ZIP-based .docx — worth naming specifically since "unsupported" alone doesn't tell someone with
+    // a .doc file what to actually do about it.
+    if (/\.(doc|xls|ppt)$/i.test(file.name)) {
+      toast(`${file.name} is an old .doc/.xls/.ppt file (Word 97-2003 format) — only the modern .docx is supported. Save it as .docx and try again.`);
+    } else {
+      toast(`${file.name}: only images, PDF, JSON or Word (.docx) files are supported.`);
+    }
+    return;
+  }
+  if (file.size > ATTACH_MAX_BYTES) { toast(`${file.name} is too large — max 10MB.`); return; }
+  let dataBase64;
+  try {
+    dataBase64 = await new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result);
+      r.onerror = () => reject(new Error("could not read file"));
+      r.readAsDataURL(file);
+    });
+  } catch (e) { toast(`Could not read ${file.name}.`); return; }
+  const isImage = kind === "image";
+  ATTACH.push({ filename: file.name, mime: file.type, dataBase64, kind, isImage, previewUrl: isImage ? URL.createObjectURL(file) : null });
+  renderAttach();
+}
+const ATTACH_KIND_LABEL = { pdf: "PDF", json: "JSON", docx: "Word" };
+function renderAttach() {
+  const el = $("attachStrip");
+  if (!el) return;
+  el.innerHTML = ATTACH.map((a, i) => `
+    <div class="attach-chip">
+      ${a.isImage ? `<img src="${a.previewUrl}" alt="">` : `<span class="af" title="${esc(ATTACH_KIND_LABEL[a.kind] || a.kind)}">${svg("file", 14)}</span>`}
+      <span class="an" title="${esc(a.filename)}">${esc(a.filename)}</span>
+      <button type="button" class="ax" data-i="${i}" aria-label="Remove ${esc(a.filename)}">${svg("close", 11, 2.4)}</button>
+    </div>`).join("");
+}
+
 // Groups the options by provider so "Ollama" reads as a provider with models
 // under it, rather than five unrelated names in a flat list.
 function fillModels() {
@@ -405,9 +488,11 @@ function reloadPreview() {
 async function send() {
   if (SENDING) return;
   const text = $("input").value.trim();
-  if (!text) return;
+  if (!text && !ATTACH.length) return;
   if (!SITE.githubRepo) { toast("This website has no repository set in NocoDB."); return; }
   if (TARGET && TARGET.resolveError) { toast("No editable theme resolved — see the site page."); return; }
+
+  const pending = ATTACH.slice();   // snapshot — ATTACH is cleared before the async upload below
 
   // Sending opens a real pull request against a client repo — never on a
   // stray Enter. Confirm names the repo, the theme and the merge policy.
@@ -420,7 +505,8 @@ async function send() {
       Site: SITE.businessName,
       Repository: SITE.githubRepo,
       Theme: (TARGET && TARGET.themeSlug) || "resolving…",
-      Change: text.length > 120 ? text.slice(0, 120) + "…" : text,
+      Change: text ? (text.length > 120 ? text.slice(0, 120) + "…" : text) : "(uses the attached file only)",
+      ...(pending.length ? { Attached: pending.map((a) => a.filename).join(", ") } : {}),
     },
     confirmLabel: SITE.requireApproval ? "Open pull request" : "Ship it",
   });
@@ -429,15 +515,38 @@ async function send() {
   SENDING = true;
   $("send").disabled = true;
   $("input").value = ""; $("input").style.height = "auto";
+  ATTACH = []; renderAttach();
 
-  THREAD.push({ role: "user", text });
+  // Attachments upload first so the chat bubble and the job prompt can both carry the
+  // real, stable /uploads/… URL rather than a throwaway object URL.
+  let attachments = [];
+  if (pending.length) {
+    const uploading = { role: "ai", text: `Uploading ${pending.length} file${pending.length > 1 ? "s" : ""}…`, jobId: null, job: null };
+    THREAD.push(uploading); renderThread();
+    try {
+      const uploaded = await Promise.all(pending.map((a) => postJSON("/api/upload-attachment", { filename: a.filename, dataBase64: a.dataBase64 })));
+      attachments = uploaded.map((u, i) => ({ url: u.url, filename: pending[i].filename, kind: u.kind }));
+    } catch (e) {
+      THREAD.splice(THREAD.indexOf(uploading), 1);
+      toast("Could not upload the attached file: " + e.message);
+      pending.forEach((a) => { if (a.previewUrl) URL.revokeObjectURL(a.previewUrl); });
+      renderThread();
+      SENDING = false; $("send").disabled = false;
+      return;
+    }
+    THREAD.splice(THREAD.indexOf(uploading), 1);
+    pending.forEach((a) => { if (a.previewUrl) URL.revokeObjectURL(a.previewUrl); });
+  }
+
+  const finalText = text || "Use the attached file as directed.";
+  THREAD.push({ role: "user", text: finalText, attachments });
   const mode = SITE.requireApproval ? "I'll pause before merging so you can approve it." : "It merges automatically once the build passes.";
   const ai = { role: "ai", text: `On it — applying that to ${SITE.businessName}. ${mode}`, jobId: null, job: null };
   THREAD.push(ai);
   renderThread(); save();
 
   try {
-    const d = await postJSON("/api/edit-run", { siteId: SITE.siteId, prompt: text, aiModel: MODEL });
+    const d = await postJSON("/api/edit-run", { siteId: SITE.siteId, prompt: finalText, aiModel: MODEL, attachments });
     ai.jobId = d.jobId;
     save(); renderThread(); startPolling();
   } catch (e) {
@@ -479,7 +588,7 @@ function startPolling() {
 // ------------------------------------------------------------------ storage
 function save() {
   try {
-    localStorage.setItem(threadKey(), JSON.stringify(THREAD.map((m) => ({ role: m.role, text: m.text, jobId: m.jobId || null }))));
+    localStorage.setItem(threadKey(), JSON.stringify(THREAD.map((m) => ({ role: m.role, text: m.text, jobId: m.jobId || null, attachments: m.attachments || undefined }))));
   } catch (e) { /* quota — the thread is a convenience, jobs are the source of truth */ }
 }
 function restore() {
