@@ -4989,6 +4989,52 @@ async function tedPushArtifacts(eventType, { businessId, draftId, mockups, servi
   } catch (e) { return { ok: false, error: String(e.message || e) }; }
 }
 
+// Per-pipeline-step push to TED, so an individual subtask under content.create / beta_site.develop
+// closes the moment its real step finishes — independent of (and in addition to) the parent-task
+// milestone push above. Fire-and-forget, same posture as tedPushArtifacts: a failed push here must
+// never slow or fail the build.
+async function tedPushSubtaskStep(parentTemplateKey, stepKey, status, {
+  businessId, draftId, hubspotDealId, hubspotCompanyId, detail, error,
+  score, beforeScore, afterScore, delta,
+} = {}) {
+  if (!TED_API_TOKEN) return { ok: false, error: "TED_API_TOKEN not set" };
+  const headers = { "Content-Type": "application/json" };
+  if (TED_AUTH_HEADER === "x-api-key") headers["X-Api-Key"] = TED_API_TOKEN;
+  else headers["Authorization"] = "Bearer " + TED_API_TOKEN;
+  const body = JSON.stringify({
+    parentTemplateKey, stepKey, status,
+    businessId, draftId,
+    dealId: hubspotDealId || null, companyId: hubspotCompanyId || null,
+    detail: detail || null, error: error || null,
+    score: score != null ? score : null,
+    beforeScore: beforeScore != null ? beforeScore : null,
+    afterScore: afterScore != null ? afterScore : null,
+    delta: delta != null ? delta : null,
+  });
+  try {
+    const r = await fetch(`${TED_BASE}/api/webhooks/onboarding/subtask-step`, { method: "POST", headers, body });
+    const ct = r.headers.get("content-type") || "";
+    if (/html/i.test(ct)) return { ok: false, error: "endpoint not deployed (got the TED web app, not the API)" };
+    const payload = ct.includes("json") ? await r.json().catch(() => ({})) : {};
+    if (!r.ok) return { ok: false, error: `HTTP ${r.status}`, payload };
+    return { ok: true, payload };
+  } catch (e) { return { ok: false, error: String(e.message || e) }; }
+}
+
+// Fire-and-forget wrapper around tedPushSubtaskStep for a running job — pulls the ids off the job's
+// own payload/record so every call site doesn't have to repeat that plumbing. `parentTemplateKey` is
+// inferred from job.type ("build"/"revise-build" -> beta_site.develop, "enrich" -> content.create);
+// pass it explicitly only if a call site's job.type doesn't already imply the right one.
+function pushSubtaskStep(job, stepKey, status, extra = {}) {
+  const parentTemplateKey = extra.parentTemplateKey
+    || (job.type === "enrich" ? "content.create" : "beta_site.develop");
+  const hubspotDealId = (job.payload || {}).hubspotDealId || null;
+  const hubspotCompanyId = (job.payload || {}).hubspotCompanyId || null;
+  tedPushSubtaskStep(parentTemplateKey, stepKey, status, {
+    businessId: job.businessId, draftId: job.draftId, hubspotDealId, hubspotCompanyId, ...extra,
+  }).then(r => console.log(`[ted-push-step] ${parentTemplateKey}/${stepKey} ${status} -> ${JSON.stringify(r).slice(0, 200)}`));
+}
+
 // ---- Content review sessions -------------------------------------------------
 // A content editor reviews the beta site itself and corrects the copy in place;
 // the widget that lets them do it lives in review-plugin.js and renders only
@@ -6545,6 +6591,12 @@ async function runThemeActivationTail(job, slug, A) {
   job.reportUrl = writeComparisonReport(job);
   await postPrComment(job);
   jobStep(job, 7, "done", job.before ? `${job.before.overall} → ${job.after.overall} (${job.delta >= 0 ? "+" : ""}${job.delta})` : `New site: ${job.after.overall}/100`);
+  // Single event, carries both facts — TED fans this out to the two subtasks ("CRO audit — new
+  // site" gets just the score, "Before / after comparison" gets just the delta) from this one push.
+  pushSubtaskStep(job, "cro_audit_after", "done", {
+    afterScore: job.after.overall, beforeScore: job.before ? job.before.overall : null, delta: job.delta,
+    detail: job.before ? `${job.before.overall} → ${job.after.overall} (${job.delta >= 0 ? "+" : ""}${job.delta})` : `New site: ${job.after.overall}/100`,
+  });
 
   try { await syncSiteRegistry(); } catch (e) { /* non-fatal: keep registry current so the new site is editable */ }
 
@@ -7017,9 +7069,12 @@ async function runJob(job) {
       try {
         job.before = await localApi("/api/cro-audit", { url: onb.existingWebsite });
         jobStep(job, 0, "done", `Existing site: ${job.before.overall}/100`);
+        pushSubtaskStep(job, "cro_audit_before", "done", { score: job.before.overall,
+          detail: `Existing site: ${job.before.overall}/100` });
       } catch (e) { jobStep(job, 0, "error", "audit failed (continuing): " + e.message); }
     } else {
       jobStep(job, 0, "done", "No existing website — skipped");
+      pushSubtaskStep(job, "cro_audit_before", "done", { detail: "No existing website — skipped" });
     }
 
     // 2 — compose the brand + build brief
@@ -7033,6 +7088,8 @@ async function runJob(job) {
     job.composed = { primary: composed.primary, secondary: composed.secondary, accent: composed.accent, headingFont: composed.headingFont, bodyFont: composed.bodyFont, brief: composed.brief || "" };
     jobStep(job, 1, "done", `Palette ${composed.primary}/${composed.accent} · ${composed.headingFont}`
       + (composed.brandSource ? " · client-confirmed" : ""));
+    pushSubtaskStep(job, "compose_prompt", "done", { detail:
+      `Palette ${composed.primary}/${composed.accent} · ${composed.headingFont}` });
 
     // ---- CLONE_MODE (step 1): clone a reference template + apply the client's
     // brand by editing its CSS variables, then serve. Short-circuits the whole
@@ -7173,6 +7230,7 @@ async function runJob(job) {
         ") — the theme's header/footer/front page all derive from home, so the build was stopped rather than ship a homepage with no content or navigation. Re-run to retry.");
     }
     jobStep(job, 2, "done", `${ok.length}/${(gen.pages || []).length} pages generated`);
+    pushSubtaskStep(job, "generate_pages", "done", { detail: `${ok.length}/${(gen.pages || []).length} pages generated` });
 
     // Home content for the TED content-task push (done later in runThemeActivationTail, once the site
     // is live). Prefer the composed home brief (from the client's real structure); fall back to the
@@ -7212,6 +7270,7 @@ async function runJob(job) {
     job.themeSlug = slug;
     if (!job.prUrl) throw new Error("push succeeded but no PR URL returned");
     jobStep(job, 4, "done", job.prUrl);
+    pushSubtaskStep(job, "wp_theme_pr", "done", { detail: job.prUrl });
 
     // 6 — CI watch → auto-fix → auto-merge
     jobStep(job, 5, "running", "Watching CI build checks…");
@@ -7255,6 +7314,9 @@ async function runJob(job) {
       if (job.steps[job.currentStep] && job.steps[job.currentStep].status === "running") { job.steps[job.currentStep].status = "error"; job.steps[job.currentStep].detail = String(e.message).slice(0, 240); }
       console.error(`job ${job.draftId} failed at step ${job.currentStep + 1}:`, e.message);
       notify(`❌ Beta site *${job.businessName}* failed: ${e.message}`);
+      // Real step key for whichever step it was on, so the matching subtask (if any is mapped to it)
+      // gets marked Failed with the actual error rather than sitting silently Not Started.
+      pushSubtaskStep(job, JOB_STEP_KEYS[job.currentStep] || String(job.currentStep), "error", { error: e.message });
     }
   } finally {
     job.finishedAt = new Date().toISOString(); saveJobs(); COST_SINK = null;
@@ -9346,6 +9408,8 @@ async function runEnrichJob(job) {
     job.enrichPlan = { services: services.map((s) => s.slug), total, truncated, refCount: ref.count };
     if (truncated) log_srv(`services truncated: ${total} → ${MAX_SERVICE_PAGES}`);
     jobStep(job, 1, "done", `${services.length} service page(s)${truncated ? ` (capped from ${total})` : ""} + brand guide${ref.count ? ` · ref has ${ref.count}` : ""}`);
+    pushSubtaskStep(job, "enrich_plan_brand", "done", { parentTemplateKey: "content.create",
+      detail: `${services.length} service page(s)${truncated ? ` (capped from ${total})` : ""} + brand guide` });
 
     // 3 — generate pages: STITCH per service (grounded in the existing site's
     // matching page copy), Gemini template+clone only as the fallback. Each page's
@@ -9456,6 +9520,8 @@ async function runEnrichJob(job) {
     const brandMain = brandGuidePage(composed, A, P.businessName);
     const hubMain = servicesHubMain(services, A, composed);
     jobStep(job, 2, "done", `${services.length + 1} page(s) generated`);
+    pushSubtaskStep(job, "enrich_generate_pages", "done", { parentTemplateKey: "content.create",
+      detail: `${services.length + 1} page(s) generated` });
 
     // 4 — write files + push + PR
     jobStep(job, 3, "running", P.headerOnly ? "Rewriting the header + opening PR…" : "Writing pages + opening PR…");
@@ -9654,6 +9720,9 @@ async function runEnrichJob(job) {
       mirrorToParent(job, "error", e.message);
       console.error(`enrich job ${job.draftId} failed:`, e.message);
       notify(`❌ Enrichment failed for *${job.businessName}*: ${e.message}`);
+      const ENRICH_FAIL_STEP_KEYS = ["enrich_pull_code", "enrich_plan_brand", "enrich_generate_pages", "enrich_push_pr", "enrich_ci", "enrich_sync"];
+      pushSubtaskStep(job, ENRICH_FAIL_STEP_KEYS[job.currentStep] || String(job.currentStep), "error",
+        { parentTemplateKey: "content.create", error: e.message });
     }
   } finally {
     job.finishedAt = new Date().toISOString(); saveJobs(); COST_SINK = null;
