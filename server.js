@@ -3010,6 +3010,14 @@ function audit(html, kw) {
 
 // ---------------------------------------------------------------- HTTP
 function send(res, code, type, body) { res.writeHead(code, { "Content-Type": type }); res.end(body); }
+// No Cache-Control header anywhere in send() means Chrome's heuristic caching can serve a stale
+// copy of a file with no versioned URL — harmless for most static assets, but nav.js/login.html
+// carry the auth/SSO logic itself, so a stale copy after a fix ships means silently testing
+// yesterday's bug. Used only for those two.
+function sendNoCache(res, code, type, body) {
+  res.writeHead(code, { "Content-Type": type, "Cache-Control": "no-cache, no-store, must-revalidate" });
+  res.end(body);
+}
 function json(res, code, obj) { send(res, code, "application/json", JSON.stringify(obj)); }
 function readBody(req) { return new Promise(r => { let d = ""; req.on("data", c => d += c); req.on("end", () => r(d)); }); }
 const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp" };
@@ -13442,9 +13450,10 @@ const server = http.createServer(async (req, res) => {
     if (p === "/styles.css") return send(res, 200, "text/css", fs.readFileSync(path.join(DIR, "public", "styles.css")));
     if (p === "/dashboard" || p === "/dashboard.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "dashboard.html")));
     if (p === "/dashboard.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "dashboard.js")));
-    if (p === "/nav.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "nav.js")));
+    if (p === "/nav.js") return sendNoCache(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "nav.js")));
     if (p === "/theme.css") return send(res, 200, "text/css", fs.readFileSync(path.join(DIR, "public", "theme.css")));
     if (p === "/job" || p === "/job.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "job.html")));
+    if (p === "/login" || p === "/login.html") return sendNoCache(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "login.html")));
     if (p === "/job.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "job.js")));
 
     if (p === "/api/onboarding" && req.method === "POST") {

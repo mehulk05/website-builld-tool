@@ -212,6 +212,11 @@
         // round trip to TED — cleared together with the key on logout.
         localStorage.setItem("g99UserName", data.name || "");
         localStorage.setItem("g99UserPhoto", data.photo || "");
+        // The header is built synchronously as soon as this script runs, straight off whatever was
+        // ALREADY in localStorage — which on this exact page load is nothing, since the exchange
+        // above is what just wrote it. Without this, the chip shows the generic fallback until the
+        // next full page load, even though the user is correctly signed in right now.
+        refreshProfileChip();
       }
     } catch (e) { /* falls through to the normal gate below */ }
     params.delete("ted_sso");
@@ -223,7 +228,12 @@
     localStorage.removeItem("g99AdminKey");
     localStorage.removeItem("g99UserName");
     localStorage.removeItem("g99UserPhoto");
-    location.reload();
+    // Straight to /login with loggedOut=1 — NOT a plain reload. A reload would hit ensureAuth()'s
+    // normal 401 path, which auto-forwards through TED and, since TED's own session is still very
+    // much alive, bounces straight back in — logout would never actually show a logged-out state.
+    // loggedOut=1 tells /login to wait for an explicit "Continue with TED" click instead of
+    // auto-redirecting, so a deliberate logout actually lands somewhere and stays there.
+    location.href = "/login?loggedOut=1";
   }
 
   async function ensureAuth() {
@@ -235,9 +245,12 @@
     if (r.status !== 401) return true;
     const body = await r.json().catch(() => ({}));
     if (body && body.tedLoginUrl) {
-      // Bounce to TED instead of the in-page password prompt. On successful login TED redirects
-      // back here (see login.component.ts) with a ticket, which consumeTedSso() above redeems.
-      window.location.href = body.tedLoginUrl + "?buildToolReturnTo=" + encodeURIComponent(location.href);
+      // Bounce through our own /login page rather than straight to TED — it is the one place that
+      // decides "already signed into TED" (instant bounce back) vs "needs the Google form", and
+      // gives a stable landing page after logout instead of a silent redirect from wherever the
+      // 401 happened to fire. /login itself carries the buildToolReturnTo handoff to TED; on success
+      // TED redirects back here with a ticket, which consumeTedSso() above redeems.
+      window.location.href = "/login?next=" + encodeURIComponent(location.pathname + location.search + location.hash);
       return new Promise(() => {});   // navigating away — never resolve
     }
     return passwordGate();             // no TED login configured — old in-page prompt, unchanged
@@ -702,20 +715,30 @@
   head.className = "g99head";
   // "New site" is the header's primary action — pointless on the page it opens.
   const onBuild = path === "/dashboard" || path === "/dashboard.html";
-  const userName = localStorage.getItem("g99UserName") || "";
-  const userPhoto = localStorage.getItem("g99UserPhoto") || "";
-  const initial = (userName.trim()[0] || "G").toUpperCase();
+  function profileChipHtml() {
+    const userName = localStorage.getItem("g99UserName") || "";
+    const userPhoto = localStorage.getItem("g99UserPhoto") || "";
+    const initial = (userName.trim()[0] || "G").toUpperCase();
+    return `
+      ${userPhoto ? `<img class="av" src="${esc(userPhoto)}" alt="" referrerpolicy="no-referrer">` : `<span class="av" aria-hidden="true">${esc(initial)}</span>`}
+      <span class="nm">${esc(userName || "Growth99 team")}</span>
+      <span class="chev" aria-hidden="true">${svg("chevron", 13, 2.4)}</span>`;
+  }
+  // Re-reads localStorage and repaints the chip in place — needed because consumeTedSso() can
+  // populate g99UserName/g99UserPhoto AFTER this header has already been built from whatever was
+  // (or wasn't) in localStorage at script-load time. Only touches the button's contents, not the
+  // button element itself, so the click listener attached to it below stays intact.
+  function refreshProfileChip() {
+    const btn = document.getElementById("g99profile");
+    if (btn) btn.innerHTML = profileChipHtml();
+  }
   head.innerHTML = `
     <button class="menu" id="g99menu" aria-label="Open navigation" aria-expanded="false" aria-controls="g99rail">${svg("menu", 18)}</button>
     <div class="ttl">${esc(title)}</div>
     <button class="searchbtn" id="g99search" aria-label="Search sites and actions">${svg("search", 15)}<span>Search sites, actions…</span><kbd>⌘K</kbd></button>
     ${onBuild ? "" : `<a class="btn primary newsite" href="/dashboard">${svg("plus", 15, 2.2)}<span>New site</span></a>`}
     <div class="profile">
-      <button class="avbtn" id="g99profile" aria-haspopup="true" aria-expanded="false" aria-label="Account menu">
-        ${userPhoto ? `<img class="av" src="${esc(userPhoto)}" alt="" referrerpolicy="no-referrer">` : `<span class="av" aria-hidden="true">${esc(initial)}</span>`}
-        <span class="nm">${esc(userName || "Growth99 team")}</span>
-        <span class="chev" aria-hidden="true">${svg("chevron", 13, 2.4)}</span>
-      </button>
+      <button class="avbtn" id="g99profile" aria-haspopup="true" aria-expanded="false" aria-label="Account menu">${profileChipHtml()}</button>
       <div class="dropdown" id="g99profilemenu" role="menu">
         <button class="logout" id="g99logout" role="menuitem">${svg("logout", 15)}<span>Log out</span></button>
       </div>

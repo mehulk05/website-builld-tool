@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en" data-shell="none">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · Growth99 Website Studio</title>
+<style>
+  :root { --ink:#1b1b1f; --ink-btn-ink:#fff; --surface:#fff; --surface-2:#f7f7f5; --line:#e6e6e3; --muted:#6e6e75; --accent:#5b4df0; --bad:#e5484d; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--surface-2); color: var(--ink);
+    display: grid; place-items: center; min-height: 100vh; padding: 24px;
+  }
+  .card {
+    width: 100%; max-width: 360px; text-align: center; background: var(--surface);
+    border: 1px solid var(--line); border-radius: 16px; padding: 36px 30px 32px;
+    box-shadow: 0 1px 2px rgba(16,16,20,.04), 0 12px 32px rgba(16,16,20,.07);
+  }
+  .lg { width: 44px; height: 44px; border-radius: 12px; margin: 0 auto 18px; background: var(--ink); color: var(--ink-btn-ink);
+    display: grid; place-items: center; font-weight: 800; font-size: 20px; }
+  h1 { margin: 0; font-size: 19px; font-weight: 800; letter-spacing: -.02em; }
+  .sub { margin: 4px 0 26px; font-size: 12.5px; font-weight: 600; color: var(--muted); }
+  .status { display: flex; align-items: center; justify-content: center; gap: 9px; font-size: 13px; font-weight: 600; color: var(--muted); min-height: 20px; margin-bottom: 18px; }
+  .spin { width: 15px; height: 15px; border-radius: 50%; border: 2px solid var(--accent); border-top-color: transparent; animation: spin .7s linear infinite; flex: none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .err { background: color-mix(in srgb, var(--bad) 10%, transparent); color: var(--bad); border-radius: 10px; padding: 9px 12px; font-size: 12.5px; margin-bottom: 16px; text-align: left; }
+  button {
+    width: 100%; padding: 11px 16px; font: inherit; font-size: 14px; font-weight: 700;
+    color: var(--ink-btn-ink); background: var(--ink); border: none; border-radius: 10px;
+    cursor: pointer; transition: opacity .14s; display: flex; align-items: center; justify-content: center; gap: 8px;
+  }
+  button:hover { opacity: .88; }
+  button:disabled { opacity: .55; cursor: default; }
+  .foot { margin: 16px 0 0; font-size: 11.5px; color: var(--muted); }
+</style>
+</head>
+<body>
+  <div class="card">
+    <span class="lg" aria-hidden="true">g</span>
+    <h1>Growth99</h1>
+    <p class="sub">Website Build Tool</p>
+    <div class="status" id="status" role="status">
+      <span class="spin" aria-hidden="true"></span>
+      Checking your TED session…
+    </div>
+    <div class="err" id="err" hidden></div>
+    <button id="continueBtn" type="button">Continue with TED</button>
+    <p class="foot" id="foot">You'll be brought right back here once you're signed in.</p>
+  </div>
+
+  <script>
+    (function () {
+      // Where to land once signed in — either the page that redirected us here, or the Studio root.
+      var params = new URLSearchParams(location.search);
+      var next = params.get("next") || "/";
+      // Set by nav.js's logout() — a deliberate "log me out" click, not a session-expired 401. TED's
+      // own session is very likely still alive, so auto-attempting here would silently sign the user
+      // straight back in and logout would never actually show a logged-out state. Wait for the
+      // explicit button click instead.
+      var justLoggedOut = params.get("loggedOut") === "1";
+      if (justLoggedOut) {
+        // Inline style, not the `hidden` attribute — .status{display:flex} outranks the browser's
+        // default [hidden]{display:none} rule (a class selector beats an attribute selector), so
+        // `.hidden = true` alone silently did nothing and the spinner stayed visible.
+        document.getElementById("status").style.display = "none";
+        document.getElementById("foot").textContent = "You've been logged out of the build tool. Continue with TED to sign back in.";
+      }
+
+      function goToTed() {
+        fetch("/api/auth-check", { headers: { "x-login": "1" } })
+          .then((r) => r.json().catch(() => ({})))
+          .then((body) => {
+            if (!body || !body.tedLoginUrl) {
+              document.getElementById("status").hidden = true;
+              var e = document.getElementById("err");
+              e.hidden = false;
+              e.textContent = "TED sign-in isn't configured on this deployment. Ask an admin to set TED_LOGIN_URL.";
+              document.getElementById("continueBtn").hidden = true;
+              return;
+            }
+            var dest = body.tedLoginUrl + "?buildToolReturnTo=" + encodeURIComponent(location.origin + next);
+            location.href = dest;
+          })
+          .catch(() => {
+            document.getElementById("status").hidden = true;
+            var e = document.getElementById("err");
+            e.hidden = false;
+            e.textContent = "Could not reach the server. Check your connection and try again.";
+          });
+      }
+
+      document.getElementById("continueBtn").onclick = goToTed;
+      // Auto-attempt immediately — UNLESS this is a deliberate logout. TED itself decides whether
+      // this browser is already signed in (instant bounce-back) or needs the Google sign-in form;
+      // the button stays as a manual fallback either way.
+      if (!justLoggedOut) goToTed();
+    })();
+  </script>
+</body>
+</html>
