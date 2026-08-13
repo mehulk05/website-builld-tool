@@ -196,13 +196,51 @@
     });
   }
 
+  // A browser arriving back from a successful TED login carries ?ted_sso=<ticket> instead of
+  // ADMIN_PASSWORD. Redeemed once, then scrubbed from the URL so a bookmark/share of this link
+  // never carries a (short-lived, but still real) credential in it.
+  async function consumeTedSso() {
+    const params = new URLSearchParams(location.search);
+    const token = params.get("ted_sso");
+    if (!token) return;
+    try {
+      const r = await fetch("/api/sso-exchange?token=" + encodeURIComponent(token));
+      const data = await r.json().catch(() => null);
+      if (data && data.ok && data.adminKey) {
+        localStorage.setItem("g99AdminKey", data.adminKey);
+        // Carried along so the profile chip (top-right) can show who's signed in without a second
+        // round trip to TED — cleared together with the key on logout.
+        localStorage.setItem("g99UserName", data.name || "");
+        localStorage.setItem("g99UserPhoto", data.photo || "");
+      }
+    } catch (e) { /* falls through to the normal gate below */ }
+    params.delete("ted_sso");
+    const qs = params.toString();
+    history.replaceState(null, "", location.pathname + (qs ? "?" + qs : "") + location.hash);
+  }
+
+  function logout() {
+    localStorage.removeItem("g99AdminKey");
+    localStorage.removeItem("g99UserName");
+    localStorage.removeItem("g99UserPhoto");
+    location.reload();
+  }
+
   async function ensureAuth() {
+    await consumeTedSso();
     // No password set on this deployment, or one already stored and still good:
     // nothing is shown at all.
     const r = await fetch("/api/auth-check", { headers: { "x-login": "1" } }).catch(() => null);
     if (!r) return false;              // server unreachable — not an auth failure
     if (r.status !== 401) return true;
-    return passwordGate();             // stays up until the password is right
+    const body = await r.json().catch(() => ({}));
+    if (body && body.tedLoginUrl) {
+      // Bounce to TED instead of the in-page password prompt. On successful login TED redirects
+      // back here (see login.component.ts) with a ticket, which consumeTedSso() above redeems.
+      window.location.href = body.tedLoginUrl + "?buildToolReturnTo=" + encodeURIComponent(location.href);
+      return new Promise(() => {});   // navigating away — never resolve
+    }
+    return passwordGate();             // no TED login configured — old in-page prompt, unchanged
   }
 
   // Every /api/* route is gated by ADMIN_PASSWORD when deployed. app.js patches window.fetch to add
@@ -264,6 +302,7 @@
     clock: `<circle cx="12" cy="12" r="9"/><path stroke-linecap="round" stroke-linejoin="round" d="M12 7v5l3.5 2"/>`,
     copy: `<rect x="9" y="9" width="11" height="11" rx="2"/><path stroke-linecap="round" stroke-linejoin="round" d="M5 15H4a1 1 0 01-1-1V4a1 1 0 011-1h10a1 1 0 011 1v1"/>`,
     download: `<path stroke-linecap="round" stroke-linejoin="round" d="M12 3v12m0 0l-4-4m4 4l4-4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/>`,
+    logout: `<path stroke-linecap="round" stroke-linejoin="round" d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9"/>`,
   };
   // svg(name) → a 1em icon; svg(name, 18) → sized.
   const svg = (name, size, sw) =>
@@ -546,6 +585,48 @@
       background: var(--line-2); border: 1px solid var(--line);
       border-radius: 6px; padding: 2px 6px; color: var(--ink-3);
     }
+    /* Profile — avatar + name button, always rightmost, after "New site". Clicking it opens a
+       small popover with just the logout action, so the header shows who's signed in at a glance
+       without a wide always-open pill. */
+    .g99head .profile { position: relative; flex: none; }
+    .g99head .profile .avbtn {
+      display: flex; align-items: center; gap: 8px; flex: none; max-width: 200px;
+      border: 1px solid var(--line); background: var(--surface); padding: 4px 10px 4px 4px;
+      border-radius: 999px; cursor: pointer; box-shadow: var(--shadow-sm);
+      transition: border-color .14s, background .14s;
+    }
+    .g99head .profile .avbtn:hover { background: var(--line-2); }
+    .g99head .profile .avbtn[aria-expanded="true"] { border-color: var(--accent); }
+    .g99head .profile .av {
+      width: 26px; height: 26px; border-radius: 50%; flex: none; object-fit: cover;
+      background: linear-gradient(135deg, #5b4df0, #c64c6c); color: #fff;
+      display: grid; place-items: center; font-weight: 700; font-size: 11.5px;
+    }
+    .g99head .profile .nm {
+      font-size: 12.5px; font-weight: 700; color: var(--ink); min-width: 0;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .g99head .profile .avbtn .chev {
+      flex: none; color: var(--muted); transition: transform .14s;
+    }
+    .g99head .profile .avbtn[aria-expanded="true"] .chev { transform: rotate(180deg); }
+    @media (max-width: 640px) { .g99head .profile .nm, .g99head .profile .chev { display: none; } .g99head .profile .avbtn { padding: 3px; } }
+
+    .g99head .profile .dropdown {
+      position: absolute; top: calc(100% + 10px); right: 0; z-index: 70; display: block;
+      width: 160px; background: var(--surface); border: 1px solid var(--line);
+      border-radius: 12px; box-shadow: var(--shadow-lg); padding: 6px;
+      opacity: 0; transform: translateY(-4px) scale(.98); pointer-events: none;
+      transition: opacity .14s, transform .14s;
+    }
+    .g99head .profile .dropdown.open { opacity: 1; transform: none; pointer-events: auto; }
+    .g99head .profile .logout {
+      display: flex; align-items: center; gap: 10px; width: 100%;
+      border: none; background: none; color: var(--bad, #e5484d); text-align: left;
+      font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+      padding: 9px 10px; border-radius: 9px; transition: background .12s;
+    }
+    .g99head .profile .logout:hover { background: var(--danger-soft, #fdecec); }
     /* hamburger — only exists below the drawer breakpoint */
     .g99head .menu { display: none; }
     .g99railscrim { display: none; }
@@ -621,11 +702,24 @@
   head.className = "g99head";
   // "New site" is the header's primary action — pointless on the page it opens.
   const onBuild = path === "/dashboard" || path === "/dashboard.html";
+  const userName = localStorage.getItem("g99UserName") || "";
+  const userPhoto = localStorage.getItem("g99UserPhoto") || "";
+  const initial = (userName.trim()[0] || "G").toUpperCase();
   head.innerHTML = `
     <button class="menu" id="g99menu" aria-label="Open navigation" aria-expanded="false" aria-controls="g99rail">${svg("menu", 18)}</button>
     <div class="ttl">${esc(title)}</div>
     <button class="searchbtn" id="g99search" aria-label="Search sites and actions">${svg("search", 15)}<span>Search sites, actions…</span><kbd>⌘K</kbd></button>
-    ${onBuild ? "" : `<a class="btn primary newsite" href="/dashboard">${svg("plus", 15, 2.2)}<span>New site</span></a>`}`;
+    ${onBuild ? "" : `<a class="btn primary newsite" href="/dashboard">${svg("plus", 15, 2.2)}<span>New site</span></a>`}
+    <div class="profile">
+      <button class="avbtn" id="g99profile" aria-haspopup="true" aria-expanded="false" aria-label="Account menu">
+        ${userPhoto ? `<img class="av" src="${esc(userPhoto)}" alt="" referrerpolicy="no-referrer">` : `<span class="av" aria-hidden="true">${esc(initial)}</span>`}
+        <span class="nm">${esc(userName || "Growth99 team")}</span>
+        <span class="chev" aria-hidden="true">${svg("chevron", 13, 2.4)}</span>
+      </button>
+      <div class="dropdown" id="g99profilemenu" role="menu">
+        <button class="logout" id="g99logout" role="menuitem">${svg("logout", 15)}<span>Log out</span></button>
+      </div>
+    </div>`;
 
   const skip = document.createElement("a");
   skip.className = "g99skip";
@@ -652,6 +746,23 @@
   document.body.insertBefore(rail, document.body.firstChild);
   document.body.insertBefore(skip, document.body.firstChild);
   head.querySelector("#g99search").onclick = () => openPalette();
+  head.querySelector("#g99logout").onclick = () => logout();
+
+  // ---- profile menu ----
+  const profileBtn = head.querySelector("#g99profile");
+  const profileMenu = head.querySelector("#g99profilemenu");
+  const setProfileMenu = (open) => {
+    profileMenu.classList.toggle("open", open);
+    profileBtn.setAttribute("aria-expanded", String(open));
+  };
+  profileBtn.onclick = (e) => { e.stopPropagation(); setProfileMenu(!profileMenu.classList.contains("open")); };
+  document.addEventListener("click", (e) => {
+    if (!profileMenu.classList.contains("open")) return;
+    if (!e.target.closest("#g99profilemenu, #g99profile")) setProfileMenu(false);
+  });
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && profileMenu.classList.contains("open")) { setProfileMenu(false); profileBtn.focus(); }
+  });
 
   // ---- mobile drawer ----
   rail.id = "g99rail";
