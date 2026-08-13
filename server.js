@@ -8,6 +8,7 @@ const os = require("os");
 const crypto = require("crypto");   // GitHub App JWT signing
 const { exec, spawn } = require("child_process");
 const { URL } = require("url");
+const zlib = require("zlib");
 
 const DIR = __dirname;
 
@@ -2325,6 +2326,81 @@ const FAVICON_MIME = {
   webp: "image/webp", ico: "image/x-icon", svg: "image/svg+xml",
 };
 
+// ---- edit-chat attachments (images, PDF, JSON, Word) -----------------------
+// What kind of file this actually is, by content — never trust the browser's reported
+// MIME type or the filename extension alone (see /api/upload-attachment).
+function detectAttachmentKind(buf) {
+  const imgExt = imageExtFromBuffer(buf);
+  if (imgExt && ["png", "jpg", "gif", "webp"].includes(imgExt)) return { kind: "image", ext: imgExt };
+  if (buf.slice(0, 5).toString("ascii") === "%PDF-") return { kind: "pdf", ext: "pdf" };
+  if (buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04) {
+    // ZIP-based — only accept it as an attachment if it's really a Word document, not any old zip.
+    return unzipEntry(buf, "word/document.xml") ? { kind: "docx", ext: "docx" } : null;
+  }
+  // No magic bytes for JSON — the only test is whether it parses.
+  if (buf.length && buf.length < 15 * 1024 * 1024) {
+    try { JSON.parse(buf.toString("utf8")); return { kind: "json", ext: "json" }; } catch (e) { /* not JSON */ }
+  }
+  return null;
+}
+// Legacy .doc/.xls/.ppt (Word 97-2003 and older) share the OLE2/CFBF compound-file container — a
+// completely different, much more involved binary format than the ZIP+XML .docx uses (a real parser
+// needs the FAT/mini-FAT allocation tables and the Word-specific piece-table layout on top). Not
+// worth building for a format almost nothing still saves in — this only exists so the upload error
+// can say "save as .docx" instead of a generic "unsupported file".
+function isLegacyOfficeFile(buf) {
+  return buf.length >= 8 && buf[0] === 0xd0 && buf[1] === 0xcf && buf[2] === 0x11 && buf[3] === 0xe0
+    && buf[4] === 0xa1 && buf[5] === 0xb1 && buf[6] === 0x1a && buf[7] === 0xe1;
+}
+// Minimal ZIP reader — just enough to pull one named entry out of a .docx (which is a ZIP of XML
+// parts). Scans local file headers directly rather than the central directory, which is simpler and
+// sufficient for the well-formed, non-streamed archives every real DOCX writer produces; a bit 3
+// ("data descriptor", sizes unknown up front) entry is skipped rather than guessed at.
+function unzipEntry(buf, entryName) {
+  let offset = 0;
+  while (offset < buf.length - 4) {
+    if (buf.readUInt32LE(offset) !== 0x04034b50) { offset++; continue; }
+    const flag = buf.readUInt16LE(offset + 6);
+    const method = buf.readUInt16LE(offset + 8);
+    const compSize = buf.readUInt32LE(offset + 18);
+    const nameLen = buf.readUInt16LE(offset + 26);
+    const extraLen = buf.readUInt16LE(offset + 28);
+    const name = buf.toString("utf8", offset + 30, offset + 30 + nameLen);
+    const dataStart = offset + 30 + nameLen + extraLen;
+    if (name === entryName && !(flag & 0x8)) {
+      const raw = buf.slice(dataStart, dataStart + compSize);
+      try { return method === 8 ? zlib.inflateRawSync(raw) : raw; } catch (e) { return null; }
+    }
+    if (!compSize && (flag & 0x8)) break;   // streamed entry with no size in the header — bail out rather than mis-scan
+    offset = dataStart + compSize;
+  }
+  return null;
+}
+// Word's paragraph/run markup stripped down to plain text — good enough for "what does this document
+// say", not a faithful re-rendering (tables, styling, headers/footers are all dropped).
+function extractDocxText(buf) {
+  const xml = unzipEntry(buf, "word/document.xml");
+  if (!xml) return null;
+  const text = xml.toString("utf8")
+    .replace(/<w:p[ >]/g, "\n$&")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/\n{2,}/g, "\n").trim();
+  return text || null;
+}
+// PDF has no simple text layer to grep — the bytes are compressed content streams — so this hands
+// the whole file to Gemini's native document understanding rather than writing a PDF parser from
+// scratch. Fails soft: a PDF that can't be read just means one less block of context on the prompt.
+async function extractPdfText(buf) {
+  try {
+    const parts = [
+      { text: "Extract the plain text content from this PDF. Return ONLY the extracted text, no commentary, no markdown fences. If it is mostly non-text (e.g. a scanned image with no readable text), say so in one short line instead." },
+      { inlineData: { mimeType: "application/pdf", data: buf.toString("base64") } },
+    ];
+    return (await geminiCall(parts, { temperature: 0, maxOutputTokens: 4000, timeoutMs: 45000 })).trim();
+  } catch (e) { return null; }
+}
+
 // Download the logo and drop it in the theme. Returns {file, mime, w, h} or null — a missing
 // or unreadable logo must never fail a build, it just means no favicon this time.
 async function writeFaviconFromLogo(themeDir, logoUrl) {
@@ -3012,7 +3088,13 @@ function audit(html, kw) {
 function send(res, code, type, body) { res.writeHead(code, { "Content-Type": type }); res.end(body); }
 function json(res, code, obj) { send(res, code, "application/json", JSON.stringify(obj)); }
 function readBody(req) { return new Promise(r => { let d = ""; req.on("data", c => d += c); req.on("end", () => r(d)); }); }
-const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp" };
+const MIME = {
+  ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".json": "application/json",
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif",
+  ".pdf": "application/pdf", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+};
+// Reference images attached in the edit chat (see /api/upload-attachment below).
+const UPLOADS_DIR = path.join(GEN, "uploads");
 
 // ============================================================ JOB RUNNER
 // Server-side pipeline: a webhook (or manual enqueue) runs the whole 7-step
@@ -6574,7 +6656,16 @@ async function processJobQueue() {
   const RUNNER = { edit: runEditJob, restore: runRestoreJob, enrich: runEnrichJob, seo: runSeoJob, "pre-release": runPreReleaseJob, "perform-pr": runPerformPrJob, "wireframe-audit": runWireframeAudit };
   try { await ((job && RUNNER[job.type] ? RUNNER[job.type] : runJob)(job)); }
   catch (e) { console.error("job runner crashed:", e); }
-  finally { JOB_RUNNING = false; processJobQueue(); }
+  finally {
+    JOB_RUNNING = false;
+    // Every job type ends up here regardless of runner. If its own runner didn't
+    // already write a type-specific report (build/edit/perform-pr do), this is the
+    // one place guaranteed to catch it, so no job type can finish silently.
+    if (job && !job.reportUrl && (job.status === "done" || job.status === "error" || job.status === "cancelled")) {
+      try { job.reportUrl = writeGenericJobReport(job); saveJobs(); } catch (e) { console.warn("fallback report write failed:", e.message); }
+    }
+    processJobQueue();
+  }
 }
 function enqueueEditJob(payload) {
   const job = newEditJob(payload);
@@ -8099,8 +8190,12 @@ async function runEditJob(job) {
         const abs = path.join(tmp, f.path);
         if (f.op === "delete") { fs.rmSync(abs, { force: true }); continue; }
         const cur = f.op === "modify" && fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : "";
-        const content = await editFileContent(f.op, f.path, f.instruction || pl.summary, cur, planContext, ai, wr || brief);
+        let content = await editFileContent(f.op, f.path, f.instruction || pl.summary, cur, planContext, ai, wr || brief);
         if (!content || (abs.endsWith(".php") && !content.includes("<?php") && cur.includes("<?php"))) throw new Error("AI returned empty/invalid content for " + f.path);
+        // Pint (PER preset) requires files to end with exactly one trailing newline; Gemini's
+        // output doesn't reliably include one, which fails CI on a style issue unrelated to the
+        // actual edit.
+        if (abs.endsWith(".php")) content = content.replace(/\s*$/, "\n");
         fs.mkdirSync(path.dirname(abs), { recursive: true });
         fs.writeFileSync(abs, content);
       }
@@ -8269,7 +8364,12 @@ async function runEditJob(job) {
       notify(`❌ Edit failed for *${job.businessName}*: ${e.message}`);
     }
   } finally {
-    job.finishedAt = new Date().toISOString(); saveJobs(); COST_SINK = null;
+    job.finishedAt = new Date().toISOString();
+    // Written on every outcome — done, error, or cancelled — so a failed run leaves behind the
+    // same answer a person would otherwise have to reconstruct from the job page: what was asked,
+    // what happened, and what still needs a human.
+    try { job.reportUrl = writeEditReport(job); } catch (e) { console.warn("edit report write failed:", e.message); }
+    saveJobs(); COST_SINK = null;
     postStatus(job);   // terminal: done | error | cancelled (+ siteUrl/prUrl/scores)
     mirrorPool(job);   // flushed immediately — this is the row that must survive a redeploy
   }
@@ -8388,6 +8488,196 @@ async function postEditPrComment(job) {
   const r = await sh(`gh pr comment ${prNum} --repo ${job.payload.githubRepo || WP_REPO} --body-file "${tmpFile}"`);
   fs.rmSync(tmpFile, { force: true });
   if (r.code) console.warn("edit PR comment failed:", (r.stderr || "").slice(-160));
+}
+
+// ---- the shareable edit report ------------------------------------------------
+// One page per edit run: what the client/requester asked for, what the AI understood
+// and did about it, whether each item is actually confirmed in the diff, and — the
+// part a status pill can't say — exactly what a human still needs to do about it.
+function editReportHtml(job) {
+  const e = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const P = job.payload || {};
+  const wo = job.workOrder || null;
+  const check = job.verification || null;
+  const steps = job.steps || [];
+  const stepChip = { done: "#1f9d6b", running: "#2a68d8", error: "#c0392b", pending: "#8a8fa3" };
+  const failedStep = steps.find((s) => s.status === "error");
+  const decision = job.status === "done"
+    ? { label: "Completed", bg: "#e6f6ef", fg: "#1f7a55", detail: job.editSummary || "Change applied and merged." }
+    : job.status === "cancelled"
+      ? { label: "Cancelled", bg: "#f2f3f7", fg: "#6b6f82", detail: "Cancelled before it finished." }
+      : (job.awaitingApproval && !job.approved)
+        ? { label: "Awaiting approval", bg: "#fdf0e3", fg: "#a65a12", detail: "Change is written and the pull request is open — it needs a human to approve the merge." }
+        : { label: "Failed", bg: "#fdeceb", fg: "#c0392b", detail: job.error || (failedStep && failedStep.detail) || "The run did not complete." };
+
+  // Every item the AI understood from the request, matched against what the diff
+  // check actually confirmed. Falls back to the raw prompt as a single row when no
+  // work order could be built (still reports something, rather than nothing).
+  const results = (check && check.results) || [];
+  const resultFor = (what) => results.find((r) => r.what === what);
+  const requestedRows = wo && wo.changes && wo.changes.length
+    ? wo.changes.map((c) => {
+        const r = resultFor(c.what);
+        const outcome = r ? (r.done === true ? "done" : r.done === false ? "not-done" : "unverified")
+          : (job.status === "done" ? "unverified" : "not-attempted");
+        return { what: c.what, where: c.where || "", outcome };
+      })
+    : [{ what: P.prompt || "(no structured request captured)", where: "", outcome: job.status === "done" ? "done" : "not-attempted" }];
+  const unclear = (wo && wo.unclear) || [];
+  const outChip = {
+    done: { bg: "#e6f6ef", fg: "#1f7a55", label: "Done" },
+    "not-done": { bg: "#fdeceb", fg: "#c0392b", label: "Not done" },
+    unverified: { bg: "#e8f0fe", fg: "#2a68d8", label: "Unverified" },
+    "not-attempted": { bg: "#f2f3f7", fg: "#6b6f82", label: "Not attempted" },
+  };
+
+  // The single question this report exists to answer beyond a pass/fail pill:
+  // is there anything left only a person can resolve, and what exactly is it.
+  const humanActions = [];
+  if (job.status === "error") humanActions.push(`The run failed: ${job.error || "see the failed check above"}.${job.prUrl ? ` Inspect the open branch/PR (${job.prUrl}) — it was pushed but never merged — then fix and re-push, or retry the run.` : " No pull request was opened; retry the run once the underlying issue is fixed."}`);
+  if (job.awaitingApproval && !job.approved) humanActions.push(`This site requires approval before merge.${job.prUrl ? ` Open the pull request (${job.prUrl})` : " Open the job"} and approve it to ship the change.`);
+  if (unclear.length) humanActions.push(`${unclear.length} part${unclear.length > 1 ? "s" : ""} of the request ${unclear.length > 1 ? "were" : "was"} too vague to act on without guessing: ${unclear.join("; ")}. Reply with more detail if ${unclear.length > 1 ? "these still need" : "it still needs"} doing.`);
+  const notDone = results.filter((r) => r.done === false);
+  if (notDone.length) humanActions.push(`${notDone.length} requested item(s) could not be confirmed in the diff, even after a retry: ${notDone.map((r) => r.what).join("; ")}. Verify manually on the live site once it has deployed.`);
+  if (!humanActions.length && job.status === "done") humanActions.push("None — everything requested was applied, checked against the diff, and merged.");
+
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Edit report — ${e(job.businessName)}</title></head>
+<body style="margin:0;font-family:Inter,-apple-system,Segoe UI,sans-serif;background:#f4f5f8;color:#1c1d29">
+<div style="max-width:960px;margin:0 auto;padding:40px 24px 80px">
+  <h1 style="font-size:24px;margin:0 0 6px">Edit report — ${e(job.businessName)}</h1>
+  <p style="color:#6b6f82;font-size:13px;margin:0 0 20px">
+    Run ${e(job.draftId)} · ${e(job.finishedAt || job.startedAt || new Date().toISOString())}
+    ${job.aiModel ? ` · model ${e(job.aiModel)}${job.aiFallback ? " (fell back — see below)" : ""}` : ""}
+    ${P.source ? ` · via ${e(P.source)}` : ""}
+    ${job.prUrl ? ` · <a href="${e(job.prUrl)}" style="color:#2a68d8">pull request</a>` : ""}
+  </p>
+  <div style="border-left:5px solid ${e(decision.fg)};background:${e(decision.bg)};border-radius:6px;padding:14px 18px;margin:0 0 24px">
+    <b style="color:${e(decision.fg)}">${e(decision.label)}</b><br>${e(decision.detail)}
+    ${job.aiFallback ? `<div style="margin-top:6px;color:#6b6f82;font-size:12.5px">${e(job.aiFallback)}</div>` : ""}
+  </div>
+
+  <h2 style="font-size:16px;margin:0 0 10px">What was requested</h2>
+  <div style="background:#fff;border:1px solid #e6e8f0;border-radius:10px;padding:14px 16px;font-size:14px;white-space:pre-wrap">${e(P.prompt || "(no prompt recorded)")}</div>
+
+  <h2 style="font-size:16px;margin:28px 0 10px">Requested changes — outcome</h2>
+  <table style="width:100%;border-collapse:collapse;font-size:13px;background:#fff;border:1px solid #e6e8f0;border-radius:10px;overflow:hidden">
+    <tr style="background:#fafbfe;color:#6b6f82"><th style="text-align:left;padding:9px 12px">Requested</th><th style="text-align:left;padding:9px 12px;width:220px">Where</th><th style="padding:9px 12px;width:110px">Outcome</th></tr>
+    ${requestedRows.map((row) => `<tr style="border-top:1px solid #eef0f6">
+      <td style="padding:9px 12px">${e(row.what)}</td>
+      <td style="padding:9px 12px;color:#6b6f82">${e(row.where || "—")}</td>
+      <td style="padding:9px 12px;text-align:center"><span style="font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;background:${(outChip[row.outcome] || outChip["not-attempted"]).bg};color:${(outChip[row.outcome] || outChip["not-attempted"]).fg}">${e((outChip[row.outcome] || outChip["not-attempted"]).label)}</span></td>
+    </tr>`).join("")}
+  </table>
+  ${unclear.length ? `<p style="margin:10px 0 0;font-size:12.5px;color:#a65a12">Not actioned — too vague to do without guessing: ${e(unclear.join("; "))}</p>` : ""}
+
+  <h2 style="font-size:16px;margin:28px 0 10px">What was done</h2>
+  <div style="background:#fff;border:1px solid #e6e8f0;border-radius:10px;padding:14px 16px;font-size:14px">${e(job.editSummary || "(no summary recorded)")}</div>
+  ${(job.editPlan || []).length ? `<table style="width:100%;border-collapse:collapse;font-size:13px;background:#fff;border:1px solid #e6e8f0;border-radius:10px;overflow:hidden;margin-top:14px">
+    <tr style="background:#fafbfe;color:#6b6f82"><th style="text-align:left;padding:9px 12px;width:100px">Action</th><th style="text-align:left;padding:9px 12px">File</th></tr>
+    ${job.editPlan.map((f) => `<tr style="border-top:1px solid #eef0f6">
+      <td style="padding:9px 12px"><span style="font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;background:#eef0fb;color:#3f4b8c;text-transform:uppercase">${e(f.op || "modify")}</span></td>
+      <td style="padding:9px 12px"><code>${e(f.path)}</code></td>
+    </tr>`).join("")}
+  </table>` : ""}
+  ${(job.textSwaps || []).length ? `<p style="margin:10px 0 0;font-size:12.5px;color:#6b6f82">${job.textSwaps.length} exact text swap(s) applied directly, without a model rewrite.</p>` : ""}
+
+  <h2 style="font-size:16px;margin:28px 0 10px">Run steps</h2>
+  <table style="width:100%;border-collapse:collapse;font-size:13px;background:#fff;border:1px solid #e6e8f0;border-radius:10px;overflow:hidden">
+    <tr style="background:#fafbfe;color:#6b6f82"><th style="text-align:left;padding:9px 12px;width:210px">Step</th><th style="padding:9px 12px;width:86px">Result</th><th style="text-align:left;padding:9px 12px">Detail</th></tr>
+    ${steps.map((s) => `<tr style="border-top:1px solid #eef0f6">
+      <td style="padding:9px 12px;font-weight:600">${e(s.label)}</td>
+      <td style="padding:9px 12px;text-align:center"><span style="font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;color:#fff;background:${stepChip[s.status] || "#8a8fa3"}">${e(s.status)}</span></td>
+      <td style="padding:9px 12px;color:#555">${e(s.detail || "")}</td>
+    </tr>`).join("")}
+  </table>
+
+  <h2 style="font-size:16px;margin:28px 0 10px">Human action needed</h2>
+  <ul style="margin:0;padding-left:20px;font-size:13.5px;color:${humanActions.length === 1 && job.status === "done" ? "#1f7a55" : "#20222a"}">
+    ${humanActions.map((a) => `<li style="margin-bottom:6px">${e(a)}</li>`).join("")}
+  </ul>
+
+  <p style="margin-top:40px;color:#8a8fa3;font-size:12px">Generated by Growth99 Studio · Edit run ${e(job.draftId)}</p>
+</div></body></html>`;
+}
+function writeEditReport(job) {
+  const dir = path.join(GEN, "reports");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, job.draftId + ".html"), editReportHtml(job));
+  fs.writeFileSync(path.join(dir, job.draftId + ".json"), JSON.stringify({
+    draftId: job.draftId, businessName: job.businessName, status: job.status, prompt: (job.payload || {}).prompt,
+    workOrder: job.workOrder, editPlan: job.editPlan, editSummary: job.editSummary, textSwaps: job.textSwaps,
+    verification: job.verification, prUrl: job.prUrl, error: job.error, aiModel: job.aiModel, aiFallback: job.aiFallback,
+    startedAt: job.startedAt, finishedAt: job.finishedAt,
+  }, null, 2));
+  return "/reports/" + job.draftId + ".html";
+}
+
+const JOB_TYPE_LABEL = { edit: "Edit", enrich: "Enrich", restore: "Restore", build: "Build", seo: "SEO", "pre-release": "Pre-release", "perform-pr": "Perform PR", "wireframe-audit": "Wireframe QA" };
+// ---- fallback report for any job type that doesn't build its own (SEO, restore,
+// enrich, wireframe-audit, pre-release, for now) — every job carries steps[],
+// payload, error and status regardless of type, which is enough to answer the same
+// three questions a bespoke report does: what ran, what happened, what's left for a
+// human. Written by processJobQueue only when a type-specific report didn't already
+// set job.reportUrl, so it never overrides the richer build/edit/perform-pr reports.
+function genericJobReportHtml(job) {
+  const e = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const P = job.payload || {};
+  const steps = job.steps || [];
+  const stepChip = { done: "#1f9d6b", running: "#2a68d8", error: "#c0392b", pending: "#8a8fa3" };
+  const failedStep = steps.find((s) => s.status === "error");
+  const typeLabel = JOB_TYPE_LABEL[job.type] || job.type || "Run";
+  const decision = job.status === "done"
+    ? { label: "Completed", bg: "#e6f6ef", fg: "#1f7a55", detail: job.editSummary || `${typeLabel} run completed.` }
+    : job.status === "cancelled"
+      ? { label: "Cancelled", bg: "#f2f3f7", fg: "#6b6f82", detail: "Cancelled before it finished." }
+      : (job.awaitingApproval && !job.approved)
+        ? { label: "Awaiting approval", bg: "#fdf0e3", fg: "#a65a12", detail: "The change is written and the pull request is open — it needs a human to approve the merge." }
+        : { label: "Failed", bg: "#fdeceb", fg: "#c0392b", detail: job.error || (failedStep && failedStep.detail) || "The run did not complete." };
+  const changed = job.editPlan || job.prChanged || null;
+  const humanActions = [];
+  if (job.status === "error") humanActions.push(`The run failed: ${job.error || "see the failed step above"}.${job.prUrl ? ` Inspect the open branch/PR (${job.prUrl}) then fix and re-push, or retry the run.` : " Retry the run once the underlying issue is fixed."}`);
+  if (job.awaitingApproval && !job.approved) humanActions.push(`This site requires approval before merge.${job.prUrl ? ` Open the pull request (${job.prUrl})` : " Open the job"} and approve it to ship the change.`);
+  if (!humanActions.length && job.status === "done") humanActions.push("None — the run completed and merged cleanly.");
+
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${e(typeLabel)} report — ${e(job.businessName)}</title></head>
+<body style="margin:0;font-family:Inter,-apple-system,Segoe UI,sans-serif;background:#f4f5f8;color:#1c1d29">
+<div style="max-width:960px;margin:0 auto;padding:40px 24px 80px">
+  <h1 style="font-size:24px;margin:0 0 6px">${e(typeLabel)} report — ${e(job.businessName)}</h1>
+  <p style="color:#6b6f82;font-size:13px;margin:0 0 20px">
+    Run ${e(job.draftId)} · ${e(job.finishedAt || job.startedAt || new Date().toISOString())}
+    ${job.prUrl ? ` · <a href="${e(job.prUrl)}" style="color:#2a68d8">pull request</a>` : ""}
+  </p>
+  <div style="border-left:5px solid ${e(decision.fg)};background:${e(decision.bg)};border-radius:6px;padding:14px 18px;margin:0 0 24px">
+    <b style="color:${e(decision.fg)}">${e(decision.label)}</b><br>${e(decision.detail)}
+  </div>
+  ${P.prompt ? `<h2 style="font-size:16px;margin:0 0 10px">What was requested</h2>
+  <div style="background:#fff;border:1px solid #e6e8f0;border-radius:10px;padding:14px 16px;font-size:14px;white-space:pre-wrap;margin-bottom:24px">${e(P.prompt)}</div>` : ""}
+
+  <h2 style="font-size:16px;margin:0 0 10px">Run steps</h2>
+  <table style="width:100%;border-collapse:collapse;font-size:13px;background:#fff;border:1px solid #e6e8f0;border-radius:10px;overflow:hidden">
+    <tr style="background:#fafbfe;color:#6b6f82"><th style="text-align:left;padding:9px 12px;width:210px">Step</th><th style="padding:9px 12px;width:86px">Result</th><th style="text-align:left;padding:9px 12px">Detail</th></tr>
+    ${steps.map((s) => `<tr style="border-top:1px solid #eef0f6">
+      <td style="padding:9px 12px;font-weight:600">${e(s.label)}</td>
+      <td style="padding:9px 12px;text-align:center"><span style="font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;color:#fff;background:${stepChip[s.status] || "#8a8fa3"}">${e(s.status)}</span></td>
+      <td style="padding:9px 12px;color:#555">${e(s.detail || "")}</td>
+    </tr>`).join("")}
+  </table>
+  ${changed && changed.length ? `<h2 style="font-size:16px;margin:28px 0 10px">Files changed</h2>
+  <ul style="font-size:13px;color:#444">${changed.map((f) => `<li><code>${e(typeof f === "string" ? f : (f.op ? `${f.op} ` : "") + f.path)}</code></li>`).join("")}</ul>` : ""}
+
+  <h2 style="font-size:16px;margin:28px 0 10px">Human action needed</h2>
+  <ul style="margin:0;padding-left:20px;font-size:13.5px;color:${humanActions.length === 1 && job.status === "done" ? "#1f7a55" : "#20222a"}">
+    ${humanActions.map((a) => `<li style="margin-bottom:6px">${e(a)}</li>`).join("")}
+  </ul>
+
+  <p style="margin-top:40px;color:#8a8fa3;font-size:12px">Generated by Growth99 Studio · ${e(typeLabel)} run ${e(job.draftId)}</p>
+</div></body></html>`;
+}
+function writeGenericJobReport(job) {
+  const dir = path.join(GEN, "reports");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, job.draftId + ".html"), genericJobReportHtml(job));
+  return "/reports/" + job.draftId + ".html";
 }
 
 // ============================================================ ENRICH ENGINE
@@ -14693,21 +14983,78 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === "/api/edit-run" && req.method === "POST") {
-      const { siteId, prompt, aiModel } = JSON.parse(await readBody(req) || "{}");
+      const { siteId, prompt, aiModel, attachments } = JSON.parse(await readBody(req) || "{}");
       if (!prompt || !prompt.trim()) return json(res, 400, { error: "prompt required" });
       const site = await findWebsite(siteId);
       if (!site) return json(res, 404, { error: "unknown siteId — refresh the site list" });
       let target; try { target = await resolveEditTarget(site); } catch (e) { return json(res, 409, { error: e.message }); }
+      // Every attachment kind ends up as more plain text appended to the prompt, so the same
+      // free-text pipeline (editPlan → editFileContent) picks it up with no separate code path per
+      // kind. Images become a URL to use as an <img src>; PDF/JSON/Word become their extracted text.
+      // NOTE: image URLs point at THIS local server (/uploads/…), which only resolves while it's
+      // running on this machine — fine for testing the change locally, but a real PR would need the
+      // file copied into the theme's own assets/img/ during the push, not linked from localhost.
+      const attachBlocks = [];
+      for (const a of (Array.isArray(attachments) ? attachments : [])) {
+        if (!a || !a.url) continue;
+        if (a.kind === "image") { attachBlocks.push(`Attached reference image (${a.filename}) — use this exact URL directly as the image source: ${absUrl(a.url)}`); continue; }
+        const localPath = path.join(UPLOADS_DIR, path.basename(String(a.url)));
+        if (!fs.existsSync(localPath)) continue;
+        if (a.kind === "json") {
+          try { attachBlocks.push(`Attached JSON (${a.filename}):\n\`\`\`json\n${fs.readFileSync(localPath, "utf8").slice(0, 8000)}\n\`\`\``); } catch (e) { /* skip — optional context */ }
+        } else if (a.kind === "pdf") {
+          const txt = await extractPdfText(fs.readFileSync(localPath));
+          if (txt) attachBlocks.push(`Attached PDF (${a.filename}) — extracted text:\n${txt.slice(0, 8000)}`);
+        } else if (a.kind === "docx") {
+          const txt = extractDocxText(fs.readFileSync(localPath));
+          if (txt) attachBlocks.push(`Attached Word document (${a.filename}) — extracted text:\n${txt.slice(0, 8000)}`);
+        }
+      }
+      const fullPrompt = attachBlocks.length ? `${prompt.trim()}\n\n${attachBlocks.join("\n\n")}` : prompt.trim();
       const job = enqueueEditJob({
         jobId: "edit-" + Date.now(),
         siteId, businessName: site.businessName, githubRepo: site.githubRepo,
         themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
-        prompt: prompt.trim(),
+        prompt: fullPrompt,
         // Only honoured for chat-initiated edits; anything unrecognised (and
         // every email request, which never sets it) falls through to Gemini.
         aiModel: isOllamaModel(aiModel) ? aiModel : "",
       });
       return json(res, 202, { jobId: job.draftId, status: job.status, monitor: "/jobs" });
+    }
+
+    // Files attached in the edit chat's "+" button — images, PDF, JSON or Word (.docx). No multipart
+    // parser in this codebase (pure Node, no deps) — the browser reads the file client-side and sends
+    // it as base64 JSON instead. Written to generated/uploads/ and served back by URL.
+    if (p === "/api/upload-attachment" && req.method === "POST") {
+      const raw = await readBody(req);
+      if (raw.length > 20 * 1024 * 1024) return json(res, 413, { error: "file too large (max ~15MB)" });
+      let body; try { body = JSON.parse(raw || "{}"); } catch (e) { return json(res, 400, { error: "bad json" }); }
+      if (!body.dataBase64) return json(res, 400, { error: "dataBase64 required" });
+      let buf;
+      try { buf = Buffer.from(String(body.dataBase64).replace(/^data:[^;]+;base64,/, ""), "base64"); }
+      catch (e) { return json(res, 400, { error: "invalid base64" }); }
+      if (!buf.length) return json(res, 400, { error: "empty file" });
+      if (buf.length > 15 * 1024 * 1024) return json(res, 413, { error: "file too large (max 15MB)" });
+      // Trust the file's own bytes, not the client-supplied name/mime — same guard
+      // writeFaviconFromLogo uses for the same reason (a renamed/mislabelled file should not be written).
+      const kind = detectAttachmentKind(buf);
+      if (!kind) {
+        if (isLegacyOfficeFile(buf)) return json(res, 400, { error: "this looks like an old .doc/.xls/.ppt file (Word 97-2003 format) — only the modern .docx format is supported. In Word: File → Save As → Word Document (.docx), then attach that." });
+        return json(res, 400, { error: "unsupported file — use an image (PNG/JPEG/GIF/WebP), PDF, JSON, or Word (.docx)" });
+      }
+      fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+      const safeBase = String(body.filename || "file").replace(/\.[a-zA-Z0-9]+$/, "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 40) || "file";
+      const name = `${Date.now()}-${safeBase}.${kind.ext}`;
+      fs.writeFileSync(path.join(UPLOADS_DIR, name), buf);
+      return json(res, 200, { url: "/uploads/" + name, filename: name, kind: kind.kind, bytes: buf.length });
+    }
+    if (p.startsWith("/uploads/")) {
+      const name = p.slice("/uploads/".length);
+      if (!/^[a-zA-Z0-9_-]+\.(png|jpe?g|gif|webp|pdf|json|docx)$/.test(name)) return send(res, 404, "text/plain", "not found");
+      const f = path.join(UPLOADS_DIR, name);
+      if (!fs.existsSync(f)) return send(res, 404, "text/plain", "not found");
+      return send(res, 200, MIME["." + name.split(".").pop().toLowerCase()] || "application/octet-stream", fs.readFileSync(f));
     }
 
     // Manual enrichment (service pages + brand guide) for a deployed site. Needs
@@ -15595,7 +15942,10 @@ const server = http.createServer(async (req, res) => {
         let fixedContent = await geminiCall([{ text: prompt }], { temperature: 0.1, maxOutputTokens: 16000, timeoutMs: 60000 });
         fixedContent = fixedContent.replace(/^```(?:php)?\n?/, "").replace(/\n?```\s*$/, "");
         if (!fixedContent.trim().startsWith("<?php") && content.trim().startsWith("<?php")) continue; // sanity: don't commit garbage
-        if (fixedContent.trim() === content.trim()) continue; // nothing changed
+        // Exact comparison, not trimmed: a Pint fix is often JUST a trailing-newline/whitespace
+        // change, and trim() on both sides made that look like "nothing changed", silently
+        // discarding a correct fix and reporting "Gemini produced no usable fix".
+        if (fixedContent === content) continue; // truly nothing changed
         const b64 = Buffer.from(fixedContent, "utf8").toString("base64");
         const put = await sh(`gh api -X PUT "repos/${repoFromPrUrl(prUrl)}/contents/${f}" -f message="Auto-fix CI build failure (Gemini)" -f content="${b64}" -f sha="${meta.sha}" -f branch="${branch}"`);
         if (!put.code) fixed.push(f);
@@ -15775,4 +16125,6 @@ module.exports = {
   imageSources, findingsImages, readSeoPages, synthMuSource, pageText,
   fixFavicon, fixSocialImage, fix404, fixCallNow, fixBlvd, fixBlogLinkColor, fixClickable,
   performPrReportHtml, performPrPrBody, performPrMarkerUrl, PERFORM_PR_STEPS,
+  editReportHtml, writeEditReport, genericJobReportHtml, writeGenericJobReport,
+  detectAttachmentKind, unzipEntry, extractDocxText, extractPdfText, isLegacyOfficeFile,
 };
