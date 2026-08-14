@@ -4518,7 +4518,12 @@ async function tedClientSite(clientId, fallbackName) {
   return {
     siteId: `ted-${clientId}`, rowId: null,
     businessName: String(info.name || info.clientName || info.businessName || fallbackName || `TED client ${clientId}`).trim(),
-    liveUrl: String(info.betaSiteUrl || "").trim(), existingSiteUrl: "",
+    // betaSiteUrl is the site we build and edit; liveSiteUrl is the client's
+    // existing public site, which is what NocoDB's "Live Site" column held and
+    // what the pre-release comparison reads. Keeping them distinct here is what
+    // lets a caller stop consulting NocoDB for either.
+    liveUrl: String(info.betaSiteUrl || "").trim(),
+    existingSiteUrl: String(info.liveSiteUrl || "").trim(),
     repoUrl: `https://github.com/${repo}`, githubRepo: repo,
     tedClientId: String(clientId), resolvedFrom: "ted",
   };
@@ -4941,6 +4946,18 @@ function tedReviewOutcomeComment(job, outcome) {
     .map((x, i) => `${i + 1}. "${clip(x.c.replaces)}" -> "${clip(x.c.literal)}"`);
   const refused = refusals.map((r, i) => `${i + 1}. ${clip(r.reason)}`);
   const page = P.reviewPath && P.reviewPath !== "/" ? P.reviewPath : "the home page";
+  // Minted here rather than at merge time because this is the one place that
+  // knows the run shipped, which task asked for it, and which PR carried it.
+  let undoLink = "";
+  const prNum = outcome.ok && job.prUrl ? (String(job.prUrl).match(/\/pull\/(\d+)/) || [])[1] : null;
+  if (prNum && P.githubRepo && P.tedTaskId) {
+    try {
+      undoLink = `${G99_TOOL_PUBLIC_URL}/undo?t=` + mintUndoToken({
+        repo: P.githubRepo, pr: prNum, taskId: P.tedTaskId,
+        siteId: P.siteId, themeSlug: P.themeSlug, reviewer: P.requestedBy, path: P.reviewPath,
+      });
+    } catch (e) { console.warn("undo link not minted:", e.message); }
+  }
   // null marks a line that is not wanted; "" is a blank line that is. Filtering
   // on "" alone would strip the paragraph breaks along with the absent lines.
   return [
@@ -4953,6 +4970,11 @@ function tedReviewOutcomeComment(job, outcome) {
     // stripped on the way out and leaves a bare double space behind it.
     `Site: ${P.businessName || "site"}${P.liveUrl ? " - " + P.liveUrl : ""}`,
     job.prUrl ? `Pull request: ${job.prUrl}` : null,
+    // Only offered when something actually shipped and there is a merged pull
+    // request to reverse. A failed run has nothing to undo, and saying otherwise
+    // sends the reviewer to a page that can only tell them so.
+    undoLink ? "" : null,
+    undoLink ? `Undo this change: ${undoLink}` : null,
     changed.length ? "" : null,
     changed.length ? (outcome.ok ? "Changed:" : "Requested:") : null,
     ...changed,
@@ -5191,6 +5213,37 @@ function mintReviewToken({ siteId, themeSlug, reviewer, email, dept, minutes, ta
     ...(taskId ? { taskId: String(taskId) } : {}),
   })).toString("base64url");
   return { token: `${body}.${reviewSign(body)}`, exp };
+}
+
+// The undo capability, handed out inside a TED comment. Signed the same way as a
+// review token and deliberately WITHOUT an expiry: the comment it lives in is
+// permanent, and a link that silently rots is worse than one that still answers
+// honestly. Its safety is not the clock — it is that the run behind it refuses
+// when the commit was already reverted, and refuses again when the wording has
+// moved on. Both of those read from git history, which outlives this process.
+//
+// It carries the pull request number, not the commit: the squash sha is only
+// known after the merge, and GitHub can always turn one into the other.
+function mintUndoToken({ repo, pr, taskId, siteId, themeSlug, reviewer, path: pagePath }) {
+  if (!REVIEW_SECRET) throw new Error("REVIEW_SECRET not set — cannot mint undo links");
+  const body = Buffer.from(JSON.stringify({
+    v: 1, kind: "undo", repo, pr: String(pr), taskId: String(taskId || ""),
+    siteId: siteId || "", themeSlug: themeSlug || "", reviewer: reviewer || "", path: pagePath || "/",
+  })).toString("base64url");
+  return `${body}.${reviewSign(body)}`;
+}
+function verifyUndoToken(token) {
+  const [body, sig] = String(token || "").split(".");
+  if (!body || !sig || !REVIEW_SECRET) return null;
+  const want = reviewSign(body);
+  if (sig.length !== want.length) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(want))) return null;
+  let d = null;
+  try { d = JSON.parse(Buffer.from(body, "base64url").toString("utf8")); } catch (e) { return null; }
+  // kind matters: without it a review token would be spendable here, and those
+  // are handed to every content writer who opens a page.
+  if (!d || d.kind !== "undo" || !d.repo || !d.pr) return null;
+  return d;
 }
 
 // Returns the payload or null. Never throws and never explains which half
@@ -8404,16 +8457,40 @@ async function runRestoreJob(job) {
     r = await run(`git rev-parse --verify --quiet ${P.sha}`, tmp);
     if (r.code || !r.stdout.trim()) throw new Error(`commit ${P.sha.slice(0, 7)} isn't in ${repo}`);
     const full = r.stdout.trim();
-    // The theme must exist at that commit, or "restore" would just delete it.
-    r = await run(`git ls-tree ${full} -- "${P.themePath}"`, tmp);
-    if (!r.stdout.trim()) throw new Error(`${P.themePath} didn't exist at ${P.sha.slice(0, 7)} — nothing to restore to`);
+    // An undo reverses one commit; a restore replaces the whole tree. Only the
+    // "theme must exist" check differs — a revert has nothing to prove there.
+    if (!P.undo) {
+      r = await run(`git ls-tree ${full} -- "${P.themePath}"`, tmp);
+      if (!r.stdout.trim()) throw new Error(`${P.themePath} didn't exist at ${P.sha.slice(0, 7)} — nothing to restore to`);
+    }
     jobStep(job, 0, "done", "Latest code pulled");
 
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
+    const branch = P.undo
+      ? `g99/undo-${P.themeSlug.replace(/^g99-/, "")}-${stamp}`
+      : `g99/restore-${P.themeSlug.replace(/^g99-/, "")}-${stamp}`;
+
+    if (P.undo) {
+      // 2 (undo) — reverse exactly one commit, and let git decide whether that is
+      // still possible. Both refusals below are answers, not failures: they are
+      // what makes an undo link safe to leave in a task comment forever.
+      jobStep(job, 1, "running", "Undoing " + P.sha.slice(0, 7));
+      // Already undone? git writes "This reverts commit <sha>" into the message
+      // of every revert, so history is the record — and unlike anything this tool
+      // stores, it survives a redeploy.
+      const prior = await run(`git log --grep="This reverts commit ${full}" --format=%h`, tmp);
+      if (prior.stdout.trim()) throw new Error(`that change was already undone (${prior.stdout.trim().split("\n")[0]}) — nothing to do`);
+      await run(`git checkout -b "${branch}"`, tmp);
+      r = await run(`git revert --no-commit ${full}`, tmp);
+      if (r.code) {
+        await run("git revert --abort", tmp).catch(() => {});
+        await run("git reset --hard", tmp).catch(() => {});
+        throw new Error("this change cannot be undone automatically — the wording has been edited again since. Correct it directly on the page instead.");
+      }
+    } else {
     // 2 — swap the theme tree for the one at that commit. Removing first is what
     // makes this a snapshot: files added after the version go away too.
     jobStep(job, 1, "running", "Restoring " + P.themeSlug + " to " + P.sha.slice(0, 7));
-    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
-    const branch = `g99/restore-${P.themeSlug.replace(/^g99-/, "")}-${stamp}`;
     await run(`git checkout -b "${branch}"`, tmp);
     await run(`git rm -r -q --ignore-unmatch -- "${P.themePath}"`, tmp);
     r = await run(`git checkout ${full} -- "${P.themePath}"`, tmp);
@@ -8424,30 +8501,45 @@ async function runRestoreJob(job) {
       const had = await run(`git ls-tree ${full} -- "${P.muPath}"`, tmp);
       if (had.stdout.trim()) await run(`git checkout ${full} -- "${P.muPath}"`, tmp);
     }
+    }
     // Guardrail: a restore may only ever touch this website's own files.
     // --cached against HEAD lists one clean path per line (no status columns or
     // rename arrows to parse) and everything above is already staged.
     const status = await run(`git diff --cached --name-only HEAD`, tmp);
     const touched = status.stdout.split("\n").map(l => l.trim().replace(/^"|"$/g, "")).filter(Boolean);
     const stray = touched.filter(f => f !== P.muPath && !f.startsWith(P.themePath + "/"));
-    if (stray.length) throw new Error("restore would touch files outside the theme — aborted: " + stray.slice(0, 3).join(", "));
-    if (!touched.length) throw new Error("that version is already what's live — nothing to restore");
-    for (const req of ["index.php", "style.css"]) {
+    if (stray.length) throw new Error(`${P.undo ? "undo" : "restore"} would touch files outside the theme — aborted: ` + stray.slice(0, 3).join(", "));
+    if (!touched.length) throw new Error(P.undo ? "there is nothing left to undo — the page already reads the way it did before" : "that version is already what's live — nothing to restore");
+    // A restore rebuilds the whole tree and must still be a theme afterwards. An
+    // undo only reverses a text edit, so these files were never in question.
+    if (!P.undo) for (const req of ["index.php", "style.css"]) {
       if (!fs.existsSync(path.join(tmp, P.themePath, req))) throw new Error(`restored theme is missing ${req} — aborted`);
     }
-    job.editSummary = `Restored ${P.themeSlug} to ${P.sha.slice(0, 7)}${P.versionLabel ? ` — ${P.versionLabel}` : ""}`;
-    job.editPlan = touched.slice(0, 8).map(f => ({ path: f, op: "restore" }));
-    jobStep(job, 1, "done", `${touched.length} file(s) rolled back`);
+    job.editSummary = P.undo
+      ? `Undid ${P.sha.slice(0, 7)}${P.versionLabel ? ` — ${P.versionLabel}` : ""}`
+      : `Restored ${P.themeSlug} to ${P.sha.slice(0, 7)}${P.versionLabel ? ` — ${P.versionLabel}` : ""}`;
+    job.editPlan = touched.slice(0, 8).map(f => ({ path: f, op: P.undo ? "undo" : "restore" }));
+    jobStep(job, 1, "done", `${touched.length} file(s) ${P.undo ? "reverted" : "rolled back"}`);
 
     // 3 — push + PR
     jobStep(job, 2, "running", "Pushing + opening PR…");
     await run(`git add -A "${P.themePath}" ${P.muPath ? `"${P.muPath}"` : ""}`, tmp);
-    r = await run(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "Restore ${P.businessName} to ${P.sha.slice(0, 7)}"`, tmp);
+    const title = P.undo
+      ? `Undo content change ${P.sha.slice(0, 7)} for ${P.businessName}`
+      : `Restore ${P.businessName} to ${P.sha.slice(0, 7)}`;
+    // "This reverts commit <sha>." is written by hand because --no-commit throws
+    // away the message git would have generated, and that line is the whole
+    // one-shot guard: the check above greps history for it. Without it the same
+    // undo link would apply a second time and quietly re-undo the undo.
+    const trailer = P.undo ? ` -m "This reverts commit ${full}."` : "";
+    r = await run(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "${title}"${trailer}`, tmp);
     if (r.code) throw new Error("commit failed: " + (r.stderr || r.stdout).slice(-160));
     r = await runRetry(`git push -u origin "${branch}"`, tmp);
     if (r.code) throw new Error("push failed: " + r.stderr.slice(-200));
-    const prBody = `Snapshot restore for **${P.businessName}**.\\n\\nPuts \`${P.themePath}\` back exactly as it was at \`${P.sha.slice(0, 7)}\`${P.versionLabel ? ` (${P.versionLabel.replace(/"/g, "'")})` : ""}, discarding theme changes made after it.\\n\\nFiles: ${touched.length}`;
-    r = await runRetry(`gh pr create --repo ${repo} --base main --head "${branch}" --title "Restore ${P.businessName} to ${P.sha.slice(0, 7)}" --body "${prBody}"`, tmp);
+    const prBody = P.undo
+      ? `Undoes a content-review change for **${P.businessName}**.\\n\\nReverses \`${P.sha.slice(0, 7)}\`${P.versionLabel ? ` (${P.versionLabel.replace(/"/g, "'")})` : ""}, putting that wording back as it was. Nothing else is touched.\\n\\nFiles: ${touched.length}`
+      : `Snapshot restore for **${P.businessName}**.\\n\\nPuts \`${P.themePath}\` back exactly as it was at \`${P.sha.slice(0, 7)}\`${P.versionLabel ? ` (${P.versionLabel.replace(/"/g, "'")})` : ""}, discarding theme changes made after it.\\n\\nFiles: ${touched.length}`;
+    r = await runRetry(`gh pr create --repo ${repo} --base main --head "${branch}" --title "${title}" --body "${prBody}"`, tmp);
     job.prUrl = (r.stdout.match(/https:\/\/github\.com\/\S+/) || [""])[0];
     job.branch = branch;
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -8471,17 +8563,41 @@ async function runRestoreJob(job) {
     // 5 — registry
     jobStep(job, 4, "running", "Updating site registry…");
     try { await syncSiteRegistry(); } catch (e) { /* non-fatal */ }
-    jobStep(job, 4, "done", "Done — the restored version is live on merge/deploy");
+    jobStep(job, 4, "done", P.undo ? "Done — the previous wording is live on merge/deploy" : "Done — the restored version is live on merge/deploy");
     job.status = "done";
-    notify(`⏪ Restore merged for *${job.businessName}*: ${job.editSummary} · ${job.prUrl || ""}`);
+    notify(`⏪ ${P.undo ? "Undo" : "Restore"} merged for *${job.businessName}*: ${job.editSummary} · ${job.prUrl || ""}`);
+    // Answer on the task the undo was started from, so the thread reads in
+    // order: here is the link, here is what changed, that change is undone.
+    if (P.undo && P.tedTaskId) {
+      tedComment([
+        `Content change undone on ${P.reviewPath && P.reviewPath !== "/" ? P.reviewPath : "the home page"}.`,
+        "",
+        `Undone by: ${P.requestedBy || "Content Team"}`,
+        `Site: ${P.businessName}${P.liveUrl ? " - " + P.liveUrl : ""}`,
+        job.prUrl ? `Pull request: ${job.prUrl}` : "",
+        "",
+        `The wording is back as it was before ${P.sha.slice(0, 7)}. Refresh the page to see it.`,
+      ].filter((l, i) => l !== "" || i > 0).join("\n"), null, 0, String(P.tedTaskId));
+    }
   } catch (e) {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
     if (e && e.cancelled) { job.status = "cancelled"; }
     else {
       job.error = e.message; job.status = "error";
       if (job.steps[job.currentStep] && job.steps[job.currentStep].status === "running") { job.steps[job.currentStep].status = "error"; job.steps[job.currentStep].detail = String(e.message).slice(0, 240); }
-      console.error(`restore job ${job.draftId} failed:`, e.message);
-      notify(`❌ Restore failed for *${job.businessName}*: ${e.message}`);
+      console.error(`${P.undo ? "undo" : "restore"} job ${job.draftId} failed:`, e.message);
+      notify(`❌ ${P.undo ? "Undo" : "Restore"} failed for *${job.businessName}*: ${e.message}`);
+      // A refused undo is the reviewer's answer, not just an ops log line — they
+      // are the one waiting to hear whether the wording went back.
+      if (P.undo && P.tedTaskId) {
+        tedComment([
+          `That content change could not be undone.`,
+          "",
+          `Site: ${P.businessName}`,
+          "",
+          String(e.message).slice(0, 400),
+        ].join("\n"), null, 0, String(P.tedTaskId));
+      }
     }
   } finally {
     job.finishedAt = new Date().toISOString(); saveJobs(); COST_SINK = null;
@@ -13715,7 +13831,11 @@ const server = http.createServer(async (req, res) => {
       if (ADMIN && !supplied && req.headers["x-login"] === "1") return json(res, 401, { error: "unauthorized", tedLoginUrl: TED_LOGIN_URL || null });
       return json(res, 200, { ok: true, gated: !!ADMIN, tedLoginUrl: TED_LOGIN_URL || null });
     }
-    if (ADMIN && p.startsWith("/api/") && !p.startsWith("/api/webhook/") && (req.headers["x-admin-key"] || "") !== ADMIN) {
+    // /api/undo is exempt for the same reason /api/webhook/* is: its signed token
+    // IS the credential, and the person clicking it came from a TED comment and
+    // has no admin key. Without this the undo link 401s for everyone it is for.
+    if (ADMIN && p.startsWith("/api/") && !p.startsWith("/api/webhook/") && p !== "/api/undo"
+      && (req.headers["x-admin-key"] || "") !== ADMIN) {
       return json(res, 401, { error: "unauthorized" }); // /api/webhook/* carries its own secret check
     }
 
@@ -13993,13 +14113,14 @@ const server = http.createServer(async (req, res) => {
         }
         return "";
       };
+      const clientId = dig("clientId", "client_id");
       const clientName = dig("clientName", "client_name", "client", "customerName", "businessName");
       const templateKey = dig("templateKey", "template_key", "taskTemplateKey");
       const status = dig("status", "taskStatus", "newStatus");
       const targetTask = tgt.id || tgt.taskId || dig("targetTaskId", "id");
-      if (!clientName) {
-        console.warn("pre-release webhook: no client name. payload:", JSON.stringify(body).slice(0, 1200));
-        return json(res, 422, { error: "no client name in payload", seen: Object.keys(body), hint: "expected trigger.clientName" });
+      if (!clientId && !clientName) {
+        console.warn("pre-release webhook: no client on the event. payload:", JSON.stringify(body).slice(0, 1200));
+        return json(res, 422, { error: "no client id or name in payload", seen: Object.keys(body), hint: "expected trigger.clientId" });
       }
       // TED's UI offers "All Events", which would fire this on every comment and
       // edit. Default to the pre-release template key so a mis-set webhook cannot
@@ -14013,20 +14134,41 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ignored: true, reason: `status ${status} is not ${wantStatus}` });
       }
 
-      let sites; try { sites = await getWebsites(true); } catch (e) { return json(res, 502, { error: "NocoDB lookup failed: " + e.message }); }
-      const norm = (s) => String(s || "").toLowerCase().replace(/\(.*?\)/g, "").replace(/[^a-z0-9]+/g, " ").trim();
-      const want = norm(clientName);
-      const exact = sites.filter((s) => norm(s.businessName) === want);
-      const loose = exact.length ? exact : sites.filter((s) => norm(s.businessName).includes(want) || want.includes(norm(s.businessName)));
-      if (loose.length !== 1) {
-        return json(res, 409, {
-          error: loose.length ? `"${clientName}" matches ${loose.length} sites` : `no NocoDB site matches "${clientName}"`,
-          candidates: loose.map((s) => s.businessName).slice(0, 5),
+      // TED's own record for the id on the event, ahead of the name lookup below.
+      // The name path is not merely less precise here, it is unsafe: TED sends
+      // "NUVO Aesthetics Clinic v2 (clone)", NocoDB holds "NUVO Aesthetics
+      // Clinic", and the loose match links them confidently to a row pointing at
+      // an entirely different repository and domain. This run clones, audits and
+      // auto-merges, so a confident wrong answer is the worst possible one.
+      let site = null;
+      if (clientId) {
+        site = await tedClientSite(clientId, clientName).catch((e) => {
+          console.log(`pre-release: TED client ${clientId} not usable (${e.message}) — falling back to the site list`);
+          return null;
         });
       }
-      const site = loose[0];
-      if (!site.githubRepo) return json(res, 409, { error: site.businessName + " has no repository set in NocoDB" });
-      if (!site.liveUrl) return json(res, 409, { error: site.businessName + " has no Domain set in NocoDB" });
+      if (site && !site.liveUrl) {
+        console.log(`pre-release: TED client ${clientId} has no beta site URL — falling back to the site list`);
+        site = null;
+      }
+      if (!site) {
+        if (!clientName) return json(res, 409, { error: `TED client ${clientId} has no usable repository or beta site, and the event carried no client name to fall back to` });
+        let sites; try { sites = await getWebsites(true); } catch (e) { return json(res, 502, { error: "NocoDB lookup failed: " + e.message }); }
+        const norm = (s) => String(s || "").toLowerCase().replace(/\(.*?\)/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+        const want = norm(clientName);
+        const exact = sites.filter((s) => norm(s.businessName) === want);
+        const loose = exact.length ? exact : sites.filter((s) => norm(s.businessName).includes(want) || want.includes(norm(s.businessName)));
+        if (loose.length !== 1) {
+          return json(res, 409, {
+            error: loose.length ? `"${clientName}" matches ${loose.length} sites` : `no NocoDB site matches "${clientName}"`,
+            candidates: loose.map((s) => s.businessName).slice(0, 5),
+          });
+        }
+        site = loose[0];
+        if (!site.githubRepo) return json(res, 409, { error: site.businessName + " has no repository set in NocoDB" });
+        if (!site.liveUrl) return json(res, 409, { error: site.businessName + " has no Domain set in NocoDB" });
+      }
+      console.log(`pre-release: ${site.businessName} resolved from ${site.resolvedFrom === "ted" ? "TED client " + site.tedClientId : "the site list"} — ${site.githubRepo} / ${site.liveUrl}`);
       let target; try { target = await resolveEditTarget(site); } catch (e) { return json(res, 409, { error: e.message }); }
       const running = [...JOBS.values()].find((j) => j.type === "perform-pr"
         && (j.status === "queued" || j.status === "running") && j.payload && j.payload.siteId === site.siteId);
@@ -14041,6 +14183,86 @@ const server = http.createServer(async (req, res) => {
         tedTaskId: targetTask || dig("id", "taskId") || "",
       });
       return json(res, 202, { jobId: job.draftId, site: site.businessName, tedTaskId: job.payload.tedTaskId || null });
+    }
+
+    // ---- undo a content-review change --------------------------------------
+    // Two routes on purpose. TED, Slack and mail clients fetch a URL the moment
+    // it is posted, to build a preview — so a link that acted on GET would undo
+    // itself before anybody read the comment. GET only renders what WOULD happen;
+    // POST is the only thing that touches a repository, and only a person
+    // clicking a button in the page produces one.
+    //
+    // Outside the admin gate because the signed token IS the credential, exactly
+    // as it is for the review link that produced the change in the first place.
+    if (p === "/undo" && req.method === "GET") {
+      const d = verifyUndoToken(u.searchParams.get("t"));
+      const esc = (s) => String(s || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+      if (!d) {
+        return send(res, 400, "text/html", `<!doctype html><meta charset="utf-8"><title>Undo</title>`
+          + `<body style="font:16px/1.6 system-ui;max-width:34rem;margin:12vh auto;padding:0 1.5rem;color:#111">`
+          + `<h1 style="font-size:1.3rem">This undo link is not valid</h1>`
+          + `<p style="color:#555">It may have been altered in transit. Open the task in TED and use the most recent link there.</p>`);
+      }
+      const page = d.path && d.path !== "/" ? d.path : "the home page";
+      return send(res, 200, "text/html", `<!doctype html><meta charset="utf-8"><title>Undo this change</title>`
+        + `<body style="font:16px/1.6 system-ui;max-width:34rem;margin:10vh auto;padding:0 1.5rem;color:#111">`
+        + `<h1 style="font-size:1.3rem;margin-bottom:.25rem">Undo this content change?</h1>`
+        + `<p style="color:#555;margin-top:0">This puts the wording on ${esc(page)} back as it was, and publishes that to the site.</p>`
+        + `<p style="color:#555">Nothing else is touched. If the text has been edited again since, this will stop and tell you instead of guessing.</p>`
+        + `<form method="POST" action="/api/undo">`
+        + `<input type="hidden" name="t" value="${esc(u.searchParams.get("t"))}">`
+        + `<button type="submit" style="font:inherit;background:#111;color:#fff;border:0;border-radius:.4rem;padding:.7rem 1.2rem;cursor:pointer">Yes, undo it</button>`
+        + `</form>`
+        + `<p style="color:#777;font-size:.85rem;margin-top:2rem">Pull request #${esc(d.pr)} in ${esc(d.repo)}</p>`);
+    }
+
+    if (p === "/api/undo" && req.method === "POST") {
+      const raw = await readBody(req);
+      // The confirmation page posts a form; anything else may send JSON.
+      let token = "";
+      if (/^\s*\{/.test(raw || "")) { try { token = (JSON.parse(raw) || {}).t || ""; } catch (e) { token = ""; } }
+      else token = new URLSearchParams(raw || "").get("t") || "";
+      const d = verifyUndoToken(token);
+      const page = (title, body) => send(res, 200, "text/html", `<!doctype html><meta charset="utf-8"><title>${title}</title>`
+        + `<body style="font:16px/1.6 system-ui;max-width:34rem;margin:12vh auto;padding:0 1.5rem;color:#111">`
+        + `<h1 style="font-size:1.3rem">${title}</h1><p style="color:#555">${body}</p>`);
+      if (!d) return page("This undo link is not valid", "Open the task in TED and use the most recent link there.");
+
+      // The squash sha is only knowable after the merge, so it is resolved now
+      // rather than baked into a link minted the moment the PR opened.
+      const view = await sh(`gh pr view ${d.pr} --repo ${d.repo} --json mergeCommitSha,state,title`);
+      let pr = null; try { pr = JSON.parse(view.stdout || "{}"); } catch (e) { pr = null; }
+      if (!pr || !pr.mergeCommitSha) return page("That change cannot be undone", "Its pull request could not be read on GitHub. A developer will need to look.");
+      if (pr.state !== "MERGED") return page("There is nothing to undo yet", "That change never reached the site.");
+
+      let site;
+      try {
+        site = d.siteId && /^ted-\d+$/i.test(d.siteId)
+          ? (await resolveReviewSite(d.siteId)).site
+          : await findWebsite(d.siteId);
+      } catch (e) { site = null; }
+      const themeSlug = d.themeSlug || (site && site.themeSlug) || "";
+      if (!themeSlug) return page("That change cannot be undone", "The site it belongs to could not be resolved. A developer will need to look.");
+
+      const running = [...JOBS.values()].find((j) => j.type === "restore" && j.payload && j.payload.undo
+        && String(j.payload.sha) === String(pr.mergeCommitSha) && (j.status === "queued" || j.status === "running"));
+      if (running) return page("Already undoing that change", "It was started a moment ago and is on its way. The task will say when it is live.");
+
+      const job = enqueueRestoreJob({
+        jobId: "undo-" + Date.now(),
+        undo: true, sha: String(pr.mergeCommitSha), versionLabel: String(pr.title || "").slice(0, 120),
+        siteId: d.siteId || (site && site.siteId) || "", businessName: (site && site.businessName) || d.repo,
+        githubRepo: d.repo, themeSlug,
+        themePath: `web/app/themes/${themeSlug}`,
+        muPath: (site && site.muPath) || "",
+        // Where the result is reported, and who to name when reporting it.
+        tedTaskId: d.taskId || "", requestedBy: d.reviewer || "Content Team",
+        reviewPath: d.path || "/", liveUrl: (site && site.liveUrl) || "",
+      });
+      console.log(`undo: ${d.repo}#${d.pr} (${String(pr.mergeCommitSha).slice(0, 7)}) queued as ${job.draftId}`);
+      return page("Undoing that change now",
+        "It goes through the same checks as any other change, so it will be live in a couple of minutes."
+        + (d.taskId ? " The TED task will say when it is done." : ""));
     }
 
     // ---- content review -----------------------------------------------------
