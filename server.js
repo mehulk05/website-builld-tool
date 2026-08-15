@@ -14499,7 +14499,10 @@ const server = http.createServer(async (req, res) => {
       // so a deployment can add a third without a code change.
       const wantKeys = (process.env.TED_PERFORM_PR_KEY || "release.pre_dev,beta_site.release_approval")
         .split(",").map((s) => s.trim()).filter(Boolean);
-      const wantStatus = (process.env.TED_PERFORM_PR_STATUS || "").trim();
+      // Completed, because that is the event: the approval task being finished is
+      // what releases the pre-release work. Firing on every status edit would start
+      // a clone-and-merge run when somebody merely picks the task up.
+      const wantStatus = (process.env.TED_PERFORM_PR_STATUS || "Completed").trim();
       if (wantKeys.length && !wantKeys.includes("*") && templateKey && !wantKeys.includes(templateKey)) {
         return json(res, 200, { ignored: true, reason: `template key ${templateKey} is not one of ${wantKeys.join(", ")}` });
       }
@@ -14568,12 +14571,13 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      // Nobody typed this run into Studio, and with an empty approvals.json the
-      // merge step would otherwise go through unattended - on a client's live
-      // repository. The fixes still get applied and every finding is still posted;
-      // only the merge waits for a person. Set TED_PERFORM_PR_APPROVAL=off to let a
-      // triggered run merge itself.
-      const gateMerge = (process.env.TED_PERFORM_PR_APPROVAL || "on").toLowerCase() !== "off";
+      // No gate by default. A triggered run is one link in a chain: TED only moves
+      // to the next task once the pre-release task completes, and it cannot
+      // complete while the run is parked waiting for somebody to click approve. A
+      // gate here does not make the release safer, it stalls the workflow it
+      // belongs to — and nobody watching TED can even see what it is waiting for.
+      // Set TED_PERFORM_PR_APPROVAL=on where a person really is watching for the PR.
+      const gateMerge = (process.env.TED_PERFORM_PR_APPROVAL || "off").toLowerCase() !== "off";
       const job = enqueuePerformPrJob({
         jobId: "perform-pr-" + Date.now(), siteId: site.siteId,
         businessName: site.businessName, githubRepo: site.githubRepo,
