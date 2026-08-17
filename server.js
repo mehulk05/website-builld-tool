@@ -13604,7 +13604,22 @@ function checklistItemReport(job, item) {
   if (decisions) L.push("", `${decisions} of these need a human decision - the run will not guess at them.`);
   if (dry) L.push("", "Dry run: audited only. No branch, no pull request, nothing pushed to the repository.");
   if (job.prUrl) L.push("", `Pull request: ${job.prUrl}`);
+  L.push("", runStamp(job));
   return { verdict, text: L.join("\n") };
+}
+
+// Identifies the run inside an eventKey, so two runs never collide on one and a
+// retry inside a single run still does.
+function runKey(job) {
+  return String((job && (job.draftId || (job.payload && job.payload.jobId))) || "run");
+}
+
+// One line on every comment saying which run wrote it. With duplicates now
+// possible on a re-run, "which of these three is current" has to be answerable
+// from the comment itself rather than from the timestamp beside it.
+function runStamp(job) {
+  const when = job.finishedAt || job.startedAt || new Date().toISOString();
+  return `Run ${when.replace("T", " ").slice(0, 16)} UTC - ${runKey(job)}`;
 }
 
 // Post every checklist item onto its own subtask. Sequential on purpose: thirteen
@@ -13618,12 +13633,18 @@ async function postChecklistToTed(job) {
     job.checklistResults[item.key] = report.verdict;
     const taskId = subs[item.key];
     if (!taskId) continue;
-    // Keyed on the subtask rather than the job, so the current verdict replaces
-    // the previous one in place. A subtask carrying three runs' worth of stale
-    // reports is the same unreadable pile this change set out to break up — the
-    // answer to "how is spelling doing" should be the top of the task, not the
-    // bottom of a thread.
-    const ai = await tedAiComment(taskId, report.text, `pre-release:${taskId}:${item.key}`);
+    // Keyed on the run as well as the subtask. Keying on the subtask alone was
+    // meant to replace the previous verdict in place, but TED does not honour
+    // eventKey as an upsert: on a collision it answers 200, leaves the old text
+    // exactly where it was, and drops the new report on the floor. Because it
+    // answers 200 the fallback below never fires either, so a re-run silently
+    // reported nothing while the subtask kept showing the previous run's
+    // verdict and the previous run's pull request number.
+    //
+    // A second comment per run is the lesser problem: a dated duplicate can be
+    // read, a stale one cannot be told apart from a current one. Retries inside
+    // one run still collapse, because they share the job id.
+    const ai = await tedAiComment(taskId, report.text, `pre-release:${taskId}:${item.key}:${runKey(job)}`);
     if (!ai.ok) {
       console.warn(`pre-release: AI comment on ${taskId} failed (${ai.reason}) - falling back`);
       tedComment(report.text, null, 0, String(taskId));
@@ -13682,13 +13703,22 @@ async function postPerformPrToTed(job, extra, phase = "final") {
       ...collapseFindings(deployOnly, 3).slice(0, 8).map((x) => `- ${x.rollup || !x.page ? x.message : `${x.page}: ${x.message}`}`));
   }
   if (extra) lines.push("", extra);
+  // Say what the run is about to do to the ticket, in the comment that does it.
+  // Nobody should have to infer a status change from the sidebar.
+  if (phase === "final" && !dry) {
+    lines.push("", job.prUrl
+      ? `Pull request is in - marking this release task Completed.`
+      : `No pull request was opened, so this task stays open.`);
+  }
   if (job.prUrl) lines.push("", `Pull request: ${job.prUrl}`);
+  lines.push("", runStamp(job));
   const text = lines.join("\n");
-  // One eventKey per job per phase: TED treats it as an idempotency key, so a
-  // retry after a timeout updates that comment rather than adding another.
-  // Same reasoning as the subtask comments: keyed on the task and phase, not the
-  // run, so the release task carries one current index rather than one per attempt.
-  const ai = await tedAiComment(taskId, text, `perform-pr:${taskId}:${phase}`);
+  // Keyed on the run, not just the task and phase. The release task must carry a
+  // comment from every run — that is the record that the run happened at all —
+  // and a task-scoped key does not produce one: TED answers 200 on a collision,
+  // keeps the old text and discards the new, so the second run's index never
+  // appears. See the note in postChecklistToTed.
+  const ai = await tedAiComment(taskId, text, `perform-pr:${taskId}:${phase}:${runKey(job)}`);
   if (ai.ok) {
     await closeTedTaskIfFinal(job, taskId, phase);
     return;
@@ -13703,9 +13733,8 @@ async function postPerformPrToTed(job, extra, phase = "final") {
 // one goes out while CI is still running, and closing a task that has not
 // finished is worse than leaving it open.
 //
-// A run that could not merge leaves the ticket open on purpose. Its pull request
-// is still waiting on a human, so the work is not complete however good the
-// report is.
+// A run that never opened a pull request leaves the ticket open on purpose:
+// there is no release to report, only an audit.
 async function closeTedTaskIfFinal(job, taskId, phase) {
   if (phase !== "final") return;
   // A dry run audited the site and changed nothing. Closing the release task off
@@ -13714,46 +13743,27 @@ async function closeTedTaskIfFinal(job, taskId, phase) {
     console.log(`TED task ${taskId} left open - dry run, nothing was released`);
     return;
   }
-  // With a checklist, the release task closes when its checklist does — every
-  // subtask Completed, nothing left running. That is a stronger statement than
-  // "a pull request merged", because it means all thirteen checks reported.
+  // The pull request is the whole test. Once a branch is pushed and a PR number
+  // exists, the release work this ticket tracks has happened, and the ticket
+  // closes — whatever the checklist got through.
   //
-  // Read back from TED rather than trusting the writes just made: a status update
-  // can fail, someone can reopen a subtask by hand while the run is finishing, and
-  // closing the parent over the top of either would hide real work.
+  // This used to require all thirteen subtasks Completed. That rule reads well
+  // and behaves badly: a run that dies at check 10, or one whose subtask writes
+  // partly fail, leaves the release ticket sitting In Progress with a merged PR
+  // behind it, and nobody goes back to close it by hand. A partial checklist is
+  // a reason to read the subtasks — each one carries its own report — not a
+  // reason to misreport the release itself as unfinished.
+  //
+  // An errored run with a PR still closes, for the same reason: the branch is in.
+  // What went wrong is in the comment posted immediately above this call.
+  if (!job.prUrl) {
+    console.log(`TED task ${taskId} left open - no pull request was opened (${job.error || "unknown"})`);
+    return;
+  }
   const subs = Object.values(job.checklistSubtasks || {}).filter(Boolean);
-  if (subs.length) {
-    if (subs.length !== PRE_RELEASE_CHECKLIST.length) {
-      console.log(`TED task ${taskId} left open — only ${subs.length}/${PRE_RELEASE_CHECKLIST.length} checklist subtasks exist`);
-      return;
-    }
-    let open;
-    try {
-      const live = await tedListSubtasks(taskId);
-      const byId = new Map(live.map((s) => [String(s.id), s]));
-      open = subs.filter((id) => String((byId.get(String(id)) || {}).status || "").toLowerCase() !== "completed");
-    } catch (e) {
-      console.warn(`TED task ${taskId} left open — could not confirm subtask statuses: ${e.message}`);
-      return;
-    }
-    if (open.length) {
-      console.log(`TED task ${taskId} left open — ${open.length} checklist subtask(s) are not Completed: ${open.join(", ")}`);
-      return;
-    }
-    const rc = await tedUpdateTask(taskId, { aiAssigned: true, status: "Completed" });
-    if (rc.ok) console.log(`TED task ${taskId} closed — all ${subs.length} checklist subtasks Completed`);
-    else console.warn(`TED task ${taskId} could not be updated: ${rc.reason}`);
-    return;
-  }
-
-  // No checklist (subtask creation failed, or TED_SUBTASKS is off) — fall back to
-  // the original rule, where a merged pull request is the evidence the run worked.
-  if (!job.prUrl || job.error) {
-    console.log(`TED task ${taskId} left open — the run did not merge (${job.error || "no pull request"})`);
-    return;
-  }
+  const done = job.checklistClosed || 0;
   const r = await tedUpdateTask(taskId, { aiAssigned: true, status: "Completed" });
-  if (r.ok) console.log(`TED task ${taskId} marked Completed and assigned to AI`);
+  if (r.ok) console.log(`TED task ${taskId} marked Completed and assigned to AI - ${done}/${subs.length || PRE_RELEASE_CHECKLIST.length} checklist subtask(s) reported`);
   else console.warn(`TED task ${taskId} could not be updated: ${r.reason}`);
 }
 
