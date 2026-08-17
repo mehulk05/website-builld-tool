@@ -15088,6 +15088,32 @@ const server = http.createServer(async (req, res) => {
       const j = JOBS.get(u.searchParams.get("id"));
       return j ? json(res, 200, j) : json(res, 404, { error: "job not found" });
     }
+    // Import job history into the live server WITHOUT a redeploy or file access —
+    // the deploy-safe way to restore /jobs on Render (disk is ephemeral). Accepts
+    // a bare array of jobs OR the exact { jobs:[...] } shape that GET /api/jobs
+    // returns, so you can pipe the export straight back in. Behind the admin-key
+    // gate (like every /api/*). Default merges by draftId (idempotent); pass
+    // ?mode=replace to clear first. Persists to jobs.json so it also survives
+    // in-container restarts.
+    if (p === "/api/jobs-import" && req.method === "POST") {
+      let body;
+      try { body = JSON.parse(await readBody(req) || "null"); } catch (e) { return json(res, 400, { error: "invalid JSON body" }); }
+      const incoming = Array.isArray(body) ? body : (body && Array.isArray(body.jobs) ? body.jobs : null);
+      if (!incoming) return json(res, 400, { error: "expected a JSON array of jobs, or { jobs: [...] }" });
+      const replace = /^(1|true|replace|yes)$/i.test(u.searchParams.get("mode") || "");
+      if (replace) JOBS.clear();
+      let n = 0;
+      for (const j of incoming) {
+        if (!j || !j.draftId) continue;
+        if (j.status === "running" || j.status === "queued") { j.status = "error"; j.error = "imported (was in-flight at export time)"; }
+        if (j.status !== "running" && j.status !== "queued") j.awaitingApproval = false;
+        try { backfillEventLog(j); } catch (e) { /* best-effort */ }
+        JOBS.set(String(j.draftId), j);
+        n++;
+      }
+      saveJobs();
+      return json(res, 200, { ok: true, imported: n, total: JOBS.size, mode: replace ? "replace" : "merge" });
+    }
 
     // Re-send this job's status to G99. The audit above can now show a failed callback; without
     // this there is nothing to do about one — the build has finished, so no further step transition
