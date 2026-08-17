@@ -4300,12 +4300,27 @@ const TED_AUTOMATION_MARK = "[automated: Growth99 Studio]";
 const TED_AI_TOKEN = process.env.TED_AI_API_KEY || process.env.TED_API_TOKEN || "";
 function tedHtml(text) {
   const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  // A bare URL in plain text is linkified by whatever renders it; a bare URL
+  // inside a <p> is just words. The content-review invitation is nothing but a
+  // link, so it has to be anchored here or the comment is unusable. Runs after
+  // escaping, so an ampersand already reads &amp; — which is what belongs in an
+  // href anyway. The character class stops at whitespace and <, so it cannot
+  // reach past the escaped text it was given.
+  // Trailing sentence punctuation is not part of the address. A semicolon is
+  // deliberately not in that set: an escaped ampersand ends in one, and eating
+  // it would corrupt every query string with two parameters.
+  const link = (s) => s.replace(/https?:\/\/[^\s<]+/g, (u) => {
+    const tail = (u.match(/[.,:!?)\]]+$/) || [""])[0];
+    const href = u.slice(0, u.length - tail.length);
+    return `<a href="${href}">${href}</a>${tail}`;
+  });
+  const w = (s) => link(esc(s));
   return String(text || "").split(/\n{2,}/).map((block) => {
     const lines = block.split("\n").filter((l) => l.trim());
     if (lines.length > 1 && lines.every((l) => /^\s*[-*]\s/.test(l))) {
-      return "<ul>" + lines.map((l) => `<li>${esc(l.replace(/^\s*[-*]\s/, ""))}</li>`).join("") + "</ul>";
+      return "<ul>" + lines.map((l) => `<li>${w(l.replace(/^\s*[-*]\s/, ""))}</li>`).join("") + "</ul>";
     }
-    return `<p>${lines.map((l) => esc(l)).join("<br>")}</p>`;
+    return `<p>${lines.map((l) => w(l)).join("<br>")}</p>`;
   }).join("");
 }
 async function tedAiComment(taskId, text, eventKey) {
@@ -4322,6 +4337,23 @@ async function tedAiComment(taskId, text, eventKey) {
     if (!r.ok) return { ok: false, reason: `HTTP ${r.status}: ${(await r.text()).slice(0, 160)}` };
     return { ok: true, body: (await r.text()).slice(0, 300) };
   } catch (e) { return { ok: false, reason: String(e && e.message || e).slice(0, 140) }; }
+}
+
+// Say something on a task as the AI agent, falling back to a named comment if
+// the AI endpoint is unreachable. Everything this tool writes should read as the
+// tool, not as whoever's token it happens to be holding: TED credits a plain
+// comment to the token's owner, so an automated report arrives under a real
+// person's name and looks like that person wrote it by hand.
+//
+// The fallback stays, because a report under the wrong name is still far better
+// than no report. It is fire-and-forget on purpose — the caller has already done
+// the work this describes, and a TED outage must not fail the run.
+async function tedSayAsAi(taskId, text, eventKey) {
+  const ai = await tedAiComment(taskId, text, eventKey);
+  if (ai.ok) return true;
+  console.warn(`TED AI comment on ${taskId} failed (${ai.reason}) - falling back to a named comment`);
+  tedComment(text, null, 0, String(taskId));
+  return false;
 }
 
 function tedComment(text, image = null, attempt = 0, taskId = null) {
@@ -5006,7 +5038,19 @@ function tedPostOutcome(job, outcome) {
   // shared and cache by URL, so the picture that came back was routinely of
   // another client's beta site — worse than no picture at all on a comment
   // whose whole job is to say precisely what changed. The words already say it.
-  if (P.tedTaskId) return tedComment(text, null, 0, P.tedTaskId);
+  //
+  // As the AI agent: a content writer selects a sentence on the beta site and
+  // the correction reports back here by itself, so the answer has no human
+  // author. Posted plainly it arrives under the token owner's name, and reads
+  // as though that person went and made the change.
+  //
+  // Keyed on the run, not the task — one task collects an outcome per
+  // correction, and TED drops the text of any comment whose eventKey it has
+  // already seen instead of updating it.
+  if (P.tedTaskId) {
+    tedSayAsAi(P.tedTaskId, text, `content-review:${P.tedTaskId}:outcome:${job.draftId}`).catch(() => {});
+    return;
+  }
   // Back onto the thread this request came from: the subtask the email flow
   // created, or the task the review link was posted on. Null when the subtask
   // could not be made (or subtasks are off), and tedComment then falls back to
@@ -5404,7 +5448,18 @@ async function tedPostReviewLink({ clientId, clientName, hubspotId, taskId, revi
     TED_REVIEW_MARK,
   ].filter((l, i) => l !== "" || i > 0).join("\n");
 
-  tedComment(text, null, 0, String(taskId));
+  // As the AI agent. Nobody wrote this invitation by hand — the webhook fired,
+  // the link was minted and posted — and under a person's name it reads like a
+  // colleague vouching for a URL, which is exactly the wrong impression to give
+  // about a link that carries a signed token.
+  //
+  // TED_REVIEW_MARK survives the trip: tedHtml only escapes & < >, so the
+  // duplicate-link guard that greps existing comments for it still matches.
+  //
+  // Keyed on the expiry, so re-issuing a link after the old one lapses posts a
+  // new comment rather than colliding with the previous invitation and being
+  // silently dropped.
+  await tedSayAsAi(String(taskId), text, `content-review:${taskId}:link:${exp}`);
   return { site, link: link.toString(), exp, pluginInstalled: installed };
 }
 
