@@ -7401,6 +7401,12 @@ async function runJob(job) {
       if (k) job.pages[k] = { status: pr.error ? "error" : "done", bytes: pr.htmlBytes || 0, error: pr.error || "" };
     }
     if (!ok.length) throw new Error("Stitch generated 0 pages: " + (((gen.pages || [])[0] || {}).error || "no output"));
+    // Close the "Generate pages" subtask in TED the MOMENT pages exist — whatever engine
+    // (Stitch or Gemini) produced them. Fired here, before the home/theme/PR checks below, so a
+    // build that generates pages but stops later still closes this subtask (the earlier position,
+    // after those checks, meant any downstream failure left the task open forever). Fire-and-forget
+    // and idempotent on TED's side, so re-confirming later is harmless.
+    pushSubtaskStep(job, "generate_pages", "done", { detail: `${ok.length}/${(gen.pages || []).length} pages generated` });
     // HOME is mandatory: buildWpTheme derives front-page.php AND the shared
     // header.php/footer.php from it, so a failed home ships a theme with an empty
     // homepage and no navigation. Fail loudly instead of releasing that.
@@ -7410,7 +7416,6 @@ async function runJob(job) {
         ") — the theme's header/footer/front page all derive from home, so the build was stopped rather than ship a homepage with no content or navigation. Re-run to retry.");
     }
     jobStep(job, 2, "done", `${ok.length}/${(gen.pages || []).length} pages generated`);
-    pushSubtaskStep(job, "generate_pages", "done", { detail: `${ok.length}/${(gen.pages || []).length} pages generated` });
 
     // Home content for the TED content-task push (done later in runThemeActivationTail, once the site
     // is live). Prefer the composed home brief (from the client's real structure); fall back to the
