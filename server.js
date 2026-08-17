@@ -6864,17 +6864,321 @@ async function retryThemeActivationTail(draftId) {
 // ============================================================================
 const REF_DIR = path.join(DIR, "reference_sites");
 
-// Pick the reference template file. Explicit name wins; else the first *.html.
+// The default rich template every clone uses unless one is named explicitly.
+// atelier = 14-section luxury medspa layout with 18 image slots (hero, welcome,
+// treatments, providers, gallery, etc.) that get filled with the client's real
+// photos at build time. Override per-build with CLONE_TEMPLATE / payload.referenceTemplate.
+const DEFAULT_TEMPLATE = process.env.CLONE_TEMPLATE || "atelier";
+
+// Pick the reference template file. Explicit name wins; else the default rich
+// template; else (only if that's missing) the first *.html on disk.
 function pickReferenceTemplate(name) {
-  const safe = name ? String(name).replace(/[^a-z0-9._-]/gi, "") : "";
-  if (safe) {
+  const tryName = (raw) => {
+    const safe = raw ? String(raw).replace(/[^a-z0-9._-]/gi, "") : "";
+    if (!safe) return null;
     const f = path.join(REF_DIR, safe.endsWith(".html") ? safe : safe + ".html");
-    if (fs.existsSync(f)) return { file: f, html: fs.readFileSync(f, "utf8") };
-  }
+    return fs.existsSync(f) ? { file: f, html: fs.readFileSync(f, "utf8") } : null;
+  };
+  const chosen = tryName(name) || tryName(DEFAULT_TEMPLATE);
+  if (chosen) return chosen;
   const files = fs.existsSync(REF_DIR) ? fs.readdirSync(REF_DIR).filter((x) => /\.html?$/i.test(x)).sort() : [];
   if (!files.length) throw new Error(`no reference template found in ${REF_DIR}`);
   const file = path.join(REF_DIR, files[0]);
   return { file, html: fs.readFileSync(file, "utf8") };
+}
+
+// Pull the client's REAL content images off their existing site so a cloned
+// template shows the client's own photography, not the template's stock spa
+// pictures. Best-effort: fetches a few core pages, harvests <img src/data-src/
+// srcset> + CSS url(), absolutizes, drops logos/icons/spacers/svgs, dedupes,
+// and returns URLs in page order (hero-ish first). Never throws.
+async function extractSiteImages(siteUrl, max = 40) {
+  if (!siteUrl) return [];
+  let origin;
+  try { origin = new URL(/^https?:\/\//i.test(siteUrl) ? siteUrl : "https://" + siteUrl); }
+  catch (e) { return []; }
+  const base = origin.origin;
+  const pages = [base + "/", base + "/about/", base + "/services/", base + "/team/", base + "/about-us/"];
+  const seen = new Map(); const out = [];   // normalized url -> {url,w,h}
+  const abs = (u) => { try { return new URL(u, base).href; } catch (e) { return null; } };
+  // Reject logos/icons AND decorative textures/backgrounds/thumbnails — those are
+  // what made the first pass look blurry & empty (a texture PNG stretched into a hero).
+  const bad = /sprite|icon|logo|favicon|spacer|placeholder|blank|pixel|1x1|loader|avatar-default|\/thumbs\/|background|[-_]bg[-_.]|leaf-bg|gold-bg|golden-circle|gradient|wave|pattern|texture|divider|swirl|scrim|overlay|\.svg(\?|$)|^data:/i;
+  // WordPress emits many resized copies (name-300x222.webp); the un-suffixed URL is
+  // the full-resolution original. Collapse to it so nothing gets upscaled/blurred.
+  const fullSize = (u) => u.replace(/-\d{2,4}x\d{2,4}(?=\.(?:jpe?g|png|webp|avif)(?:\?|$))/i, "");
+  // Record a candidate, carrying any width/height we can read off a WxH suffix so
+  // downstream placement can tell a landscape hero shot from a portrait headshot.
+  const push = (u) => {
+    let a = abs(u); if (!a) return;
+    if (!/\.(jpe?g|png|webp|avif)(\?|$)/i.test(a)) return;
+    if (bad.test(a)) return;
+    const dm = a.match(/-(\d{2,4})x(\d{2,4})(?=\.(?:jpe?g|png|webp|avif)(?:\?|$))/i);
+    const w = dm ? +dm[1] : 0, h = dm ? +dm[2] : 0;
+    a = fullSize(a);
+    if (bad.test(a)) return;
+    const cur = seen.get(a);
+    if (cur) { cur.w = Math.max(cur.w, w); cur.h = Math.max(cur.h, h); return; }
+    const rec = { url: a, w, h }; seen.set(a, rec); out.push(rec);
+  };
+  for (const pg of pages) {
+    if (out.length >= max) break;
+    let html;
+    try { const r = await fetch(pg, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 G99Bot" } }); if (!r.ok) continue; html = await r.text(); }
+    catch (e) { continue; }
+    for (const m of html.matchAll(/<img\b[^>]*?\b(?:data-lazy-src|data-src|src)=["']([^"']+)["']/gi)) push(m[1]);
+    for (const m of html.matchAll(/\bsrcset=["']([^"']+)["']/gi)) {
+      const cands = m[1].split(",").map((s) => s.trim().split(/\s+/)[0]).filter(Boolean);
+      if (cands.length) push(cands[cands.length - 1]);   // largest candidate (carries WxH)
+    }
+    for (const m of html.matchAll(/url\((["']?)([^)"']+)\1\)/gi)) push(m[2]);
+  }
+  return out.slice(0, max);
+}
+
+// Sort an image into a placement bucket from its filename + orientation, so a
+// hero slot gets a wide lifestyle/interior shot, a card gets a treatment photo,
+// and a team slot gets a portrait — instead of arbitrary round-robin.
+function classifyClientImage(rec) {
+  const n = String(rec.url || "").toLowerCase();
+  const land = rec.w && rec.h ? rec.w >= rec.h * 1.15 : false;
+  const port = rec.w && rec.h ? rec.h >= rec.w * 1.15 : false;
+  // Order matters. Specific TREATMENT terms are checked first — otherwise generic
+  // brand/location boilerplate baked into every filename (e.g. "...-clinic-Sycamore-IL")
+  // would make everything a hero. Hero terms are kept deliberately narrow (no
+  // "clinic"/"space"/"room", which appear in boilerplate).
+  if (/treatment|facial|filler|tox|neuro|sculptra|microneedl|laser|peel|\biv\b|drip|inject|hair|weight|hydra|body|\bskin\b|glow|gel|serum|vial|bhrt|nad|glutathione|ariessence|sylfirm|regenerativ/.test(n)) return "treatment";
+  if (/welcome|\bhero\b|interior|lobby|reception|exterior|building|ambian|lifestyle|storefront|waiting/.test(n)) return "hero";
+  if (port || /team|headshot|portrait|provider|staff|founder|owner|nurse|\bnp-|\bpa-|-md\b|meet-|-face/.test(n)) return "portrait";
+  return "generic";   // unlabeled: never assume hero from orientation alone (a wide
+                      // headshot crop is NOT a hero). Generic still feeds background slots.
+}
+
+// Replace the template's stock image URLs — in BOTH <img src> and CSS url() — with
+// the client's real images, placed BY ROLE: the hero + CSS-background slots take
+// wide lifestyle shots, the inline <img> slots take treatment/portrait photos. Each
+// DISTINCT template URL maps to one real image so a picture reused in two spots stays
+// consistent. Pool empty => unchanged.
+function swapTemplateImages(html, pool) {
+  if (!pool || !pool.length) return { html, swapped: 0, slots: 0 };
+  const b = { hero: [], treatment: [], portrait: [], generic: [] };
+  for (const rec of pool) b[classifyClientImage(rec)].push(rec.url);
+  // Within the hero bucket, put genuine welcome/interior/reception shots ahead of
+  // wellness/vitality product-ish ones so the top hero slot gets the best photo.
+  const heroRank = (u) => (/welcome|interior|clinic|lobby|reception|space|room|banner|exterior|building|ambian|lifestyle/i.test(u) ? 0 : 1);
+  b.hero.sort((x, y) => heroRank(x) - heroRank(y));
+  // Preference order per slot kind, with graceful fallback to whatever exists.
+  const bgPool = [...b.hero, ...b.generic, ...b.treatment, ...b.portrait];
+  const imgPool = [...b.treatment, ...b.generic, ...b.portrait, ...b.hero];
+  const allUrls = pool.map((r) => r.url);
+  const take = (arr, ptr) => { const a = arr.length ? arr : allUrls; return a[ptr.i++ % a.length]; };
+
+  // First pass: distinct template URLs in first-seen order, each tagged bg vs img
+  // (bg wins if it appears in a url(), since those are the big visual slots).
+  const role = new Map(), first = new Map(); let idx = 0;
+  html.replace(/(src=|url\()\s*["']?([^"')\s]+\.(?:jpe?g|png|webp|avif)(?:\?[^"')\s]*)?)/gi, (m, pfx, u) => {
+    const r = /^url/i.test(pfx) ? "bg" : "img";
+    if (!first.has(u)) { first.set(u, idx++); role.set(u, r); }
+    else if (r === "bg") role.set(u, "bg");
+    return m;
+  });
+  const distinct = [...first.keys()].sort((x, y) => first.get(x) - first.get(y));
+  if (!distinct.length) return { html, swapped: 0, slots: 0 };
+
+  const ptrBg = { i: 0 }, ptrImg = { i: 0 };
+  const assign = new Map(); let heroDone = false;
+  for (const u of distinct) {
+    if (role.get(u) === "bg" && !heroDone) {                 // very first bg = the hero
+      assign.set(u, (b.hero[0] || bgPool[0] || allUrls[0])); heroDone = true;
+    } else if (role.get(u) === "bg") {
+      assign.set(u, take(bgPool, ptrBg));
+    } else {
+      assign.set(u, take(imgPool, ptrImg));
+    }
+  }
+  let swapped = 0, out = html;
+  for (const [from, to] of assign) {
+    if (!to) continue;
+    const re = new RegExp(from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+    out = out.replace(re, () => { swapped++; return to; });
+  }
+  return { html: out, swapped, slots: distinct.length };
+}
+
+// ============================== EDITORIAL ENGINE ==============================
+// The medspa-mockup-tool pipeline (scrape → BrandKit → code-rendered template),
+// running INSIDE the normal build job so every TED/G99 event fires exactly as a
+// Stitch build does (postStatus only emits for job.type === "build", and the
+// step keys/positions in JOB_STEP_KEYS are untouched — only step 2's label text
+// changes). AI writes only the CONTENT (one Gemini call → BrandKit JSON); the
+// LAYOUT is deterministic code (lib/editorial/templates/*).
+
+// Scrape a site the way the medspa tool does (Playwright: palette, fonts,
+// images with alt hints, text, full-page screenshot). Falls back to a fetch-only
+// "lite" scrape when Playwright isn't available (e.g. Render without the browser
+// download) — we lose the screenshot and palette, not the build.
+async function editorialScrape(url) {
+  try {
+    const mod = await import(pathToFileURL(path.join(DIR, "lib", "editorial", "scrape.js")).href);
+    return await mod.scrape(url);
+  } catch (e) {
+    console.warn(`editorial: playwright scrape failed (${String(e.message).slice(0, 120)}) — falling back to lite fetch scrape`);
+    return liteScrape(url);
+  }
+}
+function pathToFileURL(p) { return require("url").pathToFileURL(p); }
+async function liteScrape(url) {
+  const r = await fetch(/^https?:\/\//i.test(url) ? url : "https://" + url, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 G99Bot" } });
+  const html = await r.text();
+  const pick = (re) => (html.match(re) || [, ""])[1].trim();
+  const strip = (s) => s.replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>|<[^>]+>/gi, " ").replace(/\s+/g, " ").trim();
+  const imgs = [];
+  for (const m of html.matchAll(/<img\b[^>]*?\b(?:data-lazy-src|data-src|src)=["']([^"']+)["'][^>]*?(?:alt=["']([^"']*)["'])?/gi)) {
+    try { imgs.push({ src: new URL(m[1], r.url).href, alt: m[2] || "" }); } catch (e) { /* skip */ }
+  }
+  return {
+    title: pick(/<title[^>]*>([^<]*)<\/title>/i), metaDesc: pick(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["']/i),
+    palette: [], fonts: [], logo: "", images: imgs.slice(0, 40), text: strip(html).slice(0, 12000), screenshotB64: null,
+  };
+}
+
+// One Gemini call → BrandKit JSON — the medspa tool's extract(), but (a) routed
+// through geminiCall so key rotation + cost metering keep working, and (b) SEEDED
+// with the onboarding answers so the AI invents far less: the business name,
+// services, team, review and hero line are facts we already have.
+async function extractBrandKit(raw, A, opts = {}) {
+  const seedLines = [];
+  const val = (v) => Array.isArray(v) ? v.map((x) => (x && typeof x === "object") ? [x.name, x.title].filter(Boolean).join(" — ") : String(x)).join("; ") : (v == null ? "" : String(v));
+  if (A.business_name) seedLines.push(`business name: ${A.business_name}`);
+  if (A.location) seedLines.push(`city/address: ${A.location}`);
+  if (A.phone_for_website) seedLines.push(`phone: ${A.phone_for_website}`);
+  if (A.services_offered) seedLines.push(`services (use EXACTLY these for specialties/featured): ${val(A.services_offered)}`);
+  if (A.revenue_services) seedLines.push(`signature/revenue services: ${val(A.revenue_services)}`);
+  if (A.team_roster) seedLines.push(`providers (use EXACTLY these names/roles): ${val(A.team_roster)}`);
+  if (A.featured_review) seedLines.push(`a real client review (use it as one testimonial): ${val(A.featured_review)}`);
+  if (A.hero_headline) seedLines.push(`preferred hero headline: ${A.hero_headline}`);
+  if (A.hero_subheadline) seedLines.push(`preferred hero subheadline: ${A.hero_subheadline}`);
+  if (A.primary_cta) seedLines.push(`primary CTA label: ${A.primary_cta}`);
+  if (A.business_description) seedLines.push(`about the business: ${val(A.business_description)}`);
+
+  const prompt = `You are a luxury brand extractor for a med-spa website builder.
+Below is scraped data from the client's REAL med-spa site: page text, detected color palette, fonts${raw.screenshotB64 ? ", and a screenshot" : ""}.
+
+Return ONLY JSON matching this exact shape (no markdown fence):
+{
+  "brand": { "name": "", "sub": "", "topbar": "", "phone": "", "email": "", "city": "" },
+  "theme": {
+    "cream": "#hex", "white": "#ffffff", "ink": "#hex", "body": "#hex",
+    "line": "#hex", "accent": "#hex",
+    "serifFont": "Font Name", "sansFont": "Font Name",
+    "googleFontsHref": "https://fonts.googleapis.com/css2?...&display=swap"
+  },
+  "hero": { "eyebrow": "", "h1": "", "body": "", "cta": "", "image": "url-or-empty" },
+  "about": { "eyebrow": "", "h2": "", "paras": ["", ""], "cta": "", "image": "url-or-empty" },
+  "strip": ["", "", "", "", ""],
+  "specialties": { "eyebrow": "", "h2": "", "intro": "", "cards": [ { "h3": "", "p": "", "image": "url-or-empty" } ] },
+  "providers": { "eyebrow": "", "h2": "", "tabs": ["",""], "members": [ { "name": "", "role": "", "image": "url-or-empty" } ] },
+  "testimonials": { "eyebrow": "", "h2": "", "quotes": [ { "h4": "", "p": "", "cite": "" } ] },
+  "featured": { "h2": "", "items": [ { "h3": "", "p": "", "image": "url-or-empty" } ] },
+  "cta": { "eyebrow": "", "h2": "", "body": "" },
+  "footer": { "blurb": "", "logo": "url-or-empty" },
+  "voice": "one phrase, e.g. warm-clinical-luxe",
+  "layout": "editorial | bold | minimal — pick the best fit for this brand"
+}
+
+KNOWN FACTS FROM THE CLIENT'S ONBOARDING FORM — these override anything scraped; use them verbatim where they fit:
+${seedLines.join("\n") || "(none provided)"}
+
+RULES:
+- THEME: pick colors from the detected palette. ink = darkest text color, cream = warm off-white background, accent = the brand's signature warm/muted hue, line = subtle border. Convert rgb() to hex. Keep it elegant and high-contrast.${raw.palette && raw.palette.length ? "" : " (No palette detected — use elegant medspa defaults: cream #f8f5f0, ink #1f1c18, accent #b08d57.)"}
+- FONTS: identify a serif for headings and sans for body. If unclear, use elegant defaults (serif: "Cormorant Garamond", sans: "Montserrat"). Build a valid Google Fonts href for the two families.
+- COPY: REWRITE all copy in the brand's voice — do NOT copy sentences verbatim. Fit the slots: hero h1 short (2-5 words), card p ~15 words, keep it luxurious and modern. Invent plausible content where the source lacks it.
+- Provide 3 cards, 4 providers (fewer if onboarding lists fewer), 4 testimonial quotes, 3 featured items, 5 strip items.
+- IMAGES: you are given a pool of scraped images from the client's OWN site, each with an "alt" hint. Assign the MOST RELEVANT image URL (from the pool ONLY, copy the src exactly) to: hero.image, about.image, EACH specialties card, EACH featured item, and EACH provider (match a portrait to a person by alt text when possible). Prefer treatment/skin/spa/interior photos for cards & featured; prefer people/portrait photos for providers. NEVER invent URLs. If no image in the pool fits a slot, set it to "" (elegant fallback). Do not reuse the exact same image for every slot — spread them.
+
+SCRAPED DATA:
+title: ${raw.title}
+metaDesc: ${raw.metaDesc}
+palette: ${JSON.stringify(raw.palette || [])}
+fonts: ${JSON.stringify(raw.fonts || [])}
+logo: ${raw.logo || ""}
+IMAGE POOL (assign these exact src values to slots):
+${JSON.stringify((raw.images || []).map((i) => ({ src: i.src, alt: i.alt })).slice(0, 40))}
+--- TEXT ---
+${(raw.text || "").slice(0, 14000)}`;
+
+  const parts = [{ text: prompt }];
+  if (raw.screenshotB64) parts.push({ inlineData: { mimeType: "image/png", data: raw.screenshotB64 } });
+  // The default GEMINI_MODEL is a -lite tier; the medspa tool used a full flash model
+  // and its kits were visibly better (neutral ink, correct body font). Use the full
+  // model for this ONE call — it is the single AI step of the whole engine.
+  // Prefer the full flash model, but NEVER pin hard: opts.model bypasses geminiCall's
+  // fallback chain, so a 503 on the preferred model must fall back to the default chain.
+  let rawTxt;
+  try { rawTxt = await geminiCall(parts, { temperature: 0.7, maxOutputTokens: 8000, timeoutMs: 90000, model: process.env.BRANDKIT_MODEL || "gemini-flash-latest" }); }
+  catch (e) { console.warn(`brandkit: preferred model failed (${String(e.message).slice(0, 80)}) — retrying on the default chain`); rawTxt = await geminiCall(parts, { temperature: 0.7, maxOutputTokens: 8000, timeoutMs: 90000 }); }
+  const txt = rawTxt.trim().replace(/^```json?/i, "").replace(/```$/, "").trim();
+  const kit = JSON.parse(txt);
+
+  // --- theme sanitization (the three drifts that made pages look "off" vs the medspa tool) ---
+  const th = kit.theme || (kit.theme = {});
+  // 0. normalize every hex the AI wrote: strip stray spaces ("#FFFB F5" broke --cream),
+  //    validate #RRGGBB, else fall back to an elegant default.
+  const HEX_DEFAULTS = { cream: "#f8f5f0", white: "#ffffff", ink: "#141414", body: "#585858", accent: "#b08d57" };
+  for (const [k2, dflt] of Object.entries(HEX_DEFAULTS)) {
+    const v = String(th[k2] || "").replace(/\s+/g, "");
+    th[k2] = /^#[0-9a-f]{6}$/i.test(v) ? v : dflt;
+  }
+  // 1. body font must not be the display serif — a whole page set in Tenor Sans reads wrong
+  if (th.sansFont && th.serifFont && th.sansFont.trim().toLowerCase() === th.serifFont.trim().toLowerCase()) th.sansFont = "Montserrat";
+  const fam = (f) => String(f || "").trim().replace(/\s+/g, "+");
+  th.googleFontsHref = `https://fonts.googleapis.com/css2?family=${fam(th.serifFont || "Cormorant Garamond")}:wght@300;400;500;600&family=${fam(th.sansFont || "Montserrat")}:wght@300;400;500;600&display=swap`;
+  // 2. ink must be a near-neutral dark (headings in saturated navy/brand color look off-brand)
+  const hx = (h) => { const m = String(h || "").match(/^#?([0-9a-f]{6})$/i); if (!m) return null; const n = parseInt(m[1], 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; };
+  const inkRgb = hx(th.ink);
+  if (inkRgb) {
+    const [r, g, b2] = inkRgb, mx = Math.max(r, g, b2), mn = Math.min(r, g, b2);
+    const sat = mx === 0 ? 0 : (mx - mn) / mx, lum = (0.2126 * r + 0.7152 * g + 0.0722 * b2) / 255;
+    if (sat > 0.22 || lum > 0.28) th.ink = "#141414";   // headings must be near-neutral: navy #34394D (sat .32) was still reading as off-brand
+  } else th.ink = "#141414";
+  // 3. hairlines should be subtle & translucent, derived from the body tone — not solid accent
+  const bodyRgb = hx(th.body) || [89, 85, 77];
+  th.line = `rgba(${bodyRgb[0]}, ${bodyRgb[1]}, ${bodyRgb[2]}, 0.25)`;
+
+  // Collapse WordPress thumbnail derivatives to full-resolution originals in every
+  // image the AI picked (the same -300x222 upscale-blur fix proven in clone mode).
+  const fullSize = (u) => String(u || "").replace(/-\d{2,4}x\d{2,4}(?=\.(?:jpe?g|png|webp|avif)(?:\?|$))/i, "");
+  const fixImgsIn = (o) => {
+    if (!o || typeof o !== "object") return;
+    for (const k of Object.keys(o)) {
+      if (k === "image" || k === "logo") o[k] = fullSize(o[k]);
+      else if (typeof o[k] === "object") fixImgsIn(o[k]);
+    }
+  };
+  fixImgsIn(kit);
+
+  // Guard: NEVER let a reference-site image land in the page. The pool we sent is
+  // the client's own site, but the AI could hallucinate — strip anything whose host
+  // is not the client's (or a whitelisted CDN of theirs).
+  if (opts.allowedHost) {
+    const ok = (u) => { try { return !u || new URL(u).hostname.endsWith(opts.allowedHost); } catch (e) { return false; } };
+    const guard = (o) => {
+      if (!o || typeof o !== "object") return;
+      for (const k of Object.keys(o)) {
+        if ((k === "image" || k === "logo") && !ok(o[k])) o[k] = "";
+        else if (typeof o[k] === "object") guard(o[k]);
+      }
+    };
+    guard(kit);
+  }
+  return kit;
+}
+
+// Deterministic render: kit → complete HTML page (no AI). Layout comes from the
+// kit's AI-chosen "layout" (editorial | bold | minimal), falling back to editorial.
+async function renderEditorialHome(kit) {
+  const mod = await import(pathToFileURL(path.join(DIR, "lib", "editorial", "templates", "index.js")).href);
+  return mod.render(kit);
 }
 
 // Overwrite one CSS custom-property value inside the template's <style> block.
@@ -7271,6 +7575,112 @@ async function runJob(job) {
     pushSubtaskStep(job, "compose_prompt", "done", { detail:
       `Palette ${composed.primary}/${composed.accent} · ${composed.headingFont}` });
 
+    // ---- ENGINE SELECTION ----
+    // editorial (default) = the medspa-mockup-tool pipeline: scrape → one Gemini
+    //   BrandKit call → deterministic code-rendered template. Replaces CLONE_MODE.
+    // clone = legacy CLONE_MODE (kept, explicit env only).
+    // stitch = the original Stitch generation (BUILD_ENGINE=stitch, for parity tests).
+    const CLONE_ON = /^(1|on|true|yes)$/i.test(process.env.CLONE_MODE || "");
+    const ENGINE = CLONE_ON ? "clone"
+      : String((job.payload && job.payload.engine) || process.env.BUILD_ENGINE || "editorial").toLowerCase();
+
+    // ---- EDITORIAL ENGINE (step 2, same slot as Stitch generation — the TED
+    // constraint: this runs INSIDE the build job, so jobStep(2..) → postStatus fires
+    // with the unchanged step key `generate_pages`; only the LABEL text changes).
+    if (ENGINE === "editorial") {
+      const elog = (m) => console.log(`[editorial ${job.draftId}] ${m}`);
+      try { job.steps[2].label = "Generate pages (Editorial)"; } catch (e) { /* label only */ }
+      elog(`▶ editorial build started for "${A.business_name || "client"}"`);
+
+      const existingUrl = job.payload && job.payload.existingWebsite;
+      const referenceUrl = job.payload && job.payload.referenceWebsite;
+      let allowedHost = "";
+      try { allowedHost = new URL(/^https?:\/\//i.test(existingUrl) ? existingUrl : "https://" + existingUrl).hostname.replace(/^www\./, ""); } catch (e) { /* no existing site */ }
+
+      // 1/4 scrape the EXISTING site (images + facts). Reference site is scraped
+      // best-effort for DESIGN signals only (palette/fonts/screenshot) — its images
+      // are never offered to the AI (task 5's guard).
+      jobStep(job, 2, "running", `1/4 Scraping ${existingUrl ? String(existingUrl).replace(/^https?:\/\//, "") : "(no site — onboarding only)"}…`);
+      let raw = null;
+      if (existingUrl) {
+        try { raw = await editorialScrape(existingUrl); elog(`1/4 existing scraped: imgs ${raw.images.length}, palette ${raw.palette.length}, text ${raw.text.length}b${raw.screenshotB64 ? ", screenshot" : ""}`); }
+        catch (e) { elog(`1/4 existing scrape FAILED (${e.message.slice(0, 100)})`); }
+      }
+      if (!raw) raw = { title: A.business_name || "", metaDesc: "", palette: [], fonts: [], logo: "", images: [], text: A.business_description || "", screenshotB64: null };
+      // Drop decorative/texture/thumbnail junk from the AI's image pool — the same
+      // filter proven in clone mode. Without it a leaf-texture or gold-gradient PNG
+      // lands in the about/gallery slots and reads as an empty section.
+      const DECOR = /sprite|icon|logo|favicon|spacer|placeholder|blank|pixel|1x1|loader|avatar-default|\/thumbs\/|background|[-_]bg[-_.]|leaf-bg|gold-bg|golden-circle|gradient|wave|pattern|texture|divider|swirl|scrim|overlay|\.svg(\?|$)/i;
+      const beforeN = raw.images.length;
+      raw.images = (raw.images || []).filter((i) => i && i.src && !DECOR.test(i.src));
+      if (beforeN !== raw.images.length) elog(`1/4 image pool: dropped ${beforeN - raw.images.length} decorative/texture image(s), ${raw.images.length} content photo(s) remain`);
+      // Texture-heavy homepages (NUVO) can leave a 2-photo pool for ~12 slots. Deepen
+      // the pool with the multi-page crawler (home/about/services/team — already
+      // filtered + full-size) so hero/cards/providers each get their own photo.
+      if (existingUrl && raw.images.length < 8) {
+        try {
+          const extra = await extractSiteImages(existingUrl);
+          const have = new Set(raw.images.map((i) => i.src));
+          for (const rec of extra) {
+            if (have.has(rec.url) || DECOR.test(rec.url)) continue;
+            // filename → alt hint, so the AI can still match slots ("Jeannine-Fair…" → provider)
+            raw.images.push({ src: rec.url, alt: decodeURIComponent((rec.url.split("/").pop() || "").replace(/\.[a-z4]+$/i, "").replace(/[-_]+/g, " ")) });
+            have.add(rec.url);
+          }
+          elog(`1/4 image pool deepened via multi-page crawl → ${raw.images.length} photo(s)`);
+        } catch (e) { elog(`1/4 pool deepen skipped (${e.message.slice(0, 80)})`); }
+      }
+      if (referenceUrl && String(referenceUrl) !== String(existingUrl)) {
+        try {
+          const ref = await editorialScrape(referenceUrl);
+          // design-only merge: colors/fonts/screenshot may come from the reference; images NEVER do.
+          if (ref.palette && ref.palette.length) raw.palette = ref.palette;
+          if (ref.fonts && ref.fonts.length) raw.fonts = ref.fonts;
+          if (ref.screenshotB64) raw.screenshotB64 = ref.screenshotB64;
+          elog(`1/4 reference scraped for design: palette ${ref.palette.length}, fonts ${ref.fonts.length} (images ignored by design)`);
+        } catch (e) { elog(`1/4 reference scrape skipped (${e.message.slice(0, 80)})`); }
+      }
+
+      // 2/4 one Gemini call → BrandKit (seeded with the onboarding answers)
+      jobStep(job, 2, "running", "2/4 Extracting BrandKit (one AI call — colors, fonts, copy, image mapping)…");
+      const kit = await extractBrandKit(raw, A, { allowedHost });
+      // The client's real logo image (scraped off their site) rides next to the
+      // wordmark in the nav — saves the horizontal space a long name needs.
+      if (raw.logo && allowedHost && !/white|light|footer/i.test(raw.logo)) {
+        // "white"/"light" variants are for dark footers — invisible on the light nav.
+        try { if (new URL(raw.logo).hostname.endsWith(allowedHost)) (kit.brand = kit.brand || {}).logoImg = raw.logo; } catch (e) { /* skip */ }
+      }
+      elog(`2/4 BrandKit: layout=${kit.layout || "editorial"} accent=${(kit.theme || {}).accent} serif=${(kit.theme || {}).serifFont} sans=${(kit.theme || {}).sansFont} ink=${(kit.theme || {}).ink}${(kit.brand || {}).logoImg ? " · logo img" : ""}`);
+
+      // 3/4 deterministic render (code, no AI) + the engine-agnostic QC/SEO passes
+      jobStep(job, 2, "running", `3/4 Rendering ${kit.layout || "editorial"} layout (code, no AI)…`);
+      let html = await renderEditorialHome(kit);
+      try { html = enforceFooterFacts(html); } catch (e) { elog(`footer-facts pass skipped: ${e.message.slice(0, 80)}`); }
+      try { html = seoEnhance(html, "home"); } catch (e) { elog(`seo pass skipped: ${e.message.slice(0, 80)}`); }
+      try { html = await fixImages(html); } catch (e) { elog(`image QC pass skipped: ${e.message.slice(0, 80)}`); }
+      elog(`3/4 rendered ${html.length} bytes (QC+SEO applied)`);
+
+      // 4/4 write bundle + per-draft snapshot — identical contract to the other engines:
+      // GEN/site/index.html is what buildWpTheme reads, so steps 4-8 run unchanged.
+      const siteDir = path.join(GEN, "site");
+      fs.mkdirSync(siteDir, { recursive: true });
+      fs.writeFileSync(path.join(siteDir, "index.html"), html);
+      fs.writeFileSync(path.join(GEN, "home.html"), html);
+      job.pages = { home: { status: "done", bytes: html.length, error: "" } };
+      job.brandKit = { layout: kit.layout || "editorial", accent: (kit.theme || {}).accent, serifFont: (kit.theme || {}).serifFont, sansFont: (kit.theme || {}).sansFont, voice: kit.voice || "" };
+      job.homeContent = (composed && composed.brief) || "";   // TED content task, same as stitch
+      jobStep(job, 2, "done", `Editorial home rendered — ${kit.layout || "editorial"} layout · ${(kit.theme || {}).serifFont || ""}+${(kit.theme || {}).sansFont || ""} · ${html.length} bytes`);
+      pushSubtaskStep(job, "generate_pages", "done", { detail: `1/1 pages generated (editorial · ${kit.layout || "editorial"})` });
+      const snapDir = path.join(GEN, "exports", job.draftId, "site");
+      try { fs.rmSync(snapDir, { recursive: true, force: true }); fs.cpSync(siteDir, snapDir, { recursive: true }); } catch (e) { console.warn("editorial snapshot failed:", e.message); }
+      job.siteUrl = `/view/${encodeURIComponent(job.draftId)}/`;
+      jobStep(job, 3, "done", `Assembled (editorial engine · ${kit.layout || "editorial"} template)`);
+      elog(`4/4 assembled → preview ${job.siteUrl}`);
+      const willPush = (process.env.SKIP_PUSH || "off").toLowerCase() !== "on";
+      elog(willPush ? `▶ SKIP_PUSH off → continuing to WordPress theme build + PR…` : `■ SKIP_PUSH=on → stopping at preview (no WordPress PR)`);
+      // Falls through to the shared SKIP_PUSH check + WordPress theme/PR path below.
+    }
+
     // ---- CLONE_MODE (step 1): clone a reference template + apply the client's
     // brand by editing its CSS variables, then serve. Short-circuits the whole
     // Stitch/assemble pipeline (content + layout rewrites are later steps).
@@ -7308,6 +7718,24 @@ async function runJob(job) {
         jobStep(job, 2, "running", `4/6 Placing ${team.length} team member(s) from onboarding…`);
         html = applyTeamRoster(html, team);
       } else { clog(`4/6 team roster: none in onboarding — leaving template providers`); }
+
+      // --- 4.5 swap the template's stock photos for the CLIENT's real images ---
+      // The recontent step keeps every <img src> as-is (by design), so without this
+      // the clone shows the reference template's stock spa photography. Pull the real
+      // images off the client's existing site and map them onto the template's slots.
+      const existImgUrl = job.payload && (job.payload.existingWebsite || job.payload.referenceWebsite);
+      if (existImgUrl && !/^(0|off|false|no)$/i.test(process.env.CLONE_IMAGES || "on")) {
+        try {
+          jobStep(job, 2, "running", `Extracting real images from ${String(existImgUrl).replace(/^https?:\/\//, "")}…`);
+          const pool = await extractSiteImages(existImgUrl);
+          if (pool.length) {
+            const r = swapTemplateImages(html, pool);
+            html = r.html;
+            clog(`4.5 images: pulled ${pool.length} from client site → swapped ${r.swapped} ref(s) across ${r.slots} template slot(s)`);
+            jobStep(job, 2, "running", `Swapped ${r.swapped} stock photo(s) for ${pool.length} real image(s) from the client's site…`);
+          } else { clog(`4.5 images: none extracted from ${existImgUrl} — keeping template photos`); }
+        } catch (e) { clog(`4.5 image swap failed (${e.message.slice(0, 80)}) — keeping template photos`); }
+      }
 
       // --- 5/6 layout/design variation ---
       let variant = { idx: 0, name: "classic" };
@@ -7350,7 +7778,8 @@ async function runJob(job) {
     // The Stitch generation + AI-chrome assembly below is ONLY for the normal path;
     // clone mode already produced GEN/site/ above and jumps straight to the PR path.
     const isCloneBuild = /^(1|on|true|yes)$/i.test(process.env.CLONE_MODE || "");
-    if (!isCloneBuild) {
+    const isEditorialBuild = ENGINE === "editorial";
+    if (!isCloneBuild && !isEditorialBuild) {
     // 3 — generate all pages with Stitch
     // TEMPORARY (design-quality dev cycle, DESIGN_QUALITY_PLAN.md): while iterating
     // on the generation prompt, DEV_PAGES=on cuts a build to home only — 1 Stitch
