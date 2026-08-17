@@ -7331,6 +7331,11 @@ async function runJob(job) {
       fs.writeFileSync(path.join(GEN, "home.html"), html);
       job.pages = { home: { status: "done", bytes: html.length, error: "" } };
       jobStep(job, 2, "done", `Cloned ${path.basename(ref.file)} · brand bg ${brand.primary} / accent ${brand.accent} / ${brand.headingFont}+${brand.bodyFont}`);
+      // Close the "Generate pages" subtask in TED the MOMENT the clone page exists — the
+      // Stitch-path close at line ~7409 lives inside `if (!isCloneBuild)` and never runs for
+      // clone/Gemini builds, so without this the subtask stays "To do" forever. Fire-and-forget
+      // and idempotent on TED's side, matching the Stitch-path call.
+      pushSubtaskStep(job, "generate_pages", "done", { detail: `1 page generated (clone of ${path.basename(ref.file)})` });
       const snapDir = path.join(GEN, "exports", job.draftId, "site");
       try { fs.rmSync(snapDir, { recursive: true, force: true }); fs.cpSync(siteDir, snapDir, { recursive: true }); } catch (e) { console.warn("clone snapshot failed:", e.message); }
       job.siteUrl = `/view/${encodeURIComponent(job.draftId)}/`;
