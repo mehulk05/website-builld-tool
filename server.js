@@ -4359,12 +4359,27 @@ const TED_AUTOMATION_MARK = "[automated: Growth99 Studio]";
 const TED_AI_TOKEN = process.env.TED_AI_API_KEY || process.env.TED_API_TOKEN || "";
 function tedHtml(text) {
   const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  // A bare URL in plain text is linkified by whatever renders it; a bare URL
+  // inside a <p> is just words. The content-review invitation is nothing but a
+  // link, so it has to be anchored here or the comment is unusable. Runs after
+  // escaping, so an ampersand already reads &amp; — which is what belongs in an
+  // href anyway. The character class stops at whitespace and <, so it cannot
+  // reach past the escaped text it was given.
+  // Trailing sentence punctuation is not part of the address. A semicolon is
+  // deliberately not in that set: an escaped ampersand ends in one, and eating
+  // it would corrupt every query string with two parameters.
+  const link = (s) => s.replace(/https?:\/\/[^\s<]+/g, (u) => {
+    const tail = (u.match(/[.,:!?)\]]+$/) || [""])[0];
+    const href = u.slice(0, u.length - tail.length);
+    return `<a href="${href}">${href}</a>${tail}`;
+  });
+  const w = (s) => link(esc(s));
   return String(text || "").split(/\n{2,}/).map((block) => {
     const lines = block.split("\n").filter((l) => l.trim());
     if (lines.length > 1 && lines.every((l) => /^\s*[-*]\s/.test(l))) {
-      return "<ul>" + lines.map((l) => `<li>${esc(l.replace(/^\s*[-*]\s/, ""))}</li>`).join("") + "</ul>";
+      return "<ul>" + lines.map((l) => `<li>${w(l.replace(/^\s*[-*]\s/, ""))}</li>`).join("") + "</ul>";
     }
-    return `<p>${lines.map((l) => esc(l)).join("<br>")}</p>`;
+    return `<p>${lines.map((l) => w(l)).join("<br>")}</p>`;
   }).join("");
 }
 async function tedAiComment(taskId, text, eventKey) {
@@ -4381,6 +4396,23 @@ async function tedAiComment(taskId, text, eventKey) {
     if (!r.ok) return { ok: false, reason: `HTTP ${r.status}: ${(await r.text()).slice(0, 160)}` };
     return { ok: true, body: (await r.text()).slice(0, 300) };
   } catch (e) { return { ok: false, reason: String(e && e.message || e).slice(0, 140) }; }
+}
+
+// Say something on a task as the AI agent, falling back to a named comment if
+// the AI endpoint is unreachable. Everything this tool writes should read as the
+// tool, not as whoever's token it happens to be holding: TED credits a plain
+// comment to the token's owner, so an automated report arrives under a real
+// person's name and looks like that person wrote it by hand.
+//
+// The fallback stays, because a report under the wrong name is still far better
+// than no report. It is fire-and-forget on purpose — the caller has already done
+// the work this describes, and a TED outage must not fail the run.
+async function tedSayAsAi(taskId, text, eventKey) {
+  const ai = await tedAiComment(taskId, text, eventKey);
+  if (ai.ok) return true;
+  console.warn(`TED AI comment on ${taskId} failed (${ai.reason}) - falling back to a named comment`);
+  tedComment(text, null, 0, String(taskId));
+  return false;
 }
 
 function tedComment(text, image = null, attempt = 0, taskId = null) {
@@ -4696,10 +4728,14 @@ async function tedSubtaskTitle(subject, instruction) {
 //     so this starts working the day TED accepts it.
 //   * priority is silently ignored, and title cannot be changed after create.
 //   * departmentName is dropped on create but does apply on a follow-up PUT.
-async function tedCreateSubtask({ businessName, title, description, dueDate }) {
+// `parent` and `clientName` are overrides for callers that already know both —
+// the pre-release run hangs its subtasks off the release task it was given, not
+// off the revision-cycle task, and it reads the client straight from that task
+// rather than resolving the name through the site list a second time.
+async function tedCreateSubtask({ businessName, title, description, dueDate, parent, clientName }) {
   if (!TED_API_TOKEN || !TED_SUBTASKS) return null;
   try {
-    const parentId = await tedRevisionParent(businessName);
+    const parentId = parent || await tedRevisionParent(businessName);
     const created = await tedFetchJson("/api/tasks", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -4707,7 +4743,7 @@ async function tedCreateSubtask({ businessName, title, description, dueDate }) {
         title: tedAscii(title).slice(0, 120),
         parentId: Number(parentId),
         status: "Not Started",
-        clientName: await tedClientName(businessName).catch(() => undefined),
+        clientName: clientName || await tedClientName(businessName).catch(() => undefined),
         departmentName: "Onboarding Engineering",
         startDate: new Date().toISOString().slice(0, 10),
         ...(dueDate ? { dueDate } : {}),
@@ -5061,7 +5097,19 @@ function tedPostOutcome(job, outcome) {
   // shared and cache by URL, so the picture that came back was routinely of
   // another client's beta site — worse than no picture at all on a comment
   // whose whole job is to say precisely what changed. The words already say it.
-  if (P.tedTaskId) return tedComment(text, null, 0, P.tedTaskId);
+  //
+  // As the AI agent: a content writer selects a sentence on the beta site and
+  // the correction reports back here by itself, so the answer has no human
+  // author. Posted plainly it arrives under the token owner's name, and reads
+  // as though that person went and made the change.
+  //
+  // Keyed on the run, not the task — one task collects an outcome per
+  // correction, and TED drops the text of any comment whose eventKey it has
+  // already seen instead of updating it.
+  if (P.tedTaskId) {
+    tedSayAsAi(P.tedTaskId, text, `content-review:${P.tedTaskId}:outcome:${job.draftId}`).catch(() => {});
+    return;
+  }
   // Back onto the thread this request came from: the subtask the email flow
   // created, or the task the review link was posted on. Null when the subtask
   // could not be made (or subtasks are off), and tedComment then falls back to
@@ -5459,7 +5507,18 @@ async function tedPostReviewLink({ clientId, clientName, hubspotId, taskId, revi
     TED_REVIEW_MARK,
   ].filter((l, i) => l !== "" || i > 0).join("\n");
 
-  tedComment(text, null, 0, String(taskId));
+  // As the AI agent. Nobody wrote this invitation by hand — the webhook fired,
+  // the link was minted and posted — and under a person's name it reads like a
+  // colleague vouching for a URL, which is exactly the wrong impression to give
+  // about a link that carries a signed token.
+  //
+  // TED_REVIEW_MARK survives the trip: tedHtml only escapes & < >, so the
+  // duplicate-link guard that greps existing comments for it still matches.
+  //
+  // Keyed on the expiry, so re-issuing a link after the old one lapses posts a
+  // new comment rather than colliding with the previous invitation and being
+  // silently dropped.
+  await tedSayAsAi(String(taskId), text, `content-review:${taskId}:link:${exp}`);
   return { site, link: link.toString(), exp, pluginInstalled: installed };
 }
 
@@ -6919,17 +6978,321 @@ async function retryThemeActivationTail(draftId) {
 // ============================================================================
 const REF_DIR = path.join(DIR, "reference_sites");
 
-// Pick the reference template file. Explicit name wins; else the first *.html.
+// The default rich template every clone uses unless one is named explicitly.
+// atelier = 14-section luxury medspa layout with 18 image slots (hero, welcome,
+// treatments, providers, gallery, etc.) that get filled with the client's real
+// photos at build time. Override per-build with CLONE_TEMPLATE / payload.referenceTemplate.
+const DEFAULT_TEMPLATE = process.env.CLONE_TEMPLATE || "atelier";
+
+// Pick the reference template file. Explicit name wins; else the default rich
+// template; else (only if that's missing) the first *.html on disk.
 function pickReferenceTemplate(name) {
-  const safe = name ? String(name).replace(/[^a-z0-9._-]/gi, "") : "";
-  if (safe) {
+  const tryName = (raw) => {
+    const safe = raw ? String(raw).replace(/[^a-z0-9._-]/gi, "") : "";
+    if (!safe) return null;
     const f = path.join(REF_DIR, safe.endsWith(".html") ? safe : safe + ".html");
-    if (fs.existsSync(f)) return { file: f, html: fs.readFileSync(f, "utf8") };
-  }
+    return fs.existsSync(f) ? { file: f, html: fs.readFileSync(f, "utf8") } : null;
+  };
+  const chosen = tryName(name) || tryName(DEFAULT_TEMPLATE);
+  if (chosen) return chosen;
   const files = fs.existsSync(REF_DIR) ? fs.readdirSync(REF_DIR).filter((x) => /\.html?$/i.test(x)).sort() : [];
   if (!files.length) throw new Error(`no reference template found in ${REF_DIR}`);
   const file = path.join(REF_DIR, files[0]);
   return { file, html: fs.readFileSync(file, "utf8") };
+}
+
+// Pull the client's REAL content images off their existing site so a cloned
+// template shows the client's own photography, not the template's stock spa
+// pictures. Best-effort: fetches a few core pages, harvests <img src/data-src/
+// srcset> + CSS url(), absolutizes, drops logos/icons/spacers/svgs, dedupes,
+// and returns URLs in page order (hero-ish first). Never throws.
+async function extractSiteImages(siteUrl, max = 40) {
+  if (!siteUrl) return [];
+  let origin;
+  try { origin = new URL(/^https?:\/\//i.test(siteUrl) ? siteUrl : "https://" + siteUrl); }
+  catch (e) { return []; }
+  const base = origin.origin;
+  const pages = [base + "/", base + "/about/", base + "/services/", base + "/team/", base + "/about-us/"];
+  const seen = new Map(); const out = [];   // normalized url -> {url,w,h}
+  const abs = (u) => { try { return new URL(u, base).href; } catch (e) { return null; } };
+  // Reject logos/icons AND decorative textures/backgrounds/thumbnails — those are
+  // what made the first pass look blurry & empty (a texture PNG stretched into a hero).
+  const bad = /sprite|icon|logo|favicon|spacer|placeholder|blank|pixel|1x1|loader|avatar-default|\/thumbs\/|background|[-_]bg[-_.]|leaf-bg|gold-bg|golden-circle|gradient|wave|pattern|texture|divider|swirl|scrim|overlay|\.svg(\?|$)|^data:/i;
+  // WordPress emits many resized copies (name-300x222.webp); the un-suffixed URL is
+  // the full-resolution original. Collapse to it so nothing gets upscaled/blurred.
+  const fullSize = (u) => u.replace(/-\d{2,4}x\d{2,4}(?=\.(?:jpe?g|png|webp|avif)(?:\?|$))/i, "");
+  // Record a candidate, carrying any width/height we can read off a WxH suffix so
+  // downstream placement can tell a landscape hero shot from a portrait headshot.
+  const push = (u) => {
+    let a = abs(u); if (!a) return;
+    if (!/\.(jpe?g|png|webp|avif)(\?|$)/i.test(a)) return;
+    if (bad.test(a)) return;
+    const dm = a.match(/-(\d{2,4})x(\d{2,4})(?=\.(?:jpe?g|png|webp|avif)(?:\?|$))/i);
+    const w = dm ? +dm[1] : 0, h = dm ? +dm[2] : 0;
+    a = fullSize(a);
+    if (bad.test(a)) return;
+    const cur = seen.get(a);
+    if (cur) { cur.w = Math.max(cur.w, w); cur.h = Math.max(cur.h, h); return; }
+    const rec = { url: a, w, h }; seen.set(a, rec); out.push(rec);
+  };
+  for (const pg of pages) {
+    if (out.length >= max) break;
+    let html;
+    try { const r = await fetch(pg, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 G99Bot" } }); if (!r.ok) continue; html = await r.text(); }
+    catch (e) { continue; }
+    for (const m of html.matchAll(/<img\b[^>]*?\b(?:data-lazy-src|data-src|src)=["']([^"']+)["']/gi)) push(m[1]);
+    for (const m of html.matchAll(/\bsrcset=["']([^"']+)["']/gi)) {
+      const cands = m[1].split(",").map((s) => s.trim().split(/\s+/)[0]).filter(Boolean);
+      if (cands.length) push(cands[cands.length - 1]);   // largest candidate (carries WxH)
+    }
+    for (const m of html.matchAll(/url\((["']?)([^)"']+)\1\)/gi)) push(m[2]);
+  }
+  return out.slice(0, max);
+}
+
+// Sort an image into a placement bucket from its filename + orientation, so a
+// hero slot gets a wide lifestyle/interior shot, a card gets a treatment photo,
+// and a team slot gets a portrait — instead of arbitrary round-robin.
+function classifyClientImage(rec) {
+  const n = String(rec.url || "").toLowerCase();
+  const land = rec.w && rec.h ? rec.w >= rec.h * 1.15 : false;
+  const port = rec.w && rec.h ? rec.h >= rec.w * 1.15 : false;
+  // Order matters. Specific TREATMENT terms are checked first — otherwise generic
+  // brand/location boilerplate baked into every filename (e.g. "...-clinic-Sycamore-IL")
+  // would make everything a hero. Hero terms are kept deliberately narrow (no
+  // "clinic"/"space"/"room", which appear in boilerplate).
+  if (/treatment|facial|filler|tox|neuro|sculptra|microneedl|laser|peel|\biv\b|drip|inject|hair|weight|hydra|body|\bskin\b|glow|gel|serum|vial|bhrt|nad|glutathione|ariessence|sylfirm|regenerativ/.test(n)) return "treatment";
+  if (/welcome|\bhero\b|interior|lobby|reception|exterior|building|ambian|lifestyle|storefront|waiting/.test(n)) return "hero";
+  if (port || /team|headshot|portrait|provider|staff|founder|owner|nurse|\bnp-|\bpa-|-md\b|meet-|-face/.test(n)) return "portrait";
+  return "generic";   // unlabeled: never assume hero from orientation alone (a wide
+                      // headshot crop is NOT a hero). Generic still feeds background slots.
+}
+
+// Replace the template's stock image URLs — in BOTH <img src> and CSS url() — with
+// the client's real images, placed BY ROLE: the hero + CSS-background slots take
+// wide lifestyle shots, the inline <img> slots take treatment/portrait photos. Each
+// DISTINCT template URL maps to one real image so a picture reused in two spots stays
+// consistent. Pool empty => unchanged.
+function swapTemplateImages(html, pool) {
+  if (!pool || !pool.length) return { html, swapped: 0, slots: 0 };
+  const b = { hero: [], treatment: [], portrait: [], generic: [] };
+  for (const rec of pool) b[classifyClientImage(rec)].push(rec.url);
+  // Within the hero bucket, put genuine welcome/interior/reception shots ahead of
+  // wellness/vitality product-ish ones so the top hero slot gets the best photo.
+  const heroRank = (u) => (/welcome|interior|clinic|lobby|reception|space|room|banner|exterior|building|ambian|lifestyle/i.test(u) ? 0 : 1);
+  b.hero.sort((x, y) => heroRank(x) - heroRank(y));
+  // Preference order per slot kind, with graceful fallback to whatever exists.
+  const bgPool = [...b.hero, ...b.generic, ...b.treatment, ...b.portrait];
+  const imgPool = [...b.treatment, ...b.generic, ...b.portrait, ...b.hero];
+  const allUrls = pool.map((r) => r.url);
+  const take = (arr, ptr) => { const a = arr.length ? arr : allUrls; return a[ptr.i++ % a.length]; };
+
+  // First pass: distinct template URLs in first-seen order, each tagged bg vs img
+  // (bg wins if it appears in a url(), since those are the big visual slots).
+  const role = new Map(), first = new Map(); let idx = 0;
+  html.replace(/(src=|url\()\s*["']?([^"')\s]+\.(?:jpe?g|png|webp|avif)(?:\?[^"')\s]*)?)/gi, (m, pfx, u) => {
+    const r = /^url/i.test(pfx) ? "bg" : "img";
+    if (!first.has(u)) { first.set(u, idx++); role.set(u, r); }
+    else if (r === "bg") role.set(u, "bg");
+    return m;
+  });
+  const distinct = [...first.keys()].sort((x, y) => first.get(x) - first.get(y));
+  if (!distinct.length) return { html, swapped: 0, slots: 0 };
+
+  const ptrBg = { i: 0 }, ptrImg = { i: 0 };
+  const assign = new Map(); let heroDone = false;
+  for (const u of distinct) {
+    if (role.get(u) === "bg" && !heroDone) {                 // very first bg = the hero
+      assign.set(u, (b.hero[0] || bgPool[0] || allUrls[0])); heroDone = true;
+    } else if (role.get(u) === "bg") {
+      assign.set(u, take(bgPool, ptrBg));
+    } else {
+      assign.set(u, take(imgPool, ptrImg));
+    }
+  }
+  let swapped = 0, out = html;
+  for (const [from, to] of assign) {
+    if (!to) continue;
+    const re = new RegExp(from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+    out = out.replace(re, () => { swapped++; return to; });
+  }
+  return { html: out, swapped, slots: distinct.length };
+}
+
+// ============================== EDITORIAL ENGINE ==============================
+// The medspa-mockup-tool pipeline (scrape → BrandKit → code-rendered template),
+// running INSIDE the normal build job so every TED/G99 event fires exactly as a
+// Stitch build does (postStatus only emits for job.type === "build", and the
+// step keys/positions in JOB_STEP_KEYS are untouched — only step 2's label text
+// changes). AI writes only the CONTENT (one Gemini call → BrandKit JSON); the
+// LAYOUT is deterministic code (lib/editorial/templates/*).
+
+// Scrape a site the way the medspa tool does (Playwright: palette, fonts,
+// images with alt hints, text, full-page screenshot). Falls back to a fetch-only
+// "lite" scrape when Playwright isn't available (e.g. Render without the browser
+// download) — we lose the screenshot and palette, not the build.
+async function editorialScrape(url) {
+  try {
+    const mod = await import(pathToFileURL(path.join(DIR, "lib", "editorial", "scrape.js")).href);
+    return await mod.scrape(url);
+  } catch (e) {
+    console.warn(`editorial: playwright scrape failed (${String(e.message).slice(0, 120)}) — falling back to lite fetch scrape`);
+    return liteScrape(url);
+  }
+}
+function pathToFileURL(p) { return require("url").pathToFileURL(p); }
+async function liteScrape(url) {
+  const r = await fetch(/^https?:\/\//i.test(url) ? url : "https://" + url, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 G99Bot" } });
+  const html = await r.text();
+  const pick = (re) => (html.match(re) || [, ""])[1].trim();
+  const strip = (s) => s.replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>|<[^>]+>/gi, " ").replace(/\s+/g, " ").trim();
+  const imgs = [];
+  for (const m of html.matchAll(/<img\b[^>]*?\b(?:data-lazy-src|data-src|src)=["']([^"']+)["'][^>]*?(?:alt=["']([^"']*)["'])?/gi)) {
+    try { imgs.push({ src: new URL(m[1], r.url).href, alt: m[2] || "" }); } catch (e) { /* skip */ }
+  }
+  return {
+    title: pick(/<title[^>]*>([^<]*)<\/title>/i), metaDesc: pick(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["']/i),
+    palette: [], fonts: [], logo: "", images: imgs.slice(0, 40), text: strip(html).slice(0, 12000), screenshotB64: null,
+  };
+}
+
+// One Gemini call → BrandKit JSON — the medspa tool's extract(), but (a) routed
+// through geminiCall so key rotation + cost metering keep working, and (b) SEEDED
+// with the onboarding answers so the AI invents far less: the business name,
+// services, team, review and hero line are facts we already have.
+async function extractBrandKit(raw, A, opts = {}) {
+  const seedLines = [];
+  const val = (v) => Array.isArray(v) ? v.map((x) => (x && typeof x === "object") ? [x.name, x.title].filter(Boolean).join(" — ") : String(x)).join("; ") : (v == null ? "" : String(v));
+  if (A.business_name) seedLines.push(`business name: ${A.business_name}`);
+  if (A.location) seedLines.push(`city/address: ${A.location}`);
+  if (A.phone_for_website) seedLines.push(`phone: ${A.phone_for_website}`);
+  if (A.services_offered) seedLines.push(`services (use EXACTLY these for specialties/featured): ${val(A.services_offered)}`);
+  if (A.revenue_services) seedLines.push(`signature/revenue services: ${val(A.revenue_services)}`);
+  if (A.team_roster) seedLines.push(`providers (use EXACTLY these names/roles): ${val(A.team_roster)}`);
+  if (A.featured_review) seedLines.push(`a real client review (use it as one testimonial): ${val(A.featured_review)}`);
+  if (A.hero_headline) seedLines.push(`preferred hero headline: ${A.hero_headline}`);
+  if (A.hero_subheadline) seedLines.push(`preferred hero subheadline: ${A.hero_subheadline}`);
+  if (A.primary_cta) seedLines.push(`primary CTA label: ${A.primary_cta}`);
+  if (A.business_description) seedLines.push(`about the business: ${val(A.business_description)}`);
+
+  const prompt = `You are a luxury brand extractor for a med-spa website builder.
+Below is scraped data from the client's REAL med-spa site: page text, detected color palette, fonts${raw.screenshotB64 ? ", and a screenshot" : ""}.
+
+Return ONLY JSON matching this exact shape (no markdown fence):
+{
+  "brand": { "name": "", "sub": "", "topbar": "", "phone": "", "email": "", "city": "" },
+  "theme": {
+    "cream": "#hex", "white": "#ffffff", "ink": "#hex", "body": "#hex",
+    "line": "#hex", "accent": "#hex",
+    "serifFont": "Font Name", "sansFont": "Font Name",
+    "googleFontsHref": "https://fonts.googleapis.com/css2?...&display=swap"
+  },
+  "hero": { "eyebrow": "", "h1": "", "body": "", "cta": "", "image": "url-or-empty" },
+  "about": { "eyebrow": "", "h2": "", "paras": ["", ""], "cta": "", "image": "url-or-empty" },
+  "strip": ["", "", "", "", ""],
+  "specialties": { "eyebrow": "", "h2": "", "intro": "", "cards": [ { "h3": "", "p": "", "image": "url-or-empty" } ] },
+  "providers": { "eyebrow": "", "h2": "", "tabs": ["",""], "members": [ { "name": "", "role": "", "image": "url-or-empty" } ] },
+  "testimonials": { "eyebrow": "", "h2": "", "quotes": [ { "h4": "", "p": "", "cite": "" } ] },
+  "featured": { "h2": "", "items": [ { "h3": "", "p": "", "image": "url-or-empty" } ] },
+  "cta": { "eyebrow": "", "h2": "", "body": "" },
+  "footer": { "blurb": "", "logo": "url-or-empty" },
+  "voice": "one phrase, e.g. warm-clinical-luxe",
+  "layout": "editorial | bold | minimal — pick the best fit for this brand"
+}
+
+KNOWN FACTS FROM THE CLIENT'S ONBOARDING FORM — these override anything scraped; use them verbatim where they fit:
+${seedLines.join("\n") || "(none provided)"}
+
+RULES:
+- THEME: pick colors from the detected palette. ink = darkest text color, cream = warm off-white background, accent = the brand's signature warm/muted hue, line = subtle border. Convert rgb() to hex. Keep it elegant and high-contrast.${raw.palette && raw.palette.length ? "" : " (No palette detected — use elegant medspa defaults: cream #f8f5f0, ink #1f1c18, accent #b08d57.)"}
+- FONTS: identify a serif for headings and sans for body. If unclear, use elegant defaults (serif: "Cormorant Garamond", sans: "Montserrat"). Build a valid Google Fonts href for the two families.
+- COPY: REWRITE all copy in the brand's voice — do NOT copy sentences verbatim. Fit the slots: hero h1 short (2-5 words), card p ~15 words, keep it luxurious and modern. Invent plausible content where the source lacks it.
+- Provide 3 cards, 4 providers (fewer if onboarding lists fewer), 4 testimonial quotes, 3 featured items, 5 strip items.
+- IMAGES: you are given a pool of scraped images from the client's OWN site, each with an "alt" hint. Assign the MOST RELEVANT image URL (from the pool ONLY, copy the src exactly) to: hero.image, about.image, EACH specialties card, EACH featured item, and EACH provider (match a portrait to a person by alt text when possible). Prefer treatment/skin/spa/interior photos for cards & featured; prefer people/portrait photos for providers. NEVER invent URLs. If no image in the pool fits a slot, set it to "" (elegant fallback). Do not reuse the exact same image for every slot — spread them.
+
+SCRAPED DATA:
+title: ${raw.title}
+metaDesc: ${raw.metaDesc}
+palette: ${JSON.stringify(raw.palette || [])}
+fonts: ${JSON.stringify(raw.fonts || [])}
+logo: ${raw.logo || ""}
+IMAGE POOL (assign these exact src values to slots):
+${JSON.stringify((raw.images || []).map((i) => ({ src: i.src, alt: i.alt })).slice(0, 40))}
+--- TEXT ---
+${(raw.text || "").slice(0, 14000)}`;
+
+  const parts = [{ text: prompt }];
+  if (raw.screenshotB64) parts.push({ inlineData: { mimeType: "image/png", data: raw.screenshotB64 } });
+  // The default GEMINI_MODEL is a -lite tier; the medspa tool used a full flash model
+  // and its kits were visibly better (neutral ink, correct body font). Use the full
+  // model for this ONE call — it is the single AI step of the whole engine.
+  // Prefer the full flash model, but NEVER pin hard: opts.model bypasses geminiCall's
+  // fallback chain, so a 503 on the preferred model must fall back to the default chain.
+  let rawTxt;
+  try { rawTxt = await geminiCall(parts, { temperature: 0.7, maxOutputTokens: 8000, timeoutMs: 90000, model: process.env.BRANDKIT_MODEL || "gemini-flash-latest" }); }
+  catch (e) { console.warn(`brandkit: preferred model failed (${String(e.message).slice(0, 80)}) — retrying on the default chain`); rawTxt = await geminiCall(parts, { temperature: 0.7, maxOutputTokens: 8000, timeoutMs: 90000 }); }
+  const txt = rawTxt.trim().replace(/^```json?/i, "").replace(/```$/, "").trim();
+  const kit = JSON.parse(txt);
+
+  // --- theme sanitization (the three drifts that made pages look "off" vs the medspa tool) ---
+  const th = kit.theme || (kit.theme = {});
+  // 0. normalize every hex the AI wrote: strip stray spaces ("#FFFB F5" broke --cream),
+  //    validate #RRGGBB, else fall back to an elegant default.
+  const HEX_DEFAULTS = { cream: "#f8f5f0", white: "#ffffff", ink: "#141414", body: "#585858", accent: "#b08d57" };
+  for (const [k2, dflt] of Object.entries(HEX_DEFAULTS)) {
+    const v = String(th[k2] || "").replace(/\s+/g, "");
+    th[k2] = /^#[0-9a-f]{6}$/i.test(v) ? v : dflt;
+  }
+  // 1. body font must not be the display serif — a whole page set in Tenor Sans reads wrong
+  if (th.sansFont && th.serifFont && th.sansFont.trim().toLowerCase() === th.serifFont.trim().toLowerCase()) th.sansFont = "Montserrat";
+  const fam = (f) => String(f || "").trim().replace(/\s+/g, "+");
+  th.googleFontsHref = `https://fonts.googleapis.com/css2?family=${fam(th.serifFont || "Cormorant Garamond")}:wght@300;400;500;600&family=${fam(th.sansFont || "Montserrat")}:wght@300;400;500;600&display=swap`;
+  // 2. ink must be a near-neutral dark (headings in saturated navy/brand color look off-brand)
+  const hx = (h) => { const m = String(h || "").match(/^#?([0-9a-f]{6})$/i); if (!m) return null; const n = parseInt(m[1], 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; };
+  const inkRgb = hx(th.ink);
+  if (inkRgb) {
+    const [r, g, b2] = inkRgb, mx = Math.max(r, g, b2), mn = Math.min(r, g, b2);
+    const sat = mx === 0 ? 0 : (mx - mn) / mx, lum = (0.2126 * r + 0.7152 * g + 0.0722 * b2) / 255;
+    if (sat > 0.22 || lum > 0.28) th.ink = "#141414";   // headings must be near-neutral: navy #34394D (sat .32) was still reading as off-brand
+  } else th.ink = "#141414";
+  // 3. hairlines should be subtle & translucent, derived from the body tone — not solid accent
+  const bodyRgb = hx(th.body) || [89, 85, 77];
+  th.line = `rgba(${bodyRgb[0]}, ${bodyRgb[1]}, ${bodyRgb[2]}, 0.25)`;
+
+  // Collapse WordPress thumbnail derivatives to full-resolution originals in every
+  // image the AI picked (the same -300x222 upscale-blur fix proven in clone mode).
+  const fullSize = (u) => String(u || "").replace(/-\d{2,4}x\d{2,4}(?=\.(?:jpe?g|png|webp|avif)(?:\?|$))/i, "");
+  const fixImgsIn = (o) => {
+    if (!o || typeof o !== "object") return;
+    for (const k of Object.keys(o)) {
+      if (k === "image" || k === "logo") o[k] = fullSize(o[k]);
+      else if (typeof o[k] === "object") fixImgsIn(o[k]);
+    }
+  };
+  fixImgsIn(kit);
+
+  // Guard: NEVER let a reference-site image land in the page. The pool we sent is
+  // the client's own site, but the AI could hallucinate — strip anything whose host
+  // is not the client's (or a whitelisted CDN of theirs).
+  if (opts.allowedHost) {
+    const ok = (u) => { try { return !u || new URL(u).hostname.endsWith(opts.allowedHost); } catch (e) { return false; } };
+    const guard = (o) => {
+      if (!o || typeof o !== "object") return;
+      for (const k of Object.keys(o)) {
+        if ((k === "image" || k === "logo") && !ok(o[k])) o[k] = "";
+        else if (typeof o[k] === "object") guard(o[k]);
+      }
+    };
+    guard(kit);
+  }
+  return kit;
+}
+
+// Deterministic render: kit → complete HTML page (no AI). Layout comes from the
+// kit's AI-chosen "layout" (editorial | bold | minimal), falling back to editorial.
+async function renderEditorialHome(kit) {
+  const mod = await import(pathToFileURL(path.join(DIR, "lib", "editorial", "templates", "index.js")).href);
+  return mod.render(kit);
 }
 
 // Overwrite one CSS custom-property value inside the template's <style> block.
@@ -7326,6 +7689,114 @@ async function runJob(job) {
     pushSubtaskStep(job, "compose_prompt", "done", { detail:
       `Palette ${composed.primary}/${composed.accent} · ${composed.headingFont}` });
 
+    // ---- ENGINE SELECTION ----
+    // editorial (default) = the medspa-mockup-tool pipeline: scrape → one Gemini
+    //   BrandKit call → deterministic code-rendered template. Replaces CLONE_MODE.
+    // clone = legacy CLONE_MODE (kept, explicit env only).
+    // stitch = the original Stitch generation (BUILD_ENGINE=stitch, for parity tests).
+    const CLONE_ON = /^(1|on|true|yes)$/i.test(process.env.CLONE_MODE || "");
+    const ENGINE_RAW = CLONE_ON ? "clone"
+      : String((job.payload && job.payload.engine) || process.env.BUILD_ENGINE || "webgen").toLowerCase();
+    // Stitch is retired — any stitch request generates with our Gemini/webgen engine instead.
+    const ENGINE = ENGINE_RAW === "stitch" ? "webgen" : ENGINE_RAW;
+
+    // ---- EDITORIAL ENGINE (step 2, same slot as Stitch generation — the TED
+    // constraint: this runs INSIDE the build job, so jobStep(2..) → postStatus fires
+    // with the unchanged step key `generate_pages`; only the LABEL text changes).
+    if (ENGINE === "editorial") {
+      const elog = (m) => console.log(`[editorial ${job.draftId}] ${m}`);
+      try { job.steps[2].label = "Generate pages (Editorial)"; } catch (e) { /* label only */ }
+      elog(`▶ editorial build started for "${A.business_name || "client"}"`);
+
+      const existingUrl = job.payload && job.payload.existingWebsite;
+      const referenceUrl = job.payload && job.payload.referenceWebsite;
+      let allowedHost = "";
+      try { allowedHost = new URL(/^https?:\/\//i.test(existingUrl) ? existingUrl : "https://" + existingUrl).hostname.replace(/^www\./, ""); } catch (e) { /* no existing site */ }
+
+      // 1/4 scrape the EXISTING site (images + facts). Reference site is scraped
+      // best-effort for DESIGN signals only (palette/fonts/screenshot) — its images
+      // are never offered to the AI (task 5's guard).
+      jobStep(job, 2, "running", `1/4 Scraping ${existingUrl ? String(existingUrl).replace(/^https?:\/\//, "") : "(no site — onboarding only)"}…`);
+      let raw = null;
+      if (existingUrl) {
+        try { raw = await editorialScrape(existingUrl); elog(`1/4 existing scraped: imgs ${raw.images.length}, palette ${raw.palette.length}, text ${raw.text.length}b${raw.screenshotB64 ? ", screenshot" : ""}`); }
+        catch (e) { elog(`1/4 existing scrape FAILED (${e.message.slice(0, 100)})`); }
+      }
+      if (!raw) raw = { title: A.business_name || "", metaDesc: "", palette: [], fonts: [], logo: "", images: [], text: A.business_description || "", screenshotB64: null };
+      // Drop decorative/texture/thumbnail junk from the AI's image pool — the same
+      // filter proven in clone mode. Without it a leaf-texture or gold-gradient PNG
+      // lands in the about/gallery slots and reads as an empty section.
+      const DECOR = /sprite|icon|logo|favicon|spacer|placeholder|blank|pixel|1x1|loader|avatar-default|\/thumbs\/|background|[-_]bg[-_.]|leaf-bg|gold-bg|golden-circle|gradient|wave|pattern|texture|divider|swirl|scrim|overlay|\.svg(\?|$)/i;
+      const beforeN = raw.images.length;
+      raw.images = (raw.images || []).filter((i) => i && i.src && !DECOR.test(i.src));
+      if (beforeN !== raw.images.length) elog(`1/4 image pool: dropped ${beforeN - raw.images.length} decorative/texture image(s), ${raw.images.length} content photo(s) remain`);
+      // Texture-heavy homepages (NUVO) can leave a 2-photo pool for ~12 slots. Deepen
+      // the pool with the multi-page crawler (home/about/services/team — already
+      // filtered + full-size) so hero/cards/providers each get their own photo.
+      if (existingUrl && raw.images.length < 8) {
+        try {
+          const extra = await extractSiteImages(existingUrl);
+          const have = new Set(raw.images.map((i) => i.src));
+          for (const rec of extra) {
+            if (have.has(rec.url) || DECOR.test(rec.url)) continue;
+            // filename → alt hint, so the AI can still match slots ("Jeannine-Fair…" → provider)
+            raw.images.push({ src: rec.url, alt: decodeURIComponent((rec.url.split("/").pop() || "").replace(/\.[a-z4]+$/i, "").replace(/[-_]+/g, " ")) });
+            have.add(rec.url);
+          }
+          elog(`1/4 image pool deepened via multi-page crawl → ${raw.images.length} photo(s)`);
+        } catch (e) { elog(`1/4 pool deepen skipped (${e.message.slice(0, 80)})`); }
+      }
+      if (referenceUrl && String(referenceUrl) !== String(existingUrl)) {
+        try {
+          const ref = await editorialScrape(referenceUrl);
+          // design-only merge: colors/fonts/screenshot may come from the reference; images NEVER do.
+          if (ref.palette && ref.palette.length) raw.palette = ref.palette;
+          if (ref.fonts && ref.fonts.length) raw.fonts = ref.fonts;
+          if (ref.screenshotB64) raw.screenshotB64 = ref.screenshotB64;
+          elog(`1/4 reference scraped for design: palette ${ref.palette.length}, fonts ${ref.fonts.length} (images ignored by design)`);
+        } catch (e) { elog(`1/4 reference scrape skipped (${e.message.slice(0, 80)})`); }
+      }
+
+      // 2/4 one Gemini call → BrandKit (seeded with the onboarding answers)
+      jobStep(job, 2, "running", "2/4 Extracting BrandKit (one AI call — colors, fonts, copy, image mapping)…");
+      const kit = await extractBrandKit(raw, A, { allowedHost });
+      // The client's real logo image (scraped off their site) rides next to the
+      // wordmark in the nav — saves the horizontal space a long name needs.
+      if (raw.logo && allowedHost && !/white|light|footer/i.test(raw.logo)) {
+        // "white"/"light" variants are for dark footers — invisible on the light nav.
+        try { if (new URL(raw.logo).hostname.endsWith(allowedHost)) (kit.brand = kit.brand || {}).logoImg = raw.logo; } catch (e) { /* skip */ }
+      }
+      elog(`2/4 BrandKit: layout=${kit.layout || "editorial"} accent=${(kit.theme || {}).accent} serif=${(kit.theme || {}).serifFont} sans=${(kit.theme || {}).sansFont} ink=${(kit.theme || {}).ink}${(kit.brand || {}).logoImg ? " · logo img" : ""}`);
+
+      // 3/4 deterministic render (code, no AI) + the engine-agnostic QC/SEO passes
+      jobStep(job, 2, "running", `3/4 Rendering ${kit.layout || "editorial"} layout (code, no AI)…`);
+      let html = await renderEditorialHome(kit);
+      try { html = enforceFooterFacts(html); } catch (e) { elog(`footer-facts pass skipped: ${e.message.slice(0, 80)}`); }
+      try { html = seoEnhance(html, "home"); } catch (e) { elog(`seo pass skipped: ${e.message.slice(0, 80)}`); }
+      try { html = await fixImages(html); } catch (e) { elog(`image QC pass skipped: ${e.message.slice(0, 80)}`); }
+      elog(`3/4 rendered ${html.length} bytes (QC+SEO applied)`);
+
+      // 4/4 write bundle + per-draft snapshot — identical contract to the other engines:
+      // GEN/site/index.html is what buildWpTheme reads, so steps 4-8 run unchanged.
+      const siteDir = path.join(GEN, "site");
+      fs.mkdirSync(siteDir, { recursive: true });
+      fs.writeFileSync(path.join(siteDir, "index.html"), html);
+      fs.writeFileSync(path.join(GEN, "home.html"), html);
+      job.pages = { home: { status: "done", bytes: html.length, error: "" } };
+      job.brandKit = { layout: kit.layout || "editorial", accent: (kit.theme || {}).accent, serifFont: (kit.theme || {}).serifFont, sansFont: (kit.theme || {}).sansFont, voice: kit.voice || "" };
+      job.homeContent = (composed && composed.brief) || "";   // TED content task, same as stitch
+      jobStep(job, 2, "done", `Editorial home rendered — ${kit.layout || "editorial"} layout · ${(kit.theme || {}).serifFont || ""}+${(kit.theme || {}).sansFont || ""} · ${html.length} bytes`);
+      pushSubtaskStep(job, "generate_pages", "done", { detail: `1/1 pages generated (editorial · ${kit.layout || "editorial"})` });
+      const snapDir = path.join(GEN, "exports", job.draftId, "site");
+      try { fs.rmSync(snapDir, { recursive: true, force: true }); fs.cpSync(siteDir, snapDir, { recursive: true }); } catch (e) { console.warn("editorial snapshot failed:", e.message); }
+      job.siteUrl = `/view/${encodeURIComponent(job.draftId)}/`;
+      jobStep(job, 3, "done", `Assembled (editorial engine · ${kit.layout || "editorial"} template)`);
+      elog(`4/4 assembled → preview ${job.siteUrl}`);
+      const willPush = (process.env.SKIP_PUSH || "off").toLowerCase() !== "on";
+      elog(willPush ? `▶ SKIP_PUSH off → continuing to WordPress theme build + PR…` : `■ SKIP_PUSH=on → stopping at preview (no WordPress PR)`);
+      // Falls through to the shared SKIP_PUSH check + WordPress theme/PR path below.
+    }
+
     // ---- CLONE_MODE (step 1): clone a reference template + apply the client's
     // brand by editing its CSS variables, then serve. Short-circuits the whole
     // Stitch/assemble pipeline (content + layout rewrites are later steps).
@@ -7364,6 +7835,24 @@ async function runJob(job) {
         html = applyTeamRoster(html, team);
       } else { clog(`4/6 team roster: none in onboarding — leaving template providers`); }
 
+      // --- 4.5 swap the template's stock photos for the CLIENT's real images ---
+      // The recontent step keeps every <img src> as-is (by design), so without this
+      // the clone shows the reference template's stock spa photography. Pull the real
+      // images off the client's existing site and map them onto the template's slots.
+      const existImgUrl = job.payload && (job.payload.existingWebsite || job.payload.referenceWebsite);
+      if (existImgUrl && !/^(0|off|false|no)$/i.test(process.env.CLONE_IMAGES || "on")) {
+        try {
+          jobStep(job, 2, "running", `Extracting real images from ${String(existImgUrl).replace(/^https?:\/\//, "")}…`);
+          const pool = await extractSiteImages(existImgUrl);
+          if (pool.length) {
+            const r = swapTemplateImages(html, pool);
+            html = r.html;
+            clog(`4.5 images: pulled ${pool.length} from client site → swapped ${r.swapped} ref(s) across ${r.slots} template slot(s)`);
+            jobStep(job, 2, "running", `Swapped ${r.swapped} stock photo(s) for ${pool.length} real image(s) from the client's site…`);
+          } else { clog(`4.5 images: none extracted from ${existImgUrl} — keeping template photos`); }
+        } catch (e) { clog(`4.5 image swap failed (${e.message.slice(0, 80)}) — keeping template photos`); }
+      }
+
       // --- 5/6 layout/design variation ---
       let variant = { idx: 0, name: "classic" };
       if (!/^(0|off|false|no)$/i.test(process.env.CLONE_LAYOUT || "on")) {
@@ -7386,6 +7875,11 @@ async function runJob(job) {
       fs.writeFileSync(path.join(GEN, "home.html"), html);
       job.pages = { home: { status: "done", bytes: html.length, error: "" } };
       jobStep(job, 2, "done", `Cloned ${path.basename(ref.file)} · brand bg ${brand.primary} / accent ${brand.accent} / ${brand.headingFont}+${brand.bodyFont}`);
+      // Close the "Generate pages" subtask in TED the MOMENT the clone page exists — the
+      // Stitch-path close at line ~7409 lives inside `if (!isCloneBuild)` and never runs for
+      // clone/Gemini builds, so without this the subtask stays "To do" forever. Fire-and-forget
+      // and idempotent on TED's side, matching the Stitch-path call.
+      pushSubtaskStep(job, "generate_pages", "done", { detail: `1 page generated (clone of ${path.basename(ref.file)})` });
       const snapDir = path.join(GEN, "exports", job.draftId, "site");
       try { fs.rmSync(snapDir, { recursive: true, force: true }); fs.cpSync(siteDir, snapDir, { recursive: true }); } catch (e) { console.warn("clone snapshot failed:", e.message); }
       job.siteUrl = `/view/${encodeURIComponent(job.draftId)}/`;
@@ -7401,13 +7895,12 @@ async function runJob(job) {
     // clone mode already produced GEN/site/ above and jumps straight to the PR path.
     const isCloneBuild = /^(1|on|true|yes)$/i.test(process.env.CLONE_MODE || "");
 
-    // ---- WEBGEN engine (default): our in-house design engine replaces Stitch for the
-    // 4 core pages. Composes a structured BrandKit from onboarding + the client's scanned
-    // site, renders Home/Services/About/Team, writes GEN/site/, then falls through to the
-    // shared WordPress theme/PR path below (identical contract to Stitch's GEN/site output).
-    // Set ENGINE=stitch to fall back to the legacy Stitch generation.
-    const ENGINE = (process.env.ENGINE || "webgen").toLowerCase();
-    const useWebgen = ENGINE !== "stitch" && !isCloneBuild;
+    // ---- WEBGEN engine (default): our in-house design engine — 4 designs + variants,
+    // Composes a structured BrandKit from onboarding + the client's scanned site, renders
+    // Home/Services/About/Team into GEN/site/, then falls through to the shared WP theme/PR
+    // path. Reuses the ENGINE var from the selector above (mutually exclusive with
+    // editorial/clone/stitch): default is "webgen"; set BUILD_ENGINE to switch.
+    const useWebgen = ENGINE === "webgen" && !isCloneBuild;
     if (useWebgen) {
       jobStep(job, 2, "running", "Scanning site + composing content (webgen)…");
       const existingUrl = job.payload && (job.payload.existingWebsite || job.payload.referenceWebsite);
@@ -7434,7 +7927,7 @@ async function runJob(job) {
       jobStep(job, 3, "done", "Assembled (webgen engine)");
     }
 
-    if (!isCloneBuild && !useWebgen) {
+    if (ENGINE === "stitch") { // retired — unreachable (ENGINE is coerced away from stitch above)
     // 3 — generate all pages with Stitch
     // TEMPORARY (design-quality dev cycle, DESIGN_QUALITY_PLAN.md): while iterating
     // on the generation prompt, DEV_PAGES=on cuts a build to home only — 1 Stitch
@@ -7490,6 +7983,12 @@ async function runJob(job) {
       if (k) job.pages[k] = { status: pr.error ? "error" : "done", bytes: pr.htmlBytes || 0, error: pr.error || "" };
     }
     if (!ok.length) throw new Error("Stitch generated 0 pages: " + (((gen.pages || [])[0] || {}).error || "no output"));
+    // Close the "Generate pages" subtask in TED the MOMENT pages exist — whatever engine
+    // (Stitch or Gemini) produced them. Fired here, before the home/theme/PR checks below, so a
+    // build that generates pages but stops later still closes this subtask (the earlier position,
+    // after those checks, meant any downstream failure left the task open forever). Fire-and-forget
+    // and idempotent on TED's side, so re-confirming later is harmless.
+    pushSubtaskStep(job, "generate_pages", "done", { detail: `${ok.length}/${(gen.pages || []).length} pages generated` });
     // HOME is mandatory: buildWpTheme derives front-page.php AND the shared
     // header.php/footer.php from it, so a failed home ships a theme with an empty
     // homepage and no navigation. Fail loudly instead of releasing that.
@@ -7499,7 +7998,6 @@ async function runJob(job) {
         ") — the theme's header/footer/front page all derive from home, so the build was stopped rather than ship a homepage with no content or navigation. Re-run to retry.");
     }
     jobStep(job, 2, "done", `${ok.length}/${(gen.pages || []).length} pages generated`);
-    pushSubtaskStep(job, "generate_pages", "done", { detail: `${ok.length}/${(gen.pages || []).length} pages generated` });
 
     // Home content for the TED content-task push (done later in runThemeActivationTail, once the site
     // is live). Prefer the composed home brief (from the client's real structure); fall back to the
@@ -12034,6 +12532,66 @@ const PERFORM_PR_STEPS = [
   "Publish report",
 ];
 
+// ---- the checklist people actually read -------------------------------------
+// The 13 steps above are the pipeline: eight of them are plumbing (clone, push,
+// merge) with no verdict to give. The checklist below is the QA list a human
+// signs off, and it is what gets a TED subtask each. So the two lists are
+// deliberately different shapes, and this is the mapping between them.
+//
+// One subtask per line here, one comment per subtask. That is the whole point of
+// the split: a report about spelling lands on the spelling task, not in a
+// fourteen-section document nobody opens twice.
+//
+// `labels` are prTasks[].label values (the verdict + detail line). `slugs` are
+// prFinding() task slugs (the individual findings). They are separate vocabularies
+// in this file and an item generally needs both.
+//
+// Two slugs are deliberately unmapped: `link-check` (the post-deploy live link
+// crawl) and `live-verify` (post-deploy favicon/og:image fetch). Both need a
+// merged, deployed build, so neither can report in a dry run — they go to the
+// parent task's index comment instead of owning a subtask that would sit empty.
+const PRE_RELEASE_CHECKLIST = [
+  { key: "sitemap", title: "Sitemap & Page Check",
+    what: "Every page on the client's current live site has a match on the new one, read from their sitemap.",
+    labels: ["Pages from the live site"], slugs: ["missing-pages"] },
+  { key: "urls", title: "URL Structure",
+    what: "Page slugs follow the agreed structure, with redirects written for anything renamed.",
+    labels: ["Location + URL structure"], slugs: ["url-structure"] },
+  { key: "links", title: "Internal Links",
+    what: "Every internal link in the page templates, header and footer resolves to a page that exists.",
+    labels: ["Internal links"], slugs: ["internal-links"] },
+  { key: "identity", title: "Business Name & Contact Details",
+    what: "The business name is spelled consistently, and phone, email and address agree across every page.",
+    labels: ["Business name", "Contact details"], slugs: ["business-name", "contact-details"] },
+  { key: "cta", title: "CTA on Every Page",
+    what: "No page is a dead end - each one offers a way to book or get in touch.",
+    labels: ["CTA on every page"], slugs: ["cta"] },
+  { key: "clickable", title: "Clickable Contact",
+    what: "Phone numbers and email addresses are tel:/mailto: links, not plain text.",
+    labels: ["Clickable contact"], slugs: ["clickable-contact"] },
+  { key: "content", title: "Spelling & Content Review",
+    what: "Spelling across the site, plus a page-by-page read for content problems.",
+    labels: ["Spelling", "Page audit"], slugs: ["spelling", "page-audit"] },
+  { key: "images", title: "Image Optimization",
+    what: "Images are named for what they show and served at a sensible format and weight.",
+    labels: ["Image naming", "Image format + weight"], slugs: ["image-naming", "image-format", "image-weight"] },
+  { key: "favicon", title: "Favicon",
+    what: "The theme emits a favicon and it actually loads.",
+    labels: ["Favicon"], slugs: ["favicon"] },
+  { key: "social", title: "Social Sharing Image",
+    what: "An og:image is set, so a shared link renders as a card rather than a bare URL.",
+    labels: ["Social sharing image"], slugs: [] },
+  { key: "notfound", title: "Custom 404 Page",
+    what: "A branded 404 page exists instead of the theme default.",
+    labels: ["Custom 404"], slugs: [] },
+  { key: "theme", title: "Growth99 Theme Conventions",
+    what: "Call Now button, BLVD booking button IDs, blog sidebar widget and blog link colour.",
+    labels: ["Call Now", "BLVD button ID", "Blog sidebar widget", "Blog link colour"], slugs: [] },
+  { key: "pagespeed", title: "PageSpeed (Mobile & Desktop)",
+    what: "Lighthouse performance, accessibility, best-practices and SEO scores on both form factors.",
+    labels: ["PageSpeed"], slugs: ["pagespeed"] },
+];
+
 // ---- phase 0: the client's current live site ---------------------------------
 // Their real site is the beta domain with the Growth99 staging label taken out:
 // brew-aesthetics.gogroth.com -> brew-aesthetics.com. Per product decision the
@@ -12676,6 +13234,22 @@ function replaceInTextNodes(src, from, to) {
 // correct value is known and swapping it is mechanical. Name *variants* — a page
 // saying "Brew" where the record says "Brew Aesthetics" — stay a decision,
 // because shortening a name on purpose is a normal thing for copy to do.
+// TED's client records carry working suffixes that are not part of the business's
+// name: "NUVO Aesthetics Clinic v2 (clone)" is one clinic, not a clinic called
+// "v2 (clone)". Written straight into the theme they land in the h1, the footer
+// copyright, body copy and — seen on 2026-08-15 — inside a quoted patient
+// testimonial, so the site introduced itself as "(clone)".
+//
+// Deliberately a fixed list rather than "strip any trailing parenthetical": a real
+// business can be "Smith Dermatology (Downtown)", and dropping that is its own bug.
+const CLONE_SUFFIX_RE = /\s*(?:\((?:clone|copy|test|demo|sandbox|staging)\)|\bv\d+)\s*$/i;
+function contentBusinessName(name) {
+  let s = String(name || "").trim(), prev;
+  do { prev = s; s = s.replace(CLONE_SUFFIX_RE, "").trim(); } while (s !== prev && s);
+  // Never return nothing: a client actually called "v2" keeps its name.
+  return s || String(name || "").trim();
+}
+
 function fixBusinessName(themeAbs, pages, businessName, siteName, themePath) {
   const correct = String(businessName || "").trim();
   const wrong = String(siteName || "").trim();
@@ -13502,6 +14076,179 @@ async function closeSupersededPerformPrs(repo, themeSlug, keepPrUrl) {
   }
 }
 
+// ---- the checklist, as TED subtasks -----------------------------------------
+// One subtask per PRE_RELEASE_CHECKLIST line, created up front under the release
+// task so the board shows the whole checklist before the run has anything to say
+// about it. Each one then receives its own report as a comment.
+//
+// Fail-soft per item, not per batch: TED refusing one create must not cost the
+// other twelve their reports. An item whose subtask is null simply has nowhere to
+// post, and the parent's index comment still carries its verdict.
+async function createPreReleaseSubtasks(job, parentTaskId) {
+  const made = {};
+  let clientName, dueDate;
+  try {
+    const parent = await tedFetchJson(`/api/tasks/${parentTaskId}`);
+    // TED stores an unset client as the string "[]", which is not a client name.
+    if (parent && parent.clientName && String(parent.clientName) !== "[]") clientName = parent.clientName;
+    if (parent && parent.dueDate) dueDate = parent.dueDate;
+  } catch (e) {
+    console.warn(`pre-release: could not read task ${parentTaskId} (${e.message}) - creating subtasks without its client`);
+  }
+
+  // A release task gets one checklist, not one per attempt. Re-running after a
+  // failure, or after someone fixed what the first pass flagged, must land on the
+  // same thirteen tasks people have already opened, assigned and commented on —
+  // otherwise the second run buries the first under a duplicate set.
+  const existing = new Map();
+  try {
+    for (const s of await tedListSubtasks(parentTaskId)) {
+      if (s && s.id && s.title) existing.set(String(s.title).trim(), String(s.id));
+    }
+  } catch (e) {
+    console.warn(`pre-release: could not list subtasks of ${parentTaskId} (${e.message}) - assuming none exist`);
+  }
+
+  for (const item of PRE_RELEASE_CHECKLIST) {
+    const title = `Pre-Release: ${item.title}`;
+    const reuse = existing.get(title);
+    if (reuse) {
+      made[item.key] = reuse;
+      continue;
+    }
+    const id = await tedCreateSubtask({
+      businessName: job.businessName, parent: String(parentTaskId), clientName, dueDate,
+      title: `Pre-Release: ${item.title}`,
+      description: [item.what, "",
+        `Checked automatically as part of the pre-release run for ${job.businessName}.`,
+        "The result is posted as a comment on this task when the run reaches it.",
+      ].join("\n"),
+    });
+    made[item.key] = id;
+    if (!id) console.warn(`pre-release: subtask for "${item.title}" was not created`);
+  }
+  job.checklistSubtasks = made;
+  saveJobs();
+  const n = Object.values(made).filter(Boolean).length;
+  console.log(`pre-release: ${n}/${PRE_RELEASE_CHECKLIST.length} checklist subtask(s) created under ${parentTaskId}`);
+  return made;
+}
+
+// A dry run computes its fixes into a temp checkout and throws it away, so a
+// check that "fixed" something has not fixed anything anyone can see yet. Saying
+// "Fixed" here would be a straightforward lie on a task someone signs off.
+//
+// Unresolved findings outrank a "skipped" check. Phase 2 overwrites a check's
+// status when its fix declines to run, so an audit that found seven real
+// problems ends up labelled "skipped" because the fix could not reach them —
+// the slug lives in the WordPress database, say. Skipping the fix is not the
+// same as having nothing to report, and only the findings know the difference.
+function checklistVerdict(tasks, dry, findings = []) {
+  if (!tasks.length) return "Not run";
+  const unresolved = findings.filter((f) => f.outcome && f.outcome !== OUTCOME.DONE).length;
+  if (tasks.some((t) => t.status === "fail") || unresolved) return "Needs attention";
+  if (tasks.some((t) => t.status === "fixed")) return dry ? "Fix ready" : "Fixed";
+  if (tasks.every((t) => t.status === "skipped")) return "Skipped";
+  return "Pass";
+}
+
+// The report for one checklist line. Everything it needs is already on the job —
+// this only decides which slice belongs to this item and how to say it.
+function checklistItemReport(job, item) {
+  const dry = !!(job.payload && job.payload.dryRun);
+  const tasks = (job.prTasks || []).filter((t) => item.labels.includes(t.label));
+  const findings = (job.prFindings || []).filter((f) => item.slugs.includes(f.task));
+  const verdict = checklistVerdict(tasks, dry, findings);
+  const L = [`${item.title}: ${verdict}`, "", item.what, ""];
+
+  // The check's own one-line summary, which is usually the whole answer.
+  for (const t of tasks) L.push(`- ${t.label}: ${t.detail || t.status}`);
+  // A label in the checklist that produced no check means the two lists have
+  // drifted apart - worth saying out loud rather than quietly reporting a pass.
+  const missing = item.labels.filter((l) => !tasks.some((t) => t.label === l));
+  if (missing.length && tasks.length) L.push(`- Not reached in this run: ${missing.join(", ")}`);
+
+  // A dedicated comment on a dedicated task can afford more detail than a line
+  // in a combined report could - collapsing at three was for a document carrying
+  // twenty checks at once, which is exactly what this replaced.
+  if (findings.length) {
+    const shown = collapseFindings(findings, 8);
+    L.push("", `${findings.length} finding(s):`);
+    for (const x of shown.slice(0, 12)) L.push(`- ${x.rollup || !x.page ? x.message : `${x.page}: ${x.message}`}`);
+  }
+
+  const decisions = findings.filter((x) => x.outcome === OUTCOME.DECISION).length;
+  if (decisions) L.push("", `${decisions} of these need a human decision - the run will not guess at them.`);
+  if (dry) L.push("", "Dry run: audited only. No branch, no pull request, nothing pushed to the repository.");
+  if (job.prUrl) L.push("", `Pull request: ${job.prUrl}`);
+  L.push("", runStamp(job));
+  return { verdict, text: L.join("\n") };
+}
+
+// Identifies the run inside an eventKey, so two runs never collide on one and a
+// retry inside a single run still does.
+function runKey(job) {
+  return String((job && (job.draftId || (job.payload && job.payload.jobId))) || "run");
+}
+
+// One line on every comment saying which run wrote it. With duplicates now
+// possible on a re-run, "which of these three is current" has to be answerable
+// from the comment itself rather than from the timestamp beside it.
+function runStamp(job) {
+  const when = job.finishedAt || job.startedAt || new Date().toISOString();
+  return `Run ${when.replace("T", " ").slice(0, 16)} UTC - ${runKey(job)}`;
+}
+
+// Post every checklist item onto its own subtask. Sequential on purpose: thirteen
+// parallel writes to TED is how you find out what its rate limit is.
+async function postChecklistToTed(job) {
+  const subs = job.checklistSubtasks || {};
+  const dry = !!(job.payload && job.payload.dryRun);
+  job.checklistResults = {};
+  for (const item of PRE_RELEASE_CHECKLIST) {
+    const report = checklistItemReport(job, item);
+    job.checklistResults[item.key] = report.verdict;
+    const taskId = subs[item.key];
+    if (!taskId) continue;
+    // Keyed on the run as well as the subtask. Keying on the subtask alone was
+    // meant to replace the previous verdict in place, but TED does not honour
+    // eventKey as an upsert: on a collision it answers 200, leaves the old text
+    // exactly where it was, and drops the new report on the floor. Because it
+    // answers 200 the fallback below never fires either, so a re-run silently
+    // reported nothing while the subtask kept showing the previous run's
+    // verdict and the previous run's pull request number.
+    //
+    // A second comment per run is the lesser problem: a dated duplicate can be
+    // read, a stale one cannot be told apart from a current one. Retries inside
+    // one run still collapse, because they share the job id.
+    const ai = await tedAiComment(taskId, report.text, `pre-release:${taskId}:${item.key}:${runKey(job)}`);
+    if (!ai.ok) {
+      console.warn(`pre-release: AI comment on ${taskId} failed (${ai.reason}) - falling back`);
+      tedComment(report.text, null, 0, String(taskId));
+    }
+    // The subtask is "run this check", not "fix everything it finds" — so it closes
+    // as soon as its report is on it, whatever the verdict. A check that found
+    // seven things a human must decide has still done its job; the findings live
+    // in the comment, and leaving the task open would only mean nobody can tell
+    // the checks that have run from the ones that have not.
+    //
+    // Still never in a dry run: those comments describe work that was computed and
+    // thrown away, and closing the checklist off the back of them would say the
+    // release happened.
+    //
+    // "Not run" is the exception, and the reason the parent's rule is safe: when a
+    // run dies at step 4 the checks after it never happened, and closing those
+    // would claim a check was performed that was not. They stay open, which also
+    // stops the release task closing over a half-finished run.
+    if (!dry && report.verdict !== "Not run") {
+      const r = await tedUpdateTask(taskId, { aiAssigned: true, status: "Completed" });
+      if (r.ok) job.checklistClosed = (job.checklistClosed || 0) + 1;
+      else console.warn(`pre-release: could not close subtask ${taskId}: ${r.reason}`);
+    }
+  }
+  saveJobs();
+}
+
 // Report back to the task that asked for the run. Only when the run was started
 // by a TED webhook — a run kicked off from the dashboard has no ticket to answer,
 // and posting to a default task would put one client's findings on another's thread.
@@ -13509,28 +14256,46 @@ async function postPerformPrToTed(job, extra, phase = "final") {
   const taskId = job.payload && job.payload.tedTaskId;
   if (!taskId) return;
   const f = job.prFindings || [];
-  const n = (o) => f.filter((x) => x.outcome === o).length;
-  const fixed = (job.prTasks || []).filter((t) => t.status === "fixed");
+  const dry = !!(job.payload && job.payload.dryRun);
   const lines = phase === "interim"
-    ? [`Pre-release checks ran for ${job.businessName}. Applying fixes and waiting on CI — the full report follows when it merges.`]
-    : [`Pre-release checks completed for ${job.businessName}.`];
-  lines.push("", `${(job.prTasks || []).length} checks ran. ${n("done")} done, ${n("decision")} need a decision, ${n("pending")} pending.`);
-  if (fixed.length) lines.push("", "Fixed in this run:", ...fixed.map((t) => `- ${t.label}: ${t.detail || ""}`));
-  // The hosted report lives on an ephemeral filesystem and does not survive a
-  // redeploy, so the comment has to carry enough on its own to still be worth
-  // reading after the link has died. What needs a human decision is the part
-  // that matters, so it goes in the text rather than only behind the link.
-  const decisions = collapseFindings(f.filter((x) => x.outcome === OUTCOME.DECISION), 2);
-  if (decisions.length) {
-    lines.push("", "Needs a decision:", ...decisions.slice(0, 8).map((x) => `- ${x.rollup ? x.message : `${x.page ? x.page + ": " : ""}${x.message}`}`));
+    ? [`Pre-release checks ran for ${job.businessName}. Applying fixes and waiting on CI - each check reports on its own subtask.`]
+    : [`Pre-release checks ${dry ? "dry run" : "completed"} for ${job.businessName}.`];
+
+  // An index, not a report. The detail deliberately lives on the thirteen
+  // subtasks - repeating it here is what made the old single comment unreadable,
+  // and it is the thing this rewrite exists to stop doing.
+  const results = job.checklistResults || {};
+  if (phase !== "interim" && Object.keys(results).length) {
+    const tally = (v) => PRE_RELEASE_CHECKLIST.filter((i) => results[i.key] === v).length;
+    lines.push("", `${tally("Pass")} pass, ${tally(dry ? "Fix ready" : "Fixed")} ${dry ? "fix ready" : "fixed"}, ${tally("Needs attention")} need attention.`, "");
+    lines.push(...PRE_RELEASE_CHECKLIST.map((i) => `- ${i.title}: ${results[i.key] || "not run"}`));
+    lines.push("", "Each check's full report is on its own Pre-Release subtask.");
+  }
+
+  // The two checks with no subtask of their own, because both need a merged and
+  // deployed build. They have nowhere else to go, so they report here or nowhere.
+  const deployOnly = f.filter((x) => x.task === "link-check" || x.task === "live-verify");
+  if (deployOnly.length) {
+    lines.push("", `Post-deploy checks - ${deployOnly.length} finding(s):`,
+      ...collapseFindings(deployOnly, 3).slice(0, 8).map((x) => `- ${x.rollup || !x.page ? x.message : `${x.page}: ${x.message}`}`));
   }
   if (extra) lines.push("", extra);
+  // Say what the run is about to do to the ticket, in the comment that does it.
+  // Nobody should have to infer a status change from the sidebar.
+  if (phase === "final" && !dry) {
+    lines.push("", job.prUrl
+      ? `Pull request is in - marking this release task Completed.`
+      : `No pull request was opened, so this task stays open.`);
+  }
   if (job.prUrl) lines.push("", `Pull request: ${job.prUrl}`);
-  if (job.reportUrl) lines.push("", "Full report (expires on redeploy):", absUrl(job.reportUrl));
+  lines.push("", runStamp(job));
   const text = lines.join("\n");
-  // One eventKey per job per phase: TED treats it as an idempotency key, so a
-  // retry after a timeout updates that comment rather than adding another.
-  const ai = await tedAiComment(taskId, text, `perform-pr:${job.draftId}:${phase}`);
+  // Keyed on the run, not just the task and phase. The release task must carry a
+  // comment from every run — that is the record that the run happened at all —
+  // and a task-scoped key does not produce one: TED answers 200 on a collision,
+  // keeps the old text and discards the new, so the second run's index never
+  // appears. See the note in postChecklistToTed.
+  const ai = await tedAiComment(taskId, text, `perform-pr:${taskId}:${phase}:${runKey(job)}`);
   if (ai.ok) {
     await closeTedTaskIfFinal(job, taskId, phase);
     return;
@@ -13545,17 +14310,37 @@ async function postPerformPrToTed(job, extra, phase = "final") {
 // one goes out while CI is still running, and closing a task that has not
 // finished is worse than leaving it open.
 //
-// A run that could not merge leaves the ticket open on purpose. Its pull request
-// is still waiting on a human, so the work is not complete however good the
-// report is.
+// A run that never opened a pull request leaves the ticket open on purpose:
+// there is no release to report, only an audit.
 async function closeTedTaskIfFinal(job, taskId, phase) {
   if (phase !== "final") return;
-  if (!job.prUrl || job.error) {
-    console.log(`TED task ${taskId} left open — the run did not merge (${job.error || "no pull request"})`);
+  // A dry run audited the site and changed nothing. Closing the release task off
+  // the back of that would tell everyone downstream the work is done.
+  if (job.payload && job.payload.dryRun) {
+    console.log(`TED task ${taskId} left open - dry run, nothing was released`);
     return;
   }
+  // The pull request is the whole test. Once a branch is pushed and a PR number
+  // exists, the release work this ticket tracks has happened, and the ticket
+  // closes — whatever the checklist got through.
+  //
+  // This used to require all thirteen subtasks Completed. That rule reads well
+  // and behaves badly: a run that dies at check 10, or one whose subtask writes
+  // partly fail, leaves the release ticket sitting In Progress with a merged PR
+  // behind it, and nobody goes back to close it by hand. A partial checklist is
+  // a reason to read the subtasks — each one carries its own report — not a
+  // reason to misreport the release itself as unfinished.
+  //
+  // An errored run with a PR still closes, for the same reason: the branch is in.
+  // What went wrong is in the comment posted immediately above this call.
+  if (!job.prUrl) {
+    console.log(`TED task ${taskId} left open - no pull request was opened (${job.error || "unknown"})`);
+    return;
+  }
+  const subs = Object.values(job.checklistSubtasks || {}).filter(Boolean);
+  const done = job.checklistClosed || 0;
   const r = await tedUpdateTask(taskId, { aiAssigned: true, status: "Completed" });
-  if (r.ok) console.log(`TED task ${taskId} marked Completed and assigned to AI`);
+  if (r.ok) console.log(`TED task ${taskId} marked Completed and assigned to AI - ${done}/${subs.length || PRE_RELEASE_CHECKLIST.length} checklist subtask(s) reported`);
   else console.warn(`TED task ${taskId} could not be updated: ${r.reason}`);
 }
 
@@ -13599,6 +14384,15 @@ async function runPerformPrJob(job) {
     saveJobs();
   };
   try {
+    // The checklist goes up before any work starts. Whoever triggered this should
+    // see all thirteen tasks waiting the moment they look, in checklist order,
+    // rather than watching them appear one clone later — the board is the progress
+    // report, and an empty board says nothing is happening.
+    if (P.tedTaskId) {
+      try { await createPreReleaseSubtasks(job, P.tedTaskId); }
+      catch (e) { console.warn(`pre-release: checklist subtasks not created (${e.message})`); }
+    }
+
     // ---- phase 0 -------------------------------------------------------------
     jobStep(job, 0, "running", "Cloning " + repo);
     let r = await runRetry(`gh repo clone ${repo} "${tmp}" -- --depth 1`);
@@ -13641,11 +14435,16 @@ async function runPerformPrJob(job) {
     }
 
     jobStep(job, 2, "running", "Reading contact details off the built site...");
-    const facts = await readBusinessFacts(pages, P.businessName, ai);
+    // The name that may be WRITTEN INTO the site, with TED's working suffixes
+    // taken off. P.businessName keeps the full client name for the job, the
+    // notifications and the TED comments, where "(clone)" is information.
+    const contentName = contentBusinessName(P.businessName);
+    if (contentName !== P.businessName) console.log(`pre-release: writing "${contentName}" into the site, not "${P.businessName}"`);
+    const facts = await readBusinessFacts(pages, contentName, ai);
     const socials = extractSocials(pages);
     const brand = themeBrandColor(themeAbs);
     const siteHost = siteHostOf(P.liveUrl);
-    job.prFacts = { ...facts, name: P.businessName, socials, brand };
+    job.prFacts = { ...facts, name: contentName, socials, brand };
     jobStep(job, 2, "done", [facts.phone, facts.email, socials.length ? socials.length + " social link(s)" : "", brand].filter(Boolean).join(" · ") || "no contact details found");
 
     // ---- phase 1 -------------------------------------------------------------
@@ -13665,8 +14464,8 @@ async function runPerformPrJob(job) {
     // Page templates plus header/footer: a bad link in the chrome is on every page.
     const linkF = findingsInternalLinks([...pages, ...themeChromePages(themeAbs)], muPages);
     task("Internal links", linkF.length ? "fail" : "pass", linkF.length ? `${linkF.length} link(s) point at a missing page` : "every internal link resolves", linkF);
-    const nameF = findingsBusinessName(pages, P.businessName);
-    task("Business name", nameF.length ? "fail" : "pass", nameF.length ? `${nameF.length} inconsistency(ies)` : `"${P.businessName}" used consistently`, nameF);
+    const nameF = findingsBusinessName(pages, contentName);
+    task("Business name", nameF.length ? "fail" : "pass", nameF.length ? `${nameF.length} inconsistency(ies)` : `"${contentName}" used consistently`, nameF);
     const contactF = findingsContact(pages, facts);
     task("Contact details", contactF.length ? "fail" : "pass", contactF.length ? `${contactF.length} issue(s)` : "phone, email and address agree across the site", contactF);
     // An audit never reports "fixed" — it has not fixed anything yet. Phase 2
@@ -13682,7 +14481,7 @@ async function runPerformPrJob(job) {
     const favF = findingsFavicon(themeAbs, pages, siteHost);
     task("Favicon", favF.length ? "fail" : "pass", favF.length ? "not emitted by the theme" : "already emitted", favF);
     const images = imageSources(pages);
-    const imgF = findingsImages(images, P.businessName);
+    const imgF = findingsImages(images, contentName);
     const weightF = await findingsImageWeight(images);
     task("Image naming", imgF.filter((f) => f.task === "image-naming").length ? "fail" : "pass", `${images.length} image(s) inspected`, imgF);
     task("Image format + weight", weightF.length ? "fail" : "pass", weightF.length ? `${weightF.length} oversized` : "within budget", weightF);
@@ -13691,7 +14490,7 @@ async function runPerformPrJob(job) {
     jobStep(job, 4, "done", `${favF.length + imgF.length + weightF.length + spellF.length} finding(s)`);
 
     jobStep(job, 5, "running", "Reading every page for content problems...");
-    const auditF = await findingsPageAudit(pages, P.businessName, ai);
+    const auditF = await findingsPageAudit(pages, contentName, ai);
     task("Page audit", auditF.length ? "fail" : "pass", auditF.length ? `${auditF.length} suggestion(s)` : "no content problems found", auditF);
     jobStep(job, 5, "done", `${auditF.length} suggestion(s)`);
 
@@ -13709,7 +14508,7 @@ async function runPerformPrJob(job) {
       else task(label, (result.changed || []).length ? "fixed" : "skipped", result.note);
       jobStep(job, 6, "running", label + " — " + result.note);
     };
-    record("Business name", fixBusinessName(themeAbs, pages, P.businessName, facts.name, P.themePath), "business-name");
+    record("Business name", fixBusinessName(themeAbs, pages, contentName, facts.name, P.themePath), "business-name");
     // Redirect map first, then the rename that depends on it.
     const urlFix = fixUrlStructure(themeAbs, muAbs, P.muPath, P.themePath, urls.renames || []);
     job.urlRenames = urlFix.renamed || [];
@@ -13721,10 +14520,21 @@ async function runPerformPrJob(job) {
     record("CTA on every page", fixCta(themeAbs, pages, job.prFindings, P.themePath), "cta");
     // Images last of the content fixes: it rewrites src attributes across every
     // template, so it should not race the edits above on the same files.
-    const imgFix = await performPrFixImages(themeAbs, pages, P.businessName, facts, P.themePath);
+    const imgFix = await performPrFixImages(themeAbs, pages, contentName, facts, P.themePath);
     job.imageSwaps = imgFix.swaps || [];
     record("Image naming", imgFix, "image-naming");
-    if ((imgFix.changed || []).length) { fixedTasks.add("image-format"); fixedTasks.add("image-weight"); }
+    if ((imgFix.changed || []).length) {
+      fixedTasks.add("image-format");
+      fixedTasks.add("image-weight");
+      // The image fix pulls photos into the theme as sized WebP, so it answers the
+      // weight audit as well as the naming one. Only the findings knew that; the
+      // check itself was left reading "fail" after the thing it flagged was fixed.
+      const weightTask = job.prTasks.find((x) => x.label === "Image format + weight");
+      if (weightTask && weightTask.status === "fail") {
+        weightTask.status = "fixed";
+        weightTask.detail = imgFix.note || weightTask.detail;
+      }
+    }
     record("Favicon", fixFavicon(themeAbs, pages, P.themePath, siteHost), "favicon");
     record("Social sharing image", fixSocialImage(themeAbs, pages, P.themePath, siteHost));
     record("Custom 404", fix404(themeAbs, P.themePath, brand));
@@ -13752,6 +14562,37 @@ async function runPerformPrJob(job) {
     if (whitespace.code) throw new Error("fixes failed git diff check: " + String(whitespace.stdout || whitespace.stderr).slice(-200));
     const stat = await run(`git --no-pager diff --cached --stat -- ${paths}`, tmp);
     jobStep(job, 7, "done", String(stat.stdout || "").trim().split("\n").slice(-1)[0] || "marker only");
+
+    // ---- dry run stops here ---------------------------------------------------
+    // Everything above happened in a temp checkout that is about to be deleted, so
+    // the audit is complete and the repository is untouched. PageSpeed still runs:
+    // it measures the site as it stands today, which is exactly the number someone
+    // asking for a dry run wants to see. The live link check does not - it can only
+    // describe a build that was never deployed.
+    if (P.dryRun) {
+      for (const i of [8, 9, 10]) jobStep(job, i, "done", "skipped - dry run, nothing pushed");
+      jobStep(job, 11, "running", "Running PageSpeed on the current site...");
+      const dryPsi = [await pageSpeedRun(P.liveUrl, "mobile"), await pageSpeedRun(P.liveUrl, "desktop")];
+      job.pageSpeed = dryPsi;
+      const dryPsiF = findingsPageSpeed(dryPsi);
+      const dryLine = (r) => r.ok ? `${r.strategy}: perf ${r.scores.performance ?? "-"} - a11y ${r.scores.accessibility ?? "-"} - best ${r.scores.bestPractices ?? "-"} - seo ${r.scores.seo ?? "-"}` : `${r.strategy}: ${r.reason}`;
+      task("PageSpeed", dryPsiF.length ? "fail" : "pass", dryPsi.map(dryLine).join(" | "), dryPsiF);
+      // The PageSpeed findings arrive after phase 2 resolved everyone else's, so
+      // they need the same treatment or they reach the report with no outcome.
+      resolveFindingOutcomes(dryPsiF, new Set(job.prFixedTasks || []));
+      jobStep(job, 11, "done", dryLine(dryPsi[0]));
+
+      fs.rmSync(tmp, { recursive: true, force: true });
+      jobStep(job, 12, "running", "Writing the report...");
+      job.finishedAt = new Date().toISOString();
+      job.reportUrl = writePerformPrReport(job);
+      await postChecklistToTed(job);
+      jobStep(job, 12, "done", `${job.prFindings.length} finding(s) - ${job.prChanged.length} file(s) would change`);
+      job.status = "done";
+      notify(`Pre-release dry run finished for *${job.businessName}*: ${job.prFindings.length} finding(s), ${job.prChanged.length} file(s) would change - nothing pushed`);
+      await postPerformPrToTed(job, "Dry run - the repository was not touched and no pull request was opened.");
+      return;
+    }
 
     jobStep(job, 8, "running", "Pushing + opening PR...");
     const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
@@ -13838,7 +14679,10 @@ async function runPerformPrJob(job) {
       job.status = "done";
       job.error = `PR opened but not merged — ${why}. ${job.prUrl}`;
       notify(`Perform PR audited *${job.businessName}* but did not merge (${why}) — ${absUrl(job.reportUrl)}`);
-      postPerformPrToTed(job, `The pull request is open but not merged (${why}).`);
+      // The audits all ran, so every checklist item has a verdict worth posting
+      // even though the release did not happen. The index comment follows it.
+      await postChecklistToTed(job);
+      await postPerformPrToTed(job, `The pull request is open but not merged (${why}).`);
       return;
     }
 
@@ -13872,7 +14716,8 @@ async function runPerformPrJob(job) {
     jobStep(job, 12, "done", `${job.prFindings.length} finding(s) · ${job.prChanged.length} file(s) changed`);
     job.status = "done";
     notify(`Perform PR finished for *${job.businessName}*: ${job.prChanged.length} file(s) fixed, ${job.prFindings.length} finding(s) (${high} high) — ${absUrl(job.reportUrl)}`);
-    postPerformPrToTed(job);
+    await postChecklistToTed(job);
+    await postPerformPrToTed(job);
   } catch (e) {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
     if (e && e.cancelled) job.status = "cancelled";
@@ -13889,6 +14734,16 @@ async function runPerformPrJob(job) {
     // A run that died at step 7 still learned something at steps 3–5. Publishing
     // the partial report is strictly better than losing the findings.
     try { if ((job.prTasks || []).length) job.reportUrl = writePerformPrReport(job); } catch (_) {}
+    // And the subtasks it created still need their answer. An approval timeout is
+    // the ordinary way a triggered run ends — the PR is open, every check has a
+    // verdict, and thirteen silent subtasks would be the worst of both worlds.
+    // Wrapped because a TED failure here must not replace the error that got us here.
+    try {
+      if ((job.prTasks || []).length && Object.keys(job.checklistSubtasks || {}).length) {
+        await postChecklistToTed(job);
+        await postPerformPrToTed(job, `The run stopped before finishing: ${job.error || "unknown error"}`);
+      }
+    } catch (e2) { console.warn("pre-release: could not post the checklist after a failed run:", e2.message); }
   } finally {
     job.finishedAt = job.finishedAt || new Date().toISOString();
     saveJobs();
@@ -14190,8 +15045,24 @@ const server = http.createServer(async (req, res) => {
       // that already exists — but worth setting, because unlike that one (which
       // only reads and posts a report) this endpoint can open and merge a pull
       // request against a client's repository.
+      //
+      // Accept every header TED might send it under, exactly as the content-review
+      // hook does. TED's "Secret Auth" tab sends X-TED-Webhook-Secret, a header
+      // typed on the Parameter tab is whatever was typed, and the rest of this
+      // tool uses X-Webhook-Secret. Reading only one of those means the day
+      // somebody fills in the wrong tab, every delivery 401s and the pre-release
+      // run silently stops happening.
       const secret = (process.env.PRE_RELEASE_WEBHOOK_SECRET || "").trim();
-      if (secret && (req.headers["x-webhook-secret"] || "") !== secret) return json(res, 401, { error: "bad webhook secret" });
+      if (secret) {
+        const sent = String(req.headers["x-ted-webhook-secret"] || req.headers["x-webhook-secret"]
+          || req.headers["x-ted-secret"]
+          || String(req.headers["authorization"] || "").replace(/^Bearer\s+/i, "")).trim();
+        if (sent !== secret) {
+          // Which header arrived is what makes a 401 debuggable; the value is never logged.
+          console.warn(`pre-release: bad secret (headers seen: ${Object.keys(req.headers).filter((h) => /secret|auth/i.test(h)).join(", ") || "none"})`);
+          return json(res, 401, { error: "bad webhook secret" });
+        }
+      }
       let body = {};
       try { body = JSON.parse(await readBody(req) || "{}"); } catch (e) { return json(res, 400, { error: "bad json" }); }
       // Shape confirmed by the mockup.create webhook already in production:
@@ -14218,10 +15089,19 @@ const server = http.createServer(async (req, res) => {
       // TED's UI offers "All Events", which would fire this on every comment and
       // edit. Default to the pre-release template key so a mis-set webhook cannot
       // start a merge on unrelated activity; override per deployment if it moves.
-      const wantKey = (process.env.TED_PERFORM_PR_KEY || "beta_site.release_approval").trim();
-      const wantStatus = (process.env.TED_PERFORM_PR_STATUS || "").trim();
-      if (wantKey && wantKey !== "*" && templateKey && templateKey !== wantKey) {
-        return json(res, 200, { ignored: true, reason: `template key ${templateKey} is not ${wantKey}` });
+      //
+      // A list, because two different tasks legitimately start this run:
+      // `release.pre_dev` ("Complete website pre-release development", the task
+      // the checklist hangs off) and `beta_site.release_approval`. Comma-separated
+      // so a deployment can add a third without a code change.
+      const wantKeys = (process.env.TED_PERFORM_PR_KEY || "release.pre_dev,beta_site.release_approval")
+        .split(",").map((s) => s.trim()).filter(Boolean);
+      // Completed, because that is the event: the approval task being finished is
+      // what releases the pre-release work. Firing on every status edit would start
+      // a clone-and-merge run when somebody merely picks the task up.
+      const wantStatus = (process.env.TED_PERFORM_PR_STATUS || "Completed").trim();
+      if (wantKeys.length && !wantKeys.includes("*") && templateKey && !wantKeys.includes(templateKey)) {
+        return json(res, 200, { ignored: true, reason: `template key ${templateKey} is not one of ${wantKeys.join(", ")}` });
       }
       if (wantStatus && status && status.toLowerCase() !== wantStatus.toLowerCase()) {
         return json(res, 200, { ignored: true, reason: `status ${status} is not ${wantStatus}` });
@@ -14266,16 +15146,48 @@ const server = http.createServer(async (req, res) => {
       const running = [...JOBS.values()].find((j) => j.type === "perform-pr"
         && (j.status === "queued" || j.status === "running") && j.payload && j.payload.siteId === site.siteId);
       if (running) return json(res, 202, { jobId: running.draftId, dedupe: true, site: site.businessName });
+
+      const taskId = targetTask || dig("id", "taskId") || "";
+      // A finished run is not a reason to refuse forever — re-running after someone
+      // fixes what the checklist flagged is the point, and the subtasks are adopted
+      // rather than duplicated. But TED can fire this webhook on any edit to the
+      // task, including the status change this run's own comments provoke, and each
+      // firing clones a repository and opens a pull request. So: one run per task
+      // per cooldown window, and say plainly which run is holding the slot.
+      const cooldownMin = Math.max(0, Number(process.env.TED_PERFORM_PR_COOLDOWN_MIN || 30) || 0);
+      if (taskId && cooldownMin) {
+        // A cancelled run does not hold the slot: somebody stopped it on purpose,
+        // and the next thing they usually want is to start it again.
+        const recent = [...JOBS.values()].find((j) => j.type === "perform-pr" && j.finishedAt
+          && j.status !== "cancelled"
+          && j.payload && String(j.payload.tedTaskId) === String(taskId)
+          && Date.now() - Date.parse(j.finishedAt) < cooldownMin * 60000);
+        if (recent) {
+          console.log(`pre-release: ignoring a repeat trigger for task ${taskId} - ${recent.draftId} finished ${recent.finishedAt}`);
+          return json(res, 200, { ignored: true, reason: `a run for task ${taskId} finished within the last ${cooldownMin} min`, jobId: recent.draftId });
+        }
+      }
+
+      // No gate by default. A triggered run is one link in a chain: TED only moves
+      // to the next task once the pre-release task completes, and it cannot
+      // complete while the run is parked waiting for somebody to click approve. A
+      // gate here does not make the release safer, it stalls the workflow it
+      // belongs to — and nobody watching TED can even see what it is waiting for.
+      // Set TED_PERFORM_PR_APPROVAL=on where a person really is watching for the PR.
+      const gateMerge = (process.env.TED_PERFORM_PR_APPROVAL || "off").toLowerCase() !== "off";
       const job = enqueuePerformPrJob({
         jobId: "perform-pr-" + Date.now(), siteId: site.siteId,
         businessName: site.businessName, githubRepo: site.githubRepo,
         themeSlug: target.themeSlug, themePath: target.themePath,
         muPath: target.muPath, liveUrl: site.liveUrl,
         existingSiteUrl: site.existingSiteUrl || "",
-        // Where the report goes when the run finishes.
-        tedTaskId: targetTask || dig("id", "taskId") || "",
+        // Where the checklist subtasks hang and the report goes.
+        tedTaskId: taskId, forceApproval: gateMerge,
       });
-      return json(res, 202, { jobId: job.draftId, site: site.businessName, tedTaskId: job.payload.tedTaskId || null });
+      return json(res, 202, {
+        jobId: job.draftId, site: site.businessName,
+        tedTaskId: job.payload.tedTaskId || null, awaitsApproval: gateMerge,
+      });
     }
 
     // ---- undo a content-review change --------------------------------------
@@ -14767,6 +15679,32 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/job" ) {
       const j = JOBS.get(u.searchParams.get("id"));
       return j ? json(res, 200, j) : json(res, 404, { error: "job not found" });
+    }
+    // Import job history into the live server WITHOUT a redeploy or file access —
+    // the deploy-safe way to restore /jobs on Render (disk is ephemeral). Accepts
+    // a bare array of jobs OR the exact { jobs:[...] } shape that GET /api/jobs
+    // returns, so you can pipe the export straight back in. Behind the admin-key
+    // gate (like every /api/*). Default merges by draftId (idempotent); pass
+    // ?mode=replace to clear first. Persists to jobs.json so it also survives
+    // in-container restarts.
+    if (p === "/api/jobs-import" && req.method === "POST") {
+      let body;
+      try { body = JSON.parse(await readBody(req) || "null"); } catch (e) { return json(res, 400, { error: "invalid JSON body" }); }
+      const incoming = Array.isArray(body) ? body : (body && Array.isArray(body.jobs) ? body.jobs : null);
+      if (!incoming) return json(res, 400, { error: "expected a JSON array of jobs, or { jobs: [...] }" });
+      const replace = /^(1|true|replace|yes)$/i.test(u.searchParams.get("mode") || "");
+      if (replace) JOBS.clear();
+      let n = 0;
+      for (const j of incoming) {
+        if (!j || !j.draftId) continue;
+        if (j.status === "running" || j.status === "queued") { j.status = "error"; j.error = "imported (was in-flight at export time)"; }
+        if (j.status !== "running" && j.status !== "queued") j.awaitingApproval = false;
+        try { backfillEventLog(j); } catch (e) { /* best-effort */ }
+        JOBS.set(String(j.draftId), j);
+        n++;
+      }
+      saveJobs();
+      return json(res, 200, { ok: true, imported: n, total: JOBS.size, mode: replace ? "replace" : "merge" });
     }
 
     // Re-send this job's status to G99. The audit above can now show a failed callback; without
@@ -15447,7 +16385,9 @@ const server = http.createServer(async (req, res) => {
     // responsiveness (that is /api/pre-release-run until the two are merged).
     // No Browserless dependency: every check here is HTTP + source reading.
     if (p === "/api/perform-pr-run" && req.method === "POST") {
-      const { siteId } = JSON.parse(await readBody(req) || "{}");
+      // tedTaskId: the release task the checklist subtasks hang off, and where the
+      // index comment lands. dryRun: audit everything, push nothing.
+      const { siteId, tedTaskId, dryRun } = JSON.parse(await readBody(req) || "{}");
       const site = await findWebsite(siteId);
       if (!site) return json(res, 404, { error: "unknown siteId - refresh the site list" });
       if (!site.githubRepo) return json(res, 409, { error: site.businessName + " has no repository set in NocoDB" });
@@ -15460,13 +16400,14 @@ const server = http.createServer(async (req, res) => {
         && j.payload && j.payload.siteId === site.siteId);
       if (running) return json(res, 202, { jobId: running.draftId, dedupe: true, monitor: "/jobs" });
       const job = enqueuePerformPrJob({
-        jobId: "perform-pr-" + Date.now(), siteId: site.siteId,
+        jobId: (dryRun ? "perform-pr-dry-" : "perform-pr-") + Date.now(), siteId: site.siteId,
         businessName: site.businessName, githubRepo: site.githubRepo,
         themeSlug: target.themeSlug, themePath: target.themePath,
         muPath: target.muPath, liveUrl: site.liveUrl,
         existingSiteUrl: site.existingSiteUrl || "",
+        tedTaskId: tedTaskId ? String(tedTaskId) : "", dryRun: !!dryRun,
       });
-      return json(res, 202, { jobId: job.draftId, monitor: "/jobs" });
+      return json(res, 202, { jobId: job.draftId, dryRun: !!dryRun, monitor: "/jobs" });
     }
     if (p === "/api/enrich-run" && req.method === "POST") {
       const body0 = JSON.parse(await readBody(req) || "{}");
@@ -15798,8 +16739,9 @@ const server = http.createServer(async (req, res) => {
       // straight into GEN/site/ (final output — no bind step needed). The dashboard
       // wizard and runJob both reach the generator through this same path now.
       // engine:"stitch" or "gemini" force the legacy generators; ENGINE=stitch disables webgen.
-      const webgenOff = (process.env.ENGINE || "webgen").toLowerCase() === "stitch";
-      if (!webgenOff && engine !== "stitch" && engine !== "gemini") {
+      // Stitch retired — everything (incl. any "stitch" request) goes through webgen,
+      // except an explicit "gemini" freehand test. The stitch branch below is unreachable.
+      if (engine !== "gemini") {
         let A = {}, existingUrl = "", onbScrape = false;
         try {
           const onb = JSON.parse(fs.readFileSync(path.join(DIR, "onboarding.json"), "utf8"));
@@ -16225,7 +17167,27 @@ const server = http.createServer(async (req, res) => {
       const { prUrl } = JSON.parse(await readBody(req) || "{}");
       const prNum = ((prUrl || "").match(/\/pull\/(\d+)/) || [])[1];
       if (!prNum) return json(res, 400, { error: "prUrl with /pull/<n> required" });
-      const r = await sh(`gh pr merge ${prNum} --repo ${repoFromPrUrl(prUrl)} --squash --delete-branch`);
+      const repo = repoFromPrUrl(prUrl);
+      let r = await sh(`gh pr merge ${prNum} --repo ${repo} --squash --delete-branch`);
+      // "not mergeable" means main moved after this branch was cut — someone else
+      // merged while we were auditing, opening the PR or waiting on CI. The branch
+      // is stale, not wrong. Ask GitHub to update it from the base and merge again.
+      // Once only: a second failure means something a retry cannot settle.
+      if (r.code && /not mergeable|merge commit cannot be cleanly created/i.test(String(r.stderr || r.stdout))) {
+        console.log(`pr-merge: #${prNum} is behind ${repo}'s base branch — updating it and retrying`);
+        const up = await sh(`gh api -X PUT repos/${repo}/pulls/${prNum}/update-branch`);
+        if (up.code) return json(res, 500, { error: "merge failed and the branch could not be updated: " + (up.stderr || up.stdout).slice(-300) });
+        // The update lands a merge commit, which re-runs CI. So the retry has to
+        // wait for the checks the branch protection asks for, not just for
+        // `mergeable` to stop being null — merging straight away fails on exactly
+        // the checks this update invalidated.
+        for (let i = 0; i < 8; i++) {
+          await sleep(15000);
+          r = await sh(`gh pr merge ${prNum} --repo ${repo} --squash --delete-branch`);
+          if (!r.code) break;
+          console.log(`pr-merge: #${prNum} retry ${i + 1}/8 — ${String(r.stderr || r.stdout).trim().split("\n")[0].slice(0, 120)}`);
+        }
+      }
       if (r.code) return json(res, 500, { error: "merge failed: " + (r.stderr || r.stdout).slice(-300) });
       return json(res, 200, { merged: true, prNum });
     }
@@ -16480,4 +17442,5 @@ module.exports = {
   performPrReportHtml, performPrPrBody, performPrMarkerUrl, PERFORM_PR_STEPS,
   editReportHtml, writeEditReport, genericJobReportHtml, writeGenericJobReport,
   detectAttachmentKind, unzipEntry, extractDocxText, extractPdfText, isLegacyOfficeFile,
+  PRE_RELEASE_CHECKLIST, checklistVerdict, checklistItemReport,
 };
