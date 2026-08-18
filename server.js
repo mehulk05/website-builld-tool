@@ -1189,10 +1189,10 @@ async function aiChrome(theme) {
 // Smart bind: AI-generated shared chrome injected into every page + link rewire.
 // Falls back to the deterministic canonical nav if the LLM is unavailable.
 // ------------------------------------------------------------ WordPress export (classic theme for Bedrock)
-const WP_PAGES = [["index", "front-page.php", "/"], ["services", "page-services.php", "/services/"], ["about", "page-about.php", "/about/"], ["contact", "page-contact.php", "/contact/"], ["branding", "page-branding.php", "/branding/"], ["seo", "page-seo.php", "/seo/"]];
+const WP_PAGES = [["index", "front-page.php", "/"], ["services", "page-services.php", "/services/"], ["about", "page-about.php", "/about/"], ["team", "page-team.php", "/team/"]];
 function wpRewriteLinks(html) {
   let h = html;
-  const map = { "index.html": "/", "services.html": "/services/", "about.html": "/about/", "contact.html": "/contact/", "branding.html": "/branding/", "seo.html": "/seo/" };
+  const map = { "index.html": "/", "services.html": "/services/", "about.html": "/about/", "team.html": "/team/", "contact.html": "/contact/", "branding.html": "/branding/", "seo.html": "/seo/" };
   for (const [f, to] of Object.entries(map)) h = h.split(`href="${f}"`).join(`href="${to}"`);
   return h;
 }
@@ -1215,6 +1215,69 @@ function splitPage(html) {
   if (footer) main = main.replace(footer, "");
   return { head: wpRewriteLinks(head), header: wpRewriteLinks(header), footer: wpRewriteLinks(footer), main: wpRewriteLinks(main) };
 }
+// WEBGEN engine — the in-house design engine that replaces Stitch. Composes a
+// structured BrandKit (onboarding + scanned site) and renders the 4 core pages
+// straight into GEN/site/. Shared by runJob AND the manual /api/generate-site route
+// so both entry points use the exact same generator. Output is final (no bind step).
+async function generateWebgenSite({ A = {}, composed = {}, existingUrl = "", pureScrape = false }) {
+  const webgen = require("./lib/webgen");
+  const apiKey = (typeof GEMINI_KEYS !== "undefined" && GEMINI_KEYS[0]) || process.env.GEMINI_API_KEY || "";
+  const gModel = process.env.GEMINI_MODEL || "gemini-flash-lite-latest";
+  // DEFAULT (fast) — onboarding content + browser-free image scrape + Gemini vision relevance.
+  const runDefault = async () => {
+    const team = (() => { try { return parseTeamRoster(A) || []; } catch { return []; } })();
+    const scrapeP = existingUrl ? webgen.scrapeLite(existingUrl).catch((e) => { console.warn("webgen scrapeLite failed:", e.message); return null; }) : Promise.resolve(null);
+    const k = await webgen.composeBrandKit({ siteStruct: null, A, composed, team, geminiCall });
+    const raw = await scrapeP;
+    if (raw && raw.images && raw.images.length) {
+      try {
+        const labels = await webgen.classifyPool(raw.images, apiKey, gModel);
+        webgen.enrichKitImages(k, raw.images, labels);
+      } catch (e) { console.warn("webgen image enrich failed (text-forward fallback):", e.message); }
+    }
+    return k;
+  };
+  let kit;
+  if (pureScrape && existingUrl) {
+    // PURE URL SCRAPE (toggle) — 1:1 with the standalone demo: Playwright scrape → full BrandKit.
+    // Falls back to fast mode if the browser scrape or extract errors/times out.
+    try {
+      const raw = await webgen.scrape(existingUrl);
+      kit = await webgen.extractBrandKit(raw, apiKey, gModel);
+      kit.brand = Object.assign({}, kit.brand, {
+        name: A.business_name || (kit.brand && kit.brand.name),
+        phone: A.phone_for_website || (kit.brand && kit.brand.phone),
+        email: A.email || (kit.brand && kit.brand.email),
+        city: A.location || (kit.brand && kit.brand.city),
+      });
+      if (A.logo && kit.footer) kit.footer.logo = A.logo;
+    } catch (e) { console.warn("webgen pure-scrape failed → fast mode:", e.message); kit = await runDefault(); }
+  } else {
+    kit = await runDefault();
+  }
+  // the CONFIRMED step-2 palette + fonts are the source of truth for colors — apply
+  // in BOTH modes so the site is always built on top of the brand from step 2
+  // (pure-scrape's own color guesses get overridden here).
+  if (composed && (composed.primary || composed.accent)) kit.theme = webgen.themeTokens(composed);
+  // force a specific design on every build via WEBGEN_LAYOUT (e.g. "bold");
+  // set it to "auto" (or unset) to let the AI pick per brand.
+  const forced = (process.env.WEBGEN_LAYOUT || "").toLowerCase();
+  if (webgen.DESIGN_IDS.includes(forced)) kit.layout = forced;
+  const pages = webgen.renderPages(kit);
+  const siteDir = path.join(GEN, "site");
+  fs.mkdirSync(siteDir, { recursive: true });
+  fs.writeFileSync(path.join(siteDir, "index.html"), pages.home);
+  fs.writeFileSync(path.join(siteDir, "services.html"), pages.services);
+  fs.writeFileSync(path.join(siteDir, "about.html"), pages.about);
+  fs.writeFileSync(path.join(siteDir, "team.html"), pages.team);
+  // flat copies too — the /preview/<key> route reads GEN/<key>.html (home/services/about/team)
+  fs.writeFileSync(path.join(GEN, "home.html"), pages.home);
+  fs.writeFileSync(path.join(GEN, "services.html"), pages.services);
+  fs.writeFileSync(path.join(GEN, "about.html"), pages.about);
+  fs.writeFileSync(path.join(GEN, "team.html"), pages.team);
+  return { kit, pages };
+}
+
 // opts.logoUrl   — the onboarding logo upload; becomes the site favicon
 // opts.businessId — drives the chatbot widget's data-id
 async function buildWpTheme(slug, biz, opts = {}) {
@@ -1292,11 +1355,9 @@ add_action('wp_footer', function () {
 add_action('after_switch_theme', function () {
     $pages = [
         ['title' => 'Home', 'slug' => 'home', 'template' => ''],
-        ['title' => 'Treatments', 'slug' => 'services', 'template' => 'page-services.php'],
-        ['title' => 'Team', 'slug' => 'about', 'template' => 'page-about.php'],
-        ['title' => 'Contact', 'slug' => 'contact', 'template' => 'page-contact.php'],
-        ['title' => 'Branding', 'slug' => 'branding', 'template' => 'page-branding.php'],
-        ['title' => 'SEO', 'slug' => 'seo', 'template' => 'page-seo.php'],
+        ['title' => 'Services', 'slug' => 'services', 'template' => 'page-services.php'],
+        ['title' => 'About', 'slug' => 'about', 'template' => 'page-about.php'],
+        ['title' => 'Team', 'slug' => 'team', 'template' => 'page-team.php'],
     ];
 
     $home_id = 0;
@@ -1472,11 +1533,9 @@ if (! function_exists('${fn}')) {
     {
         $pages = [
             ['title' => 'Home', 'slug' => 'home', 'template' => ''],
-            ['title' => 'Treatments', 'slug' => 'services', 'template' => 'page-services.php'],
-            ['title' => 'Team', 'slug' => 'about', 'template' => 'page-about.php'],
-            ['title' => 'Contact', 'slug' => 'contact', 'template' => 'page-contact.php'],
-            ['title' => 'Branding', 'slug' => 'branding', 'template' => 'page-branding.php'],
-            ['title' => 'SEO', 'slug' => 'seo', 'template' => 'page-seo.php'],
+            ['title' => 'Services', 'slug' => 'services', 'template' => 'page-services.php'],
+            ['title' => 'About', 'slug' => 'about', 'template' => 'page-about.php'],
+            ['title' => 'Team', 'slug' => 'team', 'template' => 'page-team.php'],
         ];
 
         $home_id = 0;
@@ -3133,7 +3192,7 @@ function localApi(pathName, body, timeoutMs = 30 * 60 * 1000) {
 }
 
 const JOB_STEPS = [
-  "CRO audit — existing site", "Compose build prompt", "Generate pages (Stitch)",
+  "CRO audit — existing site", "Compose build prompt", "Assemble pages",
   "Assemble site", "WordPress theme + PR",
   "CI checks → auto-merge", "Theme activation watch", "CRO after-audit + comparison",
   // Runs as its OWN job (see runEnrichJob); this step mirrors its progress so the
@@ -7341,7 +7400,41 @@ async function runJob(job) {
     // The Stitch generation + AI-chrome assembly below is ONLY for the normal path;
     // clone mode already produced GEN/site/ above and jumps straight to the PR path.
     const isCloneBuild = /^(1|on|true|yes)$/i.test(process.env.CLONE_MODE || "");
-    if (!isCloneBuild) {
+
+    // ---- WEBGEN engine (default): our in-house design engine replaces Stitch for the
+    // 4 core pages. Composes a structured BrandKit from onboarding + the client's scanned
+    // site, renders Home/Services/About/Team, writes GEN/site/, then falls through to the
+    // shared WordPress theme/PR path below (identical contract to Stitch's GEN/site output).
+    // Set ENGINE=stitch to fall back to the legacy Stitch generation.
+    const ENGINE = (process.env.ENGINE || "webgen").toLowerCase();
+    const useWebgen = ENGINE !== "stitch" && !isCloneBuild;
+    if (useWebgen) {
+      jobStep(job, 2, "running", "Scanning site + composing content (webgen)…");
+      const existingUrl = job.payload && (job.payload.existingWebsite || job.payload.referenceWebsite);
+      const { kit, pages } = await generateWebgenSite({ A, composed, existingUrl, pureScrape: !!(job.payload && job.payload.pureScrape) });
+      const siteDir = path.join(GEN, "site");
+      jobStep(job, 2, "running", "Rendering Home · Services · About · Team…");
+      job.pages = {
+        home: { status: "done", bytes: pages.home.length, error: "" },
+        services: { status: "done", bytes: pages.services.length, error: "" },
+        about: { status: "done", bytes: pages.about.length, error: "" },
+        team: { status: "done", bytes: pages.team.length, error: "" },
+      };
+      job.homeContent = (kit.hero && [kit.hero.h1, kit.hero.body].filter(Boolean).join(" — ")) || (composed && composed.brief) || "";
+      jobStep(job, 2, "done", `4 pages generated (webgen · ${kit.theme.accent})`);
+      pushSubtaskStep(job, "generate_pages", "done", { detail: "4 pages generated (webgen)" });
+      // 4 — assemble: GEN/site/ is the bundle; snapshot for the zip export
+      job.siteUrl = `/view/${encodeURIComponent(job.draftId)}/`;
+      try {
+        const snapDir = path.join(GEN, "exports", job.draftId, "site");
+        fs.rmSync(snapDir, { recursive: true, force: true });
+        fs.cpSync(siteDir, snapDir, { recursive: true });
+        job.zipUrl = `/api/export-zip?dir=${encodeURIComponent(`exports/${job.draftId}/site`)}&name=${encodeURIComponent(siteFolderName(job))}`;
+      } catch (e) { console.warn("webgen site snapshot failed (non-fatal):", e.message); }
+      jobStep(job, 3, "done", "Assembled (webgen engine)");
+    }
+
+    if (!isCloneBuild && !useWebgen) {
     // 3 — generate all pages with Stitch
     // TEMPORARY (design-quality dev cycle, DESIGN_QUALITY_PLAN.md): while iterating
     // on the generation prompt, DEV_PAGES=on cuts a build to home only — 1 Stitch
@@ -15692,7 +15785,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === "/api/generate-site" && req.method === "POST") {
-      const { engine, pages, deviceType, theme, stitchKeyOverride } = JSON.parse(await readBody(req) || "{}");
+      const { engine, pages, deviceType, theme, stitchKeyOverride, pureScrape } = JSON.parse(await readBody(req) || "{}");
       if (!Array.isArray(pages) || !pages.length) return json(res, 400, { error: "pages[] required" });
       const t0 = Date.now();
       // Give this client its own slice of the curated photo pool (see CURATED_OFFSET
@@ -15700,6 +15793,27 @@ const server = http.createServer(async (req, res) => {
       // runJob() — because this route is also called directly by the manual
       // dashboard/wizard flows, which never go through runJob at all.
       seedCuratedPhotos((theme && theme.displayName) || "client");
+
+      // WEBGEN (default engine): our in-house design engine renders the 4 core pages
+      // straight into GEN/site/ (final output — no bind step needed). The dashboard
+      // wizard and runJob both reach the generator through this same path now.
+      // engine:"stitch" or "gemini" force the legacy generators; ENGINE=stitch disables webgen.
+      const webgenOff = (process.env.ENGINE || "webgen").toLowerCase() === "stitch";
+      if (!webgenOff && engine !== "stitch" && engine !== "gemini") {
+        let A = {}, existingUrl = "", onbScrape = false;
+        try {
+          const onb = JSON.parse(fs.readFileSync(path.join(DIR, "onboarding.json"), "utf8"));
+          A = onb.answers || {};
+          existingUrl = onb.existingWebsite || onb.referenceWebsite || "";
+          onbScrape = !!onb.pureScrape;
+        } catch (e) { console.warn("webgen: onboarding.json unavailable —", e.message); }
+        const doScrape = (pureScrape != null) ? !!pureScrape : onbScrape;
+        const { kit, pages } = await generateWebgenSite({ A, composed: theme || {}, existingUrl, pureScrape: doScrape });
+        const mk = (k, html) => ({ page: k, pageKey: k, engine: "webgen", htmlBytes: html.length, previewUrl: `/preview/${k}`, exportUrl: `/export/${k}`, screenshotUrl: "" });
+        return json(res, 200, { engine: "webgen", siteReady: true, layout: kit.layout || "editorial",
+          pages: [mk("home", pages.home), mk("services", pages.services), mk("about", pages.about), mk("team", pages.team)],
+          seconds: ((Date.now() - t0) / 1000).toFixed(1) });
+      }
       if (engine === "gemini") {
         // stylingConstraint here too, not just service pages: buildWpTheme's
         // splitPage() strips the <head> for every page this pipeline ships —
@@ -16267,6 +16381,14 @@ const server = http.createServer(async (req, res) => {
 
     if (p.startsWith("/preview/")) {
       const f = path.join(GEN, p.slice(9).replace(/[^a-z0-9_-]/gi, "") + ".html");
+      if (fs.existsSync(f)) return send(res, 200, "text/html", fs.readFileSync(f));
+      return send(res, 404, "text/html", "<h1>Not generated yet</h1>");
+    }
+    // webgen preview nav uses real WP paths (/services/ /about/ /team/) — serve the
+    // assembled pages so the in-page navigation works before deployment.
+    if (p === "/services/" || p === "/about/" || p === "/team/") {
+      const key = p.replace(/\//g, "");
+      const f = path.join(GEN, "site", key + ".html");
       if (fs.existsSync(f)) return send(res, 200, "text/html", fs.readFileSync(f));
       return send(res, 404, "text/html", "<h1>Not generated yet</h1>");
     }

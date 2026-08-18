@@ -1,13 +1,16 @@
 {
   "name": "g99-website-build-tool",
   "version": "0.1.0",
-  "description": "Growth99 website-build pipeline prototype: onboarding -> Stitch generate -> preview/export -> SEO audit",
+  "description": "Growth99 website-build pipeline: onboarding -> webgen (3 templates + Gemini) -> preview/export -> SEO audit",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "postinstall": "playwright install chromium || true"
   },
   "license": "UNLICENSED",
   "dependencies": {
-    "jimp": "^1.6.1"
+    "@google/generative-ai": "^0.21.0",
+    "jimp": "^1.6.1",
+    "playwright": "^1.48.0"
   }
 }
