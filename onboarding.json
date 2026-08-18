@@ -1,28 +1,19 @@
 {
-  "draftId": "ruma-demo-1",
+  "draftId": "hover-1786530193",
   "businessId": null,
   "template": "WEBSITE",
-  "receivedAt": "2026-08-18T05:46:13.166Z",
+  "receivedAt": "2026-08-12T10:23:13.304Z",
   "betaSiteUrl": "",
   "betaSiteRepo": "",
   "referenceWebsite": "",
-  "existingWebsite": "https://ruma.com",
+  "existingWebsite": "https://nuvoaestheticsclinic.com",
   "confirmedBrand": null,
   "logoUrl": null,
   "answers": {
-    "business_name": "RUMA Medical",
-    "services_offered": "Injectables, Skin Health, Functional Wellness",
-    "location": "Lehi, Utah",
-    "phone_for_website": "(801) 514-7650",
-    "primary_cta": "",
-    "brand_aesthetic": "",
-    "hero_headline": "",
-    "hero_subheadline": "",
-    "why_patients_choose": "",
-    "revenue_services": "",
-    "team_roster": "",
-    "financing_offered": "",
-    "featured_review": "",
-    "seo_keywords": ""
+    "business_name": "NUVO Aesthetics Clinic",
+    "services_offered": [
+      "Botox",
+      "Fillers"
+    ]
   }
 }
