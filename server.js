@@ -1189,7 +1189,7 @@ async function aiChrome(theme) {
 // Smart bind: AI-generated shared chrome injected into every page + link rewire.
 // Falls back to the deterministic canonical nav if the LLM is unavailable.
 // ------------------------------------------------------------ WordPress export (classic theme for Bedrock)
-const WP_PAGES = [["index", "front-page.php", "/"], ["services", "page-services.php", "/services/"], ["about", "page-about.php", "/about/"], ["team", "page-team.php", "/team/"]];
+const WP_PAGES = [["index", "front-page.php", "/"], ["services", "page-services.php", "/services/"], ["about", "page-about.php", "/about/"], ["contact", "page-contact.php", "/contact/"]];
 function wpRewriteLinks(html) {
   let h = html;
   const map = { "index.html": "/", "services.html": "/services/", "about.html": "/about/", "team.html": "/team/", "contact.html": "/contact/", "branding.html": "/branding/", "seo.html": "/seo/" };
@@ -1263,18 +1263,70 @@ async function generateWebgenSite({ A = {}, composed = {}, existingUrl = "", pur
   // set it to "auto" (or unset) to let the AI pick per brand.
   const forced = (process.env.WEBGEN_LAYOUT || "").toLowerCase();
   if (webgen.DESIGN_IDS.includes(forced)) kit.layout = forced;
-  const pages = webgen.renderPages(kit);
+
+  // Approach B — services & about MIRROR the client's real corresponding page
+  // (scraped section flow + copy + images), rendered in the home theme via a
+  // blueprint. Home stays as-is (already strong); contact keeps its map/hours
+  // layout. Any scrape/blueprint failure falls back to the Approach-A render, so
+  // a page is never blank. Off with WEBGEN_SCRAPE_PAGES=off.
+  // Scan the client's real pages once, then build a shared pool of their own
+  // photos — used to (a) mirror services/about structure via blueprints and (b)
+  // fill any empty image slot (hero, split, cards, contact) so nothing is a
+  // gradient placeholder. Off with WEBGEN_SCRAPE_PAGES=off.
+  let struct = null; const imgPool = [];
+  if (existingUrl && !/^(0|off|false|no)$/i.test(process.env.WEBGEN_SCRAPE_PAGES || "on")) {
+    try { struct = await scanSiteStructure(existingUrl); } catch (e) { console.warn("[webgen] scanSiteStructure skipped:", e.message); }
+  }
+  // Logo + social links for the premium footer (onboarding first, else scraped).
+  if (existingUrl) {
+    try {
+      const extras = await scrapeBrandExtras(existingUrl);
+      kit.brand = kit.brand || {};
+      kit.brand.logo = kit.brand.logo || A.logo_file || extras.logo || "";
+      kit.brand.social = { ...(extras.social || {}), ...(kit.brand.social || {}) };
+    } catch (e) { console.warn("[webgen] brand extras skipped:", e.message); }
+  }
+
+  const seedPool = (u) => { if (u && !imgPool.includes(u)) imgPool.push(u); };
+  if (struct && struct.pages) for (const p of Object.values(struct.pages)) for (const s of (p.sections || [])) for (const u of (s.imageUrls || [])) seedPool(u);
+  // also seed the home-scrape photos already chosen into the kit (strong hero candidates)
+  seedPool(kit.hero && kit.hero.image);
+  for (const u of (kit.gallery || [])) seedPool(u);
+  for (const c of ((kit.specialties && kit.specialties.cards) || [])) seedPool(c.image);
+  for (const m of ((kit.providers && kit.providers.members) || [])) seedPool(m.image);
+
+  const pages = {
+    home: webgen.renderHome(kit),
+    services: webgen.renderServices(kit),
+    about: webgen.renderAbout(kit),
+    contact: webgen.renderContact(kit, imgPool),
+  };
+  if (struct) {
+    try {
+      const bp = async (key, title) => {
+        const st = struct.pages && struct.pages[key];
+        if (!st || !(st.sections || []).length) { console.log(`[webgen] ${key}: no scraped structure — Approach-A fallback`); return null; }
+        const b = await webgen.buildBlueprint({ pageKey: key, title, struct: st, A, geminiCall });
+        if (b) { console.log(`[webgen] ${key}: blueprint from real page — ${b.blocks.length} blocks`); return webgen.renderFromBlueprint(kit, b, title, imgPool); }
+        console.log(`[webgen] ${key}: blueprint empty — Approach-A fallback`); return null;
+      };
+      const [svc, abt] = await Promise.all([bp("services", "Our Services"), bp("about", "About Us")]);
+      if (svc) pages.services = svc;
+      if (abt) pages.about = abt;
+    } catch (e) { console.warn("[webgen] scrape-faithful pages skipped:", e.message); }
+  }
+
   const siteDir = path.join(GEN, "site");
   fs.mkdirSync(siteDir, { recursive: true });
   fs.writeFileSync(path.join(siteDir, "index.html"), pages.home);
   fs.writeFileSync(path.join(siteDir, "services.html"), pages.services);
   fs.writeFileSync(path.join(siteDir, "about.html"), pages.about);
-  fs.writeFileSync(path.join(siteDir, "team.html"), pages.team);
-  // flat copies too — the /preview/<key> route reads GEN/<key>.html (home/services/about/team)
+  fs.writeFileSync(path.join(siteDir, "contact.html"), pages.contact);
+  // flat copies too — the /preview/<key> route reads GEN/<key>.html (home/services/about/contact)
   fs.writeFileSync(path.join(GEN, "home.html"), pages.home);
   fs.writeFileSync(path.join(GEN, "services.html"), pages.services);
   fs.writeFileSync(path.join(GEN, "about.html"), pages.about);
-  fs.writeFileSync(path.join(GEN, "team.html"), pages.team);
+  fs.writeFileSync(path.join(GEN, "contact.html"), pages.contact);
   return { kit, pages };
 }
 
@@ -1357,7 +1409,7 @@ add_action('after_switch_theme', function () {
         ['title' => 'Home', 'slug' => 'home', 'template' => ''],
         ['title' => 'Services', 'slug' => 'services', 'template' => 'page-services.php'],
         ['title' => 'About', 'slug' => 'about', 'template' => 'page-about.php'],
-        ['title' => 'Team', 'slug' => 'team', 'template' => 'page-team.php'],
+        ['title' => 'Contact', 'slug' => 'contact', 'template' => 'page-contact.php'],
     ];
 
     $home_id = 0;
@@ -1535,7 +1587,7 @@ if (! function_exists('${fn}')) {
             ['title' => 'Home', 'slug' => 'home', 'template' => ''],
             ['title' => 'Services', 'slug' => 'services', 'template' => 'page-services.php'],
             ['title' => 'About', 'slug' => 'about', 'template' => 'page-about.php'],
-            ['title' => 'Team', 'slug' => 'team', 'template' => 'page-team.php'],
+            ['title' => 'Contact', 'slug' => 'contact', 'template' => 'page-contact.php'],
         ];
 
         $home_id = 0;
@@ -7906,12 +7958,12 @@ async function runJob(job) {
       const existingUrl = job.payload && (job.payload.existingWebsite || job.payload.referenceWebsite);
       const { kit, pages } = await generateWebgenSite({ A, composed, existingUrl, pureScrape: !!(job.payload && job.payload.pureScrape) });
       const siteDir = path.join(GEN, "site");
-      jobStep(job, 2, "running", "Rendering Home · Services · About · Team…");
+      jobStep(job, 2, "running", "Rendering Home · Services · About · Contact…");
       job.pages = {
         home: { status: "done", bytes: pages.home.length, error: "" },
         services: { status: "done", bytes: pages.services.length, error: "" },
         about: { status: "done", bytes: pages.about.length, error: "" },
-        team: { status: "done", bytes: pages.team.length, error: "" },
+        contact: { status: "done", bytes: pages.contact.length, error: "" },
       };
       job.homeContent = (kit.hero && [kit.hero.h1, kit.hero.body].filter(Boolean).join(" — ")) || (composed && composed.brief) || "";
       jobStep(job, 2, "done", `4 pages generated (webgen · ${kit.theme.accent})`);
@@ -9554,6 +9606,54 @@ const textOf = (html) => String(html || "")
 // One page's real structure: the heading flow in DOM order, each tagged with what it seems to
 // be and how image-heavy it is. Deliberately heuristic and fail-soft — this feeds a prompt,
 // it does not need to be a perfect parse.
+// Scrape the client's LOGO + SOCIAL links off their home page for a premium
+// footer. Best-effort; returns {logo, social:{}} and never throws.
+async function scrapeBrandExtras(url) {
+  try {
+    const r = await fetch(/^https?:\/\//i.test(url) ? url : "https://" + url, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 G99Bot" } });
+    const html = await r.text();
+    const base = new URL(r.url);
+    const abs = (u) => { try { return new URL(u, base).href; } catch (e) { return null; } };
+    // logo: the header's logo <img> (class/alt/src mentioning "logo"); prefer a light/white variant (footer is dark)
+    const head = (html.match(/<header[\s\S]*?<\/header>/i) || [""])[0] || html;
+    const logos = [...head.matchAll(/<img\b[^>]*>/gi), ...html.matchAll(/<img\b[^>]*>/gi)]
+      .map((m) => m[0]).filter((t) => /logo/i.test(t) && !/sprite|icon-|favicon/i.test(t))
+      .map((t) => { const s = t.match(/\b(?:data-src|src)=["']([^"']+)["']/i); return s ? abs(s[1]) : null; })
+      .filter((u) => u && !/^data:/i.test(u));
+    const logo = logos.find((u) => /white|light|footer|inverse/i.test(u)) || logos[0] || null;
+    // socials
+    const social = {};
+    const grab = (re, key) => { const m = html.match(re); if (m && !social[key]) social[key] = m[0]; };
+    grab(/https?:\/\/(?:www\.)?instagram\.com\/[A-Za-z0-9_.\/-]+/i, "instagram");
+    grab(/https?:\/\/(?:www\.)?facebook\.com\/[A-Za-z0-9_.\/-]+/i, "facebook");
+    grab(/https?:\/\/(?:www\.)?(?:twitter|x)\.com\/[A-Za-z0-9_.\/-]+/i, "twitter");
+    grab(/https?:\/\/(?:www\.)?tiktok\.com\/@?[A-Za-z0-9_.\/-]+/i, "tiktok");
+    grab(/https?:\/\/(?:www\.)?youtube\.com\/[A-Za-z0-9_.@\/-]+/i, "youtube");
+    grab(/https?:\/\/(?:[a-z]{2,3}\.)?linkedin\.com\/[A-Za-z0-9_.\/-]+/i, "linkedin");
+    grab(/https?:\/\/(?:www\.)?yelp\.com\/biz\/[A-Za-z0-9_.\/-]+/i, "yelp");
+    grab(/https?:\/\/(?:[a-z]{2,3}\.)?pinterest\.com\/[A-Za-z0-9_.\/-]+/i, "pinterest");
+    return { logo, social };
+  } catch (e) { return { logo: null, social: {} }; }
+}
+
+// Extract the real content-image URLs from a section chunk (src / data-src /
+// srcset-largest / CSS background url), absolutized, full-res, decor-filtered, deduped.
+function sectionImageUrls(chunk, pageUrl) {
+  let base; try { base = new URL(pageUrl); } catch (e) { return []; }
+  const DECOR = /sprite|icon|favicon|spacer|placeholder|blank|pixel|1x1|loader|avatar-default|\/thumbs\/|logo|[-_]bg[-_.]|leaf-bg|gold-bg|golden-circle|gradient|wave|pattern|texture|divider|swirl|scrim|overlay|\.svg(\?|$)/i;
+  const full = (u) => u.replace(/-\d{2,4}x\d{2,4}(?=\.(?:jpe?g|png|webp|avif)(?:\?|$))/i, "");
+  const seen = new Set(), out = [];
+  const push = (u) => {
+    let a; try { a = new URL(u, base).href; } catch (e) { return; }
+    if (!/\.(jpe?g|png|webp|avif)(\?|$)/i.test(a) || DECOR.test(a)) return;
+    a = full(a); if (DECOR.test(a) || seen.has(a)) return; seen.add(a); out.push(a);
+  };
+  for (const m of chunk.matchAll(/<img\b[^>]*?\b(?:data-lazy-src|data-src|src)=["']([^"']+)["']/gi)) push(m[1]);
+  for (const m of chunk.matchAll(/\bsrcset=["']([^"']+)["']/gi)) { const c = m[1].split(",").map((s) => s.trim().split(/\s+/)[0]).filter(Boolean); if (c.length) push(c[c.length - 1]); }
+  for (const m of chunk.matchAll(/url\((["']?)([^)"']+)\1\)/gi)) push(m[2]);
+  return out.slice(0, 6);
+}
+
 async function scanPageStructure(url) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 20000);
@@ -9616,10 +9716,15 @@ async function scanPageStructure(url) {
     const chunk = main.slice(from, to);
     // Lazy-loaded sites put the real URL in data-src / srcset, so count those too.
     const images = (chunk.match(/<img|data-src=|srcset=|background-image/gi) || []).length;
+    // Pull the REAL image URLs in this section (not just a count) so a faithful
+    // rebuild can reuse the client's own photos. Absolutize, collapse WP thumbnail
+    // derivatives to full-res, drop decorative/texture/icon junk, dedupe.
+    const imageUrls = sectionImageUrls(chunk, url);
     sections.push({
       heading: label,
       kind: classifySection(label + " " + textOf(chunk).slice(0, 300)),
       images,
+      imageUrls,
       copy: textOf(chunk).slice(0, 600),
     });
   }
@@ -16753,7 +16858,7 @@ const server = http.createServer(async (req, res) => {
         const { kit, pages } = await generateWebgenSite({ A, composed: theme || {}, existingUrl, pureScrape: doScrape });
         const mk = (k, html) => ({ page: k, pageKey: k, engine: "webgen", htmlBytes: html.length, previewUrl: `/preview/${k}`, exportUrl: `/export/${k}`, screenshotUrl: "" });
         return json(res, 200, { engine: "webgen", siteReady: true, layout: kit.layout || "editorial",
-          pages: [mk("home", pages.home), mk("services", pages.services), mk("about", pages.about), mk("team", pages.team)],
+          pages: [mk("home", pages.home), mk("services", pages.services), mk("about", pages.about), mk("contact", pages.contact)],
           seconds: ((Date.now() - t0) / 1000).toFixed(1) });
       }
       if (engine === "gemini") {
