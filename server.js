@@ -1194,6 +1194,11 @@ function wpRewriteLinks(html) {
   let h = html;
   const map = { "index.html": "/", "services.html": "/services/", "about.html": "/about/", "team.html": "/team/", "contact.html": "/contact/", "branding.html": "/branding/", "seo.html": "/seo/" };
   for (const [f, to] of Object.entries(map)) h = h.split(`href="${f}"`).join(`href="${to}"`);
+  // Localized images live in the theme's assets/img/. A relative path breaks on a
+  // sub-page URL, so resolve to the theme asset URI (this runs inside php templates,
+  // so the <?php ?> executes). Covers <img src> and CSS url().
+  h = h.replace(/\bsrc=(["'])assets\/img\/([^"']+)\1/gi, (m, q, f) => `src=${q}<?php echo esc_url(get_theme_file_uri('assets/img/${f}')); ?>${q}`);
+  h = h.replace(/url\((["']?)assets\/img\/([^)"']+)\1\)/gi, (m, q, f) => `url(<?php echo esc_url(get_theme_file_uri('assets/img/${f}')); ?>)`);
   return h;
 }
 function stripReviewBar(html) { return html.replace(/<div data-g99-review[\s\S]*?<\/div>\s*/i, ""); }
@@ -1294,6 +1299,16 @@ async function generateWebgenSite({ A = {}, composed = {}, existingUrl = "", pur
   for (const u of (kit.gallery || [])) seedPool(u);
   for (const c of ((kit.specialties && kit.specialties.cards) || [])) seedPool(c.image);
   for (const m of ((kit.providers && kit.providers.members) || [])) seedPool(m.image);
+  // POOL-DEEPEN: the section scrape misses lazy-loaded photos (texture-heavy sites
+  // like NUVO leave a thin pool). Crawl home/about/services/team with the lazy-aware
+  // multi-page extractor so every slot gets a real photo, not a placeholder.
+  if (existingUrl && imgPool.length < 14) {
+    try {
+      const before = imgPool.length;
+      for (const rec of await extractSiteImages(existingUrl, 48)) seedPool(rec.url);
+      if (imgPool.length !== before) console.log(`[webgen] image pool deepened via multi-page crawl: ${before} → ${imgPool.length}`);
+    } catch (e) { console.warn("[webgen] pool deepen skipped:", e.message); }
+  }
 
   const pages = {
     home: webgen.renderHome(kit),
@@ -1306,8 +1321,9 @@ async function generateWebgenSite({ A = {}, composed = {}, existingUrl = "", pur
       const bp = async (key, title) => {
         const st = struct.pages && struct.pages[key];
         if (!st || !(st.sections || []).length) { console.log(`[webgen] ${key}: no scraped structure — Approach-A fallback`); return null; }
-        const b = await webgen.buildBlueprint({ pageKey: key, title, struct: st, A, geminiCall });
-        if (b) { console.log(`[webgen] ${key}: blueprint from real page — ${b.blocks.length} blocks`); return webgen.renderFromBlueprint(kit, b, title, imgPool); }
+        const shot = await refPageScreenshot(st.url || existingUrl).catch(() => null);
+        const b = await webgen.buildBlueprint({ pageKey: key, title, struct: st, A, geminiCall, screenshotB64: shot });
+        if (b) { console.log(`[webgen] ${key}: blueprint from real page — ${b.blocks.length} blocks${shot ? " (design-matched to screenshot)" : ""}`); return webgen.renderFromBlueprint(kit, b, title, imgPool); }
         console.log(`[webgen] ${key}: blueprint empty — Approach-A fallback`); return null;
       };
       const [svc, abt] = await Promise.all([bp("services", "Our Services"), bp("about", "About Us")]);
@@ -1318,6 +1334,16 @@ async function generateWebgenSite({ A = {}, composed = {}, existingUrl = "", pur
 
   const siteDir = path.join(GEN, "site");
   fs.mkdirSync(siteDir, { recursive: true });
+
+  // LOCALIZE: download every external image the pages reference (both <img src>
+  // and CSS url()) into site/assets/img/ and rewrite to a relative path. Kills the
+  // hotlink dependency (images always load, and the WordPress theme ships them).
+  try {
+    const dl = new Map();   // remote URL -> local "assets/img/<name>.<ext>", shared across pages
+    for (const key of ["home", "services", "about", "contact"]) pages[key] = await localizeImages(pages[key], siteDir, dl);
+    if (dl.size) console.log(`[webgen] localized ${dl.size} image(s) into assets/img/`);
+  } catch (e) { console.warn("[webgen] image localize skipped (keeping hotlinks):", e.message); }
+
   fs.writeFileSync(path.join(siteDir, "index.html"), pages.home);
   fs.writeFileSync(path.join(siteDir, "services.html"), pages.services);
   fs.writeFileSync(path.join(siteDir, "about.html"), pages.about);
@@ -1357,6 +1383,24 @@ async function buildWpTheme(slug, biz, opts = {}) {
   const businessId = opts.businessId || null;
   const favicon = await writeFaviconFromLogo(themeDir, opts.logoUrl);
   if (favicon) written.push(`assets/${favicon.file}`);
+
+  // Ship the localized images (GEN/site/assets/img → theme/assets/img) so the theme
+  // serves the client's own photos, not hotlinks. Each file MUST go into `written`
+  // so the push commits it (otherwise it's on disk but never reaches the repo → 404
+  // live). wpRewriteLinks points every reference at get_theme_file_uri('assets/img/…').
+  try {
+    const srcAssets = path.join(siteDir, "assets", "img");
+    if (fs.existsSync(srcAssets)) {
+      const dst = path.join(themeDir, "assets", "img");
+      fs.mkdirSync(dst, { recursive: true });
+      let n = 0;
+      for (const file of fs.readdirSync(srcAssets)) {
+        fs.copyFileSync(path.join(srcAssets, file), path.join(dst, file));
+        written.push(`assets/img/${file}`); n++;
+      }
+      console.log(`[buildWpTheme] shipped ${n} localized image(s) into theme assets/img/ (committed)`);
+    }
+  } catch (e) { console.warn("[buildWpTheme] asset copy failed (images may hotlink):", e.message); }
 
   w("style.css", `/*\nTheme Name: ${biz} (Growth99)\nTheme URI: https://growth99.com\nAuthor: Growth99\nDescription: AI-generated beta theme for ${biz}. Classic theme for Bedrock WordPress.\nVersion: 1.0.0\nLicense: Proprietary\nText Domain: g99-${slug}\n*/\n`);
 
@@ -9636,6 +9680,74 @@ async function scrapeBrandExtras(url) {
   } catch (e) { return { logo: null, social: {} }; }
 }
 
+// Desktop screenshot of a reference page (via Browserless — works on Render) used
+// as a DESIGN reference the blueprint AI reproduces. Above-the-fold is enough for
+// composition cues and keeps the payload small. Null when unavailable (text-only).
+async function refPageScreenshot(url) {
+  const full = /^https?:\/\//i.test(url) ? url : "https://" + url;
+  // 1) Browserless (hosted browser — works on Render)
+  if (BROWSERLESS_TOKEN) {
+    try {
+      const api = `${BROWSERLESS_URL}/screenshot?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), Math.min(BROWSERLESS_TIMEOUT_MS, 40000));
+      const body = {
+        url: full, viewport: { width: 1280, height: 1600, deviceScaleFactor: 1 },
+        gotoOptions: { waitUntil: "networkidle2", timeout: 40000 }, waitForTimeout: 1600, bestAttempt: true,
+        options: { fullPage: false, type: "jpeg", quality: 68 },
+      };
+      let res;
+      try { res = await fetch(api, { method: "POST", signal: ctl.signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); }
+      finally { clearTimeout(timer); }
+      if (res.ok) { const buf = Buffer.from(await res.arrayBuffer()); if (buf.length > 800 && buf.length < 4_000_000) return buf.toString("base64"); }
+    } catch (e) { /* fall through to playwright */ }
+  }
+  // 2) local Playwright fallback (no Browserless token, e.g. dev machine)
+  try {
+    const { chromium } = require("playwright");
+    const browser = await chromium.launch();
+    try {
+      const page = await browser.newPage({ viewport: { width: 1280, height: 1600 } });
+      await page.goto(full, { waitUntil: "networkidle", timeout: 40000 }).catch(() => {});
+      await page.waitForTimeout(1600);
+      const buf = await page.screenshot({ type: "jpeg", quality: 68, fullPage: false });
+      return buf.toString("base64");
+    } finally { await browser.close().catch(() => {}); }
+  } catch (e) { return null; }
+}
+
+// Download every external image an HTML page references (<img src> + CSS url())
+// into <siteDir>/assets/img/ and rewrite the references to a relative local path.
+// `dl` (remote URL -> local path) is shared across pages so each image downloads
+// once. Any download failure leaves that reference untouched (still works).
+async function localizeImages(html, siteDir, dl = new Map()) {
+  if (!html) return html;
+  const imgDir = path.join(siteDir, "assets", "img");
+  const EXT = /\.(jpe?g|png|webp|avif|gif)(\?|$)/i;
+  // collect unique external image URLs from src= and url()
+  const urls = new Set();
+  for (const m of html.matchAll(/(?:src=|url\()\s*["']?(https?:\/\/[^"')\s]+)/gi)) if (EXT.test(m[1])) urls.add(m[1]);
+  let out = html;
+  for (const url of urls) {
+    if (!dl.has(url)) {
+      try {
+        const r = await fetch(url, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 G99Bot" } });
+        if (!r.ok) { dl.set(url, null); continue; }
+        const buf = Buffer.from(await r.arrayBuffer());
+        if (!buf.length || buf.length > 8_000_000) { dl.set(url, null); continue; }
+        const ext = (url.match(EXT) || [, "jpg"])[1].toLowerCase().replace("jpeg", "jpg");
+        const name = crypto.createHash("md5").update(url).digest("hex").slice(0, 16) + "." + ext;
+        fs.mkdirSync(imgDir, { recursive: true });
+        fs.writeFileSync(path.join(imgDir, name), buf);
+        dl.set(url, "assets/img/" + name);
+      } catch (e) { dl.set(url, null); }
+    }
+    const local = dl.get(url);
+    if (local) out = out.split(url).join(local);
+  }
+  return out;
+}
+
 // Extract the real content-image URLs from a section chunk (src / data-src /
 // srcset-largest / CSS background url), absolutized, full-res, decor-filtered, deduped.
 function sectionImageUrls(chunk, pageUrl) {
@@ -17384,9 +17496,11 @@ const server = http.createServer(async (req, res) => {
     const viewM = p.match(/^\/view\/([a-z0-9_-]+)(?:\/(.*))?$/i);
     if (viewM) {
       const draftId = viewM[1].replace(/[^a-z0-9_-]/gi, "");
-      const rel = (viewM[2] || "index.html").replace(/[^a-z0-9._-]/gi, "") || "index.html";
-      const f = path.join(GEN, "exports", draftId, "site", rel);
-      if (fs.existsSync(f)) return send(res, 200, MIME[path.extname(f)] || "text/html", fs.readFileSync(f));
+      // Allow sub-directory paths (assets/img/…) but strip any ".." traversal.
+      const rel = (viewM[2] || "index.html").replace(/\.\.+/g, "").replace(/[^a-z0-9._/-]/gi, "").replace(/^\/+/, "") || "index.html";
+      const base = path.join(GEN, "exports", draftId, "site");
+      const f = path.join(base, rel);
+      if (f.startsWith(base) && fs.existsSync(f) && fs.statSync(f).isFile()) return send(res, 200, MIME[path.extname(f)] || "text/html", fs.readFileSync(f));
       return send(res, 404, "text/html", `<h1>No build snapshot for draft ${escHtml(draftId)}</h1><p>It may not have finished assembling yet.</p>`);
     }
 
