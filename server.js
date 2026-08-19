@@ -1310,6 +1310,13 @@ async function generateWebgenSite({ A = {}, composed = {}, existingUrl = "", pur
     } catch (e) { console.warn("[webgen] pool deepen skipped:", e.message); }
   }
 
+  // The home hero must never be empty — it is the site's first impression. If the
+  // kit's enrich step found nothing (or picked a dead URL), take the pool's best.
+  if (imgPool.length) {
+    kit.hero = kit.hero || {};
+    if (!kit.hero.image || !imgPool.includes(kit.hero.image)) kit.hero.image = imgPool[0];
+    if (kit.about && !kit.about.image) kit.about.image = imgPool[1] || imgPool[0];
+  }
   const pages = {
     home: webgen.renderHome(kit),
     services: webgen.renderServices(kit),
