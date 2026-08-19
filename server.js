@@ -1314,8 +1314,30 @@ async function generateWebgenSite({ A = {}, composed = {}, existingUrl = "", pur
   // kit's enrich step found nothing (or picked a dead URL), take the pool's best.
   if (imgPool.length) {
     kit.hero = kit.hero || {};
-    if (!kit.hero.image || !imgPool.includes(kit.hero.image)) kit.hero.image = imgPool[0];
-    if (kit.about && !kit.about.image) kit.about.image = imgPool[1] || imgPool[0];
+    // The hero slot must get a HERO-type photo, not just whatever the crawl found
+    // first: prefer filenames that signal a hero/welcome/interior shot, avoid
+    // headshot-looking "Firstname-Lastname" files, only then fall back to pool[0].
+    const heroish = (u) => /hero|banner|welcome|main|home|space|interior|lobby|reception|storefront|exterior|clinic-(front|building)|ambien/i.test(u);
+    const portraitish = (u) => /[A-Z][a-z]+-[A-Z][a-z]+/.test((u.split("/").pop() || "")) || /headshot|portrait|team|staff|provider/i.test(u);
+    const pickHero = () => imgPool.find(heroish) || imgPool.find((u) => !portraitish(u)) || imgPool[0];
+    if (!kit.hero.image || !imgPool.includes(kit.hero.image) || (portraitish(kit.hero.image) && imgPool.some(heroish))) kit.hero.image = pickHero();
+    if (kit.about && !kit.about.image) kit.about.image = imgPool.find((u) => u !== kit.hero.image) || imgPool[0];
+    // HOME specialty cards: all-or-nothing, same as blueprint pages. A 3-card grid
+    // with one photo and two empty cards reads broken; either every card gets its
+    // own unique photo from the pool, or they all render as clean text cards.
+    const cards = (kit.specialties && kit.specialties.cards) || [];
+    if (cards.length) {
+      const used = new Set([kit.hero.image, kit.about && kit.about.image].filter(Boolean));
+      const filled = cards.map((c) => {
+        if (c.image && imgPool.includes(c.image) && !used.has(c.image)) { used.add(c.image); return c.image; }
+        const u = imgPool.find((x) => !used.has(x));
+        if (u) { used.add(u); return u; }
+        return "";
+      });
+      const allHave = filled.every(Boolean);
+      cards.forEach((c, i) => { c.image = allHave ? filled[i] : ""; });
+      if (!allHave) console.log(`[webgen] home cards: pool too thin for ${cards.length} unique photos — rendering text cards`);
+    }
   }
   const pages = {
     home: webgen.renderHome(kit),
@@ -1338,6 +1360,11 @@ async function generateWebgenSite({ A = {}, composed = {}, existingUrl = "", pur
       if (abt) pages.about = abt;
     } catch (e) { console.warn("[webgen] scrape-faithful pages skipped:", e.message); }
   }
+
+  // Cap runaway `vh` hero heights so the full-page mockup screenshot (captured at an expanded
+  // viewport) renders the hero at a real height instead of ballooning it. min(vh, px) keeps the live
+  // site fully responsive — only the capture's abnormally tall viewport hits the px bound.
+  for (const key of ["home", "services", "about", "contact"]) pages[key] = capViewportHeights(pages[key]);
 
   const siteDir = path.join(GEN, "site");
   fs.mkdirSync(siteDir, { recursive: true });
@@ -2355,6 +2382,21 @@ function clampViewportHeights(html) {
     // Plain CSS inside <style> blocks
     .replace(/(\b(?:min-height|height)\s*:\s*)(\d{1,3})(?:d|s|l)?vh\b/gi,
       (_m, p, v) => `${p}${Math.max(320, Math.round(Math.min(Number(v), 100) * VH_TO_PX))}px`);
+}
+
+// Non-destructive alternative to clampViewportHeights, always on (not gated by CLAMP_VH): wraps a
+// `vh` height in min(vh, px) instead of replacing it. On a real viewport the vh wins and the page
+// stays responsive; the px only kicks in when the viewport is abnormally tall — which is exactly what
+// a full-page screenshot tool does (it expands the viewport to the whole document, so a `min-height:
+// 88vh` hero would otherwise balloon to thousands of px and swallow the capture). This is why webgen
+// (LUXE/editorial) pages screenshot fine at the site but ballooned in the TED mockup. Raw CSS only —
+// webgen sets hero heights in a <style> block, not Tailwind classes. Idempotent (skips min(...) it
+// already wrote). px reference = VH_TO_PX (8px/vh ≈ an 800px-tall laptop viewport).
+function capViewportHeights(html) {
+  if (!html) return html;
+  return String(html)
+    .replace(/(\b(?:min-height|height)\s*:\s*)(\d{1,3})(?:d|s|l)?vh\b/gi,
+      (_m, p, v) => `${p}min(${v}vh, ${Math.round(Math.min(Number(v), 100) * VH_TO_PX)}px)`);
 }
 
 function enforceBrandFonts(html, composed) {
