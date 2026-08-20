@@ -1282,19 +1282,13 @@ async function generateWebgenSite({ A = {}, composed = {}, existingUrl = "", pur
   if (existingUrl && !/^(0|off|false|no)$/i.test(process.env.WEBGEN_SCRAPE_PAGES || "on")) {
     try { struct = await scanSiteStructure(existingUrl); } catch (e) { console.warn("[webgen] scanSiteStructure skipped:", e.message); }
   }
-  // Logo + social links for the premium footer (onboarding first, else scraped),
-  // plus the site's DETERMINISTIC colour palette — the page tint and accent then
-  // come from the client's real site, stable across runs.
+  // Logo + social links for the premium footer (onboarding first, else scraped).
   if (existingUrl) {
     try {
       const extras = await scrapeBrandExtras(existingUrl);
       kit.brand = kit.brand || {};
       kit.brand.logo = kit.brand.logo || A.logo_file || extras.logo || "";
       kit.brand.social = { ...(extras.social || {}), ...(kit.brand.social || {}) };
-      if (extras.palette && extras.palette.length) {
-        kit.theme = webgen.themeTokens(composed, extras.palette);
-        console.log(`[webgen] theme from site palette: cream ${kit.theme.cream} · accent ${kit.theme.accent} (from ${extras.palette.length} scraped colours)`);
-      }
     } catch (e) { console.warn("[webgen] brand extras skipped:", e.message); }
   }
 
@@ -9731,25 +9725,8 @@ async function scrapeBrandExtras(url) {
     grab(/https?:\/\/(?:[a-z]{2,3}\.)?linkedin\.com\/[A-Za-z0-9_.\/-]+/i, "linkedin");
     grab(/https?:\/\/(?:www\.)?yelp\.com\/biz\/[A-Za-z0-9_.\/-]+/i, "yelp");
     grab(/https?:\/\/(?:[a-z]{2,3}\.)?pinterest\.com\/[A-Za-z0-9_.\/-]+/i, "pinterest");
-    // DETERMINISTIC palette: frequency-count hex colours across the page + its first
-    // stylesheets. The AI palette extraction differs run-to-run (champagne one build,
-    // gold the next) — this gives a stable, reproducible read of the site's real tints.
-    const counts = new Map();
-    const countHex = (txt) => {
-      for (const m of txt.matchAll(/#([0-9a-f]{6})\b/gi)) { const h = "#" + m[1].toLowerCase(); counts.set(h, (counts.get(h) || 0) + 1); }
-      for (const m of txt.matchAll(/rgba?\((\d+),\s*(\d+),\s*(\d+)/g)) { const h = "#" + [m[1], m[2], m[3]].map((v) => (+v).toString(16).padStart(2, "0")).join(""); counts.set(h, (counts.get(h) || 0) + 1); }
-    };
-    countHex(html);
-    // UNIQUE stylesheets, up to 8 in parallel: cache plugins list dozens of hashed
-    // css files (many duplicated) and the brand colours often live in the LARGE
-    // theme files — first-3 was fetching tiny reset files and missing the palette.
-    const cssLinks = [...new Set([...html.matchAll(/<link[^>]+rel=["']stylesheet["'][^>]*href=["']([^"']+)["']/gi)].map((m) => abs(m[1])).filter(Boolean))].slice(0, 8);
-    await Promise.all(cssLinks.map(async (cu) => {
-      try { const cr = await fetch(cu, { headers: { "User-Agent": "Mozilla/5.0 G99Bot" } }); if (cr.ok) countHex((await cr.text()).slice(0, 400000)); } catch (e) { /* best effort */ }
-    }));
-    const palette = [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([c]) => c).slice(0, 30);
-    return { logo, social, palette };
-  } catch (e) { return { logo: null, social: {}, palette: [] }; }
+    return { logo, social };
+  } catch (e) { return { logo: null, social: {} }; }
 }
 
 // Desktop screenshot of a reference page (via Browserless — works on Render) used
