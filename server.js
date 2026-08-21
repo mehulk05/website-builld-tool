@@ -8176,7 +8176,9 @@ async function runJob(job) {
 
     // 5 — WordPress theme + PR
     jobStep(job, 4, "running", "Building theme, pushing, opening PR…");
-    const push = await localApi("/api/push-wordpress", { theme, skipRebind: true, githubRepo: job.repo }, 15 * 60 * 1000);
+    // output_format "gitops" → resources/ tree for mcptest2-template repos instead of a PHP theme.
+    const outputFormat = String((job.payload && job.payload.output_format) || process.env.OUTPUT_FORMAT || "theme").toLowerCase();
+    const push = await localApi("/api/push-wordpress", { theme, skipRebind: true, githubRepo: job.repo, format: outputFormat === "gitops" ? "gitops" : undefined }, 15 * 60 * 1000);
     job.prUrl = push.prUrl; job.branch = push.branch;
     const slug = ((push.themePath || "").match(/g99-([a-z0-9-]+)\//) || [])[1] || "";
     job.themeSlug = slug;
@@ -8185,8 +8187,30 @@ async function runJob(job) {
     pushSubtaskStep(job, "wp_theme_pr", "done", { detail: job.prUrl });
 
     // 6 — CI watch → auto-fix → auto-merge
-    jobStep(job, 5, "running", "Watching CI build checks…");
+    // GitOps repos gate differently: their "Deploy to WordPress" check only
+    // succeeds for the branch the site actually deploys (main), so a PR-branch
+    // CI wait would spin for 40 min. Merge, then watch the main deployment run.
+    if (outputFormat === "gitops") {
+      jobStep(job, 5, "running", "Merging PR (GitOps deploys from main)…");
+      await awaitApprovalIfNeeded(job, "g99-" + slug, 5);
+      if (!job.mergedExternally) await localApi("/api/pr-merge", { prUrl: job.prUrl });
+      jobStep(job, 5, "running", "Merged — waiting for WordPress deployment run on main…");
+      let deployOk = false, lastState = "";
+      for (let i = 0; i < 90; i++) {           // ~15 min
+        const r = await sh(`gh run list --repo ${job.repo} --branch main --workflow wordpress-deployment.yml --limit 1 --json status,conclusion --jq ".[0] | .status + \\":\\" + (.conclusion // \\"\\")"`);
+        lastState = (r.stdout || "").trim();
+        if (/completed:success/.test(lastState)) { deployOk = true; break; }
+        if (/completed:(failure|cancelled|timed_out)/.test(lastState)) break;
+        jobStep(job, 5, "running", `Deployment run: ${lastState || "queued"}…`);
+        await sleep(10000);
+      }
+      jobStep(job, 5, "done", deployOk ? "Merged — WordPress deployment succeeded" : `Merged — deployment run state: ${lastState || "not observed"} (check the repo Actions tab)`);
+      // No PHP theme to activate for GitOps sites — the MU plugin reconciles pages itself.
+      job.status = "done";
+      return;
+    }
     let fixes = 0, merged = false;
+    jobStep(job, 5, "running", "Watching CI build checks…");
     for (let i = 0; i < 240 && !merged; i++) {
       let st;
       try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); }
@@ -9794,6 +9818,15 @@ async function localizeImages(html, siteDir, dl = new Map()) {
     const local = dl.get(url);
     if (local) out = out.split(url).join(local);
   }
+  // Persist local-path → original-URL so downstream exporters (GitOps format)
+  // can point at the source image again. Merged across pages (shared dl map).
+  try {
+    const mapFile = path.join(siteDir, "assets", "img-map.json");
+    const prev = fs.existsSync(mapFile) ? JSON.parse(fs.readFileSync(mapFile, "utf8")) : {};
+    for (const [url, local] of dl) if (local) prev[local] = url;
+    fs.mkdirSync(path.dirname(mapFile), { recursive: true });
+    fs.writeFileSync(mapFile, JSON.stringify(prev, null, 1));
+  } catch (e) { /* map is best-effort */ }
   return out;
 }
 
@@ -15289,6 +15322,10 @@ const server = http.createServer(async (req, res) => {
         // businessId alone is reused across clone/test businesses. See tedPushArtifacts().
         hubspotDealId: body.hubspotDealId || body.dealId || null,
         hubspotCompanyId: body.hubspotCompanyId || body.companyId || null,
+        // Engine + output format overrides ride the webhook payload (used by
+        // GitOps-format repos; absent for normal builds → theme).
+        engine: body.engine || undefined,
+        output_format: body.output_format || body.outputFormat || undefined,
       });
       console.log(`webhook: ${job.businessName} · repo ${job.repo} · beta ${job.liveUrl}${betaSiteUrl || betaSiteRepo ? "" : " (deal properties missing — using this deployment's defaults)"}`
         + (confirmedBrand ? ` · client-confirmed brand ${confirmedBrand.primaryColor || "?"}/${confirmedBrand.accentColor || "?"} ${confirmedBrand.headingFont || "?"}` : " · no confirmed brand (will derive)"));
@@ -17288,6 +17325,64 @@ const server = http.createServer(async (req, res) => {
       const a = onb.answers;
       const slug = (a.business_name || "client").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32);
       if (!body.skipRebind) await ensureFreshSite(body.theme); // rebind /site/ from newest generation — never ship stale (dashboard binds itself and passes skipRebind)
+
+      // ---- GitOps output format (mcptest2 template repos) ----------------------
+      // Instead of a PHP theme, ship a resources/ tree that the G99 MU-plugin
+      // reconciles into WordPress. Touches ONLY resources/pages/<slug>/ for the
+      // four core pages — never .github/, mu-plugins/, or other resources.
+      if (body.format === "gitops") {
+        const { compileGitops } = require("./lib/gitops/compile");
+        const stampG = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
+        let branchG = `g99/gitops-${slug}-${stampG}-${Date.now().toString(36).slice(-4)}`;
+        const tmpG = path.join(os.tmpdir(), "g99gitops-" + Date.now());
+        const stepsG = [];
+        const runG = async (cmd, cwd) => { const r = await sh(cmd, cwd); stepsG.push({ cmd, code: r.code, err: (r.stderr || "").slice(-300) }); return r; };
+        try {
+          let r = await runG(`git clone --depth 1 -c core.longpaths=true "${await ghCloneUrl(repo)}" "${tmpG}"`);
+          if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
+          // Reuse the repo's existing git_id per slug so the import updates pages
+          // in place (stable _g99_git_id) instead of delete+create.
+          const existingGitId = (pslug) => {
+            try { return JSON.parse(fs.readFileSync(path.join(tmpG, "resources", "pages", pslug, "resource.json"), "utf8")).git_id || null; }
+            catch (e) { return null; }
+          };
+          const { files, pages } = compileGitops(path.join(GEN, "site"), a, existingGitId);
+          if (body.dryRun) {
+            const outDir = path.join(GEN, "gitops", slug);
+            fs.rmSync(outDir, { recursive: true, force: true });
+            for (const [rel, content] of files) { const to = path.join(outDir, rel); fs.mkdirSync(path.dirname(to), { recursive: true }); fs.writeFileSync(to, content); }
+            fs.rmSync(tmpG, { recursive: true, force: true });
+            return json(res, 200, { dryRun: true, format: "gitops", pages, outDir, files: [...files.keys()] });
+          }
+          for (const pslug of pages) fs.rmSync(path.join(tmpG, "resources", "pages", pslug), { recursive: true, force: true });
+          for (const [rel, content] of files) { const to = path.join(tmpG, rel); fs.mkdirSync(path.dirname(to), { recursive: true }); fs.writeFileSync(to, content); }
+          // Site identity: the tab title / og meta come from site.json (blogname),
+          // which otherwise keeps the previous client's name.
+          try {
+            const sj = path.join(tmpG, "resources", "site.json");
+            const site = JSON.parse(fs.readFileSync(sj, "utf8"));
+            site.blogname = a.business_name || site.blogname;
+            site.blogdescription = (a.tagline || `${a.business_name} — advanced aesthetics & wellness`).slice(0, 120);
+            fs.writeFileSync(sj, JSON.stringify(site, null, 4));
+          } catch (e) { console.warn("[gitops] site.json patch skipped:", e.message); }
+          await runG(`git checkout -b "${branchG}"`, tmpG);
+          await runG(`git add -A resources/pages resources/site.json`, tmpG);
+          r = await runG(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "GitOps: ${a.business_name} generated pages (${pages.join(", ")})"`, tmpG);
+          if (r.code) throw new Error("commit failed (no changes?): " + (r.stderr || r.stdout).slice(-200));
+          r = await runG(`git push -u origin "${branchG}"`, tmpG);
+          if (r.code) throw new Error("push failed: " + r.stderr.slice(-200));
+          const prBodyG = `Generated **${a.business_name}** pages in G99 GitOps format (\`resources/pages/{${pages.join(",")}}\`).\\n\\nEach page is an Elementor \`html\` widget (elementor_canvas — carries its own header/footer), compiled by the Growth99 Website Build Tool webgen engine. Only \`resources/pages/\` for these slugs is touched.`;
+          r = await runG(`gh pr create --repo ${repo} --base main --head "${branchG}" --title "GitOps: ${a.business_name} generated pages" --body "${prBodyG}"`, tmpG);
+          const prUrlG = (r.stdout.match(/https:\/\/github\.com\/\S+/) || [""])[0];
+          fs.rmSync(tmpG, { recursive: true, force: true });
+          if (!prUrlG && r.code) throw new Error("PR create failed: " + r.stderr.slice(-200));
+          return json(res, 200, { format: "gitops", branch: branchG, prUrl: prUrlG, pages, files: files.size });
+        } catch (e) {
+          try { fs.rmSync(tmpG, { recursive: true, force: true }); } catch (_) {}
+          return json(res, 500, { error: e.message, steps: stepsG });
+        }
+      }
+
       const built = await buildWpTheme(slug, a.business_name, {
         // Favicon source and chatbot business id: the logo is an answer, the business id
         // rides at the root of the webhook payload.
