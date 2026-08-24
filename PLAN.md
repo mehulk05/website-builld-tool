@@ -1,74 +1,56 @@
-# Plan: Use the medspa-tool process inside the build tool  (started 2026-08-15)
+# Plan: Output G99 GitOps `resources/` format instead of PHP theme  (started 2026-08-21)
 
-Goal: generate the website the **same way the medspa mockup tool does** — AI writes only the *content*,
-the *layout* is code — but take the input from the **onboarding data that already arrives**, not from a
-user-typed URL. Pages must be as good as today's, and **every TED event must fire exactly as it does
-today** (Mehul: TED subtasks close off those events).
+Goal: a build job produces a repo in the **mcptest2.gogroth.com template format** — a `resources/` tree
+(pages as Elementor JSON + resource.json + seo.json, media binaries + ref JSON, menus/site config) that
+the G99 MU-plugin reconciles into WordPress — instead of today's Bedrock repo with a custom PHP theme
+(`web/app/themes/g99-*`). TED events unchanged.
 
-Decided 2026-08-15: **home page only** for v1. Playwright, same as the medspa tool.
-Prior plans deleted per Mehul; recoverable from git at `2db745d`.
+## What the target format is (from mcptest2 ARCHITECTURE.md)
 
-## The process we are copying
+- Repo = desired state, NOT a WP install. Only `resources/` is site-specific; workflow + `web/app/mu-plugins/g99-control/` are shared fleet files that come from the template and must not be generated or touched by us.
+- Per page: `resources/pages/<slug>/{resource.json, elementor.json, seo.json}`.
+  - `resource.json`: schema_version, git_id (stable!), type, slug, title, status, page_template `elementor_header_footer`, featured_image `media:<ref>`.
+  - `elementor.json`: schema_version 1, elementor_version "3", `elements[]` — Elementor container/widget tree.
+  - `seo.json`: provider rank_math, title/description/focus keyword.
+- Media: `resources/media/<File>.webp` + `<ref>.json` ({ref, file, alt, caption}); referenced as `media:<ref>`.
+- Site-level: `menus.json`, `site.json`, `taxonomies.json`, `theme-mods.json`, `widgets.json`, `custom-css.css`, templates/ (header, footer, default-kit …).
+- `{{SITE_URL}}` is the portable token for internal links.
+- Deploy: push to branch → signed webhook → plugin fetches, validates, reconciles transactionally.
 
-This is the medspa tool's pipeline, and what each step becomes here.
+## Key design decision (needs Mehul's confirmation)
 
-| Medspa tool (today) | In the build tool | What changes |
-|---|---|---|
-| 1. User pastes a URL in a box | `existingWebsite` + `referenceWebsite` from the onboarding payload | **No input box.** Both URLs already arrive — see onboarding.sample.json |
-| 2. Playwright scrapes: colors, fonts, images, screenshot | Same, but **two** scrapes | `referenceWebsite` → design only. `existingWebsite` → images + facts |
-| 3. One Gemini call → BrandKit JSON (theme + all copy) | Same call, **seeded with the onboarding answers** | Business name, services, team, hero headline, review are already given — AI invents far less |
-| 4. Template function renders HTML (code, no AI) | Same three templates | Layout is deterministic → no per-page drift |
-| 5. Show the page | Hand off to the **existing** pipeline | assemble → WP theme → PR → CI → merge, all unchanged |
+Our webgen pages are hand-crafted HTML/CSS — Elementor has no widget for them. Options:
 
-Step 5 is why this is cheap: everything after "render HTML" already works and is engine-agnostic.
-
-## The one thing that must not break: TED events
-
-TED is **not** called directly by this tool. The chain is:
-
-```
-jobStep()  →  postStatus(job)  →  POST G99_STATUS_CALLBACK_URL
-                               →  product-service writes ledger events
-                               →  TED polls the ledger  →  subtask closes
-```
-
-So:
-
-- **`postStatus()` ignores anything that isn't `job.type === "build"`** (server.js:6158). Editorial must run
-  *inside* the normal build job. A new job type or a side route emits **nothing** — silently — and TED
-  subtasks stop closing.
-- **`JOB_STEP_KEYS` (server.js:3146) are positionally paired with `JOB_STEPS`.** Step 2's label says
-  `"Generate pages (Stitch)"`; the label may change, the **key `generate_pages` must not move**.
-- `tedPushArtifacts("SERVICE_PAGES_CREATED", …)` (server.js:6804, :10130) is a **separate** route and must
-  keep firing too.
-
-`job.emit.eventLog` (server.js:6068) already records which event fired at which step, so we can **prove**
-parity by diffing a stitch build against an editorial build.
-
-## Definition of done
-
-1. Editorial build produces a home page that reaches a merged PR.
-2. `job.emit.eventLog` diff vs. a stitch build = **empty** (same events, same step keys).
-3. `croAudit` score on editorial home ≥ stitch home for the same client.
+- **A (recommended v1): section-as-HTML-widget.** Split each generated page into its sections; each section becomes an Elementor container holding one `html` widget with that section's markup. Page CSS goes to `resources/custom-css.css`. Pixel-identical to today's output, valid Elementor JSON, editable per-section in the WP editor.
+- **B: full native-widget mapping** (heading/text-editor/image/button widgets). Real Elementor editability, but a large mapping layer and design fidelity loss. Later phase if needed.
 
 | # | Task | Files / area | Status | Notes |
 |---|------|--------------|--------|-------|
-| 1 | Scrape both URLs with Playwright | new lib/editorial/scrape.js | ⏳ pending | Port the medspa `scrape()` as-is. Run it twice: reference (design) + existing (images/facts). Add `playwright` to package.json |
-| 2 | Verify Playwright runs on Render | render.yaml, render-build.sh | ⏳ pending | Needs a browser download + memory on a free dyno. Do this **early** — if it fails, fall back to the existing `readSiteBrand` (:2072) and we lose the screenshot, not the plan |
-| 3 | BrandKit extractor, seeded with onboarding | server.js new `extractBrandKit()` near `geminiGenerate` (:1030) | ⏳ pending | One Gemini call → typed JSON. Feed it `A.business_name`, `services_offered`, `team_roster`, `hero_headline`, `featured_review`, `phone_for_website`, `location`. Go through the existing `aiCall` wrapper so cost metering + key rotation keep working |
-| 4 | Port the three templates | new templates/{base,editorial,bold,minimal,motion}.js | ⏳ pending | Pure `kit → html` functions, no deps |
-| 5 | Keep client's own photos; block the reference's | server.js image slots, `unsplashOrCurated` (:1810) | ⏳ pending | **Corrected 2026-08-15 (Mehul):** images from `existingWebsite` are the client's own — keep them, they beat stock. Only guard that `referenceWebsite` images never land in the page. Curated/Unsplash is the **fallback** when a slot has no client photo |
-| 6 | **Move CSS out of `<head>`** | server.js `splitPage` (:1200), `buildWpTheme` (:1220), templates/base.js | ⏳ pending | 🔴 **Blocker.** `splitPage()` throws away `<head>` on every page; the templates keep all their CSS in a `<style>` there → theme renders **completely unstyled**. Same cause as the tailwind bug noted at :15709. Emit a stylesheet → `style.css` |
-| 7 | **Run inside the normal build job** | server.js `runJob` (:7216), `/api/generate-site` (:15699) | ⏳ pending | 🔴 **The TED constraint.** `engine: "editorial"` is a branch inside the existing build job — not a new job type or route |
-| 8 | Engine-aware step label, key unchanged | server.js `JOB_STEPS` (:3135), `JOB_STEP_KEYS` (:3146) | ⏳ pending | Label `"Generate pages (Stitch)"` → engine-aware. **`generate_pages` key must not move or reorder** |
-| 9 | Run the existing QC + SEO chain | server.js `seoEnhance` (:2678), `injectCanonicalNav` (:2665), `enforceFooterFacts` (:2227), `qcImageResolution` (:2505), `fixImages` (:1899) | ⏳ pending | Engine-agnostic HTML→HTML passes; this is what makes the page shippable, not just pretty |
-| 10 | `tedPushArtifacts` keeps firing | server.js :6804, :10130 | ⏳ pending | Second outbound route, fails independently of `postStatus` |
-| 11 | **Prove event parity** | test-full.js, server.js exports (:16340) | ⏳ pending | Diff `emit.eventLog` between a stitch job and an editorial job. **This is the proof your TED subtasks still close** |
-| 12 | **Prove quality parity** | server.js `croAudit` (:2955), `pageScore` (:504) | ⏳ pending | Score both engines for the same client; editorial ≥ stitch |
-| 13 | Retire CLONE_MODE | server.js `reskinTemplateBrand` (:6910), CLONE_MODE (:7273), reference_sites/ | ⏳ pending | Already a rough version of this idea (patch a frozen HTML file's CSS vars). Editorial replaces it |
-| 14 | E2E with real onboarding data | full local | ⏳ pending | Feed onboarding.sample.json → merged PR, with 11 and 12 green |
+| 1 | Confirm format details w/ MCP repo owner | — | ✅ done | Does the reconciler accept `html` widgets? Is default-kit/header/footer template mandatory or does the destination site already have them? Which repo will jobs push to? |
+| 2 | GitOps resource compiler | new lib/gitops/compile.js | ✅ done | `compileResources(pages, biz, media)` → in-memory file map of the whole resources/ tree. Pure function, unit-testable offline |
+| 3 | HTML → elementor.json (option A) | lib/gitops/elementor.js, reuses section split like splitPage (server.js:~1200) | ✅ done | container + html-widget per section; stable element ids (hash of slug+index) so re-deploys don't churn |
+| 4 | resource.json + seo.json per page | lib/gitops/compile.js | ✅ done | git_id = `page-<slug>-<jobhash>` stable across pushes; SEO title/desc from onboarding data (rank_math fields, like mcptest2 samples) |
+| 5 | Media pipeline → resources/media | lib/gitops/compile.js, localizeImages (server.js:9772) | ✅ done | Localized images already downloaded → copy binary + write ref JSON; rewrite page URLs to `{{SITE_URL}}`-relative media paths |
+| 6 | Site config JSONs | lib/gitops/compile.js | ✅ done | menus.json (Home/Services/About/Contact), site.json (business name, tagline), custom-css.css (webgen page CSS), minimal taxonomies/theme-mods/widgets stubs |
+| 7 | Output-format switch in build job | server.js runJob, buildWpTheme (server.js:1395) | ✅ done | `OUTPUT_FORMAT=gitops` env / payload flag. gitops path replaces buildWpTheme; PHP-theme path stays default until proven. Same job type → postStatus/TED untouched |
+| 8 | Commit/PR flow to template-based repo | server.js push/PR helpers (:6796, :9075) | ✅ done | Clone target repo (created from mcptest2 template), replace ONLY resources/, branch + PR. Never touch .github/ or mu-plugins/ |
+| 9 | Local E2E: compile from a finished job | test script | ✅ done | Run compiler on an existing GEN/site output; validate JSON shapes against mcptest2 samples |
+| 10 | Live E2E on a test repo | mcptest2 or a new template copy | ✅ done | Real job → PR → merge → plugin reconciles → pages render on the WP site. Definition of done |
+
+## Definition of done
+
+A build-tool job pushes a `resources/` tree to a template-based repo, the G99 plugin imports it without
+validation errors, and the four pages (home/services/about/contact) render on the WordPress site looking
+the same as today's theme output. TED event log diff vs a normal build = empty.
 
 ## Not in v1
 
-About / services / contact pages, and service pages. The three templates are **homepage layouts**. Those
-need either a `pages{}` extension to the BrandKit or a new template, and are a separate plan.
+Blog posts, products, astra-portfolios, popups, per-service pages, Elementor native-widget mapping (option B),
+WordPress→Git reverse sync (plugin handles that).
+
+## Archive
+
+### Plan: Use the medspa-tool process inside the build tool (2026-08-15 → done ~2026-08-19)
+Shipped as the `webgen` engine (lib/webgen/*): scrape → BrandKit → code-rendered pages, blueprint designs,
+deterministic site-derived theming, localized images, premium contact/footer, TED event parity proven.
+Full original table recoverable from git history of PLAN.md.

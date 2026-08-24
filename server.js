@@ -8195,9 +8195,15 @@ async function runJob(job) {
       await awaitApprovalIfNeeded(job, "g99-" + slug, 5);
       if (!job.mergedExternally) await localApi("/api/pr-merge", { prUrl: job.prUrl });
       jobStep(job, 5, "running", "Merged — waiting for WordPress deployment run on main…");
+      // Match the deployment run to THIS merge's SHA — "latest run on main" can be
+      // an older, already-completed deploy and reports a false success.
+      let mergeSha = "";
+      try { mergeSha = (await sh(`gh api repos/${job.repo}/commits/main --jq .sha`)).stdout.trim(); } catch (e) { /* fall back to latest */ }
       let deployOk = false, lastState = "";
       for (let i = 0; i < 90; i++) {           // ~15 min
-        const r = await sh(`gh run list --repo ${job.repo} --branch main --workflow wordpress-deployment.yml --limit 1 --json status,conclusion --jq ".[0] | .status + \\":\\" + (.conclusion // \\"\\")"`);
+        const r = mergeSha
+          ? await sh(`gh run list --repo ${job.repo} --branch main --workflow wordpress-deployment.yml --limit 5 --json status,conclusion,headSha --jq "[.[] | select(.headSha==\\"${mergeSha}\\")][0] | if . then .status + \\":\\" + (.conclusion // \\"\\") else \\"\\" end"`)
+          : await sh(`gh run list --repo ${job.repo} --branch main --workflow wordpress-deployment.yml --limit 1 --json status,conclusion --jq ".[0] | .status + \\":\\" + (.conclusion // \\"\\")"`);
         lastState = (r.stdout || "").trim();
         if (/completed:success/.test(lastState)) { deployOk = true; break; }
         if (/completed:(failure|cancelled|timed_out)/.test(lastState)) break;
@@ -17361,8 +17367,14 @@ const server = http.createServer(async (req, res) => {
           try {
             const sj = path.join(tmpG, "resources", "site.json");
             const site = JSON.parse(fs.readFileSync(sj, "utf8"));
-            site.blogname = a.business_name || site.blogname;
-            site.blogdescription = (a.tagline || `${a.business_name} — advanced aesthetics & wellness`).slice(0, 120);
+            // WP stores these options HTML-escaped (& → &amp;), and the plugin's
+            // post-apply verify compares raw strings — any &/<
+            // in the value triggers "verification failed; rolling back". Keep them escapable-free.
+            const optSafe = (s) => String(s || "").replace(/&/g, "and").replace(/[<>"]/g, "").trim();
+            site.blogname = optSafe(a.business_name) || site.blogname;
+            // No business name here — WP renders the front-page title as
+            // "blogname – blogdescription", so repeating the name doubles it.
+            site.blogdescription = optSafe(a.tagline || "Advanced Aesthetics and Wellness").slice(0, 120);
             fs.writeFileSync(sj, JSON.stringify(site, null, 4));
           } catch (e) { console.warn("[gitops] site.json patch skipped:", e.message); }
           await runG(`git checkout -b "${branchG}"`, tmpG);
