@@ -160,9 +160,7 @@ async function restoreVersion(v) {
   // edit, so it gets the same explicit confirmation.
   const ok = await window.G99.confirm({
     title: "Restore this version?",
-    body: SITE.requireApproval
-      ? "Studio will roll the theme back to this version and open a pull request, then pause for your approval before merging."
-      : "Studio will roll the theme back to this version, open a pull request and merge it once the build passes. Theme changes made after this version are discarded.",
+    body: "Studio will roll the theme back to this version, open a pull request and merge it once the build passes. Theme changes made after this version are discarded.",
     details: {
       Site: SITE.businessName,
       Repository: SITE.githubRepo || "not set",
@@ -287,7 +285,6 @@ function render() {
         <div class="dm">${esc(domain || "no domain set")}</div>
       </div>
       <div class="right">
-        <label class="switch"><input type="checkbox" id="appr"${SITE.requireApproval ? " checked" : ""}><span class="track"></span>Approve before ship</label>
         <button class="btn" id="history" aria-expanded="false" title="Version history">${svg("clock", 15)}History</button>
         <button class="btn" id="togglePane" aria-pressed="${COLLAPSED ? "true" : "false"}" aria-controls="panes" title="${COLLAPSED ? "Show the chat panel" : "Hide the chat panel"}">${svg("panel", 15)}<span id="togglePaneLabel">${COLLAPSED ? "Show chat" : "Hide chat"}</span></button>
         <button class="btn" id="switchSite">Switch site</button>
@@ -366,13 +363,6 @@ function wire() {
     input.focus(); input.dispatchEvent(new Event("input"));
   };
   $("switchSite").onclick = () => showPicker();
-  $("appr").onchange = async (e) => {
-    try {
-      const d = await postJSON("/api/site-approval", { siteId: SITE.siteId, requireApproval: e.target.checked });
-      SITE.requireApproval = d.requireApproval;
-      toast(d.requireApproval ? "Changes will pause for your approval before merge" : "Changes auto-merge once the build is green");
-    } catch (err) { e.target.checked = !e.target.checked; toast("Could not update: " + err.message); }
-  };
   fillModels();
   $("model").onchange = (e) => {
     MODEL = e.target.value;
@@ -498,9 +488,7 @@ async function send() {
   // stray Enter. Confirm names the repo, the theme and the merge policy.
   const ok = await window.G99.confirm({
     title: "Ship this change?",
-    body: SITE.requireApproval
-      ? "Studio will write the change and open a pull request, then pause for your approval before merging."
-      : "Studio will write the change, open a pull request and merge it automatically once the build passes.",
+    body: "Studio will write the change, open a pull request and merge it automatically once the build passes.",
     details: {
       Site: SITE.businessName,
       Repository: SITE.githubRepo,
@@ -508,7 +496,7 @@ async function send() {
       Change: text ? (text.length > 120 ? text.slice(0, 120) + "…" : text) : "(uses the attached file only)",
       ...(pending.length ? { Attached: pending.map((a) => a.filename).join(", ") } : {}),
     },
-    confirmLabel: SITE.requireApproval ? "Open pull request" : "Ship it",
+    confirmLabel: "Ship it",
   });
   if (!ok) return;
 
@@ -540,8 +528,7 @@ async function send() {
 
   const finalText = text || "Use the attached file as directed.";
   THREAD.push({ role: "user", text: finalText, attachments });
-  const mode = SITE.requireApproval ? "I'll pause before merging so you can approve it." : "It merges automatically once the build passes.";
-  const ai = { role: "ai", text: `On it — applying that to ${SITE.businessName}. ${mode}`, jobId: null, job: null };
+  const ai = { role: "ai", text: `On it — applying that to ${SITE.businessName}. It merges automatically once the build passes.`, jobId: null, job: null };
   THREAD.push(ai);
   renderThread(); save();
 
