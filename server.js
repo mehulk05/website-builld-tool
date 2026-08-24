@@ -3739,7 +3739,6 @@ async function syncSiteRegistry() {
       themePath: `web/app/themes/${slug}`,
       githubRepo: WP_REPO,
       liveUrl: prev.liveUrl || LIVE_URL,
-      requireApproval: prev.requireApproval || false,
       lastPrUrl: (last && last.url) || prev.lastPrUrl || null,
       lastChange: (last && last.title) || prev.lastChange || null,
       updatedAt: (last && last.mergedAt) || prev.updatedAt || null,
@@ -3858,9 +3857,6 @@ async function resolveEditTarget(website) {
   return { themeSlug: slug, themePath: `web/app/themes/${slug}`, muPath, themes };
 }
 
-// Per-site "require approval before merge" is stored locally (siteId -> bool),
-// independent of NocoDB, so operators can gate merges per website.
-const APPROVALS_FILE = path.join(DIR, "approvals.json");
 // ---- local IDE hand-off -----------------------------------------------------
 // Cursor is browser-side (documented prompt deeplink); the other two are launched
 // here because they have no equivalent URL scheme for a prefilled prompt.
@@ -4096,9 +4092,6 @@ async function prLiveState(prUrl) {
   let d = {}; try { d = JSON.parse(r.stdout || "{}"); } catch (e) { return {}; }
   return { state: String(d.state || "").toUpperCase(), mergedAt: d.mergedAt || null };
 }
-
-function readApprovals() { try { return JSON.parse(fs.readFileSync(APPROVALS_FILE, "utf8")); } catch (e) { return {}; } }
-function writeApprovals(m) { fs.writeFileSync(APPROVALS_FILE, JSON.stringify(m, null, 2)); }
 
 // Scheduled re-audit: re-score the live active site, store the trend, alert on
 // regression. Runs on demand (/api/reaudit) and on a timer (REAUDIT_HOURS>0).
@@ -4855,7 +4848,10 @@ async function startTedSubtaskRun(taskId, { dryRun = false } = {}) {
     jobId: "edit-" + Date.now(),
     siteId: r.site.siteId, businessName: r.site.businessName, githubRepo: r.site.githubRepo,
     themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
-    prompt: r.instruction, forceApproval: true,
+    // Runs to completion on its own: TED only moves to the next task once this
+    // one closes, and it cannot close while the run is parked on an approval
+    // nobody in TED can even see it is waiting for.
+    prompt: r.instruction, forceApproval: false,
     // Not "email": there is no thread and nobody to reply to, and the email
     // reply path keys off that. The subtask id is what makes the outcome
     // comment land back where the request was made.
@@ -6638,16 +6634,18 @@ async function runPrSmoke(mode, repoIn, baseIn) {
   }
 }
 
-function siteRequiresApproval(siteId) {
-  return !!readApprovals()[siteId];
-}
-// Per-site approval gate: with green CI, if the site requires approval, pause
-// (up to 60 min) until /api/job-approve flips job.approved — then merge.
+// Approval gate. Beta site revisions never pause here: an edit, restore, enrich
+// or SEO run — however it was raised, from the edit chat, an inbound email or a
+// TED task — opens its pull request and merges itself the moment CI is green.
+// Waiting for a human was stalling requests that nobody was watching for, and a
+// revision to a beta site is reversible by another revision.
+// What still stops is a run that explicitly asks to be gated via
+// payload.forceApproval — today that is Perform PR under
+// TED_PERFORM_PR_APPROVAL=on. siteId stays in the signature for the call sites;
+// there is no longer a per-site approval setting for it to look up.
 async function awaitApprovalIfNeeded(job, siteId, stepIdx) {
-  // forceApproval overrides the per-site setting: a run nobody typed into
-  // Studio by hand (an inbound email) always gets a human before it merges.
   const forced = !!(job.payload && job.payload.forceApproval);
-  if (job.approved || (!forced && !siteRequiresApproval(siteId))) return;
+  if (job.approved || !forced) return;
   job.awaitingApproval = true;
   jobStep(job, stepIdx, "running", "Build is green — waiting for approval to merge…");
   notify(`⏳ *${job.businessName}* build passed — needs approval to go live: ${job.prUrl || ""}`);
@@ -15507,17 +15505,17 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { accepted: true, dryRun: true, siteId: site.siteId, businessName: site.businessName, matchedBy: hit.how, themeSlug: target.themeSlug, instruction });
       }
 
-      // 5 — same pipeline as the chat UI, but it always stops for a human
-      //     before merging: nobody typed this request into Studio.
+      // 5 — same pipeline as the chat UI, and it ships the same way: straight
+      //     through to main once CI is green, with no approval in between.
       const job = enqueueEditJob({
         jobId: "edit-" + Date.now(),
         siteId: site.siteId, businessName: site.businessName, githubRepo: site.githubRepo,
         themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
-        prompt: instruction, forceApproval: true,
+        prompt: instruction, forceApproval: false,
         source: "email", requestedBy: addr, emailSubject: subject, threadId, liveUrl: site.liveUrl || "",
       });
       logEmailRequest({ from, subject, messageId: body.messageId || null, status: "queued", siteId: site.siteId, matchedBy: hit.how, instruction, jobId: job.draftId });
-      notify(`📧 Email request from ${addr} → *${site.businessName}*: ${instruction.slice(0, 140)} (needs your approval before merge)`);
+      notify(`📧 Email request from ${addr} → *${site.businessName}*: ${instruction.slice(0, 140)} (shipping automatically)`);
       // File it in TED for the delivery team. Only accepted requests reach this
       // line — every decline returned above, and so did the dry run.
       //
@@ -15712,15 +15710,6 @@ const server = http.createServer(async (req, res) => {
         if (vRes.status === 401 || vRes.status === 403) return json(res, 200, { valid: false, error: `HTTP ${vRes.status}` });
         return json(res, 200, { valid: vRes.ok });
       } catch (e) { return json(res, 200, { valid: false, error: e.message }); }
-    }
-    // Toggle per-site require-approval (persisted in the registry).
-    if (p === "/api/site-approval" && req.method === "POST") {
-      const { siteId, requireApproval } = JSON.parse(await readBody(req) || "{}");
-      if (!siteId) return json(res, 400, { error: "siteId required" });
-      const m = readApprovals();
-      if (requireApproval) m[siteId] = true; else delete m[siteId];
-      writeApprovals(m);
-      return json(res, 200, { ok: true, siteId, requireApproval: !!requireApproval });
     }
     // Rendered PR diff (for the job detail page).
     if (p === "/api/pr-diff") {
@@ -16042,8 +16031,7 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/sites") {
       try {
         const sites = await getWebsites(u.searchParams.get("refresh") === "1");
-        const appr = readApprovals();
-        return json(res, 200, { sites: sites.map(s => ({ ...s, requireApproval: !!appr[s.siteId] })), syncedAt: new Date(NOCO_CACHE.at).toISOString() });
+        return json(res, 200, { sites, syncedAt: new Date(NOCO_CACHE.at).toISOString() });
       } catch (e) { return json(res, 502, { error: "NocoDB fetch failed: " + e.message }); }
     }
 

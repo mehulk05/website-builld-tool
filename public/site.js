@@ -118,7 +118,7 @@ function targetCard() {
     // pages the rebuild missed. Not derivable from the beta domain.
     ["Live site", host(SITE.existingSiteUrl) || "not set", SITE.existingSiteUrl || null],
     ["Theme", TARGET.themeSlug || (TARGET.loading ? "resolving…" : "unresolved"), null],
-    ["Merge policy", SITE.requireApproval ? "Approve before merge" : "Auto-merge on green build", null],
+    ["Merge policy", "Auto-merge on green build", null],
   ];
   return `<div class="card pad" style="padding-bottom:10px">
     <div class="card-h"><h2>Edit target</h2></div>
@@ -128,16 +128,6 @@ function targetCard() {
         <span class="k" style="flex:none;width:104px">${esc(k)}</span>
         ${href ? `<a class="v" href="${esc(href)}" target="_blank" rel="noopener" style="flex:1">${esc(v)}</a>` : `<span class="v" style="flex:1">${esc(v)}</span>`}
       </div>`).join("")}
-    <div style="padding-top:14px;border-top:1px solid var(--line-2);margin-top:4px">
-      <label class="switch">
-        <input type="checkbox" id="apprToggle" aria-describedby="apprHelp"${SITE.requireApproval ? " checked" : ""}><span class="track"></span>
-        Require approval before merge
-      </label>
-      <p id="apprHelp" style="margin:7px 0 0;font-size:12px;color:var(--muted);line-height:1.5">
-        Applies to <strong>every</strong> future run on this site, from any screen. When on, Studio opens the
-        pull request and waits for you; when off, it merges as soon as the build passes.
-      </p>
-    </div>
   </div>`;
 }
 
@@ -520,15 +510,6 @@ Auto-fixes only what has one correct answer (favicon, 404, Call Now, BLVD button
     }
   };
   const ew = $("editWith"); if (ew) ew.onclick = ideModal;
-
-  const t = $("apprToggle");
-  if (t) t.onchange = async () => {
-    try {
-      const d = await postJSON("/api/site-approval", { siteId: SITE.siteId, requireApproval: t.checked });
-      SITE.requireApproval = d.requireApproval;
-      toast(d.requireApproval ? "Approval required before merge" : "Auto-merge on green build");
-    } catch (e) { t.checked = !t.checked; toast("Could not update: " + e.message); }
-  };
 
   document.querySelectorAll(".toggle[data-t]").forEach((b) => {
     b.onclick = () => {
