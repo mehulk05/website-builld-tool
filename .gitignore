@@ -27,3 +27,8 @@ email-outbox.json
 GH_APP_PRIVATE_KEY
 GH_APP_PRIVATE_KEY.*
 ted-subtasks.json
+
+# Local test payloads / one-off scripts written while debugging a build. They hold
+# a single client's onboarding data and never belong in the repo.
+scratch-*.json
+scratch-*.js

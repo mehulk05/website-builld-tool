@@ -7932,8 +7932,12 @@ async function runJob(job) {
     // clone = legacy CLONE_MODE (kept, explicit env only).
     // stitch = the original Stitch generation (BUILD_ENGINE=stitch, for parity tests).
     const CLONE_ON = /^(1|on|true|yes)$/i.test(process.env.CLONE_MODE || "");
+    // webgen is the default engine now — it renders the full 4-page site
+    // (home/services/about/contact) that the GitOps pipeline ships. The older
+    // "editorial" engine is home-only; force it via payload/BUILD_ENGINE only for
+    // a home-only build. CLONE_MODE still wins when explicitly enabled.
     const ENGINE = CLONE_ON ? "clone"
-      : String((job.payload && job.payload.engine) || process.env.BUILD_ENGINE || "editorial").toLowerCase();
+      : String((job.payload && job.payload.engine) || process.env.BUILD_ENGINE || "webgen").toLowerCase();
 
     // ---- EDITORIAL ENGINE (step 2, same slot as Stitch generation — the TED
     // constraint: this runs INSIDE the build job, so jobStep(2..) → postStatus fires
@@ -8130,7 +8134,39 @@ async function runJob(job) {
     // clone mode already produced GEN/site/ above and jumps straight to the PR path.
     const isCloneBuild = /^(1|on|true|yes)$/i.test(process.env.CLONE_MODE || "");
     const isEditorialBuild = ENGINE === "editorial";
-    if (!isCloneBuild && !isEditorialBuild) {
+
+    // ---- WEBGEN engine (default) — restored from a50f570; the branch that
+    // actually renders the full 4-page site (Home/Services/About/Contact) into
+    // GEN/site/. A main merge on 2026-08-25 dropped this call, which silently
+    // reduced every build to home-only. generateWebgenSite writes all 4 pages
+    // fresh each run, so the gitops compiler never picks up stale sub-pages.
+    const useWebgen = ENGINE === "webgen" && !isCloneBuild;
+    if (useWebgen) {
+      jobStep(job, 2, "running", "Scanning site + composing content (webgen)…");
+      const existingUrl = job.payload && (job.payload.existingWebsite || job.payload.referenceWebsite);
+      const { kit, pages } = await generateWebgenSite({ A, composed, existingUrl, pureScrape: !!(job.payload && job.payload.pureScrape) });
+      const siteDir = path.join(GEN, "site");
+      jobStep(job, 2, "running", "Rendering Home · Services · About · Contact…");
+      job.pages = {
+        home: { status: "done", bytes: pages.home.length, error: "" },
+        services: { status: "done", bytes: pages.services.length, error: "" },
+        about: { status: "done", bytes: pages.about.length, error: "" },
+        contact: { status: "done", bytes: pages.contact.length, error: "" },
+      };
+      job.homeContent = (kit.hero && [kit.hero.h1, kit.hero.body].filter(Boolean).join(" — ")) || (composed && composed.brief) || "";
+      jobStep(job, 2, "done", `4 pages generated (webgen · ${kit.theme.accent})`);
+      pushSubtaskStep(job, "generate_pages", "done", { detail: "4 pages generated (webgen)" });
+      job.siteUrl = `/view/${encodeURIComponent(job.draftId)}/`;
+      try {
+        const snapDir = path.join(GEN, "exports", job.draftId, "site");
+        fs.rmSync(snapDir, { recursive: true, force: true });
+        fs.cpSync(siteDir, snapDir, { recursive: true });
+        job.zipUrl = `/api/export-zip?dir=${encodeURIComponent(`exports/${job.draftId}/site`)}&name=${encodeURIComponent(siteFolderName(job))}`;
+      } catch (e) { console.warn("webgen site snapshot failed (non-fatal):", e.message); }
+      jobStep(job, 3, "done", "Assembled (webgen engine)");
+    }
+
+    if (!isCloneBuild && !isEditorialBuild && !useWebgen) {
     // 3 — generate all pages with Stitch
     // TEMPORARY (design-quality dev cycle, DESIGN_QUALITY_PLAN.md): while iterating
     // on the generation prompt, DEV_PAGES=on cuts a build to home only — 1 Stitch
