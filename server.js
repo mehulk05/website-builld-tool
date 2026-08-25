@@ -17451,9 +17451,9 @@ const server = http.createServer(async (req, res) => {
       if (fs.existsSync(f)) return send(res, 200, "text/html", fs.readFileSync(f));
       return send(res, 404, "text/html", "<h1>Not generated yet</h1>");
     }
-    // webgen preview nav uses real WP paths (/services/ /about/ /team/) — serve the
+    // webgen preview nav uses real WP paths (/services/ /about/ /contact/) — serve the
     // assembled pages so the in-page navigation works before deployment.
-    if (p === "/services/" || p === "/about/" || p === "/team/") {
+    if (p === "/services/" || p === "/about/" || p === "/contact/") {
       const key = p.replace(/\//g, "");
       const f = path.join(GEN, "site", key + ".html");
       if (fs.existsSync(f)) return send(res, 200, "text/html", fs.readFileSync(f));
