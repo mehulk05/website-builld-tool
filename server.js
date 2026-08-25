@@ -7012,16 +7012,30 @@ function enqueueRestoreJob(payload) {
 // deploy/activation can lag past the ~10min poll window) can be RETRIED from this
 // point alone, via retryThemeActivationTail(), without re-running Stitch generation,
 // re-opening a PR, or re-running CI.
-async function runThemeActivationTail(job, slug, A) {
-  // 7 — wait for the mu-plugin to activate the theme on the live site
+async function runThemeActivationTail(job, slug, A, opts = {}) {
+  // 7 — wait for the site to actually serve this build. A GitOps deploy has no
+  // theme to activate (the MU plugin reconciles pages instead), so there the
+  // check is "are our generated pages live?" — everything after this step is
+  // identical for both formats, which is what keeps the TED events firing.
   jobStep(job, 6, "running", "Waiting for deploy + activation on " + job.liveUrl);
   let active = false;
   for (let i = 0; i < 40 && !active; i++) {
-    try { active = (await localApi("/api/theme-live", { url: job.liveUrl, slug })).active; } catch (e) { /* keep polling */ }
-    if (!active) { jobStep(job, 6, "running", `Not active yet (check ${i + 1}/40)…`); await sleep(15000); }
+    try {
+      if (opts.gitops) {
+        const ctl = new AbortController(); const timer = setTimeout(() => ctl.abort(), 15000);
+        const r = await fetch(job.liveUrl, { redirect: "follow", signal: ctl.signal, headers: { "User-Agent": "Mozilla/5.0 G99Bot" } });
+        clearTimeout(timer);
+        const html = await r.text();
+        // Our pages always ship the section wrappers and the business name.
+        active = /g99-sec|elementor-widget-html/.test(html) && html.includes(String(job.businessName || "").slice(0, 12));
+      } else {
+        active = (await localApi("/api/theme-live", { url: job.liveUrl, slug })).active;
+      }
+    } catch (e) { /* keep polling */ }
+    if (!active) { jobStep(job, 6, "running", `Not live yet (check ${i + 1}/40)…`); await sleep(15000); }
   }
-  if (!active) throw new Error("theme not detected on live within ~10 min — deploy may be slow; retry this step again");
-  jobStep(job, 6, "done", "Theme active on " + job.liveUrl);
+  if (!active) throw new Error((opts.gitops ? "generated pages" : "theme") + " not detected on live within ~10 min — deploy may be slow; retry this step again");
+  jobStep(job, 6, "done", (opts.gitops ? "Pages live on " : "Theme active on ") + job.liveUrl);
 
   // 8 — after-audit + comparison + report
   jobStep(job, 7, "running", "Auditing the new live site…");
@@ -8211,8 +8225,11 @@ async function runJob(job) {
         await sleep(10000);
       }
       jobStep(job, 5, "done", deployOk ? "Merged — WordPress deployment succeeded" : `Merged — deployment run state: ${lastState || "not observed"} (check the repo Actions tab)`);
-      // No PHP theme to activate for GitOps sites — the MU plugin reconciles pages itself.
-      job.status = "done";
+      if (!deployOk) throw new Error(`WordPress deployment did not succeed (${lastState || "no run observed"}) — see the repo's Actions tab`);
+      // Same tail as a theme build: live check, after-audit + report, TED artifacts.
+      // Skipping it (as this branch used to) left cro_audit_after and the
+      // MOCKUPS_CAPTURED / SERVICE_PAGES_CREATED pushes silently unfired.
+      await runThemeActivationTail(job, slug, A, { gitops: true });
       return;
     }
     let fixes = 0, merged = false;
@@ -17338,6 +17355,39 @@ const server = http.createServer(async (req, res) => {
       // four core pages — never .github/, mu-plugins/, or other resources.
       if (body.format === "gitops") {
         const { compileGitops } = require("./lib/gitops/compile");
+        // Look at what we are actually deploying INTO before generating: the
+        // repo says which theme/templates exist, the live site says which
+        // Elementor edition is installed. Both change what we may emit —
+        // elementor_canvas needs Elementor, and page-level custom_css is a PRO
+        // feature that silently drops on free Elementor (site renders unstyled).
+        const probeTarget = async (repoDir, liveUrl) => {
+          const t = { theme: "", elementor: false, elementorPro: false, templates: [], notes: [] };
+          try {
+            const site = JSON.parse(fs.readFileSync(path.join(repoDir, "resources", "site.json"), "utf8"));
+            t.theme = site.active_theme || "";
+            if (Array.isArray(site.elementor_post_types) && site.elementor_post_types.includes("page")) t.elementor = true;
+          } catch (e) { t.notes.push("no resources/site.json"); }
+          try { t.templates = fs.readdirSync(path.join(repoDir, "resources", "templates")); } catch (e) { /* none */ }
+          if (liveUrl) {
+            try {
+              const ctl = new AbortController(); const timer = setTimeout(() => ctl.abort(), 15000);
+              const r = await fetch(liveUrl, { redirect: "follow", signal: ctl.signal, headers: { "User-Agent": "Mozilla/5.0 G99Bot" } });
+              clearTimeout(timer);
+              const html = await r.text();
+              if (/elementor-pro|elementor\/pro\/assets/i.test(html)) t.elementorPro = true;
+              if (/elementor-frontend|plugins\/elementor\//i.test(html)) t.elementor = true;
+              const th = html.match(/wp-content\/themes\/([a-z0-9_-]+)/i);
+              if (th) t.theme = th[1];
+            } catch (e) { t.notes.push("live probe failed: " + String(e.message).slice(0, 60)); }
+          }
+          t.pageTemplate = t.elementor ? "elementor_canvas" : "";
+          t.cssTarget = "Customizer Additional CSS" + (t.elementorPro ? " + page custom_css (Pro)" : "");
+          if (t.templates.includes("header") || t.templates.includes("footer")) {
+            t.notes.push("repo has Elementor header/footer templates — canvas template keeps them off our pages");
+          }
+          if (!t.elementor) t.notes.push("Elementor not detected — pages use the theme's default template");
+          return t;
+        };
         const stampG = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
         let branchG = `g99/gitops-${slug}-${stampG}-${Date.now().toString(36).slice(-4)}`;
         const tmpG = path.join(os.tmpdir(), "g99gitops-" + Date.now());
@@ -17352,7 +17402,37 @@ const server = http.createServer(async (req, res) => {
             try { return JSON.parse(fs.readFileSync(path.join(tmpG, "resources", "pages", pslug, "resource.json"), "utf8")).git_id || null; }
             catch (e) { return null; }
           };
-          const { files, pages } = compileGitops(path.join(GEN, "site"), a, existingGitId);
+          const target = await probeTarget(tmpG, body.liveUrl || onb.betaSiteUrl || "");
+          console.log(`[gitops] target ${repo}: theme=${target.theme || "?"} elementor=${target.elementor} pro=${target.elementorPro} templates=[${target.templates.join(",")}] css→${target.cssTarget}${target.notes.length ? " · " + target.notes.join(" · ") : ""}`);
+          // CSS delivery: default to inlining the stylesheet inside a hidden
+          // per-page wrapper. The Customizer "Additional CSS" resource is verified
+          // by exact byte compare and rolls the whole deploy back on any WordPress
+          // re-encoding — which is what happened on this fleet (even a one-rule
+          // canary failed). The hidden <style> wrapper needs no separate resource,
+          // survives where the html widget keeps <style>, and (being hidden) never
+          // leaks CSS text onto the page where it is stripped. cssManaged=true opts
+          // back into the resources/custom-css.css channel for sites where it works.
+          const useInline = body.cssManaged ? false : true;
+          const { files, pages } = compileGitops(path.join(GEN, "site"), a, existingGitId, { pageTemplate: target.pageTemplate, cssInline: useInline });
+          // When inlining, we do not ship the managed stylesheet at all, and we
+          // drop any copy an earlier push left in the repo (it would keep failing).
+          if (useInline) {
+            files.delete("resources/custom-css.css");
+            try { fs.rmSync(path.join(tmpG, "resources", "custom-css.css"), { force: true }); } catch (e) { /* absent */ }
+          }
+          // cssProbe: ship a single canary rule instead of the real stylesheet.
+          // resources/custom-css.css is verified by exact string compare against
+          // what WordPress stored, so a site that re-encodes it rolls the whole
+          // deploy back. One trivial rule answers "does this site accept managed
+          // CSS at all?" before we spend a deploy on 16kb of it.
+          if (body.cssProbe) files.set("resources/custom-css.css", "body{color:#111111}");
+          // cssOff: stop managing the stylesheet. Dropping it from our output is
+          // not enough — a copy already committed by an earlier push stays in the
+          // repo and keeps failing verification, so remove it from the clone too.
+          if (body.cssOff) {
+            files.delete("resources/custom-css.css");
+            try { fs.rmSync(path.join(tmpG, "resources", "custom-css.css"), { force: true }); } catch (e) { /* absent */ }
+          }
           if (body.dryRun) {
             const outDir = path.join(GEN, "gitops", slug);
             fs.rmSync(outDir, { recursive: true, force: true });
@@ -17375,15 +17455,29 @@ const server = http.createServer(async (req, res) => {
             // No business name here — WP renders the front-page title as
             // "blogname – blogdescription", so repeating the name doubles it.
             site.blogdescription = optSafe(a.tagline || "Advanced Aesthetics and Wellness").slice(0, 120);
+            // A fresh template repo ships show_on_front="posts", so the generated
+            // home page would sit at /home/ while / shows the blog. Point the
+            // front page at our home page's git_id.
+            try {
+              const homeRes = files.get("resources/pages/home/resource.json");
+              const homeGitId = homeRes ? JSON.parse(homeRes).git_id : null;
+              if (homeGitId) { site.show_on_front = "page"; site.front_page_git_id = homeGitId; }
+            } catch (e) { console.warn("[gitops] front-page wiring skipped:", e.message); }
             fs.writeFileSync(sj, JSON.stringify(site, null, 4));
           } catch (e) { console.warn("[gitops] site.json patch skipped:", e.message); }
           await runG(`git checkout -b "${branchG}"`, tmpG);
-          await runG(`git add -A resources/pages resources/site.json`, tmpG);
+          // Stage everything we may have touched under resources/: pages,
+          // site.json, and any custom-css.css deletion. A single -A on the dir is
+          // robust to files that were removed (inline-CSS mode) or never existed.
+          await runG(`git add -A resources`, tmpG);
           r = await runG(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "GitOps: ${a.business_name} generated pages (${pages.join(", ")})"`, tmpG);
           if (r.code) throw new Error("commit failed (no changes?): " + (r.stderr || r.stdout).slice(-200));
           r = await runG(`git push -u origin "${branchG}"`, tmpG);
           if (r.code) throw new Error("push failed: " + r.stderr.slice(-200));
-          const prBodyG = `Generated **${a.business_name}** pages in G99 GitOps format (\`resources/pages/{${pages.join(",")}}\`).\\n\\nEach page is an Elementor \`html\` widget (elementor_canvas — carries its own header/footer), compiled by the Growth99 Website Build Tool webgen engine. Only \`resources/pages/\` for these slugs is touched.`;
+          const prBodyG = `Generated **${a.business_name}** pages in G99 GitOps format (\`resources/pages/{${pages.join(",")}}\`).\\n\\n`
+            + `Each section is its own Elementor container + \`html\` widget, compiled by the Growth99 Website Build Tool webgen engine.\\n\\n`
+            + `**Detected target:** theme \`${target.theme || "?"}\` · Elementor ${target.elementor ? (target.elementorPro ? "Pro" : "free") : "not detected"} · page template \`${target.pageTemplate || "(theme default)"}\` · CSS → ${target.cssTarget}`
+            + (target.notes.length ? `\\n\\n_${target.notes.join(" · ")}_` : "");
           r = await runG(`gh pr create --repo ${repo} --base main --head "${branchG}" --title "GitOps: ${a.business_name} generated pages" --body "${prBodyG}"`, tmpG);
           const prUrlG = (r.stdout.match(/https:\/\/github\.com\/\S+/) || [""])[0];
           fs.rmSync(tmpG, { recursive: true, force: true });
