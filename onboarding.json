@@ -1,39 +1,19 @@
 {
-  "draftId": "nuvo-gitops-mt2s5p05",
-  "businessId": 88888,
+  "draftId": "hover-1786530193",
+  "businessId": null,
   "template": "WEBSITE",
-  "receivedAt": "2026-08-21T10:02:05.411Z",
-  "betaSiteUrl": "https://prodteam.gogroth.com/",
-  "betaSiteRepo": "G99agency/mcptest2.gogroth.com",
+  "receivedAt": "2026-08-12T10:23:13.304Z",
+  "betaSiteUrl": "",
+  "betaSiteRepo": "",
   "referenceWebsite": "",
-  "existingWebsite": "https://nuvoaestheticsclinic.com/",
+  "existingWebsite": "https://nuvoaestheticsclinic.com",
   "confirmedBrand": null,
   "logoUrl": null,
   "answers": {
     "business_name": "NUVO Aesthetics Clinic",
-    "location": "Sycamore, IL",
-    "phone_for_website": "(815) 991-5150",
-    "business_description": "Medical aesthetics and wellness clinic offering injectables, dermal fillers, Sculptra, medical weight loss and bio-identical hormone therapy.",
     "services_offered": [
-      "Neurotoxins",
-      "Dermal Fillers",
-      "Sculptra Aesthetic",
-      "Medical Weight Loss",
-      "Bio-Identical Hormone Therapy"
-    ],
-    "revenue_services": [
-      "Neurotoxins",
-      "Dermal Fillers",
-      "Sculptra Aesthetic"
-    ],
-    "featured_review": "\"Natural results and a team that truly listens.\" — Google, 5★",
-    "primary_cta": "Book a consultation",
-    "team_roster": [
-      {
-        "name": "Dr. Elena Marsh",
-        "title": "MD, Medical Director"
-      }
-    ],
-    "hero_headline": "Aesthetics and wellness, elevated"
+      "Botox",
+      "Fillers"
+    ]
   }
 }

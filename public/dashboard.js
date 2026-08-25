@@ -39,7 +39,7 @@ async function api(path, body) {
 
 // ---------- state ----------
 let ONB = {}, A = {}, composed = null, croBefore = null, croAfter = null, prUrl = null;
-const PAGES = [{ key: "home", title: "Home" }, { key: "services", title: "Services" }, { key: "about", title: "About" }, { key: "team", title: "Team" }];
+const PAGES = [{ key: "home", title: "Home" }, { key: "services", title: "Services" }, { key: "about", title: "About" }, { key: "contact", title: "Contact" }];
 
 // editable fields: [key, label, type]
 const FIELDS = [
@@ -132,7 +132,7 @@ async function saveForm() {
 const STEPS = [
   ["CRO audit — existing site", "Scoring the client's current website for conversion."],
   ["Compose build prompt", "AI writes the brand system + build brief from the CRO findings and site."],
-  ["Assemble pages", "Filling the chosen template with the brand: Home, Services, About, Team."],
+  ["Generate pages (Stitch)", "Building Home, Services, About, Contact."],
   ["WordPress theme + open PR", "Packaging a classic WP theme and opening a GitHub PR."],
   ["Paste the live URL", "Where the pushed site is deployed."],
   ["CRO audit — new site", "Scoring the deployed beta site."],
@@ -381,16 +381,15 @@ async function buildBetaSite() {
     setStep(2, "done", `Prompt ready (${src}).`);
     out(2, `${brandStrip(composed)}<textarea class="promptbox" id="briefBox">${esc(composed.brief || "")}</textarea><div class="hint">Auto-composed. This exact brief drives generation.</div>`);
 
-    // Step 3 — assemble pages (fill template) with live per-page progress
-    setStep(3, "run", "Assembling 4 pages (Home · Services · About · Team)…");
+    // Step 3 — generate pages (Stitch) with live per-page progress
+    setStep(3, "run", "Generating 4 pages with Stitch…");
     out(3, progressRows());
     if ($("briefBox")) composed.brief = $("briefBox").value;
     const theme = themeFromComposed();
     const pages = PAGES.map((p) => ({ key: p.key, prompt: `${composed.brief}\n\n${pageSections(p.key)}\n\nReturn one complete, responsive, production-quality HTML page with the SEO requirements applied.` }));
     const poll = setInterval(updateProgressRows, 2000);
     let gen;
-    const pureScrape = !!($("pureScrape") && $("pureScrape").checked);
-    try { gen = await api("/api/generate-site", { engine: "", deviceType: "DESKTOP", theme, pages, pureScrape }); }
+    try { gen = await api("/api/generate-site", { engine: "", deviceType: "DESKTOP", theme, pages }); }
     finally { clearInterval(poll); await updateProgressRows(); }
     const results = (gen.pages || gen.results || []);
     const okPages = Array.isArray(results) ? results.filter((x) => x && !x.error) : [];
@@ -400,15 +399,10 @@ async function buildBetaSite() {
     }
     const okKeys = new Set(okPages.map((x) => x.page || x.pageKey));
 
-    // Assemble: webgen already wrote the final GEN/site/ — only legacy engines need a bind.
-    let bound;
-    if (gen.engine === "webgen" || gen.siteReady) {
-      bound = { siteUrl: "/site/", chromeSource: "webgen engine" };
-    } else {
-      setStep(3, "run", `Generated ${okPages.length}/${PAGES.length} — assembling site with Gemini…`);
-      bound = await api("/api/bind-site", { engine: "", theme });
-    }
-    setStep(3, "done", `Generated ${okPages.length} of ${PAGES.length} pages · site ${(gen.engine === "webgen") ? "rendered" : "assembled"} (${bound.chromeSource || "AI chrome"}).`);
+    // Assemble the pages into one coherent site (Gemini AI chrome) + preview link
+    setStep(3, "run", `Generated ${okPages.length}/${PAGES.length} — assembling site with Gemini…`);
+    const bound = await api("/api/bind-site", { engine: "", theme });
+    setStep(3, "done", `Generated ${okPages.length} of ${PAGES.length} pages · site assembled (${bound.chromeSource || "AI chrome"}).`);
     out(3, `${thumbStrip([...okKeys])}${progressRowsFinal(okKeys)}<div style="margin-top:12px"><a class="prlink" href="${esc(bound.siteUrl || "/site/")}" target="_blank">↗ Preview assembled site</a></div>${okPages.length < PAGES.length ? `<div class="hint">⚠ ${PAGES.length - okPages.length} page(s) failed in Stitch — retry Build for a full set.</div>` : ""}`);
 
     // Step 4 — WP theme + PR (site already bound above; skipRebind avoids doing it twice)

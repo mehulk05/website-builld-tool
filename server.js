@@ -1189,10 +1189,10 @@ async function aiChrome(theme) {
 // Smart bind: AI-generated shared chrome injected into every page + link rewire.
 // Falls back to the deterministic canonical nav if the LLM is unavailable.
 // ------------------------------------------------------------ WordPress export (classic theme for Bedrock)
-const WP_PAGES = [["index", "front-page.php", "/"], ["services", "page-services.php", "/services/"], ["about", "page-about.php", "/about/"], ["contact", "page-contact.php", "/contact/"]];
+const WP_PAGES = [["index", "front-page.php", "/"], ["services", "page-services.php", "/services/"], ["about", "page-about.php", "/about/"], ["contact", "page-contact.php", "/contact/"], ["branding", "page-branding.php", "/branding/"], ["seo", "page-seo.php", "/seo/"]];
 function wpRewriteLinks(html) {
   let h = html;
-  const map = { "index.html": "/", "services.html": "/services/", "about.html": "/about/", "team.html": "/team/", "contact.html": "/contact/", "branding.html": "/branding/", "seo.html": "/seo/" };
+  const map = { "index.html": "/", "services.html": "/services/", "about.html": "/about/", "contact.html": "/contact/", "branding.html": "/branding/", "seo.html": "/seo/" };
   for (const [f, to] of Object.entries(map)) h = h.split(`href="${f}"`).join(`href="${to}"`);
   // Localized images live in the theme's assets/img/. A relative path breaks on a
   // sub-page URL, so resolve to the theme asset URI (this runs inside php templates,
@@ -1485,9 +1485,11 @@ add_action('wp_footer', function () {
 add_action('after_switch_theme', function () {
     $pages = [
         ['title' => 'Home', 'slug' => 'home', 'template' => ''],
-        ['title' => 'Services', 'slug' => 'services', 'template' => 'page-services.php'],
-        ['title' => 'About', 'slug' => 'about', 'template' => 'page-about.php'],
+        ['title' => 'Treatments', 'slug' => 'services', 'template' => 'page-services.php'],
+        ['title' => 'Team', 'slug' => 'about', 'template' => 'page-about.php'],
         ['title' => 'Contact', 'slug' => 'contact', 'template' => 'page-contact.php'],
+        ['title' => 'Branding', 'slug' => 'branding', 'template' => 'page-branding.php'],
+        ['title' => 'SEO', 'slug' => 'seo', 'template' => 'page-seo.php'],
     ];
 
     $home_id = 0;
@@ -1663,9 +1665,11 @@ if (! function_exists('${fn}')) {
     {
         $pages = [
             ['title' => 'Home', 'slug' => 'home', 'template' => ''],
-            ['title' => 'Services', 'slug' => 'services', 'template' => 'page-services.php'],
-            ['title' => 'About', 'slug' => 'about', 'template' => 'page-about.php'],
+            ['title' => 'Treatments', 'slug' => 'services', 'template' => 'page-services.php'],
+            ['title' => 'Team', 'slug' => 'about', 'template' => 'page-about.php'],
             ['title' => 'Contact', 'slug' => 'contact', 'template' => 'page-contact.php'],
+            ['title' => 'Branding', 'slug' => 'branding', 'template' => 'page-branding.php'],
+            ['title' => 'SEO', 'slug' => 'seo', 'template' => 'page-seo.php'],
         ];
 
         $home_id = 0;
@@ -3337,7 +3341,7 @@ function localApi(pathName, body, timeoutMs = 30 * 60 * 1000) {
 }
 
 const JOB_STEPS = [
-  "CRO audit — existing site", "Compose build prompt", "Assemble pages",
+  "CRO audit — existing site", "Compose build prompt", "Generate pages (Stitch)",
   "Assemble site", "WordPress theme + PR",
   "CI checks → auto-merge", "Theme activation watch", "CRO after-audit + comparison",
   // Runs as its OWN job (see runEnrichJob); this step mirrors its progress so the
@@ -3943,7 +3947,6 @@ async function syncSiteRegistry() {
       themePath: `web/app/themes/${slug}`,
       githubRepo: WP_REPO,
       liveUrl: prev.liveUrl || LIVE_URL,
-      requireApproval: prev.requireApproval || false,
       lastPrUrl: (last && last.url) || prev.lastPrUrl || null,
       lastChange: (last && last.title) || prev.lastChange || null,
       updatedAt: (last && last.mergedAt) || prev.updatedAt || null,
@@ -4062,9 +4065,6 @@ async function resolveEditTarget(website) {
   return { themeSlug: slug, themePath: `web/app/themes/${slug}`, muPath, themes };
 }
 
-// Per-site "require approval before merge" is stored locally (siteId -> bool),
-// independent of NocoDB, so operators can gate merges per website.
-const APPROVALS_FILE = path.join(DIR, "approvals.json");
 // ---- local IDE hand-off -----------------------------------------------------
 // Cursor is browser-side (documented prompt deeplink); the other two are launched
 // here because they have no equivalent URL scheme for a prefilled prompt.
@@ -4300,9 +4300,6 @@ async function prLiveState(prUrl) {
   let d = {}; try { d = JSON.parse(r.stdout || "{}"); } catch (e) { return {}; }
   return { state: String(d.state || "").toUpperCase(), mergedAt: d.mergedAt || null };
 }
-
-function readApprovals() { try { return JSON.parse(fs.readFileSync(APPROVALS_FILE, "utf8")); } catch (e) { return {}; } }
-function writeApprovals(m) { fs.writeFileSync(APPROVALS_FILE, JSON.stringify(m, null, 2)); }
 
 // Scheduled re-audit: re-score the live active site, store the trend, alert on
 // regression. Runs on demand (/api/reaudit) and on a timer (REAUDIT_HOURS>0).
@@ -5059,7 +5056,10 @@ async function startTedSubtaskRun(taskId, { dryRun = false } = {}) {
     jobId: "edit-" + Date.now(),
     siteId: r.site.siteId, businessName: r.site.businessName, githubRepo: r.site.githubRepo,
     themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
-    prompt: r.instruction, forceApproval: true,
+    // Runs to completion on its own: TED only moves to the next task once this
+    // one closes, and it cannot close while the run is parked on an approval
+    // nobody in TED can even see it is waiting for.
+    prompt: r.instruction, forceApproval: false,
     // Not "email": there is no thread and nobody to reply to, and the email
     // reply path keys off that. The subtask id is what makes the outcome
     // comment land back where the request was made.
@@ -6842,16 +6842,18 @@ async function runPrSmoke(mode, repoIn, baseIn) {
   }
 }
 
-function siteRequiresApproval(siteId) {
-  return !!readApprovals()[siteId];
-}
-// Per-site approval gate: with green CI, if the site requires approval, pause
-// (up to 60 min) until /api/job-approve flips job.approved — then merge.
+// Approval gate. Beta site revisions never pause here: an edit, restore, enrich
+// or SEO run — however it was raised, from the edit chat, an inbound email or a
+// TED task — opens its pull request and merges itself the moment CI is green.
+// Waiting for a human was stalling requests that nobody was watching for, and a
+// revision to a beta site is reversible by another revision.
+// What still stops is a run that explicitly asks to be gated via
+// payload.forceApproval — today that is Perform PR under
+// TED_PERFORM_PR_APPROVAL=on. siteId stays in the signature for the call sites;
+// there is no longer a per-site approval setting for it to look up.
 async function awaitApprovalIfNeeded(job, siteId, stepIdx) {
-  // forceApproval overrides the per-site setting: a run nobody typed into
-  // Studio by hand (an inbound email) always gets a human before it merges.
   const forced = !!(job.payload && job.payload.forceApproval);
-  if (job.approved || (!forced && !siteRequiresApproval(siteId))) return;
+  if (job.approved || !forced) return;
   job.awaitingApproval = true;
   jobStep(job, stepIdx, "running", "Build is green — waiting for approval to merge…");
   notify(`⏳ *${job.businessName}* build passed — needs approval to go live: ${job.prUrl || ""}`);
@@ -7854,10 +7856,8 @@ async function runJob(job) {
     // clone = legacy CLONE_MODE (kept, explicit env only).
     // stitch = the original Stitch generation (BUILD_ENGINE=stitch, for parity tests).
     const CLONE_ON = /^(1|on|true|yes)$/i.test(process.env.CLONE_MODE || "");
-    const ENGINE_RAW = CLONE_ON ? "clone"
-      : String((job.payload && job.payload.engine) || process.env.BUILD_ENGINE || "webgen").toLowerCase();
-    // Stitch is retired — any stitch request generates with our Gemini/webgen engine instead.
-    const ENGINE = ENGINE_RAW === "stitch" ? "webgen" : ENGINE_RAW;
+    const ENGINE = CLONE_ON ? "clone"
+      : String((job.payload && job.payload.engine) || process.env.BUILD_ENGINE || "editorial").toLowerCase();
 
     // ---- EDITORIAL ENGINE (step 2, same slot as Stitch generation — the TED
     // constraint: this runs INSIDE the build job, so jobStep(2..) → postStatus fires
@@ -8053,40 +8053,8 @@ async function runJob(job) {
     // The Stitch generation + AI-chrome assembly below is ONLY for the normal path;
     // clone mode already produced GEN/site/ above and jumps straight to the PR path.
     const isCloneBuild = /^(1|on|true|yes)$/i.test(process.env.CLONE_MODE || "");
-
-    // ---- WEBGEN engine (default): our in-house design engine — 4 designs + variants,
-    // Composes a structured BrandKit from onboarding + the client's scanned site, renders
-    // Home/Services/About/Team into GEN/site/, then falls through to the shared WP theme/PR
-    // path. Reuses the ENGINE var from the selector above (mutually exclusive with
-    // editorial/clone/stitch): default is "webgen"; set BUILD_ENGINE to switch.
-    const useWebgen = ENGINE === "webgen" && !isCloneBuild;
-    if (useWebgen) {
-      jobStep(job, 2, "running", "Scanning site + composing content (webgen)…");
-      const existingUrl = job.payload && (job.payload.existingWebsite || job.payload.referenceWebsite);
-      const { kit, pages } = await generateWebgenSite({ A, composed, existingUrl, pureScrape: !!(job.payload && job.payload.pureScrape) });
-      const siteDir = path.join(GEN, "site");
-      jobStep(job, 2, "running", "Rendering Home · Services · About · Contact…");
-      job.pages = {
-        home: { status: "done", bytes: pages.home.length, error: "" },
-        services: { status: "done", bytes: pages.services.length, error: "" },
-        about: { status: "done", bytes: pages.about.length, error: "" },
-        contact: { status: "done", bytes: pages.contact.length, error: "" },
-      };
-      job.homeContent = (kit.hero && [kit.hero.h1, kit.hero.body].filter(Boolean).join(" — ")) || (composed && composed.brief) || "";
-      jobStep(job, 2, "done", `4 pages generated (webgen · ${kit.theme.accent})`);
-      pushSubtaskStep(job, "generate_pages", "done", { detail: "4 pages generated (webgen)" });
-      // 4 — assemble: GEN/site/ is the bundle; snapshot for the zip export
-      job.siteUrl = `/view/${encodeURIComponent(job.draftId)}/`;
-      try {
-        const snapDir = path.join(GEN, "exports", job.draftId, "site");
-        fs.rmSync(snapDir, { recursive: true, force: true });
-        fs.cpSync(siteDir, snapDir, { recursive: true });
-        job.zipUrl = `/api/export-zip?dir=${encodeURIComponent(`exports/${job.draftId}/site`)}&name=${encodeURIComponent(siteFolderName(job))}`;
-      } catch (e) { console.warn("webgen site snapshot failed (non-fatal):", e.message); }
-      jobStep(job, 3, "done", "Assembled (webgen engine)");
-    }
-
-    if (ENGINE === "stitch") { // retired — unreachable (ENGINE is coerced away from stitch above)
+    const isEditorialBuild = ENGINE === "editorial";
+    if (!isCloneBuild && !isEditorialBuild) {
     // 3 — generate all pages with Stitch
     // TEMPORARY (design-quality dev cycle, DESIGN_QUALITY_PLAN.md): while iterating
     // on the generation prompt, DEV_PAGES=on cuts a build to home only — 1 Stitch
@@ -9933,15 +9901,10 @@ async function scanPageStructure(url) {
     const chunk = main.slice(from, to);
     // Lazy-loaded sites put the real URL in data-src / srcset, so count those too.
     const images = (chunk.match(/<img|data-src=|srcset=|background-image/gi) || []).length;
-    // Pull the REAL image URLs in this section (not just a count) so a faithful
-    // rebuild can reuse the client's own photos. Absolutize, collapse WP thumbnail
-    // derivatives to full-res, drop decorative/texture/icon junk, dedupe.
-    const imageUrls = sectionImageUrls(chunk, url);
     sections.push({
       heading: label,
       kind: classifySection(label + " " + textOf(chunk).slice(0, 300)),
       images,
-      imageUrls,
       copy: textOf(chunk).slice(0, 600),
     });
   }
@@ -15926,17 +15889,17 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { accepted: true, dryRun: true, siteId: site.siteId, businessName: site.businessName, matchedBy: hit.how, themeSlug: target.themeSlug, instruction });
       }
 
-      // 5 — same pipeline as the chat UI, but it always stops for a human
-      //     before merging: nobody typed this request into Studio.
+      // 5 — same pipeline as the chat UI, and it ships the same way: straight
+      //     through to main once CI is green, with no approval in between.
       const job = enqueueEditJob({
         jobId: "edit-" + Date.now(),
         siteId: site.siteId, businessName: site.businessName, githubRepo: site.githubRepo,
         themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
-        prompt: instruction, forceApproval: true,
+        prompt: instruction, forceApproval: false,
         source: "email", requestedBy: addr, emailSubject: subject, threadId, liveUrl: site.liveUrl || "",
       });
       logEmailRequest({ from, subject, messageId: body.messageId || null, status: "queued", siteId: site.siteId, matchedBy: hit.how, instruction, jobId: job.draftId });
-      notify(`📧 Email request from ${addr} → *${site.businessName}*: ${instruction.slice(0, 140)} (needs your approval before merge)`);
+      notify(`📧 Email request from ${addr} → *${site.businessName}*: ${instruction.slice(0, 140)} (shipping automatically)`);
       // File it in TED for the delivery team. Only accepted requests reach this
       // line — every decline returned above, and so did the dry run.
       //
@@ -16131,15 +16094,6 @@ const server = http.createServer(async (req, res) => {
         if (vRes.status === 401 || vRes.status === 403) return json(res, 200, { valid: false, error: `HTTP ${vRes.status}` });
         return json(res, 200, { valid: vRes.ok });
       } catch (e) { return json(res, 200, { valid: false, error: e.message }); }
-    }
-    // Toggle per-site require-approval (persisted in the registry).
-    if (p === "/api/site-approval" && req.method === "POST") {
-      const { siteId, requireApproval } = JSON.parse(await readBody(req) || "{}");
-      if (!siteId) return json(res, 400, { error: "siteId required" });
-      const m = readApprovals();
-      if (requireApproval) m[siteId] = true; else delete m[siteId];
-      writeApprovals(m);
-      return json(res, 200, { ok: true, siteId, requireApproval: !!requireApproval });
     }
     // Rendered PR diff (for the job detail page).
     if (p === "/api/pr-diff") {
@@ -16461,8 +16415,7 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/sites") {
       try {
         const sites = await getWebsites(u.searchParams.get("refresh") === "1");
-        const appr = readApprovals();
-        return json(res, 200, { sites: sites.map(s => ({ ...s, requireApproval: !!appr[s.siteId] })), syncedAt: new Date(NOCO_CACHE.at).toISOString() });
+        return json(res, 200, { sites, syncedAt: new Date(NOCO_CACHE.at).toISOString() });
       } catch (e) { return json(res, 502, { error: "NocoDB fetch failed: " + e.message }); }
     }
 
@@ -17052,7 +17005,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === "/api/generate-site" && req.method === "POST") {
-      const { engine, pages, deviceType, theme, stitchKeyOverride, pureScrape } = JSON.parse(await readBody(req) || "{}");
+      const { engine, pages, deviceType, theme, stitchKeyOverride } = JSON.parse(await readBody(req) || "{}");
       if (!Array.isArray(pages) || !pages.length) return json(res, 400, { error: "pages[] required" });
       const t0 = Date.now();
       // Give this client its own slice of the curated photo pool (see CURATED_OFFSET
@@ -17060,28 +17013,6 @@ const server = http.createServer(async (req, res) => {
       // runJob() — because this route is also called directly by the manual
       // dashboard/wizard flows, which never go through runJob at all.
       seedCuratedPhotos((theme && theme.displayName) || "client");
-
-      // WEBGEN (default engine): our in-house design engine renders the 4 core pages
-      // straight into GEN/site/ (final output — no bind step needed). The dashboard
-      // wizard and runJob both reach the generator through this same path now.
-      // engine:"stitch" or "gemini" force the legacy generators; ENGINE=stitch disables webgen.
-      // Stitch retired — everything (incl. any "stitch" request) goes through webgen,
-      // except an explicit "gemini" freehand test. The stitch branch below is unreachable.
-      if (engine !== "gemini") {
-        let A = {}, existingUrl = "", onbScrape = false;
-        try {
-          const onb = JSON.parse(fs.readFileSync(path.join(DIR, "onboarding.json"), "utf8"));
-          A = onb.answers || {};
-          existingUrl = onb.existingWebsite || onb.referenceWebsite || "";
-          onbScrape = !!onb.pureScrape;
-        } catch (e) { console.warn("webgen: onboarding.json unavailable —", e.message); }
-        const doScrape = (pureScrape != null) ? !!pureScrape : onbScrape;
-        const { kit, pages } = await generateWebgenSite({ A, composed: theme || {}, existingUrl, pureScrape: doScrape });
-        const mk = (k, html) => ({ page: k, pageKey: k, engine: "webgen", htmlBytes: html.length, previewUrl: `/preview/${k}`, exportUrl: `/export/${k}`, screenshotUrl: "" });
-        return json(res, 200, { engine: "webgen", siteReady: true, layout: kit.layout || "editorial",
-          pages: [mk("home", pages.home), mk("services", pages.services), mk("about", pages.about), mk("contact", pages.contact)],
-          seconds: ((Date.now() - t0) / 1000).toFixed(1) });
-      }
       if (engine === "gemini") {
         // stylingConstraint here too, not just service pages: buildWpTheme's
         // splitPage() strips the <head> for every page this pipeline ships —
@@ -17812,14 +17743,6 @@ const server = http.createServer(async (req, res) => {
 
     if (p.startsWith("/preview/")) {
       const f = path.join(GEN, p.slice(9).replace(/[^a-z0-9_-]/gi, "") + ".html");
-      if (fs.existsSync(f)) return send(res, 200, "text/html", fs.readFileSync(f));
-      return send(res, 404, "text/html", "<h1>Not generated yet</h1>");
-    }
-    // webgen preview nav uses real WP paths (/services/ /about/ /team/) — serve the
-    // assembled pages so the in-page navigation works before deployment.
-    if (p === "/services/" || p === "/about/" || p === "/team/") {
-      const key = p.replace(/\//g, "");
-      const f = path.join(GEN, "site", key + ".html");
       if (fs.existsSync(f)) return send(res, 200, "text/html", fs.readFileSync(f));
       return send(res, 404, "text/html", "<h1>Not generated yet</h1>");
     }
