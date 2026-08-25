@@ -8235,7 +8235,10 @@ async function runJob(job) {
     // 5 — WordPress theme + PR
     jobStep(job, 4, "running", "Building theme, pushing, opening PR…");
     // output_format "gitops" → resources/ tree for mcptest2-template repos instead of a PHP theme.
-    const outputFormat = String((job.payload && job.payload.output_format) || process.env.OUTPUT_FORMAT || "theme").toLowerCase();
+    // GitOps is the default output format now (all current target repos are the
+    // G99 GitOps template). A payload/env value can still force "theme" for a
+    // legacy Bedrock repo, but no config is needed for the normal case.
+    const outputFormat = String((job.payload && job.payload.output_format) || process.env.OUTPUT_FORMAT || "gitops").toLowerCase();
     const push = await localApi("/api/push-wordpress", { theme, skipRebind: true, githubRepo: job.repo, format: outputFormat === "gitops" ? "gitops" : undefined }, 15 * 60 * 1000);
     job.prUrl = push.prUrl; job.branch = push.branch;
     const slug = ((push.themePath || "").match(/g99-([a-z0-9-]+)\//) || [])[1] || "";
