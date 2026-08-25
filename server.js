@@ -8240,6 +8240,16 @@ async function runJob(job) {
     job.prUrl = push.prUrl; job.branch = push.branch;
     const slug = ((push.themePath || "").match(/g99-([a-z0-9-]+)\//) || [])[1] || "";
     job.themeSlug = slug;
+    // GitOps re-run with byte-identical output: nothing to commit is a SUCCESS,
+    // not a failure — the repo (and the live site) already hold this exact build.
+    // Skip the PR/merge/deploy-watch and go straight to the verify + TED tail.
+    if (outputFormat === "gitops" && push.noChanges) {
+      jobStep(job, 4, "done", "No changes — repo already matches generated output");
+      pushSubtaskStep(job, "wp_theme_pr", "done", { detail: "No changes (already current)" });
+      jobStep(job, 5, "done", "Nothing to deploy — site already current");
+      await runThemeActivationTail(job, slug, A, { gitops: true });
+      return;
+    }
     if (!job.prUrl) throw new Error("push succeeded but no PR URL returned");
     jobStep(job, 4, "done", job.prUrl);
     pushSubtaskStep(job, "wp_theme_pr", "done", { detail: job.prUrl });
@@ -17477,8 +17487,18 @@ const server = http.createServer(async (req, res) => {
           // site.json, and any custom-css.css deletion. A single -A on the dir is
           // robust to files that were removed (inline-CSS mode) or never existed.
           await runG(`git add -A resources`, tmpG);
+          // If a re-run produced byte-identical resources, there is genuinely
+          // nothing to commit — that is NOT a failure, the repo already holds this
+          // exact site. Detect it up front (staged diff empty) and return a clean
+          // "no changes" result instead of letting `git commit` error the job.
+          const staged = await runG(`git diff --cached --quiet`, tmpG);   // exit 1 = there ARE staged changes
+          if (staged.code === 0) {
+            fs.rmSync(tmpG, { recursive: true, force: true });
+            console.log(`[gitops] ${repo}: no changes — repo already matches generated output`);
+            return json(res, 200, { format: "gitops", branch: null, prUrl: null, pages, files: files.size, noChanges: true });
+          }
           r = await runG(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "GitOps: ${a.business_name} generated pages (${pages.join(", ")})"`, tmpG);
-          if (r.code) throw new Error("commit failed (no changes?): " + (r.stderr || r.stdout).slice(-200));
+          if (r.code) throw new Error("commit failed: " + (r.stderr || r.stdout).slice(-200));
           r = await runG(`git push -u origin "${branchG}"`, tmpG);
           if (r.code) throw new Error("push failed: " + r.stderr.slice(-200));
           const prBodyG = `Generated **${a.business_name}** pages in G99 GitOps format (\`resources/pages/{${pages.join(",")}}\`).\\n\\n`
