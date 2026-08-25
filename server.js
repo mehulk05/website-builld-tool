@@ -1194,6 +1194,11 @@ function wpRewriteLinks(html) {
   let h = html;
   const map = { "index.html": "/", "services.html": "/services/", "about.html": "/about/", "contact.html": "/contact/", "branding.html": "/branding/", "seo.html": "/seo/" };
   for (const [f, to] of Object.entries(map)) h = h.split(`href="${f}"`).join(`href="${to}"`);
+  // Localized images live in the theme's assets/img/. A relative path breaks on a
+  // sub-page URL, so resolve to the theme asset URI (this runs inside php templates,
+  // so the <?php ?> executes). Covers <img src> and CSS url().
+  h = h.replace(/\bsrc=(["'])assets\/img\/([^"']+)\1/gi, (m, q, f) => `src=${q}<?php echo esc_url(get_theme_file_uri('assets/img/${f}')); ?>${q}`);
+  h = h.replace(/url\((["']?)assets\/img\/([^)"']+)\1\)/gi, (m, q, f) => `url(<?php echo esc_url(get_theme_file_uri('assets/img/${f}')); ?>)`);
   return h;
 }
 function stripReviewBar(html) { return html.replace(/<div data-g99-review[\s\S]*?<\/div>\s*/i, ""); }
@@ -1215,6 +1220,176 @@ function splitPage(html) {
   if (footer) main = main.replace(footer, "");
   return { head: wpRewriteLinks(head), header: wpRewriteLinks(header), footer: wpRewriteLinks(footer), main: wpRewriteLinks(main) };
 }
+// WEBGEN engine — the in-house design engine that replaces Stitch. Composes a
+// structured BrandKit (onboarding + scanned site) and renders the 4 core pages
+// straight into GEN/site/. Shared by runJob AND the manual /api/generate-site route
+// so both entry points use the exact same generator. Output is final (no bind step).
+async function generateWebgenSite({ A = {}, composed = {}, existingUrl = "", pureScrape = false }) {
+  const webgen = require("./lib/webgen");
+  const apiKey = (typeof GEMINI_KEYS !== "undefined" && GEMINI_KEYS[0]) || process.env.GEMINI_API_KEY || "";
+  const gModel = process.env.GEMINI_MODEL || "gemini-flash-lite-latest";
+  // DEFAULT (fast) — onboarding content + browser-free image scrape + Gemini vision relevance.
+  const runDefault = async () => {
+    const team = (() => { try { return parseTeamRoster(A) || []; } catch { return []; } })();
+    const scrapeP = existingUrl ? webgen.scrapeLite(existingUrl).catch((e) => { console.warn("webgen scrapeLite failed:", e.message); return null; }) : Promise.resolve(null);
+    const k = await webgen.composeBrandKit({ siteStruct: null, A, composed, team, geminiCall });
+    const raw = await scrapeP;
+    if (raw && raw.images && raw.images.length) {
+      try {
+        const labels = await webgen.classifyPool(raw.images, apiKey, gModel);
+        webgen.enrichKitImages(k, raw.images, labels);
+      } catch (e) { console.warn("webgen image enrich failed (text-forward fallback):", e.message); }
+    }
+    return k;
+  };
+  let kit;
+  if (pureScrape && existingUrl) {
+    // PURE URL SCRAPE (toggle) — 1:1 with the standalone demo: Playwright scrape → full BrandKit.
+    // Falls back to fast mode if the browser scrape or extract errors/times out.
+    try {
+      const raw = await webgen.scrape(existingUrl);
+      kit = await webgen.extractBrandKit(raw, apiKey, gModel);
+      kit.brand = Object.assign({}, kit.brand, {
+        name: A.business_name || (kit.brand && kit.brand.name),
+        phone: A.phone_for_website || (kit.brand && kit.brand.phone),
+        email: A.email || (kit.brand && kit.brand.email),
+        city: A.location || (kit.brand && kit.brand.city),
+      });
+      if (A.logo && kit.footer) kit.footer.logo = A.logo;
+    } catch (e) { console.warn("webgen pure-scrape failed → fast mode:", e.message); kit = await runDefault(); }
+  } else {
+    kit = await runDefault();
+  }
+  // the CONFIRMED step-2 palette + fonts are the source of truth for colors — apply
+  // in BOTH modes so the site is always built on top of the brand from step 2
+  // (pure-scrape's own color guesses get overridden here).
+  if (composed && (composed.primary || composed.accent)) kit.theme = webgen.themeTokens(composed);
+  // force a specific design on every build via WEBGEN_LAYOUT (e.g. "bold");
+  // set it to "auto" (or unset) to let the AI pick per brand.
+  const forced = (process.env.WEBGEN_LAYOUT || "").toLowerCase();
+  if (webgen.DESIGN_IDS.includes(forced)) kit.layout = forced;
+
+  // Approach B — services & about MIRROR the client's real corresponding page
+  // (scraped section flow + copy + images), rendered in the home theme via a
+  // blueprint. Home stays as-is (already strong); contact keeps its map/hours
+  // layout. Any scrape/blueprint failure falls back to the Approach-A render, so
+  // a page is never blank. Off with WEBGEN_SCRAPE_PAGES=off.
+  // Scan the client's real pages once, then build a shared pool of their own
+  // photos — used to (a) mirror services/about structure via blueprints and (b)
+  // fill any empty image slot (hero, split, cards, contact) so nothing is a
+  // gradient placeholder. Off with WEBGEN_SCRAPE_PAGES=off.
+  let struct = null; const imgPool = [];
+  if (existingUrl && !/^(0|off|false|no)$/i.test(process.env.WEBGEN_SCRAPE_PAGES || "on")) {
+    try { struct = await scanSiteStructure(existingUrl); } catch (e) { console.warn("[webgen] scanSiteStructure skipped:", e.message); }
+  }
+  // Logo + social links for the premium footer (onboarding first, else scraped).
+  if (existingUrl) {
+    try {
+      const extras = await scrapeBrandExtras(existingUrl);
+      kit.brand = kit.brand || {};
+      kit.brand.logo = kit.brand.logo || A.logo_file || extras.logo || "";
+      kit.brand.social = { ...(extras.social || {}), ...(kit.brand.social || {}) };
+    } catch (e) { console.warn("[webgen] brand extras skipped:", e.message); }
+  }
+
+  const seedPool = (u) => { if (u && !imgPool.includes(u)) imgPool.push(u); };
+  if (struct && struct.pages) for (const p of Object.values(struct.pages)) for (const s of (p.sections || [])) for (const u of (s.imageUrls || [])) seedPool(u);
+  // also seed the home-scrape photos already chosen into the kit (strong hero candidates)
+  seedPool(kit.hero && kit.hero.image);
+  for (const u of (kit.gallery || [])) seedPool(u);
+  for (const c of ((kit.specialties && kit.specialties.cards) || [])) seedPool(c.image);
+  for (const m of ((kit.providers && kit.providers.members) || [])) seedPool(m.image);
+  // POOL-DEEPEN: the section scrape misses lazy-loaded photos (texture-heavy sites
+  // like NUVO leave a thin pool). Crawl home/about/services/team with the lazy-aware
+  // multi-page extractor so every slot gets a real photo, not a placeholder.
+  if (existingUrl && imgPool.length < 14) {
+    try {
+      const before = imgPool.length;
+      for (const rec of await extractSiteImages(existingUrl, 48)) seedPool(rec.url);
+      if (imgPool.length !== before) console.log(`[webgen] image pool deepened via multi-page crawl: ${before} → ${imgPool.length}`);
+    } catch (e) { console.warn("[webgen] pool deepen skipped:", e.message); }
+  }
+
+  // The home hero must never be empty — it is the site's first impression. If the
+  // kit's enrich step found nothing (or picked a dead URL), take the pool's best.
+  if (imgPool.length) {
+    kit.hero = kit.hero || {};
+    // The hero slot must get a HERO-type photo, not just whatever the crawl found
+    // first: prefer filenames that signal a hero/welcome/interior shot, avoid
+    // headshot-looking "Firstname-Lastname" files, only then fall back to pool[0].
+    const heroish = (u) => /hero|banner|welcome|main|home|space|interior|lobby|reception|storefront|exterior|clinic-(front|building)|ambien/i.test(u);
+    const portraitish = (u) => /[A-Z][a-z]+-[A-Z][a-z]+/.test((u.split("/").pop() || "")) || /headshot|portrait|team|staff|provider/i.test(u);
+    const pickHero = () => imgPool.find(heroish) || imgPool.find((u) => !portraitish(u)) || imgPool[0];
+    if (!kit.hero.image || !imgPool.includes(kit.hero.image) || (portraitish(kit.hero.image) && imgPool.some(heroish))) kit.hero.image = pickHero();
+    if (kit.about && !kit.about.image) kit.about.image = imgPool.find((u) => u !== kit.hero.image) || imgPool[0];
+    // HOME specialty cards: all-or-nothing, same as blueprint pages. A 3-card grid
+    // with one photo and two empty cards reads broken; either every card gets its
+    // own unique photo from the pool, or they all render as clean text cards.
+    const cards = (kit.specialties && kit.specialties.cards) || [];
+    if (cards.length) {
+      const used = new Set([kit.hero.image, kit.about && kit.about.image].filter(Boolean));
+      const filled = cards.map((c) => {
+        if (c.image && imgPool.includes(c.image) && !used.has(c.image)) { used.add(c.image); return c.image; }
+        const u = imgPool.find((x) => !used.has(x));
+        if (u) { used.add(u); return u; }
+        return "";
+      });
+      const allHave = filled.every(Boolean);
+      cards.forEach((c, i) => { c.image = allHave ? filled[i] : ""; });
+      if (!allHave) console.log(`[webgen] home cards: pool too thin for ${cards.length} unique photos — rendering text cards`);
+    }
+  }
+  const pages = {
+    home: webgen.renderHome(kit),
+    services: webgen.renderServices(kit),
+    about: webgen.renderAbout(kit),
+    contact: webgen.renderContact(kit, imgPool),
+  };
+  if (struct) {
+    try {
+      const bp = async (key, title) => {
+        const st = struct.pages && struct.pages[key];
+        if (!st || !(st.sections || []).length) { console.log(`[webgen] ${key}: no scraped structure — Approach-A fallback`); return null; }
+        const shot = await refPageScreenshot(st.url || existingUrl).catch(() => null);
+        const b = await webgen.buildBlueprint({ pageKey: key, title, struct: st, A, geminiCall, screenshotB64: shot });
+        if (b) { console.log(`[webgen] ${key}: blueprint from real page — ${b.blocks.length} blocks${shot ? " (design-matched to screenshot)" : ""}`); return webgen.renderFromBlueprint(kit, b, title, imgPool); }
+        console.log(`[webgen] ${key}: blueprint empty — Approach-A fallback`); return null;
+      };
+      const [svc, abt] = await Promise.all([bp("services", "Our Services"), bp("about", "About Us")]);
+      if (svc) pages.services = svc;
+      if (abt) pages.about = abt;
+    } catch (e) { console.warn("[webgen] scrape-faithful pages skipped:", e.message); }
+  }
+
+  // Cap runaway `vh` hero heights so the full-page mockup screenshot (captured at an expanded
+  // viewport) renders the hero at a real height instead of ballooning it. min(vh, px) keeps the live
+  // site fully responsive — only the capture's abnormally tall viewport hits the px bound.
+  for (const key of ["home", "services", "about", "contact"]) pages[key] = capViewportHeights(pages[key]);
+
+  const siteDir = path.join(GEN, "site");
+  fs.mkdirSync(siteDir, { recursive: true });
+
+  // LOCALIZE: download every external image the pages reference (both <img src>
+  // and CSS url()) into site/assets/img/ and rewrite to a relative path. Kills the
+  // hotlink dependency (images always load, and the WordPress theme ships them).
+  try {
+    const dl = new Map();   // remote URL -> local "assets/img/<name>.<ext>", shared across pages
+    for (const key of ["home", "services", "about", "contact"]) pages[key] = await localizeImages(pages[key], siteDir, dl);
+    if (dl.size) console.log(`[webgen] localized ${dl.size} image(s) into assets/img/`);
+  } catch (e) { console.warn("[webgen] image localize skipped (keeping hotlinks):", e.message); }
+
+  fs.writeFileSync(path.join(siteDir, "index.html"), pages.home);
+  fs.writeFileSync(path.join(siteDir, "services.html"), pages.services);
+  fs.writeFileSync(path.join(siteDir, "about.html"), pages.about);
+  fs.writeFileSync(path.join(siteDir, "contact.html"), pages.contact);
+  // flat copies too — the /preview/<key> route reads GEN/<key>.html (home/services/about/contact)
+  fs.writeFileSync(path.join(GEN, "home.html"), pages.home);
+  fs.writeFileSync(path.join(GEN, "services.html"), pages.services);
+  fs.writeFileSync(path.join(GEN, "about.html"), pages.about);
+  fs.writeFileSync(path.join(GEN, "contact.html"), pages.contact);
+  return { kit, pages };
+}
+
 // opts.logoUrl   — the onboarding logo upload; becomes the site favicon
 // opts.businessId — drives the chatbot widget's data-id
 async function buildWpTheme(slug, biz, opts = {}) {
@@ -1242,6 +1417,24 @@ async function buildWpTheme(slug, biz, opts = {}) {
   const businessId = opts.businessId || null;
   const favicon = await writeFaviconFromLogo(themeDir, opts.logoUrl);
   if (favicon) written.push(`assets/${favicon.file}`);
+
+  // Ship the localized images (GEN/site/assets/img → theme/assets/img) so the theme
+  // serves the client's own photos, not hotlinks. Each file MUST go into `written`
+  // so the push commits it (otherwise it's on disk but never reaches the repo → 404
+  // live). wpRewriteLinks points every reference at get_theme_file_uri('assets/img/…').
+  try {
+    const srcAssets = path.join(siteDir, "assets", "img");
+    if (fs.existsSync(srcAssets)) {
+      const dst = path.join(themeDir, "assets", "img");
+      fs.mkdirSync(dst, { recursive: true });
+      let n = 0;
+      for (const file of fs.readdirSync(srcAssets)) {
+        fs.copyFileSync(path.join(srcAssets, file), path.join(dst, file));
+        written.push(`assets/img/${file}`); n++;
+      }
+      console.log(`[buildWpTheme] shipped ${n} localized image(s) into theme assets/img/ (committed)`);
+    }
+  } catch (e) { console.warn("[buildWpTheme] asset copy failed (images may hotlink):", e.message); }
 
   w("style.css", `/*\nTheme Name: ${biz} (Growth99)\nTheme URI: https://growth99.com\nAuthor: Growth99\nDescription: AI-generated beta theme for ${biz}. Classic theme for Bedrock WordPress.\nVersion: 1.0.0\nLicense: Proprietary\nText Domain: g99-${slug}\n*/\n`);
 
@@ -2193,6 +2386,21 @@ function clampViewportHeights(html) {
     // Plain CSS inside <style> blocks
     .replace(/(\b(?:min-height|height)\s*:\s*)(\d{1,3})(?:d|s|l)?vh\b/gi,
       (_m, p, v) => `${p}${Math.max(320, Math.round(Math.min(Number(v), 100) * VH_TO_PX))}px`);
+}
+
+// Non-destructive alternative to clampViewportHeights, always on (not gated by CLAMP_VH): wraps a
+// `vh` height in min(vh, px) instead of replacing it. On a real viewport the vh wins and the page
+// stays responsive; the px only kicks in when the viewport is abnormally tall — which is exactly what
+// a full-page screenshot tool does (it expands the viewport to the whole document, so a `min-height:
+// 88vh` hero would otherwise balloon to thousands of px and swallow the capture). This is why webgen
+// (LUXE/editorial) pages screenshot fine at the site but ballooned in the TED mockup. Raw CSS only —
+// webgen sets hero heights in a <style> block, not Tailwind classes. Idempotent (skips min(...) it
+// already wrote). px reference = VH_TO_PX (8px/vh ≈ an 800px-tall laptop viewport).
+function capViewportHeights(html) {
+  if (!html) return html;
+  return String(html)
+    .replace(/(\b(?:min-height|height)\s*:\s*)(\d{1,3})(?:d|s|l)?vh\b/gi,
+      (_m, p, v) => `${p}min(${v}vh, ${Math.round(Math.min(Number(v), 100) * VH_TO_PX)}px)`);
 }
 
 function enforceBrandFonts(html, composed) {
@@ -6806,16 +7014,30 @@ function enqueueRestoreJob(payload) {
 // deploy/activation can lag past the ~10min poll window) can be RETRIED from this
 // point alone, via retryThemeActivationTail(), without re-running Stitch generation,
 // re-opening a PR, or re-running CI.
-async function runThemeActivationTail(job, slug, A) {
-  // 7 — wait for the mu-plugin to activate the theme on the live site
+async function runThemeActivationTail(job, slug, A, opts = {}) {
+  // 7 — wait for the site to actually serve this build. A GitOps deploy has no
+  // theme to activate (the MU plugin reconciles pages instead), so there the
+  // check is "are our generated pages live?" — everything after this step is
+  // identical for both formats, which is what keeps the TED events firing.
   jobStep(job, 6, "running", "Waiting for deploy + activation on " + job.liveUrl);
   let active = false;
   for (let i = 0; i < 40 && !active; i++) {
-    try { active = (await localApi("/api/theme-live", { url: job.liveUrl, slug })).active; } catch (e) { /* keep polling */ }
-    if (!active) { jobStep(job, 6, "running", `Not active yet (check ${i + 1}/40)…`); await sleep(15000); }
+    try {
+      if (opts.gitops) {
+        const ctl = new AbortController(); const timer = setTimeout(() => ctl.abort(), 15000);
+        const r = await fetch(job.liveUrl, { redirect: "follow", signal: ctl.signal, headers: { "User-Agent": "Mozilla/5.0 G99Bot" } });
+        clearTimeout(timer);
+        const html = await r.text();
+        // Our pages always ship the section wrappers and the business name.
+        active = /g99-sec|elementor-widget-html/.test(html) && html.includes(String(job.businessName || "").slice(0, 12));
+      } else {
+        active = (await localApi("/api/theme-live", { url: job.liveUrl, slug })).active;
+      }
+    } catch (e) { /* keep polling */ }
+    if (!active) { jobStep(job, 6, "running", `Not live yet (check ${i + 1}/40)…`); await sleep(15000); }
   }
-  if (!active) throw new Error("theme not detected on live within ~10 min — deploy may be slow; retry this step again");
-  jobStep(job, 6, "done", "Theme active on " + job.liveUrl);
+  if (!active) throw new Error((opts.gitops ? "generated pages" : "theme") + " not detected on live within ~10 min — deploy may be slow; retry this step again");
+  jobStep(job, 6, "done", (opts.gitops ? "Pages live on " : "Theme active on ") + job.liveUrl);
 
   // 8 — after-audit + comparison + report
   jobStep(job, 7, "running", "Auditing the new live site…");
@@ -7936,7 +8158,9 @@ async function runJob(job) {
 
     // 5 — WordPress theme + PR
     jobStep(job, 4, "running", "Building theme, pushing, opening PR…");
-    const push = await localApi("/api/push-wordpress", { theme, skipRebind: true, githubRepo: job.repo }, 15 * 60 * 1000);
+    // output_format "gitops" → resources/ tree for mcptest2-template repos instead of a PHP theme.
+    const outputFormat = String((job.payload && job.payload.output_format) || process.env.OUTPUT_FORMAT || "theme").toLowerCase();
+    const push = await localApi("/api/push-wordpress", { theme, skipRebind: true, githubRepo: job.repo, format: outputFormat === "gitops" ? "gitops" : undefined }, 15 * 60 * 1000);
     job.prUrl = push.prUrl; job.branch = push.branch;
     const slug = ((push.themePath || "").match(/g99-([a-z0-9-]+)\//) || [])[1] || "";
     job.themeSlug = slug;
@@ -7945,8 +8169,39 @@ async function runJob(job) {
     pushSubtaskStep(job, "wp_theme_pr", "done", { detail: job.prUrl });
 
     // 6 — CI watch → auto-fix → auto-merge
-    jobStep(job, 5, "running", "Watching CI build checks…");
+    // GitOps repos gate differently: their "Deploy to WordPress" check only
+    // succeeds for the branch the site actually deploys (main), so a PR-branch
+    // CI wait would spin for 40 min. Merge, then watch the main deployment run.
+    if (outputFormat === "gitops") {
+      jobStep(job, 5, "running", "Merging PR (GitOps deploys from main)…");
+      await awaitApprovalIfNeeded(job, "g99-" + slug, 5);
+      if (!job.mergedExternally) await localApi("/api/pr-merge", { prUrl: job.prUrl });
+      jobStep(job, 5, "running", "Merged — waiting for WordPress deployment run on main…");
+      // Match the deployment run to THIS merge's SHA — "latest run on main" can be
+      // an older, already-completed deploy and reports a false success.
+      let mergeSha = "";
+      try { mergeSha = (await sh(`gh api repos/${job.repo}/commits/main --jq .sha`)).stdout.trim(); } catch (e) { /* fall back to latest */ }
+      let deployOk = false, lastState = "";
+      for (let i = 0; i < 90; i++) {           // ~15 min
+        const r = mergeSha
+          ? await sh(`gh run list --repo ${job.repo} --branch main --workflow wordpress-deployment.yml --limit 5 --json status,conclusion,headSha --jq "[.[] | select(.headSha==\\"${mergeSha}\\")][0] | if . then .status + \\":\\" + (.conclusion // \\"\\") else \\"\\" end"`)
+          : await sh(`gh run list --repo ${job.repo} --branch main --workflow wordpress-deployment.yml --limit 1 --json status,conclusion --jq ".[0] | .status + \\":\\" + (.conclusion // \\"\\")"`);
+        lastState = (r.stdout || "").trim();
+        if (/completed:success/.test(lastState)) { deployOk = true; break; }
+        if (/completed:(failure|cancelled|timed_out)/.test(lastState)) break;
+        jobStep(job, 5, "running", `Deployment run: ${lastState || "queued"}…`);
+        await sleep(10000);
+      }
+      jobStep(job, 5, "done", deployOk ? "Merged — WordPress deployment succeeded" : `Merged — deployment run state: ${lastState || "not observed"} (check the repo Actions tab)`);
+      if (!deployOk) throw new Error(`WordPress deployment did not succeed (${lastState || "no run observed"}) — see the repo's Actions tab`);
+      // Same tail as a theme build: live check, after-audit + report, TED artifacts.
+      // Skipping it (as this branch used to) left cro_audit_after and the
+      // MOCKUPS_CAPTURED / SERVICE_PAGES_CREATED pushes silently unfired.
+      await runThemeActivationTail(job, slug, A, { gitops: true });
+      return;
+    }
     let fixes = 0, merged = false;
+    jobStep(job, 5, "running", "Watching CI build checks…");
     for (let i = 0; i < 240 && !merged; i++) {
       let st;
       try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); }
@@ -9459,6 +9714,131 @@ const textOf = (html) => String(html || "")
 // One page's real structure: the heading flow in DOM order, each tagged with what it seems to
 // be and how image-heavy it is. Deliberately heuristic and fail-soft — this feeds a prompt,
 // it does not need to be a perfect parse.
+// Scrape the client's LOGO + SOCIAL links off their home page for a premium
+// footer. Best-effort; returns {logo, social:{}} and never throws.
+async function scrapeBrandExtras(url) {
+  try {
+    const r = await fetch(/^https?:\/\//i.test(url) ? url : "https://" + url, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 G99Bot" } });
+    const html = await r.text();
+    const base = new URL(r.url);
+    const abs = (u) => { try { return new URL(u, base).href; } catch (e) { return null; } };
+    // logo: the header's logo <img> (class/alt/src mentioning "logo"); prefer a light/white variant (footer is dark)
+    const head = (html.match(/<header[\s\S]*?<\/header>/i) || [""])[0] || html;
+    const logos = [...head.matchAll(/<img\b[^>]*>/gi), ...html.matchAll(/<img\b[^>]*>/gi)]
+      .map((m) => m[0]).filter((t) => /logo/i.test(t) && !/sprite|icon-|favicon/i.test(t))
+      .map((t) => { const s = t.match(/\b(?:data-src|src)=["']([^"']+)["']/i); return s ? abs(s[1]) : null; })
+      .filter((u) => u && !/^data:/i.test(u));
+    const logo = logos.find((u) => /white|light|footer|inverse/i.test(u)) || logos[0] || null;
+    // socials
+    const social = {};
+    const grab = (re, key) => { const m = html.match(re); if (m && !social[key]) social[key] = m[0]; };
+    grab(/https?:\/\/(?:www\.)?instagram\.com\/[A-Za-z0-9_.\/-]+/i, "instagram");
+    grab(/https?:\/\/(?:www\.)?facebook\.com\/[A-Za-z0-9_.\/-]+/i, "facebook");
+    grab(/https?:\/\/(?:www\.)?(?:twitter|x)\.com\/[A-Za-z0-9_.\/-]+/i, "twitter");
+    grab(/https?:\/\/(?:www\.)?tiktok\.com\/@?[A-Za-z0-9_.\/-]+/i, "tiktok");
+    grab(/https?:\/\/(?:www\.)?youtube\.com\/[A-Za-z0-9_.@\/-]+/i, "youtube");
+    grab(/https?:\/\/(?:[a-z]{2,3}\.)?linkedin\.com\/[A-Za-z0-9_.\/-]+/i, "linkedin");
+    grab(/https?:\/\/(?:www\.)?yelp\.com\/biz\/[A-Za-z0-9_.\/-]+/i, "yelp");
+    grab(/https?:\/\/(?:[a-z]{2,3}\.)?pinterest\.com\/[A-Za-z0-9_.\/-]+/i, "pinterest");
+    return { logo, social };
+  } catch (e) { return { logo: null, social: {} }; }
+}
+
+// Desktop screenshot of a reference page (via Browserless — works on Render) used
+// as a DESIGN reference the blueprint AI reproduces. Above-the-fold is enough for
+// composition cues and keeps the payload small. Null when unavailable (text-only).
+async function refPageScreenshot(url) {
+  const full = /^https?:\/\//i.test(url) ? url : "https://" + url;
+  // 1) Browserless (hosted browser — works on Render)
+  if (BROWSERLESS_TOKEN) {
+    try {
+      const api = `${BROWSERLESS_URL}/screenshot?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), Math.min(BROWSERLESS_TIMEOUT_MS, 40000));
+      const body = {
+        url: full, viewport: { width: 1280, height: 1600, deviceScaleFactor: 1 },
+        gotoOptions: { waitUntil: "networkidle2", timeout: 40000 }, waitForTimeout: 1600, bestAttempt: true,
+        options: { fullPage: false, type: "jpeg", quality: 68 },
+      };
+      let res;
+      try { res = await fetch(api, { method: "POST", signal: ctl.signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); }
+      finally { clearTimeout(timer); }
+      if (res.ok) { const buf = Buffer.from(await res.arrayBuffer()); if (buf.length > 800 && buf.length < 4_000_000) return buf.toString("base64"); }
+    } catch (e) { /* fall through to playwright */ }
+  }
+  // 2) local Playwright fallback (no Browserless token, e.g. dev machine)
+  try {
+    const { chromium } = require("playwright");
+    const browser = await chromium.launch();
+    try {
+      const page = await browser.newPage({ viewport: { width: 1280, height: 1600 } });
+      await page.goto(full, { waitUntil: "networkidle", timeout: 40000 }).catch(() => {});
+      await page.waitForTimeout(1600);
+      const buf = await page.screenshot({ type: "jpeg", quality: 68, fullPage: false });
+      return buf.toString("base64");
+    } finally { await browser.close().catch(() => {}); }
+  } catch (e) { return null; }
+}
+
+// Download every external image an HTML page references (<img src> + CSS url())
+// into <siteDir>/assets/img/ and rewrite the references to a relative local path.
+// `dl` (remote URL -> local path) is shared across pages so each image downloads
+// once. Any download failure leaves that reference untouched (still works).
+async function localizeImages(html, siteDir, dl = new Map()) {
+  if (!html) return html;
+  const imgDir = path.join(siteDir, "assets", "img");
+  const EXT = /\.(jpe?g|png|webp|avif|gif)(\?|$)/i;
+  // collect unique external image URLs from src= and url()
+  const urls = new Set();
+  for (const m of html.matchAll(/(?:src=|url\()\s*["']?(https?:\/\/[^"')\s]+)/gi)) if (EXT.test(m[1])) urls.add(m[1]);
+  let out = html;
+  for (const url of urls) {
+    if (!dl.has(url)) {
+      try {
+        const r = await fetch(url, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 G99Bot" } });
+        if (!r.ok) { dl.set(url, null); continue; }
+        const buf = Buffer.from(await r.arrayBuffer());
+        if (!buf.length || buf.length > 8_000_000) { dl.set(url, null); continue; }
+        const ext = (url.match(EXT) || [, "jpg"])[1].toLowerCase().replace("jpeg", "jpg");
+        const name = crypto.createHash("md5").update(url).digest("hex").slice(0, 16) + "." + ext;
+        fs.mkdirSync(imgDir, { recursive: true });
+        fs.writeFileSync(path.join(imgDir, name), buf);
+        dl.set(url, "assets/img/" + name);
+      } catch (e) { dl.set(url, null); }
+    }
+    const local = dl.get(url);
+    if (local) out = out.split(url).join(local);
+  }
+  // Persist local-path → original-URL so downstream exporters (GitOps format)
+  // can point at the source image again. Merged across pages (shared dl map).
+  try {
+    const mapFile = path.join(siteDir, "assets", "img-map.json");
+    const prev = fs.existsSync(mapFile) ? JSON.parse(fs.readFileSync(mapFile, "utf8")) : {};
+    for (const [url, local] of dl) if (local) prev[local] = url;
+    fs.mkdirSync(path.dirname(mapFile), { recursive: true });
+    fs.writeFileSync(mapFile, JSON.stringify(prev, null, 1));
+  } catch (e) { /* map is best-effort */ }
+  return out;
+}
+
+// Extract the real content-image URLs from a section chunk (src / data-src /
+// srcset-largest / CSS background url), absolutized, full-res, decor-filtered, deduped.
+function sectionImageUrls(chunk, pageUrl) {
+  let base; try { base = new URL(pageUrl); } catch (e) { return []; }
+  const DECOR = /sprite|icon|favicon|spacer|placeholder|blank|pixel|1x1|loader|avatar-default|\/thumbs\/|logo|[-_]bg[-_.]|leaf-bg|gold-bg|golden-circle|gradient|wave|pattern|texture|divider|swirl|scrim|overlay|\.svg(\?|$)/i;
+  const full = (u) => u.replace(/-\d{2,4}x\d{2,4}(?=\.(?:jpe?g|png|webp|avif)(?:\?|$))/i, "");
+  const seen = new Set(), out = [];
+  const push = (u) => {
+    let a; try { a = new URL(u, base).href; } catch (e) { return; }
+    if (!/\.(jpe?g|png|webp|avif)(\?|$)/i.test(a) || DECOR.test(a)) return;
+    a = full(a); if (DECOR.test(a) || seen.has(a)) return; seen.add(a); out.push(a);
+  };
+  for (const m of chunk.matchAll(/<img\b[^>]*?\b(?:data-lazy-src|data-src|src)=["']([^"']+)["']/gi)) push(m[1]);
+  for (const m of chunk.matchAll(/\bsrcset=["']([^"']+)["']/gi)) { const c = m[1].split(",").map((s) => s.trim().split(/\s+/)[0]).filter(Boolean); if (c.length) push(c[c.length - 1]); }
+  for (const m of chunk.matchAll(/url\((["']?)([^)"']+)\1\)/gi)) push(m[2]);
+  return out.slice(0, 6);
+}
+
 async function scanPageStructure(url) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 20000);
@@ -14928,6 +15308,10 @@ const server = http.createServer(async (req, res) => {
         // businessId alone is reused across clone/test businesses. See tedPushArtifacts().
         hubspotDealId: body.hubspotDealId || body.dealId || null,
         hubspotCompanyId: body.hubspotCompanyId || body.companyId || null,
+        // Engine + output format overrides ride the webhook payload (used by
+        // GitOps-format repos; absent for normal builds → theme).
+        engine: body.engine || undefined,
+        output_format: body.output_format || body.outputFormat || undefined,
       });
       console.log(`webhook: ${job.businessName} · repo ${job.repo} · beta ${job.liveUrl}${betaSiteUrl || betaSiteRepo ? "" : " (deal properties missing — using this deployment's defaults)"}`
         + (confirmedBrand ? ` · client-confirmed brand ${confirmedBrand.primaryColor || "?"}/${confirmedBrand.accentColor || "?"} ${confirmedBrand.headingFont || "?"}` : " · no confirmed brand (will derive)"));
@@ -16895,6 +17279,147 @@ const server = http.createServer(async (req, res) => {
       const a = onb.answers;
       const slug = (a.business_name || "client").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32);
       if (!body.skipRebind) await ensureFreshSite(body.theme); // rebind /site/ from newest generation — never ship stale (dashboard binds itself and passes skipRebind)
+
+      // ---- GitOps output format (mcptest2 template repos) ----------------------
+      // Instead of a PHP theme, ship a resources/ tree that the G99 MU-plugin
+      // reconciles into WordPress. Touches ONLY resources/pages/<slug>/ for the
+      // four core pages — never .github/, mu-plugins/, or other resources.
+      if (body.format === "gitops") {
+        const { compileGitops } = require("./lib/gitops/compile");
+        // Look at what we are actually deploying INTO before generating: the
+        // repo says which theme/templates exist, the live site says which
+        // Elementor edition is installed. Both change what we may emit —
+        // elementor_canvas needs Elementor, and page-level custom_css is a PRO
+        // feature that silently drops on free Elementor (site renders unstyled).
+        const probeTarget = async (repoDir, liveUrl) => {
+          const t = { theme: "", elementor: false, elementorPro: false, templates: [], notes: [] };
+          try {
+            const site = JSON.parse(fs.readFileSync(path.join(repoDir, "resources", "site.json"), "utf8"));
+            t.theme = site.active_theme || "";
+            if (Array.isArray(site.elementor_post_types) && site.elementor_post_types.includes("page")) t.elementor = true;
+          } catch (e) { t.notes.push("no resources/site.json"); }
+          try { t.templates = fs.readdirSync(path.join(repoDir, "resources", "templates")); } catch (e) { /* none */ }
+          if (liveUrl) {
+            try {
+              const ctl = new AbortController(); const timer = setTimeout(() => ctl.abort(), 15000);
+              const r = await fetch(liveUrl, { redirect: "follow", signal: ctl.signal, headers: { "User-Agent": "Mozilla/5.0 G99Bot" } });
+              clearTimeout(timer);
+              const html = await r.text();
+              if (/elementor-pro|elementor\/pro\/assets/i.test(html)) t.elementorPro = true;
+              if (/elementor-frontend|plugins\/elementor\//i.test(html)) t.elementor = true;
+              const th = html.match(/wp-content\/themes\/([a-z0-9_-]+)/i);
+              if (th) t.theme = th[1];
+            } catch (e) { t.notes.push("live probe failed: " + String(e.message).slice(0, 60)); }
+          }
+          t.pageTemplate = t.elementor ? "elementor_canvas" : "";
+          t.cssTarget = "Customizer Additional CSS" + (t.elementorPro ? " + page custom_css (Pro)" : "");
+          if (t.templates.includes("header") || t.templates.includes("footer")) {
+            t.notes.push("repo has Elementor header/footer templates — canvas template keeps them off our pages");
+          }
+          if (!t.elementor) t.notes.push("Elementor not detected — pages use the theme's default template");
+          return t;
+        };
+        const stampG = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
+        let branchG = `g99/gitops-${slug}-${stampG}-${Date.now().toString(36).slice(-4)}`;
+        const tmpG = path.join(os.tmpdir(), "g99gitops-" + Date.now());
+        const stepsG = [];
+        const runG = async (cmd, cwd) => { const r = await sh(cmd, cwd); stepsG.push({ cmd, code: r.code, err: (r.stderr || "").slice(-300) }); return r; };
+        try {
+          let r = await runG(`git clone --depth 1 -c core.longpaths=true "${await ghCloneUrl(repo)}" "${tmpG}"`);
+          if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
+          // Reuse the repo's existing git_id per slug so the import updates pages
+          // in place (stable _g99_git_id) instead of delete+create.
+          const existingGitId = (pslug) => {
+            try { return JSON.parse(fs.readFileSync(path.join(tmpG, "resources", "pages", pslug, "resource.json"), "utf8")).git_id || null; }
+            catch (e) { return null; }
+          };
+          const target = await probeTarget(tmpG, body.liveUrl || onb.betaSiteUrl || "");
+          console.log(`[gitops] target ${repo}: theme=${target.theme || "?"} elementor=${target.elementor} pro=${target.elementorPro} templates=[${target.templates.join(",")}] css→${target.cssTarget}${target.notes.length ? " · " + target.notes.join(" · ") : ""}`);
+          // CSS delivery: default to inlining the stylesheet inside a hidden
+          // per-page wrapper. The Customizer "Additional CSS" resource is verified
+          // by exact byte compare and rolls the whole deploy back on any WordPress
+          // re-encoding — which is what happened on this fleet (even a one-rule
+          // canary failed). The hidden <style> wrapper needs no separate resource,
+          // survives where the html widget keeps <style>, and (being hidden) never
+          // leaks CSS text onto the page where it is stripped. cssManaged=true opts
+          // back into the resources/custom-css.css channel for sites where it works.
+          const useInline = body.cssManaged ? false : true;
+          const { files, pages } = compileGitops(path.join(GEN, "site"), a, existingGitId, { pageTemplate: target.pageTemplate, cssInline: useInline });
+          // When inlining, we do not ship the managed stylesheet at all, and we
+          // drop any copy an earlier push left in the repo (it would keep failing).
+          if (useInline) {
+            files.delete("resources/custom-css.css");
+            try { fs.rmSync(path.join(tmpG, "resources", "custom-css.css"), { force: true }); } catch (e) { /* absent */ }
+          }
+          // cssProbe: ship a single canary rule instead of the real stylesheet.
+          // resources/custom-css.css is verified by exact string compare against
+          // what WordPress stored, so a site that re-encodes it rolls the whole
+          // deploy back. One trivial rule answers "does this site accept managed
+          // CSS at all?" before we spend a deploy on 16kb of it.
+          if (body.cssProbe) files.set("resources/custom-css.css", "body{color:#111111}");
+          // cssOff: stop managing the stylesheet. Dropping it from our output is
+          // not enough — a copy already committed by an earlier push stays in the
+          // repo and keeps failing verification, so remove it from the clone too.
+          if (body.cssOff) {
+            files.delete("resources/custom-css.css");
+            try { fs.rmSync(path.join(tmpG, "resources", "custom-css.css"), { force: true }); } catch (e) { /* absent */ }
+          }
+          if (body.dryRun) {
+            const outDir = path.join(GEN, "gitops", slug);
+            fs.rmSync(outDir, { recursive: true, force: true });
+            for (const [rel, content] of files) { const to = path.join(outDir, rel); fs.mkdirSync(path.dirname(to), { recursive: true }); fs.writeFileSync(to, content); }
+            fs.rmSync(tmpG, { recursive: true, force: true });
+            return json(res, 200, { dryRun: true, format: "gitops", pages, outDir, files: [...files.keys()] });
+          }
+          for (const pslug of pages) fs.rmSync(path.join(tmpG, "resources", "pages", pslug), { recursive: true, force: true });
+          for (const [rel, content] of files) { const to = path.join(tmpG, rel); fs.mkdirSync(path.dirname(to), { recursive: true }); fs.writeFileSync(to, content); }
+          // Site identity: the tab title / og meta come from site.json (blogname),
+          // which otherwise keeps the previous client's name.
+          try {
+            const sj = path.join(tmpG, "resources", "site.json");
+            const site = JSON.parse(fs.readFileSync(sj, "utf8"));
+            // WP stores these options HTML-escaped (& → &amp;), and the plugin's
+            // post-apply verify compares raw strings — any &/<
+            // in the value triggers "verification failed; rolling back". Keep them escapable-free.
+            const optSafe = (s) => String(s || "").replace(/&/g, "and").replace(/[<>"]/g, "").trim();
+            site.blogname = optSafe(a.business_name) || site.blogname;
+            // No business name here — WP renders the front-page title as
+            // "blogname – blogdescription", so repeating the name doubles it.
+            site.blogdescription = optSafe(a.tagline || "Advanced Aesthetics and Wellness").slice(0, 120);
+            // A fresh template repo ships show_on_front="posts", so the generated
+            // home page would sit at /home/ while / shows the blog. Point the
+            // front page at our home page's git_id.
+            try {
+              const homeRes = files.get("resources/pages/home/resource.json");
+              const homeGitId = homeRes ? JSON.parse(homeRes).git_id : null;
+              if (homeGitId) { site.show_on_front = "page"; site.front_page_git_id = homeGitId; }
+            } catch (e) { console.warn("[gitops] front-page wiring skipped:", e.message); }
+            fs.writeFileSync(sj, JSON.stringify(site, null, 4));
+          } catch (e) { console.warn("[gitops] site.json patch skipped:", e.message); }
+          await runG(`git checkout -b "${branchG}"`, tmpG);
+          // Stage everything we may have touched under resources/: pages,
+          // site.json, and any custom-css.css deletion. A single -A on the dir is
+          // robust to files that were removed (inline-CSS mode) or never existed.
+          await runG(`git add -A resources`, tmpG);
+          r = await runG(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "GitOps: ${a.business_name} generated pages (${pages.join(", ")})"`, tmpG);
+          if (r.code) throw new Error("commit failed (no changes?): " + (r.stderr || r.stdout).slice(-200));
+          r = await runG(`git push -u origin "${branchG}"`, tmpG);
+          if (r.code) throw new Error("push failed: " + r.stderr.slice(-200));
+          const prBodyG = `Generated **${a.business_name}** pages in G99 GitOps format (\`resources/pages/{${pages.join(",")}}\`).\\n\\n`
+            + `Each section is its own Elementor container + \`html\` widget, compiled by the Growth99 Website Build Tool webgen engine.\\n\\n`
+            + `**Detected target:** theme \`${target.theme || "?"}\` · Elementor ${target.elementor ? (target.elementorPro ? "Pro" : "free") : "not detected"} · page template \`${target.pageTemplate || "(theme default)"}\` · CSS → ${target.cssTarget}`
+            + (target.notes.length ? `\\n\\n_${target.notes.join(" · ")}_` : "");
+          r = await runG(`gh pr create --repo ${repo} --base main --head "${branchG}" --title "GitOps: ${a.business_name} generated pages" --body "${prBodyG}"`, tmpG);
+          const prUrlG = (r.stdout.match(/https:\/\/github\.com\/\S+/) || [""])[0];
+          fs.rmSync(tmpG, { recursive: true, force: true });
+          if (!prUrlG && r.code) throw new Error("PR create failed: " + r.stderr.slice(-200));
+          return json(res, 200, { format: "gitops", branch: branchG, prUrl: prUrlG, pages, files: files.size });
+        } catch (e) {
+          try { fs.rmSync(tmpG, { recursive: true, force: true }); } catch (_) {}
+          return json(res, 500, { error: e.message, steps: stepsG });
+        }
+      }
+
       const built = await buildWpTheme(slug, a.business_name, {
         // Favicon source and chatbot business id: the logo is an answer, the business id
         // rides at the root of the webhook payload.
@@ -17152,9 +17677,11 @@ const server = http.createServer(async (req, res) => {
     const viewM = p.match(/^\/view\/([a-z0-9_-]+)(?:\/(.*))?$/i);
     if (viewM) {
       const draftId = viewM[1].replace(/[^a-z0-9_-]/gi, "");
-      const rel = (viewM[2] || "index.html").replace(/[^a-z0-9._-]/gi, "") || "index.html";
-      const f = path.join(GEN, "exports", draftId, "site", rel);
-      if (fs.existsSync(f)) return send(res, 200, MIME[path.extname(f)] || "text/html", fs.readFileSync(f));
+      // Allow sub-directory paths (assets/img/…) but strip any ".." traversal.
+      const rel = (viewM[2] || "index.html").replace(/\.\.+/g, "").replace(/[^a-z0-9._/-]/gi, "").replace(/^\/+/, "") || "index.html";
+      const base = path.join(GEN, "exports", draftId, "site");
+      const f = path.join(base, rel);
+      if (f.startsWith(base) && fs.existsSync(f) && fs.statSync(f).isFile()) return send(res, 200, MIME[path.extname(f)] || "text/html", fs.readFileSync(f));
       return send(res, 404, "text/html", `<h1>No build snapshot for draft ${escHtml(draftId)}</h1><p>It may not have finished assembling yet.</p>`);
     }
 
