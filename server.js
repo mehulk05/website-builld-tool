@@ -7321,6 +7321,64 @@ async function liteScrape(url) {
 // through geminiCall so key rotation + cost metering keep working, and (b) SEEDED
 // with the onboarding answers so the AI invents far less: the business name,
 // services, team, review and hero line are facts we already have.
+// Salvage a BrandKit JSON that came back truncated (unterminated string) — the
+// classic maxOutputTokens cut-off. Strict parse first; if that throws, close an
+// odd trailing quote and balance the open []/{} so the last (partial) field is
+// dropped but everything before it survives. Returns null if unrecoverable.
+function parseKitJson(txt) {
+  try { return JSON.parse(txt); } catch (e) { /* try repair */ }
+  let t = String(txt);
+  // Walk once, tracking string state and the open-bracket stack, so we can close
+  // the containers in the CORRECT nesting order (a naive "]×n then }×n" balancer
+  // mis-closes an object left open inside an array).
+  const stack = [];
+  let inStr = false, esc = false;
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === "{" || c === "[") stack.push(c);
+    else if (c === "}" || c === "]") stack.pop();
+  }
+  if (inStr) t += '"';                                   // close an unterminated string
+  t = t.replace(/,\s*$/, "");                            // drop a dangling comma
+  for (let i = stack.length - 1; i >= 0; i--) t += stack[i] === "{" ? "}" : "]";
+  try { return JSON.parse(t); } catch (e) { return null; }
+}
+
+// Deterministic BrandKit built from onboarding only — used when every AI attempt
+// fails. The theme is left empty on purpose: the sanitization pass after the call
+// fills it with elegant defaults, so the page still renders, just with
+// template-derived copy instead of AI-written copy.
+function fallbackEditorialKit(A) {
+  const list = (v) => Array.isArray(v)
+    ? v.map((x) => (x && typeof x === "object") ? (x.name || x.title || x.h3 || "") : String(x)).filter(Boolean)
+    : String(v || "").split(/[;,\n]+/).map((s) => s.trim()).filter(Boolean);
+  const svc = list(A.revenue_services).concat(list(A.services_offered)).filter((v, i, a) => a.indexOf(v) === i);
+  const team = Array.isArray(A.team_roster) ? A.team_roster : [];
+  const name = A.business_name || "Our Practice";
+  return {
+    brand: { name, sub: "", topbar: A.location || "", phone: A.phone_for_website || "", email: "", city: A.location || "" },
+    theme: {},
+    hero: { eyebrow: A.location || "", h1: A.hero_headline || name, body: A.hero_subheadline || A.business_description || "", cta: A.primary_cta || "Book a Consultation", image: "" },
+    about: { eyebrow: "About Us", h2: `Welcome to ${name}`, paras: [String(A.business_description || A.why_patients_choose || "").slice(0, 400)].filter(Boolean), cta: "Learn More", image: "" },
+    strip: svc.slice(0, 5),
+    specialties: { eyebrow: "Our Services", h2: "What We Offer", intro: "", cards: svc.slice(0, 3).map((s) => ({ h3: s, p: "", image: "" })) },
+    providers: { eyebrow: "Our Team", h2: "Meet Our Specialists", tabs: [], members: team.slice(0, 4).map((m) => ({ name: (m && (m.name || m.title)) || String(m), role: (m && m.role) || "Specialist", image: "" })) },
+    testimonials: { eyebrow: "Reviews", h2: "What Our Clients Say", quotes: (A.featured_review ? [{ h4: "", p: String(A.featured_review), cite: "Verified client" }] : []) },
+    featured: { h2: "Signature Treatments", items: svc.slice(0, 3).map((s) => ({ h3: s, p: "", image: "" })) },
+    cta: { eyebrow: "", h2: `Ready to visit ${name}?`, body: "" },
+    footer: { blurb: A.business_description ? String(A.business_description).slice(0, 160) : "", logo: A.logo || "" },
+    voice: "warm-clinical-luxe",
+    layout: "editorial",
+  };
+}
+
 async function extractBrandKit(raw, A, opts = {}) {
   const seedLines = [];
   const val = (v) => Array.isArray(v) ? v.map((x) => (x && typeof x === "object") ? [x.name, x.title].filter(Boolean).join(" — ") : String(x)).join("; ") : (v == null ? "" : String(v));
@@ -7389,11 +7447,29 @@ ${(raw.text || "").slice(0, 14000)}`;
   // model for this ONE call — it is the single AI step of the whole engine.
   // Prefer the full flash model, but NEVER pin hard: opts.model bypasses geminiCall's
   // fallback chain, so a 503 on the preferred model must fall back to the default chain.
-  let rawTxt;
-  try { rawTxt = await geminiCall(parts, { temperature: 0.7, maxOutputTokens: 8000, timeoutMs: 90000, model: process.env.BRANDKIT_MODEL || "gemini-flash-latest" }); }
-  catch (e) { console.warn(`brandkit: preferred model failed (${String(e.message).slice(0, 80)}) — retrying on the default chain`); rawTxt = await geminiCall(parts, { temperature: 0.7, maxOutputTokens: 8000, timeoutMs: 90000 }); }
-  const txt = rawTxt.trim().replace(/^```json?/i, "").replace(/```$/, "").trim();
-  const kit = JSON.parse(txt);
+  // A big client (many services + long text) can overflow an 8k-token response and
+  // truncate the JSON mid-string ("Unterminated string in JSON") — which used to
+  // crash the whole build. Retry with an ESCALATING token budget (a plain retry
+  // would just re-hit the same cap), salvage a truncated body where possible, and
+  // if every attempt still fails, fall back to a deterministic onboarding-only kit
+  // so the job NEVER dies on this step.
+  const preferred = process.env.BRANDKIT_MODEL || "gemini-flash-latest";
+  const budgets = [8000, 12000, 16000];
+  let kit = null;
+  for (let i = 0; i < budgets.length && !kit; i++) {
+    const cap = budgets[i];
+    let rawTxt;
+    try { rawTxt = await geminiCall(parts, { temperature: 0.7, maxOutputTokens: cap, timeoutMs: 90000, model: preferred }); }
+    catch (e) {
+      console.warn(`brandkit: model failed @${cap} (${String(e.message).slice(0, 80)}) — default chain`);
+      try { rawTxt = await geminiCall(parts, { temperature: 0.7, maxOutputTokens: cap, timeoutMs: 90000 }); }
+      catch (e2) { console.warn(`brandkit: default chain also failed @${cap} (${String(e2.message).slice(0, 80)})`); continue; }
+    }
+    const txt = rawTxt.trim().replace(/^```json?/i, "").replace(/```$/, "").trim();
+    kit = parseKitJson(txt);
+    if (!kit) console.warn(`brandkit: unparseable JSON @${cap} (likely truncated) — ${i + 1 < budgets.length ? "retrying with a larger budget" : "falling back to onboarding kit"}`);
+  }
+  if (!kit) kit = fallbackEditorialKit(A);
 
   // --- theme sanitization (the three drifts that made pages look "off" vs the medspa tool) ---
   const th = kit.theme || (kit.theme = {});
