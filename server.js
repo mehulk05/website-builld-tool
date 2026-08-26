@@ -9,6 +9,9 @@ const crypto = require("crypto");   // GitHub App JWT signing
 const { exec, spawn } = require("child_process");
 const { URL } = require("url");
 const zlib = require("zlib");
+// GitOps JSON sites (resources/**.json) presented to the edit pipeline as text
+// files. See gitops-json.js for why the pipeline is adapted rather than forked.
+const GJ = require("./gitops-json");
 
 const DIR = __dirname;
 
@@ -4051,6 +4054,44 @@ async function repoFileExists(repo, filePath) {
 // theme in the repo; else a clear error. A g99-* theme also carries its
 // auto-activator mu-plugin; hand-onboarded themes (e.g. "ecka") do not.
 async function resolveEditTarget(website) {
+  // In a local rehearsal the checkout on disk is the truth, and asking GitHub
+  // what shape it is would be both slower and wrong — the point of the mode is
+  // to work on a site before its repository is involved at all.
+  const localRepo = (process.env.EDIT_LOCAL_REPO || "").trim();
+  if (localRepo && fs.existsSync(localRepo)) {
+    if (GJ.isGitopsRoot(localRepo)) {
+      const slug = String(website.businessName || "site").toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "site";
+      return { kind: "gitops", themeSlug: slug, themePath: "resources", muPath: "", themes: [] };
+    }
+    const themesDir = path.join(localRepo, "web", "app", "themes");
+    const found = fs.existsSync(themesDir)
+      ? fs.readdirSync(themesDir).filter((f) => !f.startsWith(".") && fs.statSync(path.join(themesDir, f)).isDirectory())
+      : [];
+    if (found.length === 1) {
+      const slug = found[0], bare = slug.replace(/^g99-/, "");
+      return {
+        kind: "theme", themeSlug: slug, themePath: `web/app/themes/${slug}`,
+        muPath: slug.startsWith("g99-") ? `web/app/mu-plugins/g99-activate-${bare}.php` : "", themes: found,
+      };
+    }
+    throw new Error(`EDIT_LOCAL_REPO (${localRepo}) is neither a GitOps tree (no resources/site.json) nor a checkout with exactly one theme — found ${found.length}`);
+  }
+  // A GitOps repository is checked FIRST, because the theme lookup below would
+  // otherwise appear to succeed on it and send every edit at a path the
+  // repository does not contain. Model B has no theme: the site is
+  // resources/**.json, reconciled into WordPress by the g99-control MU plugin,
+  // and the theme the live domain reports (hello-elementor) is a stock theme
+  // this pipeline must never write to. resources/site.json is the marker — it is
+  // the one file every imported site has and no classic theme repo does.
+  if (await repoFileExists(website.githubRepo, "resources/site.json")) {
+    const slug = String(website.businessName || "site").toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "site";
+    // themePath is "resources" so that everything scoped to it downstream —
+    // the in-scope check, git add, the diff, the restore job — keeps working
+    // with no second code path.
+    return { kind: "gitops", themeSlug: slug, themePath: "resources", muPath: "", themes: [] };
+  }
   const liveSlug = website.liveUrl ? await detectActiveTheme(website.liveUrl) : null;
   const themes = await listRepoThemes(website.githubRepo).catch(() => []);
   let slug = null;
@@ -4062,7 +4103,7 @@ async function resolveEditTarget(website) {
   }
   const bare = slug.replace(/^g99-/, "");
   const muPath = slug.startsWith("g99-") ? `web/app/mu-plugins/g99-activate-${bare}.php` : "";
-  return { themeSlug: slug, themePath: `web/app/themes/${slug}`, muPath, themes };
+  return { kind: "theme", themeSlug: slug, themePath: `web/app/themes/${slug}`, muPath, themes };
 }
 
 // ---- local IDE hand-off -----------------------------------------------------
@@ -5055,7 +5096,7 @@ async function startTedSubtaskRun(taskId, { dryRun = false } = {}) {
   const job = enqueueEditJob({
     jobId: "edit-" + Date.now(),
     siteId: r.site.siteId, businessName: r.site.businessName, githubRepo: r.site.githubRepo,
-    themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
+    kind: target.kind, themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
     // Runs to completion on its own: TED only moves to the next task once this
     // one closes, and it cannot close while the run is parked on an approval
     // nobody in TED can even see it is waiting for.
@@ -5457,11 +5498,14 @@ function verifyTedSsoTicket(token) {
 // link sits in a comment for days, and the correction that comes back has no
 // other way to say which thread it is answering. A link minted by hand has no
 // task and simply carries none.
-function mintReviewToken({ siteId, themeSlug, reviewer, email, dept, minutes, taskId }) {
+function mintReviewToken({ siteId, themeSlug, reviewer, email, dept, minutes, taskId, kind }) {
   if (!REVIEW_SECRET) throw new Error("REVIEW_SECRET not set (falls back to WEBHOOK_SECRET or ADMIN_PASSWORD) — cannot mint review links");
   const exp = Date.now() + Math.max(5, Number(minutes) || REVIEW_TTL_MIN) * 60000;
   const body = Buffer.from(JSON.stringify({
     v: 1, siteId, themeSlug, reviewer, email: email || "", dept: dept || "", exp,
+    // Which site model this link is for. A token minted before this existed has
+    // no kind and is treated as a classic theme, which is what it was.
+    ...(kind ? { kind } : {}),
     ...(taskId ? { taskId: String(taskId) } : {}),
   })).toString("base64url");
   return { token: `${body}.${reviewSign(body)}`, exp };
@@ -5554,9 +5598,14 @@ function reviewTextVariants(s) {
 function reviewTargetFromToken(d) {
   const slug = String(d.themeSlug || "");
   const bare = slug.replace(/^g99-/, "");
+  const site = { siteId: d.siteId, businessName: d.siteId, githubRepo: "", liveUrl: "" };
+  if (d.kind === "gitops") {
+    return { site, target: { kind: "gitops", themeSlug: slug, themePath: "resources", muPath: "" } };
+  }
   return {
-    site: { siteId: d.siteId, businessName: d.siteId, githubRepo: "", liveUrl: "" },
+    site,
     target: {
+      kind: "theme",
       themeSlug: slug,
       themePath: `web/app/themes/${slug}`,
       muPath: slug.startsWith("g99-") ? `web/app/mu-plugins/g99-activate-${bare}.php` : "",
@@ -5689,8 +5738,13 @@ function reviewWorkOrder(changes, { reviewer, pagePath }) {
 // sentence also sits in five other templates is not permission to rewrite them.
 // Shared chrome is a second tier rather than a peer, so a footer edit still
 // works while a body edit can never reach the footer by accident.
-function reviewSwapTiers(pagePath, muSrc, themePath) {
+function reviewSwapTiers(pagePath, muSrc, themePath, gitops) {
   const slug = String(pagePath || "/").replace(/^\/+|\/+$/g, "").split("/")[0].toLowerCase();
+  // On a GitOps site the page IS the tier. Header and footer are inlined into
+  // each page's own HTML blocks rather than living in shared templates, so
+  // there is no second tier to fall through to — and no way for a correction
+  // typed on one page to reach another.
+  if (gitops) return [[`resources/pages/${slug || "home"}/elementor.json${GJ.SEP}doc`]];
   let template = "front-page.php";
   if (slug) {
     const hit = readMuPages(muSrc).find((p) => String(p.slug).toLowerCase() === slug);
@@ -5711,19 +5765,32 @@ function reviewSwapTiers(pagePath, muSrc, themePath) {
 // change that is refused here is refused in production for the same reason. A
 // rehearsal that is more permissive than the real thing teaches nothing.
 function applyReviewLocally(root, target, pagePath, workOrder) {
-  const themeAbs = path.join(root, target.themePath);
-  if (!fs.existsSync(themeAbs)) throw new Error(`REVIEW_LOCAL_REPO has no ${target.themePath}`);
-  const files = fs.readdirSync(themeAbs).filter((f) => /\.php$/i.test(f))
-    .map((f) => ({ rel: `${target.themePath}/${f}`, content: fs.readFileSync(path.join(themeAbs, f), "utf8") }));
-  let muSrc = "";
-  if (target.muPath && fs.existsSync(path.join(root, target.muPath))) {
-    muSrc = fs.readFileSync(path.join(root, target.muPath), "utf8");
-    files.push({ rel: target.muPath, content: muSrc });
+  const gitops = target.kind === "gitops" || GJ.isGitopsRoot(root);
+  // A locally rehearsed review builds its target from the token, which carries a
+  // theme slug and nothing about the site model. The checkout itself is the
+  // authority: on a GitOps tree the theme path in that target names a directory
+  // that has never existed, and "resources" is what everything below means.
+  const themePath = gitops ? "resources" : target.themePath;
+  const themeAbs = path.join(root, themePath);
+  if (!fs.existsSync(themeAbs)) throw new Error(`REVIEW_LOCAL_REPO has no ${themePath}`);
+  let files, muSrc = "";
+  if (gitops) {
+    // The page the correction was typed on is the only thing worth loading:
+    // reviewSwapTiers below will refuse everything else anyway.
+    files = GJ.expandResources(root, { prompt: "" }).source;
+  } else {
+    files = fs.readdirSync(themeAbs).filter((f) => /\.php$/i.test(f))
+      .map((f) => ({ rel: `${themePath}/${f}`, content: fs.readFileSync(path.join(themeAbs, f), "utf8") }));
+    if (target.muPath && fs.existsSync(path.join(root, target.muPath))) {
+      muSrc = fs.readFileSync(path.join(root, target.muPath), "utf8");
+      files.push({ rel: target.muPath, content: muSrc });
+    }
   }
   const refused = [];
   const applied = applyTextSwaps(workOrder, files, root, {
-    tiers: reviewSwapTiers(pagePath, muSrc, target.themePath),
+    tiers: reviewSwapTiers(pagePath, muSrc, themePath, gitops),
     maxHits: 5, visibleOnly: true, wordSafe: true, refused,
+    ...(gitops ? { write: (rel, content) => GJ.writeVirtual(root, rel, content) } : {}),
   });
   // Same rule as a live run: anything the swap could not place is reported, never
   // guessed at by a model.
@@ -8444,6 +8511,18 @@ const THEME_CONVENTIONS = `This is a classic WordPress (Roots Bedrock) theme at 
 - Styling uses Tailwind + Google Fonts from CDN in the page <head>. Preserve the existing palette/fonts unless the change is explicitly about them.
 - All PHP must pass Laravel Pint (PER preset): blank line after <?php in pure-PHP files; a named function's opening brace on its own line; one statement per line.`;
 
+// The same job on a GitOps site. There is no theme and no PHP: the site is
+// Elementor content in resources/**.json, presented to you as text views. The
+// rules below are about the VIEW, because that is all the model ever sees — the
+// JSON underneath is written by gitops-json.js, never by a model.
+const GITOPS_CONVENTIONS = `This website is stored as Elementor content in JSON, not as theme code. You are shown text views of it. Conventions you MUST follow:
+- A path ending "::doc" is a page's editable text: a series of blocks, each wrapped in <!--G99 <id> <key>--> … <!--/G99 <id>-->. Return the WHOLE view back, markers and all, with only the wording inside the blocks you were asked to change touched. Never invent, rename, reorder or drop a marker.
+- Inside a block whose key is "html" you are editing raw page HTML — headers, footers, sections and their inline styles all live there. Any other key is one Elementor field: plain text or light inline HTML only.
+- A path ending "::css" is that page's stylesheet. "::title" is a page title, "::content" a post body, "::seo" the Rank Math title/description, "::blogname" the site name, and menus.json::doc the navigation labels.
+- To ADD a section to a page, insert one new block using the literal id "new" and key "html", positioned after the block it should follow.
+- Never delete a page, post or product: this repository is the site's desired state, so a removal here deletes it from the live site. Retiring a page is a status change and is not your call.
+- Do not touch image URLs, element ids, class names or the site's palette unless the request is explicitly about them.`;
+
 function stripFence(t) { return String(t || "").replace(/^```(?:json|php|html)?\s*\n?/i, "").replace(/\n?```\s*$/i, "").trim(); }
 
 // ---- 1. The work order ------------------------------------------------------
@@ -8599,6 +8678,11 @@ function visibleHits(content, find, wordSafe) {
 //                word must be unique (1) to be safe at all; a phrase may repeat.
 //   visibleOnly — ignore matches in markup, attributes and PHP.
 //   refused    — array the caller passes in to collect what was declined and why.
+//   scope      — optional (change) => [rel,…] confining ONE change to those files.
+//                Different from `tiers`, which applies to the whole batch: this
+//                reads the sender's own "where" and is how "on the home page"
+//                stops a shared sentence being rewritten on every other page
+//                that happens to contain it.
 function applyTextSwaps(workOrder, files, rootAbs, opts) {
   const O = opts || {};
   const done = [];
@@ -8613,8 +8697,14 @@ function applyTextSwaps(workOrder, files, rootAbs, opts) {
     const oneWord = !/\s/.test(c.replaces.trim());
     const ceiling = O.maxHits ? (oneWord ? 1 : O.maxHits) : Infinity;
 
+    let searchGroups = groups;
+    if (O.scope) {
+      const only = O.scope(c, i);
+      if (only && only.length) searchGroups = [only.map((rel) => byRel.get(rel)).filter(Boolean)];
+    }
+
     let chosen = null;
-    for (const group of groups) {
+    for (const group of searchGroups) {
       const found = [];
       for (const f of group) {
         const form = forms.find((s) => s && f.content.includes(s));
@@ -8650,7 +8740,11 @@ function applyTextSwaps(workOrder, files, rootAbs, opts) {
       } else {
         f.content = f.content.split(form).join(c.literal);
       }
-      fs.writeFileSync(path.join(rootAbs, f.rel), f.content);
+      // `write` lets a caller decide what "save this file" means. A GitOps site
+      // has no file to save: the swap lands inside an Elementor JSON node, and
+      // the caller passes a writer that knows how to fold it back in.
+      if (O.write) O.write(f.rel, f.content);
+      else fs.writeFileSync(path.join(rootAbs, f.rel), f.content);
       touched.push({ rel: f.rel, count });
     }
     if (touched.length) done.push({ n: i + 1, what: c.what, replaces: c.replaces, literal: c.literal, files: touched });
@@ -8754,8 +8848,10 @@ function outlineText(outline) {
 
 async function editPlan(manifest, req, ai) {
   const p = [
-    `You are editing an existing WordPress theme${req.businessName ? ` for "${req.businessName}"` : ""}. Decide the MINIMAL set of files to create/modify/delete that satisfies the request — nothing more. Touch only files under the theme dir or its mu-plugin.`,
-    THEME_CONVENTIONS,
+    req.gitops
+      ? `You are editing an existing WordPress website${req.businessName ? ` for "${req.businessName}"` : ""}, stored as Elementor content in JSON. Decide the MINIMAL set of views to modify that satisfies the request — nothing more. Use the exact paths listed below, including their "::" suffix, and never propose "delete".`
+      : `You are editing an existing WordPress theme${req.businessName ? ` for "${req.businessName}"` : ""}. Decide the MINIMAL set of files to create/modify/delete that satisfies the request — nothing more. Touch only files under the theme dir or its mu-plugin.`,
+    req.conventions || THEME_CONVENTIONS,
     `\nFILES PRESENT (path — bytes):\n${manifest.map(f => `- ${f.path} (${f.bytes})`).join("\n")}`,
     req.outline ? "\n" + req.outline : "",
     req.evidence ? "\n" + req.evidence : "",
@@ -8769,8 +8865,10 @@ async function editPlan(manifest, req, ai) {
 }
 async function editFileContent(op, path_, instruction, currentContent, planContext, ai, req) {
   const p = [
-    `You are ${op === "create" ? "creating" : "rewriting"} the file ${path_} in a WordPress theme. Output the COMPLETE final file content — no markdown fences, no commentary.`,
-    THEME_CONVENTIONS,
+    (req && req.gitops)
+      ? `You are rewriting the view ${path_} of a WordPress website stored as Elementor JSON. Output the COMPLETE final view — no markdown fences, no commentary.`
+      : `You are ${op === "create" ? "creating" : "rewriting"} the file ${path_} in a WordPress theme. Output the COMPLETE final file content — no markdown fences, no commentary.`,
+    (req && req.conventions) || THEME_CONVENTIONS,
     planContext ? `\nThis change spans multiple files — use these EXACT paths/filenames when one references another (e.g. a mu-plugin 'template' must match the created page-*.php filename here):\n${planContext}` : "",
     // 3. The per-file instruction is the planner's summary of someone else's
     // words. Carrying the request itself down here as well is what stops copy
@@ -8946,7 +9044,7 @@ async function runLocalReviewEdit(job) {
     jobStep(job, 1, "done", `${wo.changes.length} exact correction(s) from ${P.requestedBy || "a reviewer"}`);
 
     jobStep(job, 2, "running", "Applying to " + P.reviewPath + "…");
-    const out = applyReviewLocally(root, { themePath: P.themePath, muPath: P.muPath }, P.reviewPath, wo);
+    const out = applyReviewLocally(root, { kind: P.kind, themePath: P.themePath, muPath: P.muPath }, P.reviewPath, wo);
     job.textSwaps = out.applied;
     job.reviewRefused = out.refused;
     job.editSummary = out.applied.length ? swapsText(out.applied) : "nothing applied";
@@ -8983,20 +9081,40 @@ async function runEditJob(job) {
   // Local content-review runs never reach the git machinery below.
   if (P.localApply) return runLocalReviewEdit(job);
   const repo = P.githubRepo || WP_REPO;
-  const tmp = path.join(os.tmpdir(), "g99edit-" + Date.now());
+  // EDIT_LOCAL_REPO turns every edit into a laptop rehearsal: the run uses that
+  // checkout instead of cloning, and stops after the files are written. Nothing
+  // is branched, pushed, PR'd, merged or deployed. The plan, the swaps, the AI
+  // writes and the guardrails are all the real ones — only git is absent — so a
+  // change refused here is refused in production for the same reason.
+  //
+  // This is what makes trying the GitOps JSON path safe before a client repo is
+  // ever involved. Same idea as REVIEW_LOCAL_REPO, which only ever covered the
+  // content-review batches, not a typed request.
+  const localRepo = (process.env.EDIT_LOCAL_REPO || "").trim();
+  const tmp = localRepo || path.join(os.tmpdir(), "g99edit-" + Date.now());
   const run = async (cmd, cwd) => sh(cmd, cwd);
   const runRetry = async (cmd, cwd, n = 3) => { let r; for (let i = 1; i <= n; i++) { r = await run(cmd, cwd); if (!r.code) return r; await sleep(3000 * i); } return r; };
   try {
     // 1 — pull latest
+    let r = { code: 0, stdout: "", stderr: "" };
+    if (localRepo) {
+      if (!fs.existsSync(localRepo)) throw new Error(`EDIT_LOCAL_REPO points at ${localRepo}, which does not exist`);
+      jobStep(job, 0, "running", "Using local checkout");
+    } else {
     jobStep(job, 0, "running", "Cloning " + repo);
-    let r = await runRetry(`gh repo clone ${repo} "${tmp}" -- --depth 1`);
+    r = await runRetry(`gh repo clone ${repo} "${tmp}" -- --depth 1`);
     const cloneUrl = await ghCloneUrl(repo);
     if (r.code) r = await runRetry(`git clone --depth 1 "${cloneUrl}" "${tmp}"`);
     if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
     if (/x-access-token:/.test(cloneUrl)) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
+    }
+    // Which site model this repository uses. The payload says so (resolveEditTarget
+    // decided it), but the checkout is re-read as well: a job queued before a site
+    // was migrated must not write PHP into a repository that no longer has a theme.
+    const gitops = P.kind === "gitops" || GJ.isGitopsRoot(tmp);
     const themeAbs = path.join(tmp, P.themePath);
-    if (!fs.existsSync(themeAbs)) throw new Error("theme not found in repo: " + P.themePath);
-    jobStep(job, 0, "done", "Latest code pulled");
+    if (!fs.existsSync(themeAbs)) throw new Error(`${gitops ? "resources tree" : "theme"} not found in ${localRepo ? "EDIT_LOCAL_REPO" : "repo"}: ${P.themePath}`);
+    jobStep(job, 0, "done", localRepo ? `Local checkout · ${gitops ? "GitOps JSON site" : "classic theme"}` : (gitops ? "Latest content pulled" : "Latest code pulled"));
 
     // 2 — plan
     // Which model does the thinking. Set only by the edit chat; an email
@@ -9016,6 +9134,11 @@ async function runEditJob(job) {
     // Re-runnable: the retry below needs to see the files as the first pass
     // left them, not as they were when the run started.
     const scanTheme = () => {
+      // A GitOps repository has no theme directory. Its pages are Elementor JSON,
+      // expanded here into virtual text files so everything downstream — the
+      // planner, the evidence search, the text swaps, the writer, the verifier —
+      // keeps working without knowing the difference.
+      if (gitops) return GJ.expandResources(tmp, { prompt: P.prompt });
       const manifest = [], source = [];
       const readSource = (rel, abs) => {
         if (!TEXTUAL.test(rel)) return;
@@ -9034,6 +9157,21 @@ async function runEditJob(job) {
       return { manifest, source };
     };
     let { manifest, source } = scanTheme();
+
+    // The one place that knows whether a path is a real file or a view onto a
+    // JSON node. Everything below reads and writes through these three.
+    const srcExists = (rel) => gitops ? GJ.existsVirtual(tmp, rel) : fs.existsSync(path.join(tmp, rel));
+    const srcRead = (rel) => {
+      if (gitops) return GJ.readVirtual(tmp, rel) || "";
+      const abs = path.join(tmp, rel);
+      return fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : "";
+    };
+    const srcWrite = (rel, content) => {
+      if (gitops) { GJ.writeVirtual(tmp, rel, content); return; }
+      const abs = path.join(tmp, rel);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, content);
+    };
 
     // Understand the ask before working out where it lands. A failure here is
     // not fatal — the run continues on the raw request, exactly as it did
@@ -9060,10 +9198,30 @@ async function runEditJob(job) {
     // not: it may only touch that page (then shared chrome), only visible text,
     // and only where the target is unambiguous. See applyTextSwaps.
     const reviewRefused = [];
+    // "Change the CTA heading on the home page" must change it on the home page.
+    // The generated sites repeat whole sections — the same CTA block sits on
+    // home, services, about and contact — so an unscoped swap silently rewrote
+    // four pages when one was asked for. The work order already records the
+    // sender's own words for the location; this turns them into a page.
+    const pageSlugs = [...new Set(source
+      .map((f) => (f.rel.match(/^resources\/pages\/([^/]+)\//) || [])[1])
+      .filter(Boolean))];
+    const scopeFor = (c) => {
+      const where = String((c && c.where) || "").toLowerCase();
+      if (!where) return null;
+      let slug = pageSlugs.find((s) => where.includes(s) || where.includes(s.replace(/-/g, " ")));
+      // "homepage", "home page" and "/" all mean the front page, which is not
+      // named "homepage" in the tree.
+      if (!slug && /home\s*page|^\/$/.test(where)) slug = pageSlugs.find((s) => s === "home");
+      if (!slug) return null;                       // no page named: unrestricted, as before
+      return source.filter((f) => f.rel.startsWith(`resources/pages/${slug}/`)).map((f) => f.rel);
+    };
+    const swapBase = gitops ? { write: srcWrite, scope: scopeFor } : {};
     const swapOpts = P.reviewPath ? {
-      tiers: reviewSwapTiers(P.reviewPath, (source.find((f) => f.rel === P.muPath) || {}).content, P.themePath),
+      ...swapBase,
+      tiers: reviewSwapTiers(P.reviewPath, (source.find((f) => f.rel === P.muPath) || {}).content, P.themePath, gitops),
       maxHits: 5, visibleOnly: true, wordSafe: true, refused: reviewRefused,
-    } : undefined;
+    } : (gitops ? swapBase : undefined);
     const swaps = workOrder ? applyTextSwaps(workOrder, source, tmp, swapOpts) : [];
     job.textSwaps = swaps;
     const swapped = new Set(swaps.map((s) => s.n));
@@ -9097,7 +9255,10 @@ async function runEditJob(job) {
     const evidence = locateTerms(source, requestTerms(P.prompt, forAi || workOrder));
     const outline = source.map((f) => ({ rel: f.rel, items: fileOutline(f.content) })).filter((o) => o.items.length);
     // What the planner and every file writer below both work from.
-    const brief = { prompt: P.prompt, businessName: P.businessName, workOrder: workOrderText(forAi) };
+    // The site model travels with the brief, so the planner and every file
+    // writer are told the same story about what they are editing.
+    const conventions = gitops ? GITOPS_CONVENTIONS : THEME_CONVENTIONS;
+    const brief = { prompt: P.prompt, businessName: P.businessName, workOrder: workOrderText(forAi), gitops, conventions };
     const allowed = (rel) => rel === P.muPath || rel.startsWith(P.themePath + "/");
 
     // With no work order there is only the raw prompt, so the model still runs.
@@ -9124,20 +9285,32 @@ async function runEditJob(job) {
     const applyPlan = async (pl, wr) => {
       const planContext = pl.files.map(f => `${f.op} ${f.path}`).join("\n");
       for (const f of pl.files) {
-        const abs = path.join(tmp, f.path);
-        if (f.op === "delete") { fs.rmSync(abs, { force: true }); continue; }
-        const cur = f.op === "modify" && fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : "";
+        if (f.op === "delete") {
+          // On a GitOps site "delete" would mean removing a page, a post or a
+          // product from the site's desired state, and the deployer would then
+          // remove it from WordPress. Retiring a page is a status change, not an
+          // rm, so a planner asking for one is declined rather than obeyed.
+          if (gitops) { console.warn(`edit job ${job.draftId}: refused to delete ${f.path} on a GitOps site`); continue; }
+          fs.rmSync(path.join(tmp, f.path), { force: true });
+          continue;
+        }
+        const cur = f.op === "modify" && srcExists(f.path) ? srcRead(f.path) : "";
         let content = await editFileContent(f.op, f.path, f.instruction || pl.summary, cur, planContext, ai, wr || brief);
-        if (!content || (abs.endsWith(".php") && !content.includes("<?php") && cur.includes("<?php"))) throw new Error("AI returned empty/invalid content for " + f.path);
+        if (!content || (/\.php$/i.test(f.path) && !content.includes("<?php") && cur.includes("<?php"))) throw new Error("AI returned empty/invalid content for " + f.path);
         // Pint (PER preset) requires files to end with exactly one trailing newline; Gemini's
         // output doesn't reliably include one, which fails CI on a style issue unrelated to the
         // actual edit.
-        if (abs.endsWith(".php")) content = content.replace(/\s*$/, "\n");
-        fs.mkdirSync(path.dirname(abs), { recursive: true });
-        fs.writeFileSync(abs, content);
+        if (/\.php$/i.test(f.path)) content = content.replace(/\s*$/, "\n");
+        srcWrite(f.path, content);
       }
-      // guardrail: theme must still have its required files
-      for (const req of ["index.php", "style.css"]) {
+      // guardrail: the site must still have the files that make it a site. For a
+      // theme that is index.php + style.css; for a GitOps tree it is site.json,
+      // without which the deployer has nothing to reconcile against. (Every JSON
+      // resource is re-parsed as it is written, so structural damage cannot get
+      // this far in the first place.)
+      if (gitops) {
+        if (!fs.existsSync(path.join(tmp, "resources", "site.json"))) throw new Error("edit would remove resources/site.json — aborted");
+      } else for (const req of ["index.php", "style.css"]) {
         if (!fs.existsSync(path.join(themeAbs, req))) throw new Error(`edit would remove required ${req} — aborted`);
       }
     };
@@ -9152,6 +9325,11 @@ async function runEditJob(job) {
     jobStep(job, 3, "running", "Checking the work…");
     const paths = `"${P.themePath}"${P.muPath ? ` "${P.muPath}"` : ""}`;
     const stagedDiff = async () => {
+      // A local rehearsal must not touch the index of somebody's working
+      // checkout, so it reads the unstaged diff instead. Same evidence for the
+      // verifier; the only thing it cannot show is a brand-new untracked file,
+      // which a GitOps edit never produces.
+      if (localRepo) return (await run(`git --no-pager diff --unified=1 -- ${paths}`, tmp)).stdout || "";
       await run(`git add -A -- ${paths}`, tmp);
       return (await run(`git --no-pager diff --cached --unified=1 -- ${paths}`, tmp)).stdout || "";
     };
@@ -9174,7 +9352,7 @@ async function runEditJob(job) {
         const retryWo = { changes: again.map((r) => ({ what: r.what, where: r.where, replaces: r.replaces, literal: r.literal })), constraints: workOrder.constraints, unclear: [] };
         const scan = scanTheme();     // the files as the first pass left them
         const retryBrief = {
-          prompt: P.prompt, businessName: P.businessName,
+          prompt: P.prompt, businessName: P.businessName, gitops, conventions,
           workOrder: workOrderText(retryWo) + "\n\nAn earlier attempt at this same request already made its other changes. Do ONLY the items above and leave everything else exactly as it now stands.",
         };
         const plan2 = await editPlan(scan.manifest, {
@@ -9202,6 +9380,27 @@ async function runEditJob(job) {
       jobStep(job, 3, "done", check
         ? `${check.done} of ${check.total} confirmed${check.missed ? ` · ${check.missed} not done` : ""}${job.retried ? " (after a retry)" : ""}`
         : "Nothing checkable — skipped");
+    }
+
+    // A local rehearsal ends here, with the files written and checked. Steps 5-7
+    // are git, CI and the registry — all of which need a repository this run
+    // deliberately does not have. Reported as skipped rather than done, so a
+    // rehearsal can never be mistaken for something that shipped.
+    if (localRepo) {
+      const changed = (job.editPlan || []).map((f) => f.path);
+      for (const i of [4, 5, 6]) jobStep(job, i, "done", "Skipped — local rehearsal");
+      job.status = "done";
+      job.localRehearsal = localRepo;
+      // Said in the summary, not only in the steps: the Activity list shows the
+      // summary alone, and a rehearsal sitting there reading like a shipped edit
+      // is exactly the confusion this mode must not create.
+      job.editSummary = "Local rehearsal — " + (job.editSummary || "no summary").trim();
+      job.editSummaryEmail = job.editSummary;
+      jobStep(job, 3, "done", `${changed.length || swaps.length} view(s) written into ${localRepo}`
+        + (check ? ` · ${check.done}/${check.total} confirmed` : ""));
+      saveJobs();
+      console.log(`edit job ${job.draftId}: LOCAL rehearsal — wrote ${changed.join(", ") || swapsText(swaps)} into ${localRepo}; nothing pushed`);
+      return;
     }
 
     // 5 — push + PR
@@ -9237,6 +9436,13 @@ async function runEditJob(job) {
       if (await ciEarlyExit(job, 5, P.siteId, st, i)) { merged = true; break; }
       if (st.allPass) { await awaitApprovalIfNeeded(job, P.siteId, 5); if (!job.mergedExternally) await localApi("/api/pr-merge", { prUrl: job.prUrl }); merged = true; jobStep(job, 5, "done", job.mergedExternally ? "Merged on GitHub" : `Merged${fixes ? ` after ${fixes} fix(es)` : ""}`); break; }
       if (st.anyFail) {
+        // The auto-fixer is a PHP/CI repair loop: it reads a build log and
+        // rewrites theme files. On a GitOps site a red check means the
+        // deployment validated the resource tree and rejected it, which is a
+        // content problem the fixer cannot reason about — and letting it write
+        // into Elementor JSON to chase a green tick is how a page gets wrecked.
+        // Stop and hand the PR to a human instead.
+        if (gitops) throw new Error("the deployment check failed on this change — it needs a look rather than an automatic retry: " + job.prUrl);
         if (fixes >= 3) throw new Error("CI still failing after 3 auto-fix attempts — " + job.prUrl);
         fixes++; jobStep(job, 5, "running", `Build failed — Gemini auto-fix ${fixes}/3…`);
         const fix = await localApi("/api/pr-autofix", { prUrl: job.prUrl }, 5 * 60 * 1000);
@@ -9282,7 +9488,9 @@ async function runEditJob(job) {
       + (notDone.length ? `\n⚠️ ${notDone.map((r2) => `${r2.done === false ? "not done" : "unverified"}: ${r2.what}`).join("; ")}` : "")
       + (skipped.length ? `\n⚠️ Not actioned (too vague to do without guessing): ${skipped.join("; ")}` : ""));
   } catch (e) {
-    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
+    // Only ever remove a directory this run created. In a local rehearsal `tmp`
+    // IS the developer's own checkout, and a failed edit must not delete it.
+    if (!localRepo) { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {} }
     if (e && e.cancelled) { job.status = "cancelled"; }
     else {
       job.error = e.message; job.status = "error";
@@ -9386,10 +9594,15 @@ async function runRestoreJob(job) {
     const stray = touched.filter(f => f !== P.muPath && !f.startsWith(P.themePath + "/"));
     if (stray.length) throw new Error(`${P.undo ? "undo" : "restore"} would touch files outside the theme — aborted: ` + stray.slice(0, 3).join(", "));
     if (!touched.length) throw new Error(P.undo ? "there is nothing left to undo — the page already reads the way it did before" : "that version is already what's live — nothing to restore");
-    // A restore rebuilds the whole tree and must still be a theme afterwards. An
-    // undo only reverses a text edit, so these files were never in question.
-    if (!P.undo) for (const req of ["index.php", "style.css"]) {
-      if (!fs.existsSync(path.join(tmp, P.themePath, req))) throw new Error(`restored theme is missing ${req} — aborted`);
+    // A restore rebuilds the whole tree and must still be a site afterwards — a
+    // theme needs index.php + style.css, a GitOps tree needs site.json for the
+    // deployer to reconcile against. An undo only reverses a text edit, so these
+    // files were never in question.
+    if (!P.undo) {
+      const required = (P.kind === "gitops" || GJ.isGitopsRoot(tmp)) ? ["site.json"] : ["index.php", "style.css"];
+      for (const req of required) {
+        if (!fs.existsSync(path.join(tmp, P.themePath, req))) throw new Error(`restored site is missing ${req} — aborted`);
+      }
     }
     job.editSummary = P.undo
       ? `Undid ${P.sha.slice(0, 7)}${P.versionLabel ? ` — ${P.versionLabel}` : ""}`
@@ -15698,7 +15911,7 @@ const server = http.createServer(async (req, res) => {
       try {
         const { site, target } = await resolveReviewSite(body.site || body.siteId || body.businessName);
         const { token, exp } = mintReviewToken({
-          siteId: site.siteId, themeSlug: target.themeSlug, reviewer,
+          siteId: site.siteId, themeSlug: target.themeSlug, kind: target.kind, reviewer,
           email: body.email, dept: body.dept || "Content", minutes: body.minutes,
         });
         if (!/^https?:\/\//i.test(site.liveUrl || "")) throw new Error(`${site.businessName} has no beta site URL in NocoDB — there is nowhere to send the reviewer`);
@@ -15744,7 +15957,14 @@ const server = http.createServer(async (req, res) => {
       // could write corrections into another client's theme — silently, because
       // the text would match there too.
       const active = String(body.activeTheme || "").trim();
-      if (!active || active !== d.themeSlug) {
+      // The check exists because several beta sites share one WordPress install
+      // and differ only by which theme is active — without it, a session minted
+      // for one client could write into another's theme, silently, because the
+      // text matches there too. A GitOps site is its own install with its own
+      // repository, and the theme it serves is a stock one (hello-elementor)
+      // that no session could ever name, so the comparison would reject every
+      // legitimate batch. The binding there is the site itself, not the theme.
+      if (d.kind !== "gitops" && (!active || active !== d.themeSlug)) {
         console.warn(`review: refused a batch for ${d.siteId} — session theme ${d.themeSlug}, site is serving ${active || "nothing"}`);
         return json(res, 409, { ok: false, error: "this site is not serving the theme this review link was made for" });
       }
@@ -15815,7 +16035,7 @@ const server = http.createServer(async (req, res) => {
           localApply: localRoot || null,
           jobId: "edit-" + Date.now(),
           siteId: site.siteId, businessName: site.businessName, githubRepo: site.githubRepo,
-          themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
+          kind: target.kind, themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
           // The prompt is only ever read by humans here — the PR body, Slack, the
           // job page. The work order is what the run actually acts on.
           prompt: `Content review by ${d.reviewer} on ${pagePath}:\n`
@@ -16019,7 +16239,7 @@ const server = http.createServer(async (req, res) => {
       const job = enqueueEditJob({
         jobId: "edit-" + Date.now(),
         siteId: site.siteId, businessName: site.businessName, githubRepo: site.githubRepo,
-        themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
+        kind: target.kind, themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
         prompt: instruction, forceApproval: false,
         source: "email", requestedBy: addr, emailSubject: subject, threadId, liveUrl: site.liveUrl || "",
       });
@@ -16605,7 +16825,7 @@ const server = http.createServer(async (req, res) => {
       const job = enqueueRestoreJob({
         jobId: "restore-" + Date.now(),
         siteId, businessName: site.businessName, githubRepo: site.githubRepo,
-        themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
+        kind: target.kind, themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
         sha: String(sha), versionLabel: String(label || "").slice(0, 120),
       });
       return json(res, 202, { jobId: job.draftId, status: job.status, monitor: "/jobs" });
@@ -16680,7 +16900,7 @@ const server = http.createServer(async (req, res) => {
       const job = enqueueEditJob({
         jobId: "edit-" + Date.now(),
         siteId, businessName: site.businessName, githubRepo: site.githubRepo,
-        themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
+        kind: target.kind, themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
         prompt: fullPrompt,
         // Only honoured for chat-initiated edits; anything unrecognised (and
         // every email request, which never sets it) falls through to Gemini.
@@ -16755,7 +16975,7 @@ const server = http.createServer(async (req, res) => {
       const job = enqueueSeoJob({
         jobId: (body0.dryRun ? "seo-dry-" : "seo-") + Date.now(), dryRun: !!body0.dryRun,
         siteId: site.siteId, businessName: site.businessName, githubRepo: site.githubRepo,
-        themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
+        kind: target.kind, themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
         liveUrl: site.liveUrl || "",
       });
       return json(res, 202, { jobId: job.draftId, dryRun: !!body0.dryRun, monitor: "/jobs" });
@@ -16875,7 +17095,7 @@ const server = http.createServer(async (req, res) => {
       const job = enqueueEnrichJob({
         jobId: (body0.headerOnly ? "nav-" : "enrich-") + Date.now(), businessId: src.businessId, liveUrl: site.liveUrl,
         siteId, businessName: site.businessName, githubRepo: site.githubRepo,
-        themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
+        kind: target.kind, themeSlug: target.themeSlug, themePath: target.themePath, muPath: target.muPath,
         answers: src.answers, composed: src.composed, referenceWebsite: src.referenceWebsite || "",
         // fall back to the answers' current-site field so content grounding isn't
         // silently skipped when the source build's payload lacks existingWebsite
@@ -17921,6 +18141,17 @@ if (require.main === module) {
       : live
         ? "content review: LIVE — corrections open a pull request and auto-merge to the client repository"
         : "content review: OFF — submissions are refused (set REVIEW_LOCAL_REPO for a local run, or REVIEW_LIVE=on to publish)");
+  }
+  // The same must never be ambiguous for a typed request. Printed loudly because
+  // this mode makes every edit stop short of the repository — useful for a
+  // rehearsal, alarming if nobody meant to turn it on.
+  {
+    const editLocal = (process.env.EDIT_LOCAL_REPO || "").trim();
+    if (editLocal) {
+      console.log(`edits: LOCAL REHEARSAL — every edit is written into ${editLocal}`);
+      console.log(`       ${GJ.isGitopsRoot(editLocal) ? "GitOps JSON site (resources/)" : "classic theme checkout"} · nothing is cloned, branched, pushed, merged or deployed`);
+      if (!fs.existsSync(editLocal)) console.log("       ⚠ that path does not exist — edits will fail until it does");
+    }
   }
   // Scheduled re-audit (off unless REAUDIT_HOURS > 0, to avoid burning quota).
   const reauditHours = parseFloat(process.env.REAUDIT_HOURS || "0");
