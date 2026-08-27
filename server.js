@@ -3826,14 +3826,52 @@ function prettyName(slug) {
 // ever appear. Cached because it changes about never, and every CI poll would otherwise pay
 // for the lookup.
 const WORKFLOW_CACHE = new Map();   // repo -> boolean
+// Can anything in this repo ever put a check on a PULL REQUEST? Not "are there
+// workflows" — the GitOps fleet repos have one, and it deploys on `push` with a
+// paths filter, so a pull request there carries no checks at all. Waiting for
+// them burned the full ~40 minute watch and then reported a misleading timeout.
+//
+// Bias is deliberate: anything unreadable counts as gated, because waiting on a
+// bad guess costs time and merging on one costs a site.
 async function repoHasWorkflows(repo) {
   if (WORKFLOW_CACHE.has(repo)) return WORKFLOW_CACHE.get(repo);
-  const r = await sh(`gh api repos/${repo}/contents/.github/workflows --jq ".[].name"`);
-  // 404 (no such path) => no workflows. Any other failure is inconclusive, so assume there
-  // ARE workflows: waiting is safe, merging an ungated PR on a bad guess is not.
-  const has = r.code ? !/not found|404/i.test((r.stderr || "") + (r.stdout || "")) : !!(r.stdout || "").trim();
-  WORKFLOW_CACHE.set(repo, has);
-  return has;
+  const r = await sh(`gh api repos/${repo}/contents/.github/workflows --jq ".[].path"`);
+  if (r.code) {
+    const has = !/not found|404/i.test((r.stderr || "") + (r.stdout || ""));
+    WORKFLOW_CACHE.set(repo, has);
+    return has;
+  }
+  const files = (r.stdout || "").split("\n").map((s) => s.trim()).filter(Boolean).slice(0, 12);
+  if (!files.length) { WORKFLOW_CACHE.set(repo, false); return false; }
+  let gated = false;
+  for (const f of files) {
+    const c = await sh(`gh api "repos/${repo}/contents/${f}" --jq ".content" -H "Accept: application/vnd.github+json"`);
+    // Unreadable file: assume it gates, and stop looking.
+    if (c.code) { gated = true; break; }
+    let text = "";
+    try { text = Buffer.from((c.stdout || "").replace(/\s+/g, ""), "base64").toString("utf8"); } catch (e) { gated = true; break; }
+    if (workflowGatesPrs(text)) { gated = true; break; }
+  }
+  WORKFLOW_CACHE.set(repo, gated);
+  return gated;
+}
+// True when the workflow's `on:` block names pull_request. Only that block is
+// read: "pull_request" also appears in `if: github.event_name == ...` guards on
+// workflows that never run on one, and matching those would put us straight back
+// to waiting forever.
+function workflowGatesPrs(yaml) {
+  const lines = String(yaml || "").split(/\r?\n/).filter((l) => !/^\s*#/.test(l));
+  const start = lines.findIndex((l) => /^on\s*:/.test(l));
+  if (start < 0) return false;
+  const head = lines[start];
+  // Inline forms: `on: pull_request` and `on: [push, pull_request]`.
+  if (/^on\s*:\s*\S/.test(head)) return /pull_request/.test(head);
+  const block = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^\S/.test(lines[i])) break;              // next top-level key ends the block
+    block.push(lines[i]);
+  }
+  return /(^|\s)pull_request(_target)?\s*:/m.test(block.join("\n")) || /^\s*-\s*pull_request/m.test(block.join("\n"));
 }
 
 // Reasons a CI watch can stop before its checks ever go green. Both were invisible to the
@@ -3859,8 +3897,17 @@ async function ciEarlyExit(job, stepIdx, siteId, st, i) {
 }
 
 function selectPrChecks(rows, requireAllChecks = false) {
-  const candidates = (Array.isArray(rows) ? rows : [])
-    .filter((cols) => cols.length >= 2 && (requireAllChecks || /^build/i.test(String(cols[0] || "").trim())))
+  const all = (Array.isArray(rows) ? rows : []).filter((cols) => cols.length >= 2);
+  const isBuild = (cols) => /^build/i.test(String(cols[0] || "").trim());
+  // The build-only gate is historical and assumes every repo names its gating
+  // check "build ...". The GitOps fleet names its one check "Deploy to
+  // WordPress", so the filter threw away the only signal there was and left the
+  // watcher believing the pull request had no checks at all. Where nothing
+  // matches the old name, every check counts instead — a red deploy should stop
+  // a merge, and it could not while it was being filtered out.
+  const useAll = requireAllChecks || !all.some(isBuild);
+  const candidates = all
+    .filter((cols) => useAll || isBuild(cols))
     .map((cols) => ({ name: String(cols[0] || "").trim(), status: String(cols[1] || "").trim(), url: String(cols[3] || "").trim() }));
   const byName = {};
   for (const check of candidates) {
