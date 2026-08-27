@@ -3897,8 +3897,17 @@ async function ciEarlyExit(job, stepIdx, siteId, st, i) {
 }
 
 function selectPrChecks(rows, requireAllChecks = false) {
-  const candidates = (Array.isArray(rows) ? rows : [])
-    .filter((cols) => cols.length >= 2 && (requireAllChecks || /^build/i.test(String(cols[0] || "").trim())))
+  const all = (Array.isArray(rows) ? rows : []).filter((cols) => cols.length >= 2);
+  const isBuild = (cols) => /^build/i.test(String(cols[0] || "").trim());
+  // The build-only gate is historical and assumes every repo names its gating
+  // check "build ...". The GitOps fleet names its one check "Deploy to
+  // WordPress", so the filter threw away the only signal there was and left the
+  // watcher believing the pull request had no checks at all. Where nothing
+  // matches the old name, every check counts instead — a red deploy should stop
+  // a merge, and it could not while it was being filtered out.
+  const useAll = requireAllChecks || !all.some(isBuild);
+  const candidates = all
+    .filter((cols) => useAll || isBuild(cols))
     .map((cols) => ({ name: String(cols[0] || "").trim(), status: String(cols[1] || "").trim(), url: String(cols[3] || "").trim() }));
   const byName = {};
   for (const check of candidates) {
