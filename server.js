@@ -2611,6 +2611,21 @@ async function extractPdfText(buf) {
     return (await geminiCall(parts, { temperature: 0, maxOutputTokens: 4000, timeoutMs: 45000 })).trim();
   } catch (e) { return null; }
 }
+// What an attached image actually shows, in the requester's own words for the edit
+// pipeline to act on — the request text decides whether the image is a new asset or
+// just a pointer, but only if it can see what the image is pointing AT. Scoped by the
+// user's own prompt so "what's marked in red" resolves to the actual marked text/element,
+// not a generic image caption. Fails soft: no description just means less context, not a
+// dropped request.
+async function describeAttachedImage(buf, mimeType, userPrompt) {
+  try {
+    const parts = [
+      { text: `A user attached this image alongside this website-edit request: "${String(userPrompt || "").slice(0, 400)}"\n\nDescribe what the image shows, in plain text. If any part of it is marked, circled, boxed, highlighted, or annotated in any way (e.g. a red box, an arrow, a highlighted word), say exactly what element or text it is pointing at — quote the exact text if it is pointing at text. Be concise and factual, no commentary.` },
+      { inlineData: { mimeType, data: buf.toString("base64") } },
+    ];
+    return (await geminiCall(parts, { temperature: 0, maxOutputTokens: 500, timeoutMs: 30000 })).trim();
+  } catch (e) { return null; }
+}
 
 // Download the logo and drop it in the theme. Returns {file, mime, w, h} or null — a missing
 // or unreadable logo must never fail a build, it just means no favicon this time.
@@ -16876,15 +16891,37 @@ const server = http.createServer(async (req, res) => {
       let target; try { target = await resolveEditTarget(site); } catch (e) { return json(res, 409, { error: e.message }); }
       // Every attachment kind ends up as more plain text appended to the prompt, so the same
       // free-text pipeline (editPlan → editFileContent) picks it up with no separate code path per
-      // kind. Images become a URL to use as an <img src>; PDF/JSON/Word become their extracted text.
-      // NOTE: image URLs point at THIS local server (/uploads/…), which only resolves while it's
-      // running on this machine — fine for testing the change locally, but a real PR would need the
-      // file copied into the theme's own assets/img/ during the push, not linked from localhost.
+      // kind. PDF/JSON/Word become their extracted text. NOTE: image URLs point at THIS local
+      // server (/uploads/…), which only resolves while it's running on this machine — fine for
+      // testing the change locally, but a real PR would need the file copied into the theme's own
+      // assets/img/ during the push, not linked from localhost.
       const attachBlocks = [];
       for (const a of (Array.isArray(attachments) ? attachments : [])) {
         if (!a || !a.url) continue;
-        if (a.kind === "image") { attachBlocks.push(`Attached reference image (${a.filename}) — use this exact URL directly as the image source: ${absUrl(a.url)}`); continue; }
         const localPath = path.join(UPLOADS_DIR, path.basename(String(a.url)));
+        if (a.kind === "image") {
+          // An attached image is NOT always "use this as the new picture" — it's just as often an
+          // annotated screenshot of the site itself, pointing at something to change ("the word
+          // marked in red"). This pipeline is text-only; without actually looking at the image, the
+          // AI has no way to tell those two cases apart, and previously always assumed the first —
+          // which meant a screenshot pasted purely as a pointer got inserted as a literal <img src>,
+          // overwriting a real theme image. describeAttachedImage gives the AI the image's actual
+          // content in text form (including what any annotation is pointing at) so the request text
+          // itself — not this code — decides which case it is.
+          let block = `Attached image (${a.filename}), available at this URL: ${absUrl(a.url)}.`;
+          if (fs.existsSync(localPath)) {
+            try {
+              const buf = fs.readFileSync(localPath);
+              const ext = imageExtFromBuffer(buf);
+              const mimeType = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp" }[ext] || "image/png";
+              const desc = await describeAttachedImage(buf, mimeType, prompt);
+              if (desc) block += ` What it shows: ${desc}`;
+            } catch (e) { /* description is a nice-to-have, not a requirement */ }
+          }
+          block += ` Only use this URL as an <img src> if the request is actually asking to insert or replace a picture with this exact image. If it is instead a reference or an annotated screenshot used to point at something to change (e.g. marked, circled, or highlighted text), use it only to understand the request — do not put this URL anywhere in the page.`;
+          attachBlocks.push(block);
+          continue;
+        }
         if (!fs.existsSync(localPath)) continue;
         if (a.kind === "json") {
           try { attachBlocks.push(`Attached JSON (${a.filename}):\n\`\`\`json\n${fs.readFileSync(localPath, "utf8").slice(0, 8000)}\n\`\`\``); } catch (e) { /* skip — optional context */ }
@@ -18215,6 +18252,6 @@ module.exports = {
   fixFavicon, fixSocialImage, fix404, fixCallNow, fixBlvd, fixBlogLinkColor, fixClickable,
   performPrReportHtml, performPrPrBody, performPrMarkerUrl, PERFORM_PR_STEPS,
   editReportHtml, writeEditReport, genericJobReportHtml, writeGenericJobReport,
-  detectAttachmentKind, unzipEntry, extractDocxText, extractPdfText, isLegacyOfficeFile,
+  detectAttachmentKind, unzipEntry, extractDocxText, extractPdfText, isLegacyOfficeFile, describeAttachedImage,
   PRE_RELEASE_CHECKLIST, checklistVerdict, checklistItemReport,
 };
