@@ -17112,6 +17112,22 @@ const server = http.createServer(async (req, res) => {
     if (p === "/sites.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "sites.js")));
 
     if (p === "/jobs" || p === "/jobs.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "jobs.html")));
+
+    // Stock image library (image-pool/), served from this tool's own origin.
+    // Generated sites reference these photos by absolute URL, so a published
+    // client site loads them from here rather than hotlinking whichever med-spa
+    // site each photo was harvested from.
+    if (p.startsWith("/pool/")) {
+      const rel = decodeURIComponent(p.slice(6));
+      const root = path.join(DIR, "image-pool");
+      const f = path.join(root, rel);
+      if (!f.startsWith(root) || rel.includes("..")) return json(res, 403, { error: "forbidden" });
+      if (!fs.existsSync(f) || !fs.statSync(f).isFile()) return json(res, 404, { error: "not found" });
+      const ext = path.extname(f).toLowerCase();
+      const mime = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : ext === ".avif" ? "image/avif" : "image/jpeg";
+      res.writeHead(200, { "Content-Type": mime, "Cache-Control": "public, max-age=31536000, immutable" });
+      return res.end(fs.readFileSync(f));
+    }
     if (p === "/jobs.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "jobs.js")));
 
     // Comparison reports written by the job runner.
