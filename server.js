@@ -12,6 +12,9 @@ const zlib = require("zlib");
 // GitOps JSON sites (resources/**.json) presented to the edit pipeline as text
 // files. See gitops-json.js for why the pipeline is adapted rather than forked.
 const GJ = require("./gitops-json");
+// The pre-release run's Model B half: the page list, the brand colour and the
+// site-level fixes that have no PHP equivalent. See gitops-prerelease.js.
+const GP = require("./gitops-prerelease");
 
 const DIR = __dirname;
 
@@ -4017,9 +4020,47 @@ async function fetchNocoWebsites() {
   const d = await r.json();
   return (d.list || []).map(mapNocoRow).filter(w => w.businessName && w.githubRepo);
 }
+// Websites named by hand in sites.manual.json. Read fresh each time rather than
+// cached at boot: editing that file is how someone adds a site the directory
+// does not carry yet, and making them restart the tool to be believed is the
+// kind of friction that sends people back to hardcoding.
+function manualWebsites() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(DIR, "sites.manual.json"), "utf8"));
+    return (raw.sites || []).filter((s) => s && s.siteId && s.githubRepo).map((s) => ({
+      siteId: String(s.siteId),
+      rowId: null,
+      businessName: String(s.businessName || s.siteId),
+      liveUrl: String(s.liveUrl || ""),
+      existingSiteUrl: String(s.existingSiteUrl || ""),
+      githubRepo: normalizeRepo(s.githubRepo) || String(s.githubRepo),
+      repoUrl: `https://github.com/${normalizeRepo(s.githubRepo) || s.githubRepo}`,
+      resolvedFrom: "manual",
+    }));
+  } catch (e) {
+    if (e.code !== "ENOENT") console.warn("sites.manual.json not read:", e.message);
+    return [];
+  }
+}
+// NocoDB is off by default. It was the original directory and is kept behind
+// this flag rather than deleted: TED coverage is thin (1 of 148 clients when it
+// was last measured) and turning the old source back on must stay a one-variable
+// decision, not a code change.
+const NOCODB_SITES = String(process.env.NOCODB_SITES || "off").toLowerCase() === "on";
 async function getWebsites(refresh) {
   if (!refresh && NOCO_CACHE.sites.length && Date.now() - NOCO_CACHE.at < 60000) return NOCO_CACHE.sites;
-  const sites = await fetchNocoWebsites();
+  const manual = manualWebsites();
+  // Manual wins outright. An entry in that file is somebody saying "this repo,
+  // this site" on purpose, and a directory that disagrees is the thing being
+  // worked around — TED has already handed back a repository that 404s for one
+  // of these clients, and silently preferring it would undo the fix.
+  const taken = new Set(manual.map((s) => s.siteId));
+  const named = new Set(manual.map((s) => tedNorm(s.businessName)));
+  const rest = NOCODB_SITES
+    ? (await fetchNocoWebsites().catch((e) => { console.warn("nocodb: site list unavailable:", e.message); return []; }))
+        .filter((s) => !taken.has(s.siteId) && !named.has(tedNorm(s.businessName)))
+    : [];
+  const sites = [...manual, ...rest];
   NOCO_CACHE = { sites, at: Date.now() };
   return sites;
 }
@@ -4099,7 +4140,7 @@ async function resolveEditTarget(website) {
   else if (themes.length === 1) slug = themes[0];                   // only one theme → unambiguous
   else if (liveSlug && !themes.length) slug = liveSlug;             // repo listing failed → trust the live slug
   if (!slug) {
-    throw new Error(`Couldn't determine which theme to edit for ${website.businessName}. The live domain (${website.liveUrl || "none set"}) ${liveSlug ? `serves "${liveSlug}", which isn't in the repo` : "didn't reveal an active theme"}, and the repo has ${themes.length} theme(s)${themes.length ? ` (${themes.join(", ")})` : ""}. Set the correct Domain in NocoDB, or ensure the repo has exactly one theme.`);
+    throw new Error(`Couldn't determine which theme to edit for ${website.businessName}. The live domain (${website.liveUrl || "none set"}) ${liveSlug ? `serves "${liveSlug}", which isn't in the repo` : "didn't reveal an active theme"}, and the repo has ${themes.length} theme(s)${themes.length ? ` (${themes.join(", ")})` : ""}. Set the correct liveUrl for this site, or ensure the repo has exactly one theme.`);
   }
   const bare = slug.replace(/^g99-/, "");
   const muPath = slug.startsWith("g99-") ? `web/app/mu-plugins/g99-activate-${bare}.php` : "";
@@ -4366,7 +4407,7 @@ const SITE_AUDITS_FILE = path.join(DIR, "site-audits.json");
 function readSiteAudits() { try { return JSON.parse(fs.readFileSync(SITE_AUDITS_FILE, "utf8")); } catch (e) { return {}; } }
 function writeSiteAudits(m) { fs.writeFileSync(SITE_AUDITS_FILE, JSON.stringify(m, null, 2)); }
 async function auditWebsite(site) {
-  if (!site.liveUrl) throw new Error("This website has no Domain set in NocoDB — nothing to audit.");
+  if (!site.liveUrl) throw new Error("This website has no domain set — nothing to audit.");
   const rep = await croAudit({ url: site.liveUrl, label: site.businessName || site.liveUrl });
   const num = (v) => (typeof v === "number" && isFinite(v) ? Math.round(v) : null);
   const store = readSiteAudits();
@@ -4803,11 +4844,18 @@ async function tedClientSite(clientId, fallbackName) {
   };
 }
 
-// The check that makes TED-first safe. A repository with no themes in it cannot
-// be edited, so it is the same question resolveEditTarget() asks next — asked
-// one step earlier, where there is still a NocoDB row to fall back to.
+// The check that makes TED-first safe. A repository the pipeline cannot edit is
+// no use no matter who named it, so this asks the same question
+// resolveEditTarget() asks next — one step earlier, where there is still another
+// source to fall back to.
+//
+// BOTH site models count. Model B has no web/app/themes at all: its site is
+// resources/**.json reconciled by the g99-control MU plugin. Judging usability
+// on themes alone rejected every GitOps repository — which, since GitOps is now
+// what a new build produces, meant TED could only ever resolve the old kind.
 async function tedRepoUsable(repo) {
   if (!repo) return false;
+  if (await repoFileExists(repo, "resources/site.json")) return true;
   const themes = await listRepoThemes(repo).catch(() => []);
   return themes.length > 0;
 }
@@ -4823,7 +4871,7 @@ async function withTedFields(site, hubspotId) {
   const sameUrl = !ted.betaSiteUrl || ted.betaSiteUrl === site.liveUrl;
   if (sameRepo && sameUrl) return site;                       // nothing to prefer
   if (!(await tedRepoUsable(ted.githubRepo))) {
-    console.warn(`ted: ignoring ${site.businessName} -> ${ted.githubRepo} (repository does not resolve) — keeping ${site.githubRepo || "no repo"} from NocoDB`);
+    console.warn(`ted: ignoring ${site.businessName} -> ${ted.githubRepo} (repository does not resolve) — keeping ${site.githubRepo || "no repo"} from ${site.resolvedFrom || "the site list"}`);
     return site;
   }
   console.log(`ted: ${site.businessName} resolved from TED client ${ted.clientId} (${ted.githubRepo}${ted.betaSiteUrl ? ", " + ted.betaSiteUrl : ""})`);
@@ -4843,7 +4891,7 @@ async function resolveClientSite(clientName, hubspotId) {
 
   if (nocoHit) {
     const site = await withTedFields(nocoHit, hubspotId);
-    if (!site.githubRepo) throw new Error(`${site.businessName} has no repository in NocoDB`);
+    if (!site.githubRepo) throw new Error(`${site.businessName} has no repository set`);
     return site;
   }
 
@@ -4852,7 +4900,7 @@ async function resolveClientSite(clientName, hubspotId) {
   // is synthesised so per-site state (approvals, job dedupe) still has a key.
   const ted = await tedSiteFields(clientName, hubspotId);
   if (ted && await tedRepoUsable(ted.githubRepo)) {
-    console.log(`ted: ${clientName} has no NocoDB row — resolved entirely from TED client ${ted.clientId} (${ted.githubRepo})`);
+    console.log(`ted: ${clientName} is not in the site list — resolved entirely from TED client ${ted.clientId} (${ted.githubRepo})`);
     return {
       siteId: `ted-${ted.clientId}`, rowId: null, businessName: clientName,
       liveUrl: ted.betaSiteUrl, existingSiteUrl: "", repoUrl: `https://github.com/${ted.githubRepo}`,
@@ -5634,7 +5682,7 @@ async function resolveReviewSite(idOrName) {
     .concat(sites.filter((s) => tedNorm(s.businessName) === tedNorm(want)));
   const site = hits[0];
   if (!site) throw new Error(`no site matches "${want}"`);
-  if (!site.githubRepo) throw new Error(`${site.businessName} has no repository in NocoDB`);
+  if (!site.githubRepo) throw new Error(`${site.businessName} has no repository set`);
   const target = await resolveEditTarget(site);
   return { site, target };
 }
@@ -11444,13 +11492,37 @@ function pageHeadings(php) {
   }
   return out;
 }
+// A theme's src is almost never a literal path — it is
+// src="<?php echo esc_url(get_theme_file_uri('assets/img/hero.webp')); ?>".
+// What every image check wants is the file that resolves to, which is the path
+// literal inside that call. Returns "" when there is no literal to find, so a
+// dynamic src is skipped rather than audited as a badly named file.
+function phpSrcFile(raw) {
+  const value = String(raw || "");
+  if (!value.includes("<?")) return value;
+  const literals = [...value.matchAll(/['"]([^'"]*\.[a-z0-9]{2,5})['"]/gi)].map((m) => m[1]);
+  return literals.length ? literals[literals.length - 1] : "";
+}
 function pageImages(php) {
+  const source = String(php || "");
+  // PHP blocks are masked to spaces of the SAME length before the tag is
+  // matched, so every offset below still points at the real source. Without
+  // this, [^>]* stops at the ">" inside "?>": the tag is cut in half and every
+  // filename comes back as "<", which is what made the image findings junk.
+  const masked = source.replace(/<\?[\s\S]*?\?>/g, (m) => " ".repeat(m.length));
   const out = [];
-  for (const m of String(php || "").matchAll(/<img\b([^>]*)>/gi)) {
-    const attrs = m[1];
+  for (const tag of masked.matchAll(/<img\b([^>]*)>/gi)) {
+    // Group 1 opens immediately after "<img" (\b is zero-width) and closes one
+    // character before the tag's end.
+    const from = tag.index + 4, to = tag.index + tag[0].length - 1;
+    const attrs = source.slice(from, to), attrsMasked = masked.slice(from, to);
+    // Located in the masked copy — where a quote inside PHP cannot end the
+    // value early — then read back out of the real one.
+    const sm = attrsMasked.match(/\bsrc\s*=\s*(["'])([^"']*)\1/di);
+    const rawSrc = sm ? attrs.slice(sm.indices[2][0], sm.indices[2][1]) : "";
     out.push({
-      raw: m[0],
-      src: (attrs.match(/\bsrc=["']([^"']+)["']/i) || [])[1] || "",
+      raw: source.slice(tag.index, tag.index + tag[0].length),
+      src: phpSrcFile(rawSrc),
       alt: (attrs.match(/\balt=["']([^"']*)["']/i) || [])[1],
     });
   }
@@ -12449,7 +12521,7 @@ function seoPrBody(job, entries, renames, audit, check, stripped, origin) {
   const L = [];
   L.push(`Automated SEO for **${job.businessName}** — ${entries.length} page(s).`, "");
   if (stripped.length) L.push(`Removed the hardcoded ${stripped.join(", ")} from \`header.php\` — it was shared by every page. Each page now has its own, generated in \`inc/g99-seo.php\`.`, "");
-  if (!origin) L.push("> No domain is set for this site in NocoDB, so canonical and `og:url` were left out rather than guessed.", "");
+  if (!origin) L.push("> No domain is set for this site, so canonical and `og:url` were left out rather than guessed.", "");
   L.push(`**Checks:** ${check.pass} of ${check.total} pass.`, "");
   L.push("| Page | Title | Chars | Primary keyword |", "|---|---|---|---|");
   for (const e of entries) L.push(`| \`/${e.slug === "home" ? "" : e.slug + "/"}\` | ${e.metaTitle.replace(/\|/g, "\\|")} | ${e.metaTitle.length} | ${e.primaryKeyword.replace(/\|/g, "\\|")} |`);
@@ -12905,7 +12977,7 @@ async function runPreReleaseJob(job) {
     const muSrc = muAbs && fs.existsSync(muAbs) ? fs.readFileSync(muAbs, "utf8") : synthMuSource(themeAbs);
     const { pages: sourcePages } = readSeoPages(themeAbs, muSrc);
     if (!sourcePages.length) throw new Error("no registered pages found in active theme");
-    if (!P.liveUrl) throw new Error("site has no live domain in NocoDB - mobile pages cannot be rendered");
+    if (!P.liveUrl) throw new Error("site has no live domain set - mobile pages cannot be rendered");
     const pages = sourcePages.map((p) => ({ slug: p.slug, title: p.title, file: p.file, url: mobilePageUrl(P.liveUrl, p.slug) }));
     job.mobilePages = pages;
     const sourceByFile = new Map(pages.map((page) => [page.file, mobileSourceContext(themeAbs, page.file)]));
@@ -13266,7 +13338,7 @@ async function resolveLiveSite(betaUrl, businessName, existingSiteUrl) {
   const candidate = declared ? (/^https?:\/\//i.test(declared) ? declared : "https://" + declared.replace(/^\/+/, ""))
     : liveSiteCandidate(betaUrl);
   const source = declared ? "NocoDB Live Site" : "derived from the beta domain";
-  if (!candidate) return { ok: false, url: "", source, reason: "no Live Site set in NocoDB, and none could be derived from the beta domain" };
+  if (!candidate) return { ok: false, url: "", source, reason: "no existing-site URL set, and none could be derived from the beta domain" };
   const r = await fetchText(candidate);
   if (!r.ok) return { ok: false, url: candidate, source, reason: r.error ? `unreachable (${r.error})` : `unreachable (HTTP ${r.status})` };
   // The name gate protects against a parked domain or a squatter handing us a
@@ -13277,7 +13349,7 @@ async function resolveLiveSite(betaUrl, businessName, existingSiteUrl) {
     const tokens = nameTokens(businessName);
     const text = pageText(r.html).toLowerCase();
     if (tokens.length && !tokens.some((t) => text.includes(t))) {
-      return { ok: false, url: candidate, source, reason: `resolved but does not mention "${businessName}" — not treated as the client's site. Set the Live Site column in NocoDB to fix this.` };
+      return { ok: false, url: candidate, source, reason: `resolved but does not mention "${businessName}" — not treated as the client's site. Set existingSiteUrl for this site to fix this.` };
     }
   }
   return { ok: true, url: candidate, source };
@@ -13457,10 +13529,21 @@ function siteHostOf(liveUrl) {
 // Which rule applies is not a setting anywhere, so it is inferred: more than one
 // distinct location across the service URLs means multi-location.
 const prSlugify = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+// A page that is not a service does not need a location in its URL, and telling
+// it to take one is worse than noise now that the rename can actually be applied
+// on a GitOps site: it would move /services/ to /services-in-sycamore-il/.
+// Everything added below was seen being reported on a real site.
 const NON_SERVICE_SLUGS = new Set(["home", "about", "about-us", "contact", "contact-us", "team", "our-team", "blog",
   "privacy-policy", "privacy", "terms", "gallery", "testimonials", "reviews", "financing", "specials", "offers",
   "careers", "faq", "faqs", "locations", "shop", "cart", "checkout", "my-account", "branding", "brand-guide",
-  "seo", "seo-report", "sitemap", "search", "thank-you", "book", "booking", "appointment"]);
+  "seo", "seo-report", "sitemap", "search", "thank-you", "book", "booking", "appointment",
+  "blogs", "news", "service", "services", "meet-the-team", "html-sitemap", "terms-conditions",
+  "terms-and-conditions", "disclaimer", "accessibility", "promotions", "events", "upcoming-events",
+  "memberships", "vip-memberships", "self-assessment", "consultation", "financing-options",
+  "before-and-after", "results", "products", "store", "account", "login"]);
+// WordPress suffixes a slug that collides — "blogs-2" is the blog page, not a
+// service called blogs-2 — so the suffix comes off before the list is consulted.
+const bareSlug = (slug) => String(slug || "").toLowerCase().replace(/-\d+$/, "");
 function splitLocationSlug(slug) {
   const m = String(slug || "").match(/^(.+?)-in-(.+)$/);
   return m ? { base: m[1], location: m[2] } : { base: String(slug || ""), location: "" };
@@ -13469,7 +13552,8 @@ function findingsUrlStructure(pages, facts) {
   const out = [];
   const services = pages.filter((p) => {
     const slug = String(p.slug || "").toLowerCase();
-    return slug !== "home" && !NON_SERVICE_SLUGS.has(slug) && !/^(blog|post|category|tag)-/.test(slug);
+    return slug !== "home" && !NON_SERVICE_SLUGS.has(slug) && !NON_SERVICE_SLUGS.has(bareSlug(slug))
+      && !/^(blog|post|category|tag)-/.test(slug);
   });
   if (!services.length) return { findings: out, renames: [], mode: "none", detail: "no service pages to check" };
 
@@ -13611,9 +13695,13 @@ const NOT_HERE_TASKS = new Set([]);
 // only when the corresponding fix reports that it changed a file.
 const FIXABLE_TASKS = new Set(["favicon", "clickable-contact", "business-name", "internal-links",
   "spelling", "cta", "image-naming", "image-format", "image-weight"]);
-function resolveFindingOutcomes(findings, fixedTasks) {
+// notHere is what THIS run cannot reach, on top of what no run can. A GitOps
+// site puts the image tasks back in that category: the photos sit inside raw
+// Elementor HTML, and a repo-local copy has no URL to point at. Reporting them
+// as "pending" would promise a later run that is never coming.
+function resolveFindingOutcomes(findings, fixedTasks, notHere) {
   for (const f of findings) {
-    if (NOT_HERE_TASKS.has(f.task)) { f.outcome = OUTCOME.NOT_HERE; continue; }
+    if (NOT_HERE_TASKS.has(f.task) || (notHere && notHere.has(f.task))) { f.outcome = OUTCOME.NOT_HERE; continue; }
     if (FIXABLE_TASKS.has(f.task)) { f.outcome = fixedTasks.has(f.task) ? OUTCOME.DONE : OUTCOME.PENDING; continue; }
     f.outcome = OUTCOME.DECISION;
   }
@@ -13726,14 +13814,35 @@ function findingsFavicon(themeAbs, pages, siteHost) {
     logo ? "No favicon link is emitted by the theme" : "No favicon link is emitted by the theme, and no usable site-owned image was found to derive one from",
     { expected: logo || "a 48×48 icon on the site's own domain", fix: logo ? "auto" : "proposed" })];
 }
+// The Model B favicon. There is no header.php to emit a <link rel="icon"> from
+// and nothing should add one: WordPress prints the site icon itself, and
+// site.json is where this model declares it.
+function findingsGitopsFavicon(root) {
+  if (GP.hasFavicon(root)) return [];
+  const declared = String(GP.siteJson(root).site_icon || "").trim();
+  return [prFinding("favicon", "high", "(site-wide)",
+    declared ? `site.json sets site_icon to ${declared}, which is not in resources/media`
+      : "site.json sets no site icon, so search results and browser tabs show the WordPress default",
+    { found: declared || "(none)", expected: "site_icon: media:<ref>", fix: "auto" })];
+}
 // Images on these builds are remote URLs (Stitch/Unsplash/WP uploads), not files
 // in the repo — a pull request cannot rename or recompress them. Detection is
 // still worth running; the fix is a proposal for whoever owns the media library.
+// The audit's own image list. Reads through the same PHP-aware helpers as
+// pageImages: the old regex here was `<img[^>]+src=...`, which stopped at the
+// ">" inside "?>" and reported every theme image as the filename "<".
 function imageSources(pages) {
   const out = [];
   for (const pg of pages) {
-    for (const m of String(pg.php || "").matchAll(/<img[^>]+src\s*=\s*["']([^"']+)["']/gi)) out.push({ page: pg.slug, src: m[1] });
-    for (const m of String(pg.php || "").matchAll(/background-image\s*:\s*url\(\s*["']?([^"')]+)["']?\s*\)/gi)) out.push({ page: pg.slug, src: m[1] });
+    for (const img of pageImages(pg.php)) if (img.src) out.push({ page: pg.slug, src: img.src });
+    const source = String(pg.php || "");
+    const masked = source.replace(/<\?[\s\S]*?\?>/g, (m) => " ".repeat(m.length));
+    for (const m of masked.matchAll(/background-image\s*:\s*url\(\s*["']?([^"')]*)["']?\s*\)/gi)) {
+      const declared = source.slice(m.index, m.index + m[0].length);
+      const inner = declared.slice(declared.indexOf("(") + 1).replace(/\)\s*$/, "").trim().replace(/^["']|["']$/g, "");
+      const src = phpSrcFile(inner);
+      if (src) out.push({ page: pg.slug, src });
+    }
   }
   return out;
 }
@@ -13782,9 +13891,20 @@ async function findingsImageWeight(images, limit = 24) {
   }
   return out;
 }
+// A hard character cut lands mid-word, and the model downstream then reports
+// the fragment as a defect: "Begin Your Journey" arrived as "Begi" and came
+// back as a spelling mistake on a page that had none. Cut on whitespace
+// instead, and only where a sensible break exists.
+function clipWords(text, limit) {
+  const s = String(text || "");
+  if (s.length <= limit) return s;
+  const cut = s.slice(0, limit);
+  const gap = cut.lastIndexOf(" ");
+  return gap > limit * 0.5 ? cut.slice(0, gap) : cut;
+}
 async function findingsSpelling(pages, ai) {
   const out = [];
-  const batch = pages.slice(0, 14).map((p) => `### ${p.slug}\n${(p.text || "").slice(0, 2200)}`).join("\n\n");
+  const batch = pages.slice(0, 14).map((p) => `### ${p.slug}\n${clipWords(p.text, 2200)}`).join("\n\n");
   if (!batch.trim()) return out;
   try {
     const raw = await aiCall([{ text: [
@@ -13804,7 +13924,7 @@ async function findingsSpelling(pages, ai) {
 }
 async function findingsPageAudit(pages, businessName, ai) {
   const out = [];
-  const batch = pages.slice(0, 12).map((p) => `### ${p.slug} — ${p.title}\n${(p.text || "").slice(0, 1800)}`).join("\n\n");
+  const batch = pages.slice(0, 12).map((p) => `### ${p.slug} — ${p.title}\n${clipWords(p.text, 1800)}`).join("\n\n");
   if (!batch.trim()) return out;
   try {
     const raw = await aiCall([{ text: [
@@ -13830,6 +13950,22 @@ async function findingsPageAudit(pages, businessName, ai) {
 // Call Now bar or a second favicon link.
 const PR_MARK = "g99-perform-pr";
 function readIf(abs) { return fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : ""; }
+// Every page-level fixer below builds its path with path.join(themeAbs, page.file)
+// and then reads it, edits the text and writes it back. On a GitOps site that path
+// carries a "::audit" selector and is not a file — so the two ends of that
+// sandwich, and only those, know the difference. The fixers themselves do not,
+// which is why there is one spelling fixer rather than two.
+function srcRead(abs) {
+  if (!GJ.isVirtualAbs(abs)) return readIf(abs);
+  try { return GJ.readVirtualAbs(abs) || ""; } catch (_) { return ""; }
+}
+function srcWrite(abs, text) {
+  if (!GJ.isVirtualAbs(abs)) { fs.writeFileSync(abs, text); return true; }
+  // A write that folds back onto nothing is the model's own guard against a
+  // mangled view; it must not take down a run that got twelve other pages right.
+  try { GJ.writeVirtualAbs(abs, text); return true; }
+  catch (e) { console.warn(`pre-release: ${GJ.realPath(abs)} not written (${e.message})`); return false; }
+}
 function appendToFunctions(themeAbs, marker, php) {
   const abs = path.join(themeAbs, "functions.php");
   const cur = readIf(abs);
@@ -13885,11 +14021,13 @@ function fixBusinessName(themeAbs, pages, businessName, siteName, themePath) {
   let total = 0;
   for (const pg of pages) {
     const abs = path.join(themeAbs, pg.file);
-    const php = readIf(abs);
+    const php = srcRead(abs);
     if (!php || !php.includes(wrong)) continue;
     const { out, hits } = replaceInTextNodes(php, wrong, correct);
-    if (hits) { fs.writeFileSync(abs, out); changed.push(themePath + "/" + pg.file); total += hits; }
+    if (hits && srcWrite(abs, out)) { changed.push(themePath + "/" + GJ.realPath(pg.file)); total += hits; }
   }
+  // Absent on a GitOps site, where the chrome is a template resource and the site
+  // name proper is site.json's blogname — both handled by the Model B fixer.
   for (const shared of ["header.php", "footer.php"]) {
     const abs = path.join(themeAbs, shared);
     const php = readIf(abs);
@@ -14056,10 +14194,16 @@ function findingsInternalLinks(pages, muPages) {
 // A dead internal link gets a redirect to the closest page we do have. Closeness
 // is measured on shared slug words, and a link with no plausible destination is
 // left for a human rather than pointed somewhere arbitrary.
+//
+// Only pages are candidates. A GitOps site registers its posts and products as
+// known slugs so a link to one is not called dead — but a nav link to a service
+// page that no longer exists must not be sent to a blog article that happens to
+// share a word with it. Model A entries carry no `kind` and all qualify, which
+// is what they always did.
 function bestRedirectTarget(target, muPages) {
   const words = new Set(String(target).split(/[^a-z0-9]+/i).filter((w) => w.length > 2));
   let best = null, bestScore = 0;
-  for (const p of muPages) {
+  for (const p of (muPages || []).filter((m) => !m.kind || m.kind === "page")) {
     const slug = String(p.slug || "").toLowerCase();
     if (!slug) continue;
     const hits = [...words].filter((w) => slug.includes(w)).length;
@@ -14067,7 +14211,12 @@ function bestRedirectTarget(target, muPages) {
   }
   return bestScore > 0 ? best : null;
 }
-function fixInternalLinks(themeAbs, themePath, findings, muPages) {
+// writeMap is how a 301 gets written, and it is the only thing about this fix
+// that differs between the two site models: inc/g99-redirects.php on a theme,
+// resources/redirections.json on a GitOps tree. Which pages exist, which dead
+// link is closest to which of them, and whether a link is worth redirecting at
+// all are the same questions on both.
+function fixInternalLinks(themeAbs, themePath, findings, muPages, writeMap) {
   const dead = findings.filter((f) => f.task === "internal-links" && f.found);
   if (!dead.length) return { changed: [], note: "every internal link resolves", skipped: true, redirects: [] };
   const pairs = [], redirects = [];
@@ -14079,7 +14228,8 @@ function fixInternalLinks(themeAbs, themePath, findings, muPages) {
     redirects.push({ from: "/" + target + "/", to: "/" + to + "/", page: f.page });
   }
   if (!pairs.length) return { changed: [], note: `${dead.length} dead link(s) with no plausible destination — left for review`, skipped: true, redirects: [] };
-  const red = writeRedirectMap(themeAbs, themePath, pairs);
+  const red = writeMap ? writeMap(pairs) : writeRedirectMap(themeAbs, themePath, pairs);
+  if (!red.changed.length) return { changed: [], note: red.note || "the redirect map could not be written", skipped: true, redirects: [] };
   return { changed: red.changed, redirects, note: `${redirects.length} dead link(s) 301'd to the nearest matching page` };
 }
 
@@ -14093,7 +14243,7 @@ function fixSpelling(themeAbs, pages, findings, themePath) {
   const corrections = [];
   for (const pg of pages) {
     const abs = path.join(themeAbs, pg.file);
-    let php = readIf(abs);
+    let php = srcRead(abs);
     if (!php) continue;
     let touched = false;
     for (const f of wanted) {
@@ -14104,7 +14254,7 @@ function fixSpelling(themeAbs, pages, findings, themePath) {
       const { out, hits } = replaceInTextNodes(php, f.found, f.expected);
       if (hits) { php = out; touched = true; corrections.push({ page: pg.slug, from: f.found, to: f.expected, hits }); f.corrected = true; }
     }
-    if (touched) { fs.writeFileSync(abs, php); changed.push(themePath + "/" + pg.file); }
+    if (touched && srcWrite(abs, php)) changed.push(themePath + "/" + GJ.realPath(pg.file));
   }
   if (!corrections.length) return { changed: [], note: "the suggested words were not found in the templates", skipped: true, corrections: [] };
   return { changed: [...new Set(changed)], corrections, note: corrections.map((c) => `"${c.from}" → "${c.to}"`).join(", ").slice(0, 150) };
@@ -14130,20 +14280,27 @@ function fixCta(themeAbs, pages, findings, themePath) {
   const donorPage = pages.find((p) => p.slug === "home" && extractCtaBlock(p.php))
     || pages.find((p) => !missing.has(p.slug) && extractCtaBlock(p.php));
   if (!donorPage) return { changed: [], note: "no existing CTA section to copy from", skipped: true, added: [] };
-  const block = extractCtaBlock(donorPage.php);
+  // A donor taken from a GitOps page arrives out of that page's ::audit view, so
+  // it can carry the view's own markers if the section straddled two widgets.
+  // They would be copied verbatim into the new block and read as ordinary text.
+  const block = extractCtaBlock(donorPage.php).replace(/<!--\/?G99 [^>]*-->/g, "");
   const changed = [], added = [];
   for (const pg of pages) {
     if (!missing.has(pg.slug)) continue;
     const abs = path.join(themeAbs, pg.file);
-    const php = readIf(abs);
+    const php = srcRead(abs);
     if (!php || php.includes(`${PR_MARK}:cta`)) continue;
-    // Before get_footer() so it closes the page, matching where CTAs sit elsewhere.
     const marker = `\n<!-- ${PR_MARK}:cta — copied from /${donorPage.slug} -->\n${block}\n`;
-    const out = /get_footer\s*\(/.test(php)
-      ? php.replace(/(<\?php\s*)?\s*get_footer\s*\(\s*\)\s*;?/i, (m) => marker + m)
-      : php + marker;
-    fs.writeFileSync(abs, out);
-    changed.push(themePath + "/" + pg.file);
+    // A GitOps document is a list of blocks, not a template with a footer call in
+    // it. The literal id "new" is how the virtual-file layer adds one, and putting
+    // it last is the same placement get_footer() gives it on a PHP theme.
+    const out = GJ.isVirtualAbs(abs)
+      ? `${php}\n\n<!--G99 new html-->${marker}<!--/G99 new-->\n`
+      : /get_footer\s*\(/.test(php)
+        ? php.replace(/(<\?php\s*)?\s*get_footer\s*\(\s*\)\s*;?/i, (m) => marker + m)
+        : php + marker;
+    if (!srcWrite(abs, out)) continue;
+    changed.push(themePath + "/" + GJ.realPath(pg.file));
     added.push(pg.slug);
   }
   if (!added.length) return { changed: [], note: "CTA already added on a previous run", skipped: true, added: [] };
@@ -14204,6 +14361,15 @@ function cdnWebpUrl(src, width = IMG_TARGET_WIDTH) {
 // Confirmed live, 2026-08-06: "Cannot read properties of undefined (reading 'city')"
 // at this line, reproduced by calling fixImages(html) exactly as generate-site does.
 async function performPrFixImages(themeAbs, pages, businessName, facts, themePath) {
+  // A GitOps page is Elementor content, and its photos sit inside raw HTML. The
+  // fleet's media resolver only rewrites a "media:<ref>" that is a whole string
+  // value or an Elementor {id, url} control — never one inside markup — so a
+  // localised copy in resources/media has no URL this pull request can point at.
+  // Renaming and recompressing stays a report on this model. (An image WIDGET
+  // could be repointed; no site emitted by the Design Engine uses one.)
+  if (pages.some((p) => GJ.isVirtual(p.file))) {
+    return { changed: [], skipped: true, swaps: [], note: "images live in raw Elementor HTML — a repo-local copy has no resolvable URL on a GitOps site, so naming and weight are reported for the media library" };
+  }
   const bizSlug = prSlugify(businessName).split("-").slice(0, 3).join("-");
   const loc = facts.city ? `in-${prSlugify(facts.city)}${facts.region ? "-" + prSlugify(facts.region) : ""}` : "";
   const dir = path.join(themeAbs, "assets", "img");
@@ -14354,7 +14520,7 @@ function fixBlvd(themeAbs, pages, themePath) {
   let tagged = 0;
   for (const pg of pages) {
     const abs = path.join(themeAbs, pg.file);
-    let php = readIf(abs);
+    let php = srcRead(abs);
     if (!php) continue;
     const before = php;
     php = php.replace(/<a\b[^>]*>/gi, (tag) => {
@@ -14362,7 +14528,7 @@ function fixBlvd(themeAbs, pages, themePath) {
       tagged++;
       return tag.replace(/^<a\b/i, '<a id="blvd_booking"');
     });
-    if (php !== before) { fs.writeFileSync(abs, php); changed.push(themePath + "/" + pg.file); }
+    if (php !== before && srcWrite(abs, php)) changed.push(themePath + "/" + GJ.realPath(pg.file));
   }
   if (!tagged) return { changed: [], note: "no Boulevard booking links found — nothing to tag", skipped: true };
   return { changed, note: `blvd_booking added to ${tagged} button(s)` };
@@ -14387,13 +14553,46 @@ function fixBlogSidebar(themeAbs) {
   if (!hasBlog) return { changed: [], note: "theme has no blog templates — sidebar not applicable", skipped: true };
   return { changed: [], note: "blog templates exist; sidebar widget is not yet automated", skipped: true };
 }
+
+// ---- the three Model B conventions that report rather than fix ---------------
+// Each of these writes markup that must appear on every page. On a PHP theme
+// that is functions.php. On a GitOps tree the equivalent is a theme part — and
+// in every repository seen so far templates/header and templates/footer export
+// with an empty elements[], which means WordPress still owns them. Writing
+// elements into an empty template would not ADD a call bar or a 404, it would
+// replace the live footer with one. So these say what is missing, precisely
+// enough to act on, and change nothing.
+function fixGitops404(root) {
+  const found = GP.notFoundTemplate(root);
+  if (found) return { changed: [], note: `templates/${found} handles 404s` };
+  return {
+    changed: [], skipped: true,
+    note: "no 404 theme part in resources/templates — build one in Elementor with an Error 404 display condition, and it will export here",
+  };
+}
+function fixGitopsCallNow(root, pages, chrome, phone) {
+  const st = GP.callNowState(root, pages, chrome);
+  if (st.ok) return { changed: [], note: st.how };
+  if (!phone) return { changed: [], skipped: true, note: "no phone number on the site to call" };
+  return {
+    changed: [], skipped: true,
+    note: `no sticky Call Now bar. It belongs in the footer theme part, which WordPress still owns on this site — add it there pointing at ${phone}`,
+  };
+}
+function fixGitopsBlogSidebar(root) {
+  const blog = GP.blogState(root);
+  if (!blog.has) return { changed: [], note: "this site has no blog — sidebar not applicable", skipped: true };
+  return { changed: [], skipped: true, note: `blog present (${blog.templates.join(", ") || "posts only"}); the sidebar widget is a WordPress-side setting, not a resource` };
+}
 function fixClickable(themeAbs, pages, themePath) {
   const changed = [];
   let linked = 0;
   for (const pg of pages) {
     const abs = path.join(themeAbs, pg.file);
-    const php = readIf(abs);
+    const php = srcRead(abs);
     if (!php) continue;
+    // A G99 marker matches the tag split, so the audit view's own comments are
+    // never treated as text and a phone number keeps the marker it sits inside.
     const parts = php.split(/(<[^>]+>)/);
     let depth = 0, touched = false;
     for (let i = 0; i < parts.length; i++) {
@@ -14409,7 +14608,7 @@ function fixClickable(themeAbs, pages, themePath) {
         .replace(EMAIL_RE, (m) => { linked++; touched = true; return `<a href="mailto:${m.trim()}">${m}</a>`; });
       parts[i] = next;
     }
-    if (touched) { fs.writeFileSync(abs, parts.join("")); changed.push(themePath + "/" + pg.file); }
+    if (touched && srcWrite(abs, parts.join(""))) changed.push(themePath + "/" + GJ.realPath(pg.file));
   }
   if (!linked) return { changed: [], note: "every phone and email is already a link" };
   return { changed: [...new Set(changed)], note: `${linked} phone/email mention(s) linked` };
@@ -14439,6 +14638,43 @@ async function waitForPerformPrDeployment(liveUrl, themeSlug, jobId) {
   }
   throw new Error(`deployment did not expose release marker ${jobId} within ${Math.round(timeoutMs / 60000)} minute(s): ${last}`);
 }
+// The Model B answer to the marker file, and a better one: the g99-control plugin
+// publishes the exact commit it has reconciled, which is the same endpoint the
+// fleet's own deployment workflow watches. So instead of asking "is a file we
+// wrote visible yet", this asks the site which commit it is serving — and it
+// distinguishes a deployment that is still running from one that was REJECTED,
+// which a marker poll can only report as a timeout.
+const DEPLOY_STATUS_PATH = "/wp-json/g99-control/v1/deployment-status";
+async function waitForGitopsDeployment(liveUrl, sha, branch = "main") {
+  if (!sha) throw new Error("no merge commit to wait for — the pull request reported none");
+  const timeoutMs = Math.max(30000, Number(process.env.PR_DEPLOY_TIMEOUT_MS || 900000) || 900000);
+  const pollMs = Math.max(2000, Number(process.env.PR_DEPLOY_POLL_MS || 10000) || 10000);
+  const root = String(liveUrl || "").replace(/\/+$/, "");
+  const url = `${root}${DEPLOY_STATUS_PATH}?commit=${encodeURIComponent(sha)}&branch=${encodeURIComponent(branch)}`;
+  const started = Date.now();
+  let last = "no answer yet";
+  while (Date.now() - started < timeoutMs) {
+    try {
+      const r = await fetch(url, { redirect: "follow", cache: "no-store", headers: { "User-Agent": "G99PerformPRDeployProbe/1.0" } });
+      const body = r.ok ? await r.json().catch(() => null) : null;
+      const status = String((body && body.status) || (r.ok ? "invalid_response" : `HTTP ${r.status}`));
+      if (status === "success") return { deployedAt: new Date().toISOString(), sha };
+      // The reconciler rolls back on failure, so the live site is the PREVIOUS
+      // build. Measuring it would report scores for a release that did not happen.
+      if (status === "failed" || status === "invalid_request") {
+        throw new Error(`the control plugin rejected ${sha.slice(0, 8)}: ${String((body && body.message) || status).slice(0, 200)}`);
+      }
+      if (status === "ignored") throw new Error(`${branch} is not this site's deploy branch — nothing was reconciled`);
+      last = status + ((body && body.job && body.job.step) ? ` (${body.job.step})` : "");
+    } catch (e) {
+      if (/rejected|deploy branch/.test(String(e.message))) throw e;
+      last = String((e && e.message) || e).slice(0, 120);
+    }
+    await sleep(pollMs);
+  }
+  throw new Error(`WordPress did not report ${sha.slice(0, 8)} deployed within ${Math.round(timeoutMs / 60000)} minute(s): ${last}`);
+}
+
 // Runs after merge because renaming or relinking anything above changes URLs —
 // a link check against pre-merge source would be checking the wrong site.
 async function verifyLinks(origin, max = 120) {
@@ -14517,7 +14753,7 @@ function performPrReportHtml(job) {
   const tasks = job.prTasks || [];
   // Resolved here rather than only at write time, so rendering a stored run —
   // a re-render, a replay from the JSON sibling — still labels every row.
-  const findings = resolveFindingOutcomes(job.prFindings || [], new Set(job.prFixedTasks || []));
+  const findings = resolveFindingOutcomes(job.prFindings || [], new Set(job.prFixedTasks || []), new Set(job.prNotHere || []));
   const bySeverity = (s) => findings.filter((f) => f.severity === s).length;
   const byOutcome = (o) => findings.filter((f) => f.outcome === o).length;
   const chip = { pass: "#1f9d6b", fixed: "#2a68d8", fail: "#c0392b", skipped: "#8a8fa3" };
@@ -14973,7 +15209,7 @@ function newPerformPrJob(payload) {
     businessName: payload.businessName || payload.siteId || "Site", status: "queued", currentStep: 0,
     steps: PERFORM_PR_STEPS.map((label) => ({ label, status: "pending", detail: "" })), payload,
     prUrl: null, branch: null, reportUrl: null,
-    liveSite: null, prFacts: null, prTasks: [], prFindings: [], prChanged: [], pageSpeed: null,
+    liveSite: null, prFacts: null, prTasks: [], prFindings: [], prChanged: [], prNotHere: [], pageSpeed: null,
     editPlan: null, editSummary: "Pre-release checks", error: null,
     cost: { gemini: 0, stitch: 0 }, cancelRequested: false, awaitingApproval: false,
     createdAt: new Date().toISOString(), startedAt: null, finishedAt: null,
@@ -15023,13 +15259,32 @@ async function runPerformPrJob(job) {
     if (r.code) r = await runRetry(`git clone --depth 1 "${cloneUrl}" "${tmp}"`);
     if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
     if (/x-access-token:/.test(cloneUrl)) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
+    // Which model this repository is, read off the checkout rather than off the
+    // payload: resolveEditTarget already answered the same question over the
+    // GitHub API, and the tree in hand cannot be out of date with itself.
+    const gitops = GJ.isGitopsRoot(tmp);
     const themeAbs = path.join(tmp, P.themePath);
-    if (!fs.existsSync(themeAbs)) throw new Error("theme not found: " + P.themePath);
-    const muAbs = P.muPath ? path.join(tmp, P.muPath) : "";
-    const muSrc = muAbs && fs.existsSync(muAbs) ? fs.readFileSync(muAbs, "utf8") : synthMuSource(themeAbs);
-    const { pages, muPages } = readSeoPages(themeAbs, muSrc);
-    if (!pages.length) throw new Error("no registered pages found in the active theme");
-    jobStep(job, 0, "done", `${pages.length} page(s) in ${P.themePath}`);
+    if (!fs.existsSync(themeAbs)) throw new Error((gitops ? "resources/ not found: " : "theme not found: ") + P.themePath);
+    const muAbs = gitops || !P.muPath ? "" : path.join(tmp, P.muPath);
+    let pages, muPages;
+    if (gitops) {
+      // The Model B page list. Same shape as a theme's, so every check below is
+      // the same code — see gitops-prerelease.js for what does differ.
+      ({ pages, muPages } = GP.readPages(tmp, { pageText, pageHeadings, pageImages, pageLinks }));
+      if (!pages.length) throw new Error("no published pages found in resources/pages");
+    } else {
+      const muSrc = muAbs && fs.existsSync(muAbs) ? fs.readFileSync(muAbs, "utf8") : synthMuSource(themeAbs);
+      ({ pages, muPages } = readSeoPages(themeAbs, muSrc));
+      if (!pages.length) throw new Error("no registered pages found in the active theme");
+    }
+    // A published page the repository holds no content for is one finding, not
+    // one of every content finding there is. Reported once, then kept out of the
+    // checks that presuppose copy — otherwise twelve empty shells produce twelve
+    // "no CTA", twelve "never names the brand" and bury the page that has a real
+    // problem. Its slug still counts everywhere URLs are compared.
+    const emptyPages = pages.filter((p) => !String(p.php || "").trim());
+    const contentPages = pages.filter((p) => String(p.php || "").trim());
+    jobStep(job, 0, "done", `${pages.length} ${gitops ? "published page(s) in resources/pages" : `page(s) in ${P.themePath}`}${emptyPages.length ? ` — ${emptyPages.length} with no content` : ""}`);
 
     // The live site is read for one thing only: its sitemap, which tells us which
     // pages the client publishes today. Everything else about the business comes
@@ -15063,9 +15318,11 @@ async function runPerformPrJob(job) {
     // notifications and the TED comments, where "(clone)" is information.
     const contentName = contentBusinessName(P.businessName);
     if (contentName !== P.businessName) console.log(`pre-release: writing "${contentName}" into the site, not "${P.businessName}"`);
-    const facts = await readBusinessFacts(pages, contentName, ai);
-    const socials = extractSocials(pages);
-    const brand = themeBrandColor(themeAbs);
+    const facts = await readBusinessFacts(contentPages, contentName, ai);
+    const socials = extractSocials(contentPages);
+    // Same heuristic, different pile of CSS: a GitOps site states its palette in
+    // each page's document_settings.custom_css, not in style.css.
+    const brand = gitops ? GP.brandColor(tmp) : themeBrandColor(themeAbs);
     const siteHost = siteHostOf(P.liveUrl);
     job.prFacts = { ...facts, name: contentName, socials, brand };
     jobStep(job, 2, "done", [facts.phone, facts.email, socials.length ? socials.length + " social link(s)" : "", brand].filter(Boolean).join(" · ") || "no contact details found");
@@ -15085,35 +15342,47 @@ async function runPerformPrJob(job) {
     // Checked against the page list rather than over the network, so a dead
     // internal link can still be fixed in this PR instead of found after deploy.
     // Page templates plus header/footer: a bad link in the chrome is on every page.
-    const linkF = findingsInternalLinks([...pages, ...themeChromePages(themeAbs)], muPages);
+    const chrome = gitops ? GP.chromePages(tmp) : themeChromePages(themeAbs);
+    const linkF = findingsInternalLinks([...contentPages, ...chrome], muPages);
     task("Internal links", linkF.length ? "fail" : "pass", linkF.length ? `${linkF.length} link(s) point at a missing page` : "every internal link resolves", linkF);
-    const nameF = findingsBusinessName(pages, contentName);
+    const nameF = findingsBusinessName(contentPages, contentName);
     task("Business name", nameF.length ? "fail" : "pass", nameF.length ? `${nameF.length} inconsistency(ies)` : `"${contentName}" used consistently`, nameF);
-    const contactF = findingsContact(pages, facts);
+    const contactF = findingsContact(contentPages, facts);
     task("Contact details", contactF.length ? "fail" : "pass", contactF.length ? `${contactF.length} issue(s)` : "phone, email and address agree across the site", contactF);
     // An audit never reports "fixed" — it has not fixed anything yet. Phase 2
     // upgrades these to "fixed" only when it actually changes a file, so a fix
     // that declines to run (no site-owned logo, say) stays honest in the report.
-    const clickF = findingsClickable(pages, facts);
+    const clickF = findingsClickable(contentPages, facts);
     task("Clickable contact", clickF.length ? "fail" : "pass", clickF.length ? `${clickF.length} plain-text mention(s) to link` : "already clickable", clickF);
-    const ctaF = findingsCta(pages);
-    task("CTA on every page", ctaF.length ? "fail" : "pass", ctaF.length ? `${ctaF.length} page(s) without a CTA` : `all ${pages.length} page(s) have a CTA`, ctaF);
+    const ctaF = findingsCta(contentPages);
+    task("CTA on every page", ctaF.length ? "fail" : "pass", ctaF.length ? `${ctaF.length} page(s) without a CTA` : `all ${contentPages.length} page(s) have a CTA`, ctaF);
     jobStep(job, 3, "done", `${nameF.length + contactF.length + clickF.length + ctaF.length} finding(s)`);
 
     jobStep(job, 4, "running", "Favicon, images, spelling...");
-    const favF = findingsFavicon(themeAbs, pages, siteHost);
-    task("Favicon", favF.length ? "fail" : "pass", favF.length ? "not emitted by the theme" : "already emitted", favF);
-    const images = imageSources(pages);
+    // WordPress prints the site icon on a GitOps site and site.json is where it
+    // is declared, so there is no header.php to check and nothing should add one.
+    const favF = gitops ? findingsGitopsFavicon(tmp) : findingsFavicon(themeAbs, contentPages, siteHost);
+    task("Favicon", favF.length ? "fail" : "pass",
+      favF.length ? (gitops ? "site.json sets no site icon" : "not emitted by the theme") : (gitops ? "site.json sets a site icon" : "already emitted"), favF);
+    const images = imageSources(contentPages);
     const imgF = findingsImages(images, contentName);
     const weightF = await findingsImageWeight(images);
     task("Image naming", imgF.filter((f) => f.task === "image-naming").length ? "fail" : "pass", `${images.length} image(s) inspected`, imgF);
     task("Image format + weight", weightF.length ? "fail" : "pass", weightF.length ? `${weightF.length} oversized` : "within budget", weightF);
-    const spellF = await findingsSpelling(pages, ai);
+    const spellF = await findingsSpelling(contentPages, ai);
     task("Spelling", spellF.length ? "fail" : "pass", spellF.length ? `${spellF.length} suspected misspelling(s)` : "no misspellings found", spellF);
     jobStep(job, 4, "done", `${favF.length + imgF.length + weightF.length + spellF.length} finding(s)`);
 
     jobStep(job, 5, "running", "Reading every page for content problems...");
-    const auditF = await findingsPageAudit(pages, contentName, ai);
+    const auditF = await findingsPageAudit(contentPages, contentName, ai);
+    // The empty pages, said once each. A published page the repository holds no
+    // content for outranks anything a content pass could say about it.
+    for (const pg of emptyPages) {
+      auditF.unshift(prFinding("page-audit", "high", pg.slug,
+        gitops ? "Published page with no content in the repository — elementor.json has no elements and resource.json no body"
+          : "Published page with no content in its template",
+        { expected: "page content, or the page unpublished", fix: "proposed" }));
+    }
     task("Page audit", auditF.length ? "fail" : "pass", auditF.length ? `${auditF.length} suggestion(s)` : "no content problems found", auditF);
     jobStep(job, 5, "done", `${auditF.length} suggestion(s)`);
 
@@ -15131,19 +15400,32 @@ async function runPerformPrJob(job) {
       else task(label, (result.changed || []).length ? "fixed" : "skipped", result.note);
       jobStep(job, 6, "running", label + " — " + result.note);
     };
-    record("Business name", fixBusinessName(themeAbs, pages, contentName, facts.name, P.themePath), "business-name");
+    const nameFix = fixBusinessName(themeAbs, contentPages, contentName, facts.name, P.themePath);
+    // blogname is the one place the page-level rename cannot reach: WordPress
+    // prints it in the title tag and the feed, and no page template contains it.
+    if (gitops) {
+      const siteName = GP.fixSiteName(tmp, contentName, facts.name);
+      nameFix.changed = [...(nameFix.changed || []), ...siteName.changed];
+      if (siteName.changed.length) nameFix.note = [nameFix.note, siteName.note].filter(Boolean).join(" · ");
+    }
+    record("Business name", nameFix, "business-name");
     // Redirect map first, then the rename that depends on it.
-    const urlFix = fixUrlStructure(themeAbs, muAbs, P.muPath, P.themePath, urls.renames || []);
+    const urlFix = gitops
+      ? GP.fixUrlStructure(tmp, urls.renames || [], URL_RENAME_ENABLED)
+      : fixUrlStructure(themeAbs, muAbs, P.muPath, P.themePath, urls.renames || []);
     job.urlRenames = urlFix.renamed || [];
     record("Location + URL structure", urlFix, "url-structure");
-    const linkFix = fixInternalLinks(themeAbs, P.themePath, job.prFindings, muPages);
+    // Where a 301 is written is the only part of the link fix that differs
+    // between the models: a PHP map on one, resources/redirections.json on the other.
+    const linkFix = fixInternalLinks(themeAbs, P.themePath, job.prFindings, muPages,
+      gitops ? ((pairs) => GP.writeRedirects(tmp, pairs)) : null);
     job.linkRedirects = linkFix.redirects || [];
     record("Internal links", linkFix, "internal-links");
-    record("Spelling", fixSpelling(themeAbs, pages, job.prFindings, P.themePath), "spelling");
-    record("CTA on every page", fixCta(themeAbs, pages, job.prFindings, P.themePath), "cta");
+    record("Spelling", fixSpelling(themeAbs, contentPages, job.prFindings, P.themePath), "spelling");
+    record("CTA on every page", fixCta(themeAbs, contentPages, job.prFindings, P.themePath), "cta");
     // Images last of the content fixes: it rewrites src attributes across every
     // template, so it should not race the edits above on the same files.
-    const imgFix = await performPrFixImages(themeAbs, pages, contentName, facts, P.themePath);
+    const imgFix = await performPrFixImages(themeAbs, contentPages, contentName, facts, P.themePath);
     job.imageSwaps = imgFix.swaps || [];
     record("Image naming", imgFix, "image-naming");
     if ((imgFix.changed || []).length) {
@@ -15158,33 +15440,45 @@ async function runPerformPrJob(job) {
         weightTask.detail = imgFix.note || weightTask.detail;
       }
     }
-    record("Favicon", fixFavicon(themeAbs, pages, P.themePath, siteHost), "favicon");
-    record("Social sharing image", fixSocialImage(themeAbs, pages, P.themePath, siteHost));
-    record("Custom 404", fix404(themeAbs, P.themePath, brand));
-    record("Call Now", fixCallNow(themeAbs, P.themePath, facts.phone, brand));
-    record("BLVD button ID", fixBlvd(themeAbs, pages, P.themePath));
-    record("Blog sidebar widget", fixBlogSidebar(themeAbs));
-    record("Blog link colour", fixBlogLinkColor(themeAbs, P.themePath, brand));
-    record("Clickable contact", fixClickable(themeAbs, pages, P.themePath), "clickable-contact");
+    record("Favicon", gitops ? GP.fixFavicon(tmp) : fixFavicon(themeAbs, contentPages, P.themePath, siteHost), "favicon");
+    record("Social sharing image", gitops ? GP.fixSocialImage(tmp, pages) : fixSocialImage(themeAbs, contentPages, P.themePath, siteHost));
+    record("Custom 404", gitops ? fixGitops404(tmp) : fix404(themeAbs, P.themePath, brand));
+    record("Call Now", gitops ? fixGitopsCallNow(tmp, contentPages, chrome, facts.phone) : fixCallNow(themeAbs, P.themePath, facts.phone, brand));
+    record("BLVD button ID", fixBlvd(themeAbs, contentPages, P.themePath));
+    record("Blog sidebar widget", gitops ? fixGitopsBlogSidebar(tmp) : fixBlogSidebar(themeAbs));
+    record("Blog link colour", gitops ? GP.fixBlogLinkColor(tmp, brand, PR_MARK) : fixBlogLinkColor(themeAbs, P.themePath, brand));
+    record("Clickable contact", fixClickable(themeAbs, contentPages, P.themePath), "clickable-contact");
     // Now — and only now — each finding learns what actually happened to it.
     // Kept on the job so the phase-4 findings (links, PageSpeed) get resolved
     // the same way when the report is written.
     job.prFixedTasks = [...fixedTasks];
-    resolveFindingOutcomes(job.prFindings, fixedTasks);
+    // Kept on the job for the same reason as prFixedTasks: the report re-resolves
+    // outcomes when it renders, including a re-render months later.
+    job.prNotHere = gitops ? ["image-naming", "image-format", "image-weight"] : [];
+    resolveFindingOutcomes(job.prFindings, fixedTasks, new Set(job.prNotHere));
     job.prChanged = [...new Set(job.prChanged)];
     job.editPlan = job.prChanged.map((p2) => ({ path: p2, op: "modify" }));
     jobStep(job, 6, "done", job.prChanged.length ? `${job.prChanged.length} file(s) changed` : "nothing to change");
 
     // ---- phase 3 -------------------------------------------------------------
     jobStep(job, 7, "running", "Checking the diff...");
-    const marker = path.join(themeAbs, "g99-perform-pr-marker.txt");
-    fs.writeFileSync(marker, job.draftId + "\n");
+    // The marker is how a PHP theme proves which build the live site is serving.
+    // A GitOps tree is schema- and referentially validated before it is applied,
+    // so an unrecognised file under resources/ would not prove anything — it would
+    // fail the deployment and roll it back. Model B has a better signal anyway:
+    // the control plugin reports the exact commit it deployed. See below.
+    if (!gitops) fs.writeFileSync(path.join(themeAbs, "g99-perform-pr-marker.txt"), job.draftId + "\n");
     const paths = `"${P.themePath}"`;
     await run(`git add -A -- ${paths}`, tmp);
     const whitespace = await run(`git diff --cached --check -- ${paths}`, tmp);
     if (whitespace.code) throw new Error("fixes failed git diff check: " + String(whitespace.stdout || whitespace.stderr).slice(-200));
     const stat = await run(`git --no-pager diff --cached --stat -- ${paths}`, tmp);
-    jobStep(job, 7, "done", String(stat.stdout || "").trim().split("\n").slice(-1)[0] || "marker only");
+    // Without a marker the index can be genuinely empty, and `git commit` fails on
+    // one. A run that found nothing to fix is a good outcome, not a failure: it
+    // publishes its audit and opens no pull request.
+    const staged = await run(`git diff --cached --name-only -- ${paths}`, tmp);
+    const nothingStaged = !String(staged.stdout || "").trim();
+    jobStep(job, 7, "done", String(stat.stdout || "").trim().split("\n").slice(-1)[0] || (gitops ? "nothing to change" : "marker only"));
 
     // ---- dry run stops here ---------------------------------------------------
     // Everything above happened in a temp checkout that is about to be deleted, so
@@ -15192,8 +15486,10 @@ async function runPerformPrJob(job) {
     // it measures the site as it stands today, which is exactly the number someone
     // asking for a dry run wants to see. The live link check does not - it can only
     // describe a build that was never deployed.
-    if (P.dryRun) {
-      for (const i of [8, 9, 10]) jobStep(job, i, "done", "skipped - dry run, nothing pushed");
+    const auditOnly = P.dryRun || nothingStaged;
+    const auditWhy = P.dryRun ? "dry run, nothing pushed" : "nothing to change - no pull request needed";
+    if (auditOnly) {
+      for (const i of [8, 9, 10]) jobStep(job, i, "done", "skipped - " + auditWhy);
       jobStep(job, 11, "running", "Running PageSpeed on the current site...");
       const dryPsi = [await pageSpeedRun(P.liveUrl, "mobile"), await pageSpeedRun(P.liveUrl, "desktop")];
       job.pageSpeed = dryPsi;
@@ -15202,7 +15498,7 @@ async function runPerformPrJob(job) {
       task("PageSpeed", dryPsiF.length ? "fail" : "pass", dryPsi.map(dryLine).join(" | "), dryPsiF);
       // The PageSpeed findings arrive after phase 2 resolved everyone else's, so
       // they need the same treatment or they reach the report with no outcome.
-      resolveFindingOutcomes(dryPsiF, new Set(job.prFixedTasks || []));
+      resolveFindingOutcomes(dryPsiF, new Set(job.prFixedTasks || []), new Set(job.prNotHere || []));
       jobStep(job, 11, "done", dryLine(dryPsi[0]));
 
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -15210,10 +15506,14 @@ async function runPerformPrJob(job) {
       job.finishedAt = new Date().toISOString();
       job.reportUrl = writePerformPrReport(job);
       await postChecklistToTed(job);
-      jobStep(job, 12, "done", `${job.prFindings.length} finding(s) - ${job.prChanged.length} file(s) would change`);
+      jobStep(job, 12, "done", `${job.prFindings.length} finding(s) - ${job.prChanged.length} file(s) ${P.dryRun ? "would change" : "changed"}`);
       job.status = "done";
-      notify(`Pre-release dry run finished for *${job.businessName}*: ${job.prFindings.length} finding(s), ${job.prChanged.length} file(s) would change - nothing pushed`);
-      await postPerformPrToTed(job, "Dry run - the repository was not touched and no pull request was opened.");
+      notify(P.dryRun
+        ? `Pre-release dry run finished for *${job.businessName}*: ${job.prFindings.length} finding(s), ${job.prChanged.length} file(s) would change - nothing pushed`
+        : `Pre-release finished for *${job.businessName}*: ${job.prFindings.length} finding(s), nothing to change - no pull request opened`);
+      await postPerformPrToTed(job, P.dryRun
+        ? "Dry run - the repository was not touched and no pull request was opened."
+        : "Every fix this run owns was already in place, so there was nothing to commit and no pull request was opened. The findings above still need a human.");
       return;
     }
 
@@ -15265,7 +15565,13 @@ async function runPerformPrJob(job) {
         // since before Perform PR existed — retrying is pointless and throwing
         // buries the reason. Stop cleanly, leave the PR open, say which check.
         const failing = (st.checks || []).filter((c) => c.status === "fail");
-        const repairable = failing.filter((c) => /^build/i.test(c.name));
+        // On a GitOps site nothing is repairable here. The auto-fixer reads a
+        // build log and rewrites theme files; a red check on this model means the
+        // deployment validated the resource tree and rejected it, which is a
+        // content problem — and letting the fixer write into Elementor JSON to
+        // chase a green tick is how a page gets wrecked. Same rule the revision
+        // pipeline already follows.
+        const repairable = gitops ? [] : failing.filter((c) => /^build/i.test(c.name));
         if (!repairable.length) {
           job.ciBlockedBy = failing.map((c) => c.name).join(", ") || "an unknown check";
           jobStep(job, 9, "error", `${job.ciBlockedBy} failing — not a build check the auto-fixer can repair. PR left open.`);
@@ -15311,7 +15617,17 @@ async function runPerformPrJob(job) {
 
     // ---- phase 4 -------------------------------------------------------------
     jobStep(job, 10, "running", `Waiting for release ${job.draftId} to deploy...`);
-    await waitForPerformPrDeployment(P.liveUrl, P.themeSlug, job.draftId);
+    if (gitops) {
+      // Which commit landed on main, so the site can be asked about that one
+      // rather than about whatever it happens to be serving now.
+      const v = await run(`gh pr view "${job.prUrl}" --json mergeCommit -q .mergeCommit.oid`);
+      const sha = String(v.stdout || "").trim();
+      jobStep(job, 10, "running", `Waiting for ${sha.slice(0, 8) || "the merge commit"} to reconcile into WordPress...`);
+      const dep = await waitForGitopsDeployment(P.liveUrl, sha);
+      job.deployedSha = dep.sha;
+    } else {
+      await waitForPerformPrDeployment(P.liveUrl, P.themeSlug, job.draftId);
+    }
     const settle = Math.max(0, Number(process.env.PR_DEPLOY_WAIT_MS || 5000) || 5000);
     if (settle) await sleep(settle);
     jobStep(job, 10, "running", "Checking links on the deployed site...");
@@ -15765,8 +16081,8 @@ const server = http.createServer(async (req, res) => {
           });
         }
         site = loose[0];
-        if (!site.githubRepo) return json(res, 409, { error: site.businessName + " has no repository set in NocoDB" });
-        if (!site.liveUrl) return json(res, 409, { error: site.businessName + " has no Domain set in NocoDB" });
+        if (!site.githubRepo) return json(res, 409, { error: site.businessName + " has no repository set" });
+        if (!site.liveUrl) return json(res, 409, { error: site.businessName + " has no domain set" });
       }
       console.log(`pre-release: ${site.businessName} resolved from ${site.resolvedFrom === "ted" ? "TED client " + site.tedClientId : "the site list"} — ${site.githubRepo} / ${site.liveUrl}`);
       let target; try { target = await resolveEditTarget(site); } catch (e) { return json(res, 409, { error: e.message }); }
@@ -16482,7 +16798,7 @@ const server = http.createServer(async (req, res) => {
       if (!base && body.siteId) {
         const site = await findWebsite(body.siteId);
         if (!site) return json(res, 404, { error: "unknown site — refresh the list" });
-        if (!site.liveUrl) return json(res, 400, { error: "This website has no Domain set in NocoDB — nothing to audit." });
+        if (!site.liveUrl) return json(res, 400, { error: "This website has no domain set — nothing to audit." });
         base = site.liveUrl;
         if (!slugs) {
           // derive the page list from the newest enrich run for this site
@@ -16988,8 +17304,8 @@ const server = http.createServer(async (req, res) => {
       if (!BROWSERLESS_TOKEN) return json(res, 409, { error: "BROWSERLESS_TOKEN is not configured - add it to .env and restart the server" });
       const site = await findWebsite(siteId);
       if (!site) return json(res, 404, { error: "unknown siteId - refresh the site list" });
-      if (!site.githubRepo) return json(res, 409, { error: site.businessName + " has no repository set in NocoDB" });
-      if (!site.liveUrl) return json(res, 409, { error: site.businessName + " has no Domain set in NocoDB" });
+      if (!site.githubRepo) return json(res, 409, { error: site.businessName + " has no repository set" });
+      if (!site.liveUrl) return json(res, 409, { error: site.businessName + " has no domain set" });
       let target;
       try { target = await resolveEditTarget(site); }
       catch (e) { return json(res, 409, { error: e.message }); }
@@ -17014,8 +17330,8 @@ const server = http.createServer(async (req, res) => {
       const { siteId, tedTaskId, dryRun } = JSON.parse(await readBody(req) || "{}");
       const site = await findWebsite(siteId);
       if (!site) return json(res, 404, { error: "unknown siteId - refresh the site list" });
-      if (!site.githubRepo) return json(res, 409, { error: site.businessName + " has no repository set in NocoDB" });
-      if (!site.liveUrl) return json(res, 409, { error: site.businessName + " has no Domain set in NocoDB" });
+      if (!site.githubRepo) return json(res, 409, { error: site.businessName + " has no repository set" });
+      if (!site.liveUrl) return json(res, 409, { error: site.businessName + " has no domain set" });
       let target;
       try { target = await resolveEditTarget(site); }
       catch (e) { return json(res, 409, { error: e.message }); }
@@ -18217,4 +18533,6 @@ module.exports = {
   editReportHtml, writeEditReport, genericJobReportHtml, writeGenericJobReport,
   detectAttachmentKind, unzipEntry, extractDocxText, extractPdfText, isLegacyOfficeFile,
   PRE_RELEASE_CHECKLIST, checklistVerdict, checklistItemReport,
+  srcRead, srcWrite, findingsGitopsFavicon, fixGitops404, fixGitopsCallNow, fixGitopsBlogSidebar,
+  waitForGitopsDeployment,
 };

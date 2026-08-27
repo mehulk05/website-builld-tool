@@ -1,0 +1,40 @@
+{
+  "_comment": [
+    "Websites named by hand, ahead of any directory. This is the FIRST source the",
+    "tool consults and it WINS: a manual entry is a deliberate human decision and",
+    "is never overridden by TED or NocoDB. Delete an entry once TED carries the",
+    "same repository and the normal flow takes over with no code change.",
+    "",
+    "businessName is also the TED join key — it is normalised (lowercased,",
+    "bracketed suffixes dropped) and matched against TED client names, which is",
+    "how a run finds the client's revision-cycle and pre-release tasks.",
+    "",
+    "siteId must be stable: approvals.json, job dedupe and review links key off it."
+  ],
+  "sites": [
+    {
+      "siteId": "man-mcptest2",
+      "businessName": "NUVO Aesthetics Clinic",
+      "githubRepo": "G99agency/mcptest2.gogroth.com",
+      "liveUrl": "https://mcptest2.gogroth.com/",
+      "existingSiteUrl": "https://nuvoaestheticsclinic.com/",
+      "note": "GitOps JSON (Model B) pilot. Named to match TED client 1397 'NUVO Aesthetics Clinic (clone)', so revisions post to task 9077 and pre-release to 9080."
+    },
+    {
+      "siteId": "man-prodteam",
+      "businessName": "Prodteam Beta",
+      "githubRepo": "G99agency/prodteam.gogroth.com",
+      "liveUrl": "https://prodteam.gogroth.com/",
+      "existingSiteUrl": "",
+      "note": "PHP theme (Model A), ten client themes, currently serving g99-white-coat-aesthetics-llc. Deliberately NOT named after a TED client: it is shared infrastructure, not one client's site."
+    },
+    {
+      "siteId": "man-nuvoaestheticsclinic",
+      "businessName": "NUVO Aesthetics Clinic v2",
+      "githubRepo": "G99agency/nuvoaestheticsclinic.gogroth.com",
+      "liveUrl": "https://nuvoaestheticsclinic.gogroth.com/",
+      "existingSiteUrl": "",
+      "note": "What TED client 1534 points at. Checked 2026-08-27: the repo has neither web/app/themes nor resources/site.json, so an edit will refuse until something is built there."
+    }
+  ]
+}
