@@ -7,7 +7,8 @@
   "w": 950,
   "h": 1066,
   "alt": "Dermal Filler By Enchanted Medical Aesthetics",
-  "bytes": 64384
+  "bytes": 64384,
+  "hasText": false
  },
  {
   "file": "providers/cassisaesthetics__Owner-768x1151.webp",
@@ -17,7 +18,9 @@
   "w": 683,
   "h": 1023,
   "alt": "",
-  "bytes": 20416
+  "bytes": 20416,
+  "hasText": true,
+  "qcNote": "FIGS logo on pocket"
  },
  {
   "file": "services/cassisaesthetics__creams-683x1024.webp",
@@ -27,7 +30,8 @@
   "w": 605,
   "h": 907,
   "alt": "",
-  "bytes": 38132
+  "bytes": 38132,
+  "hasText": false
  },
  {
   "file": "providers/cassisaesthetics__Cassis-683x1024.webp",
@@ -37,7 +41,8 @@
   "w": 600,
   "h": 899,
   "alt": "",
-  "bytes": 23098
+  "bytes": 23098,
+  "hasText": false
  },
  {
   "file": "services/ruma__Ruma-Medical-E2-80-8B-Our-Specialties.webp",
@@ -47,7 +52,9 @@
   "w": 678,
   "h": 896,
   "alt": "Medical Assistant",
-  "bytes": 83150
+  "bytes": 83150,
+  "hasText": true,
+  "qcNote": "vertical text watermark"
  },
  {
   "file": "hero/ruma__Ruma-Medical-E2-80-8B-Hero-Space-Image.webp",
@@ -57,7 +64,9 @@
   "w": 648,
   "h": 627,
   "alt": "Ruma medical aesthetics",
-  "bytes": 61378
+  "bytes": 61378,
+  "hasText": true,
+  "qcNote": "CUTTING-EDGE TREATMENTS"
  },
  {
   "file": "hero/kdsmile__bigstock-modern-dental-cabinet-in-white-457981845-1-zuqopwy-.jpg",
@@ -67,7 +76,8 @@
   "w": 3360,
   "h": 2240,
   "alt": " Koski Depaul Dental Group Office image ",
-  "bytes": 352805
+  "bytes": 352805,
+  "hasText": false
  },
  {
   "file": "providers/kdsmile__iwkqtfyvgzrfzac2ma9a1oie0a54wsf6fq-migrated.jpg",
@@ -77,7 +87,9 @@
   "w": 2024,
   "h": 2048,
   "alt": "image of the doctor Kyle  Koski, DMD",
-  "bytes": 933240
+  "bytes": 933240,
+  "hasText": true,
+  "qcNote": "Cherokee brand logo on sleeve"
  },
  {
   "file": "hero/kdsmile__8caaf6-45a24f9a325242dcb4f59e4c18ac8402-mv2-asdyhlj-migrated.webp",
@@ -87,7 +99,8 @@
   "w": 1899,
   "h": 893,
   "alt": "This is Banner image of Koski Depaul Dental Group",
-  "bytes": 124832
+  "bytes": 124832,
+  "hasText": false
  },
  {
   "file": "providers/kdsmile__Kaleigh-Koski-Web-Pic.jpg",
@@ -97,7 +110,8 @@
   "w": 1011,
   "h": 1154,
   "alt": "image of the doctor Kyle  Koski, DMD",
-  "bytes": 81943
+  "bytes": 81943,
+  "hasText": false
  },
  {
   "file": "services/whitecoataesthetics__Microneedling-Service.jpg",
@@ -107,7 +121,9 @@
   "w": 1366,
   "h": 1821,
   "alt": "Microneedling Treatment at White Coat Aesthetics in Las Vegas, NV",
-  "bytes": 265349
+  "bytes": 265349,
+  "hasText": true,
+  "qcNote": "numbers on microneedling device"
  },
  {
   "file": "services/whitecoataesthetics__dermalfillers-whitecoataesthetics.png",
@@ -117,7 +133,8 @@
   "w": 1029,
   "h": 691,
   "alt": "Dermal Fillers going on at White Coat Aesthetics in Las Vegas, NV",
-  "bytes": 724844
+  "bytes": 724844,
+  "hasText": false
  },
  {
   "file": "providers/whitecoataesthetics__image-21.png",
@@ -127,7 +144,8 @@
   "w": 958,
   "h": 684,
   "alt": "Two ladies holding package from White Coat Aesthetics | Medspa in Las Vegas, NV",
-  "bytes": 875187
+  "bytes": 875187,
+  "hasText": false
  },
  {
   "file": "providers/whitecoataesthetics__image-20.png",
@@ -137,7 +155,9 @@
   "w": 986,
   "h": 608,
   "alt": "Staff of White Coat Aesthetics | Medspa in Las Vegas, NV",
-  "bytes": 775303
+  "bytes": 775303,
+  "hasText": true,
+  "qcNote": "White Coat Aesthetics logo"
  },
  {
   "file": "services/wwaesthetics__TempSure-C2-AE-Image-in-Mount-Juliet-TN.webp",
@@ -147,7 +167,9 @@
   "w": 1366,
   "h": 2049,
   "alt": "TempSure® Image in Mount Juliet, TN",
-  "bytes": 96184
+  "bytes": 96184,
+  "hasText": true,
+  "qcNote": "laser aperture warning label"
  },
  {
   "file": "services/wwaesthetics__Hydradermabrasion-A-in-Mount-Juliet-TN-scaled.webp",
@@ -157,7 +179,9 @@
   "w": 1366,
   "h": 2048,
   "alt": "Hydradermabrasion A in Mount Juliet, TN",
-  "bytes": 74362
+  "bytes": 74362,
+  "hasText": true,
+  "qcNote": "logo on scrub top"
  },
  {
   "file": "providers/wwaesthetics__Meet-Our-Team-of-Experts-West-Wilson-Aesthetics-in-Mount-Jul.webp",
@@ -167,7 +191,8 @@
   "w": 1366,
   "h": 910,
   "alt": "Meet Our Team of Experts West Wilson Aesthetics in Mount Juliet, TN",
-  "bytes": 45808
+  "bytes": 45808,
+  "hasText": false
  },
  {
   "file": "services/wwaesthetics__780127549-18125225374772681-7500598818298942863-nfull.webp",
@@ -177,7 +202,9 @@
   "w": 640,
   "h": 1138,
   "alt": "This is your sign to shop our different medical-grade skincare lines at West Wilson Aesthetics! Stop by & one of our team members will find exactly what works for you!",
-  "bytes": 24650
+  "bytes": 24650,
+  "hasText": true,
+  "qcNote": "the art of the girl grip"
  },
  {
   "file": "services/wwaesthetics__780157982-18125213011772681-9038350308440197371-nfull.webp",
@@ -187,7 +214,9 @@
   "w": 640,
   "h": 1138,
   "alt": "Why are so many people loving XERF? ✨\n• It helps tighten and firm the skin without surgery.\n• There are no needles involved.\n• Downtime is minimal, so you can get back to your day.\n• It helps smooth the appearance of fine lines and skin laxity.\nReady to experience XERF for yourself? Book your consultation with West Wilson Aesthetics today. 🤍",
-  "bytes": 74688
+  "bytes": 74688,
+  "hasText": true,
+  "qcNote": "text overlay about XERF"
  },
  {
   "file": "services/timelessbeautybarwellness__AquaPorin-Hydrating-Cream-Blythewood-Esthetics-Wellness.webp",
@@ -197,7 +226,8 @@
   "w": 1366,
   "h": 1366,
   "alt": "",
-  "bytes": 73014
+  "bytes": 73014,
+  "hasText": false
  },
  {
   "file": "services/timelessbeautybarwellness__Cleansing-Gel-with-Salicylic-Acid-Blythewood-Esthetics-Welln.webp",
@@ -207,7 +237,8 @@
   "w": 1366,
   "h": 1366,
   "alt": "",
-  "bytes": 43604
+  "bytes": 43604,
+  "hasText": false
  },
  {
   "file": "services/timelessbeautybarwellness__Cleansing-Gel-with-Mandelic-Acid-Blythewood-Esthetics-Wellne.webp",
@@ -217,7 +248,8 @@
   "w": 1366,
   "h": 1366,
   "alt": "",
-  "bytes": 220876
+  "bytes": 220876,
+  "hasText": false
  },
  {
   "file": "services/timelessbeautybarwellness__Vitamin-Veil-Cleanser-Blythewood-Esthetics-Wellness.webp",
@@ -227,7 +259,8 @@
   "w": 1366,
   "h": 1366,
   "alt": "",
-  "bytes": 54230
+  "bytes": 54230,
+  "hasText": false
  },
  {
   "file": "hero/therefreshroom__5C5A0505.jpg",
@@ -237,7 +270,8 @@
   "w": 540,
   "h": 360,
   "alt": "",
-  "bytes": 41340
+  "bytes": 41340,
+  "hasText": false
  },
  {
   "file": "hero/agerejuvenation__menopause-treatment-hero-tampa-fl.webp",
@@ -247,7 +281,8 @@
   "w": 1536,
   "h": 1025,
   "alt": "Women’s health clinic care in Tampa",
-  "bytes": 83778
+  "bytes": 83778,
+  "hasText": false
  },
  {
   "file": "services/agerejuvenation__medical-weight-loss-hero-tampa-fl.webp",
@@ -257,7 +292,8 @@
   "w": 1536,
   "h": 1024,
   "alt": "Physician-supervised weight loss service in Tampa",
-  "bytes": 83902
+  "bytes": 83902,
+  "hasText": false
  },
  {
   "file": "services/agerejuvenation__medical-spa-hero-tampa-fl.webp",
@@ -267,7 +303,8 @@
   "w": 1536,
   "h": 1024,
   "alt": "Medical spa aesthetic treatments in Tampa",
-  "bytes": 80660
+  "bytes": 80660,
+  "hasText": false
  },
  {
   "file": "services/agerejuvenation__iv-therapy-hero-tampa-fl.webp",
@@ -277,7 +314,8 @@
   "w": 1536,
   "h": 1024,
   "alt": "IV, longevity, and recovery therapies at our Tampa wellness center",
-  "bytes": 68130
+  "bytes": 68130,
+  "hasText": false
  },
  {
   "file": "providers/vibeaestheticsmedspa__About-us-team-image-1536x1001.webp",
@@ -287,7 +325,8 @@
   "w": 1366,
   "h": 890,
   "alt": "",
-  "bytes": 74328
+  "bytes": 74328,
+  "hasText": false
  },
  {
   "file": "hero/secretsaesthetics__Secrets-Aesthetics.webp",
@@ -297,7 +336,8 @@
   "w": 1366,
   "h": 1821,
   "alt": "Secrets Aesthetics",
-  "bytes": 274944
+  "bytes": 274944,
+  "hasText": false
  },
  {
   "file": "services/skinflectionspa__Untitled-design-4-1-scaled.jpg",
@@ -307,7 +347,8 @@
   "w": 2560,
   "h": 2286,
   "alt": "",
-  "bytes": 906284
+  "bytes": 906284,
+  "hasText": false
  },
  {
   "file": "services/skinflectionspa__Untitled-design-2-1-scaled.jpg",
@@ -317,7 +358,8 @@
   "w": 2560,
   "h": 2069,
   "alt": "",
-  "bytes": 420815
+  "bytes": 420815,
+  "hasText": false
  },
  {
   "file": "services/skinflectionspa__HSF-37-M8FTreatment1-1.jpg",
@@ -327,7 +369,9 @@
   "w": 1439,
   "h": 1028,
   "alt": "",
-  "bytes": 186010
+  "bytes": 186010,
+  "hasText": true,
+  "qcNote": "Sheena name tag and logo"
  },
  {
   "file": "services/skinflectionspa__Screenshot-2025-11-19-at-2-19-21-PM-1.jpg",
@@ -337,7 +381,8 @@
   "w": 1152,
   "h": 913,
   "alt": "",
-  "bytes": 258237
+  "bytes": 258237,
+  "hasText": false
  },
  {
   "file": "hero/skinflectionspa__01562-1.jpg",
@@ -347,7 +392,9 @@
   "w": 1200,
   "h": 857,
   "alt": "",
-  "bytes": 171095
+  "bytes": 171095,
+  "hasText": true,
+  "qcNote": "wellness lounge text on glass"
  },
  {
   "file": "services/skinflectionspa__Screenshot-2025-11-19-at-2-20-05-PM.jpg",
@@ -357,7 +404,8 @@
   "w": 1162,
   "h": 881,
   "alt": "",
-  "bytes": 202361
+  "bytes": 202361,
+  "hasText": false
  },
  {
   "file": "providers/prettypleaseaesthetics__772964707-18351635101222975-6406250707581561533-nfull.webp",
@@ -367,7 +415,8 @@
   "w": 640,
   "h": 1134,
   "alt": "Algorithm, do your thing 😀",
-  "bytes": 30574
+  "bytes": 30574,
+  "hasText": false
  },
  {
   "file": "hero/sageandsilence__Tranquil-lake-sunset-meditation-stillness-water-reflection-c.png",
@@ -377,7 +426,8 @@
   "w": 1166,
   "h": 352,
   "alt": "Tranquil-lake-sunset-meditation-stillness-water-reflection-calmness..png",
-  "bytes": 630982
+  "bytes": 630982,
+  "hasText": false
  },
  {
   "file": "hero/ericksondermatology__Erickson-Cosmetic-Dermatology-and-Lifestyle-Medicine-office-.jpg",
@@ -387,7 +437,9 @@
   "w": 1502,
   "h": 999,
   "alt": "Erickson Cosmetic Dermatology and Lifestyle Medicine office photo indoors",
-  "bytes": 73516
+  "bytes": 73516,
+  "hasText": true,
+  "qcNote": "Erickson Cosmetic Dermatology logo"
  },
  {
   "file": "hero/ericksondermatology__office-photo-6.jpg",
@@ -397,7 +449,8 @@
   "w": 1000,
   "h": 667,
   "alt": "Erickson Cosmetic Dermatology & Lifestyle Medicine office photo",
-  "bytes": 37970
+  "bytes": 37970,
+  "hasText": false
  },
  {
   "file": "hero/ericksondermatology__office-photo3.jpg",
@@ -407,7 +460,8 @@
   "w": 1000,
   "h": 667,
   "alt": "Erickson Cosmetic Dermatology & Lifestyle Medicine office photo",
-  "bytes": 42408
+  "bytes": 42408,
+  "hasText": false
  },
  {
   "file": "services/ruma__Skin-Health-about-section.webp",
@@ -417,7 +471,8 @@
   "w": 1365,
   "h": 2048,
   "alt": "Aesthetic treatment",
-  "bytes": 92480
+  "bytes": 92480,
+  "hasText": false
  },
  {
   "file": "providers/ruma__SHELBY-HEADSHOT.webp",
@@ -427,7 +482,9 @@
   "w": 1365,
   "h": 2048,
   "alt": "Alastin | Medical Aesthetics & Wellness In Lehi, UT | RUMA Medical",
-  "bytes": 79746
+  "bytes": 79746,
+  "hasText": true,
+  "qcNote": "clothing brand logo"
  },
  {
   "file": "services/ruma__Aesthetic-injectables-aboutsection.webp",
@@ -437,7 +494,9 @@
   "w": 1080,
   "h": 1350,
   "alt": "Aesthetic injectables",
-  "bytes": 132904
+  "bytes": 132904,
+  "hasText": true,
+  "qcNote": "text on syringe barrel"
  },
  {
   "file": "hero/ruma__intimate-wellness-section.webp",
@@ -447,7 +506,8 @@
   "w": 768,
   "h": 1076,
   "alt": "Sexual health",
-  "bytes": 33616
+  "bytes": 33616,
+  "hasText": false
  },
  {
   "file": "services/ruma__Functional-wellness-683x1024.webp",
@@ -457,7 +517,9 @@
   "w": 683,
   "h": 1024,
   "alt": "Functional wellness",
-  "bytes": 34440
+  "bytes": 34440,
+  "hasText": true,
+  "qcNote": "RUMA aesthetics logo"
  },
  {
   "file": "hero/ruma__ruma-about-us-section.webp",
@@ -467,7 +529,9 @@
   "w": 537,
   "h": 698,
   "alt": "ruma medical",
-  "bytes": 45744
+  "bytes": 45744,
+  "hasText": true,
+  "qcNote": "REFINEMENT OVER AUGMENTATION"
  },
  {
   "file": "providers/whitecoataesthetics__Amanda-Ralph-scaled.jpg",
@@ -477,7 +541,9 @@
   "w": 1707,
   "h": 2560,
   "alt": "Amanda Ralph, Owner, Medical Director | White Coat Aesthetics in Las Vegas, NV",
-  "bytes": 437027
+  "bytes": 437027,
+  "hasText": true,
+  "qcNote": "White Coat Aesthetics logo"
  },
  {
   "file": "providers/whitecoataesthetics__MeiMei-Valenzuela-1-scaled.jpg",
@@ -487,7 +553,9 @@
   "w": 1707,
   "h": 2560,
   "alt": "Meimei Valenzuela, Marketing Manager | White Coat Aesthetics in Las Vegas, NV",
-  "bytes": 382339
+  "bytes": 382339,
+  "hasText": true,
+  "qcNote": "Apple logo on laptop"
  },
  {
   "file": "providers/whitecoataesthetics__Meimei-Valenzuela-scaled.jpg",
@@ -497,7 +565,8 @@
   "w": 1707,
   "h": 2560,
   "alt": "Meimei Valenzuela, Marketing Manager | White Coat Aesthetics in Las Vegas, NV",
-  "bytes": 343717
+  "bytes": 343717,
+  "hasText": false
  },
  {
   "file": "providers/whitecoataesthetics__Lauren-Banks-scaled.jpg",
@@ -507,7 +576,8 @@
   "w": 1707,
   "h": 2560,
   "alt": "Lauren Banks, Front Desk Manager | White Coat Aesthetics in Las Vegas, NV",
-  "bytes": 285689
+  "bytes": 285689,
+  "hasText": false
  },
  {
   "file": "providers/azureplasticsurgery__Rachel-Bowles-DSC8366-3-1536x1290.jpg",
@@ -517,7 +587,9 @@
   "w": 1366,
   "h": 1147,
   "alt": "Rachel Bowles aesthetician / aesthetic coordinator at Azure Plastic Surgery & Med Spa",
-  "bytes": 177220
+  "bytes": 177220,
+  "hasText": true,
+  "qcNote": "Azure Plastic Surgery logo"
  },
  {
   "file": "providers/azureplasticsurgery__Shelby-Horton-DSC8406-1-3-1-1536x1281.jpg",
@@ -527,7 +599,9 @@
   "w": 1366,
   "h": 1139,
   "alt": "Shelby Horton, RN, BSN Nurse injector at Azure Plastic Surgery & Med Spa",
-  "bytes": 196591
+  "bytes": 196591,
+  "hasText": true,
+  "qcNote": "brand logo and Figs label"
  },
  {
   "file": "providers/azureplasticsurgery__Emily-Jones--DSC8345-3-1536x1180.jpg",
@@ -537,7 +611,8 @@
   "w": 1366,
   "h": 1049,
   "alt": "Emily Jones medical assistant/aesthetician at Azure Plastic Surgery & Med Spa",
-  "bytes": 168232
+  "bytes": 168232,
+  "hasText": false
  },
  {
   "file": "hero/prettypleaseaesthetics__About-section-staff-at-pretty-please-aesthetics-1536x1024-1.webp",
@@ -547,7 +622,8 @@
   "w": 1366,
   "h": 910,
   "alt": "About-section-staff-at-pretty-please-aesthetics",
-  "bytes": 49486
+  "bytes": 49486,
+  "hasText": false
  },
  {
   "file": "services/ericksondermatology__Dermal-Fillers-Before-and-After-Photo-by-Dr--Erickson-in-Chi.png",
@@ -557,7 +633,9 @@
   "w": 1528,
   "h": 1192,
   "alt": "Dermal Fillers Before and After Photo by Dr. Erickson in Chicago, IL",
-  "bytes": 77774
+  "bytes": 77774,
+  "hasText": true,
+  "qcNote": "faint watermark at top center"
  },
  {
   "file": "services/ericksondermatology__Botox-Before-and-After-Photo-by-Dr--Erickson-in-Chicago-IL.png",
@@ -567,7 +645,9 @@
   "w": 1200,
   "h": 896,
   "alt": "Botox Before and After Photo by Dr. Erickson in Chicago, IL",
-  "bytes": 41590
+  "bytes": 41590,
+  "hasText": true,
+  "qcNote": "Erickson Cosmetic Dermatology logo"
  },
  {
   "file": "services/ericksondermatology__CoolSculpting-Before-and-After-Photo-by-Dr--Erickson-in-Chic.png",
@@ -577,7 +657,9 @@
   "w": 1200,
   "h": 773,
   "alt": "CoolSculpting Before and After Photo by Dr. Erickson in Chicago, IL",
-  "bytes": 29304
+  "bytes": 29304,
+  "hasText": true,
+  "qcNote": "Erickson Cosmetic Dermatology watermark"
  },
  {
   "file": "services/ericksondermatology__Laser-Before-and-After-Photo-by-Dr--Erickson-in-Chicago-IL.png",
@@ -587,7 +669,9 @@
   "w": 1200,
   "h": 718,
   "alt": "Laser Before and After Photo by Dr. Erickson in Chicago, IL",
-  "bytes": 45388
+  "bytes": 45388,
+  "hasText": true,
+  "qcNote": "Erickson Cosmetic Dermatology watermark"
  },
  {
   "file": "services/ericksondermatology__EmSculpt-Before-and-After-Photo-by-Dr--Erickson-in-Chicago-I.png",
@@ -597,7 +681,9 @@
   "w": 1200,
   "h": 578,
   "alt": "EmSculpt Before and After Photo by Dr. Erickson in Chicago, IL",
-  "bytes": 21406
+  "bytes": 21406,
+  "hasText": true,
+  "qcNote": "Erickson Cosmetic Dermatology logo"
  },
  {
   "file": "hero/ericksondermatology__dr-erickson-dermatology-office2.jpg",
@@ -607,7 +693,8 @@
   "w": 1000,
   "h": 667,
   "alt": "dr erickson dermatology office",
-  "bytes": 37474
+  "bytes": 37474,
+  "hasText": false
  },
  {
   "file": "providers/agerejuvenation__menopause-hero-tampa-fl.webp",
@@ -617,7 +704,8 @@
   "w": 1536,
   "h": 1024,
   "alt": "",
-  "bytes": 60494
+  "bytes": 60494,
+  "hasText": false
  },
  {
   "file": "providers/agerejuvenation__erectile-dysfunction-treatment-hero-tampa-fl.webp",
@@ -627,7 +715,8 @@
   "w": 1536,
   "h": 1024,
   "alt": "",
-  "bytes": 61738
+  "bytes": 61738,
+  "hasText": false
  },
  {
   "file": "providers/agerejuvenation__gut-inflammation-hero-tampa-fl.webp",
@@ -637,7 +726,8 @@
   "w": 1536,
   "h": 1024,
   "alt": "",
-  "bytes": 71676
+  "bytes": 71676,
+  "hasText": false
  },
  {
   "file": "providers/agerejuvenation__glutathione-injections-hero-tampa-fl.webp",
@@ -647,7 +737,8 @@
   "w": 1536,
   "h": 1024,
   "alt": "",
-  "bytes": 74490
+  "bytes": 74490,
+  "hasText": false
  },
  {
   "file": "hero/agerejuvenation__tirzepatide-hero-tampa-fl.webp",
@@ -657,7 +748,8 @@
   "w": 1536,
   "h": 1024,
   "alt": "",
-  "bytes": 113556
+  "bytes": 113556,
+  "hasText": false
  },
  {
   "file": "hero/agerejuvenation__vitamin-injections-hero-tampa-fl.webp",
@@ -667,7 +759,8 @@
   "w": 1536,
   "h": 1024,
   "alt": "",
-  "bytes": 103904
+  "bytes": 103904,
+  "hasText": false
  },
  {
   "file": "services/agerejuvenation__semaglutide-hero-tampa-fl.webp",
@@ -677,7 +770,8 @@
   "w": 1536,
   "h": 1022,
   "alt": "",
-  "bytes": 81528
+  "bytes": 81528,
+  "hasText": false
  },
  {
   "file": "providers/agerejuvenation__weight-gain-hero-tampa-fl.webp",
@@ -687,7 +781,8 @@
   "w": 1536,
   "h": 975,
   "alt": "",
-  "bytes": 82342
+  "bytes": 82342,
+  "hasText": false
  },
  {
   "file": "hero/agerejuvenation__chronic-fatigue-hero-tampa-fl.webp",
@@ -697,7 +792,8 @@
   "w": 1536,
   "h": 864,
   "alt": "",
-  "bytes": 88096
+  "bytes": 88096,
+  "hasText": false
  },
  {
   "file": "hero/agerejuvenation__cagrilintide-hero-tampa-fl.webp",
@@ -707,7 +803,8 @@
   "w": 1536,
   "h": 864,
   "alt": "",
-  "bytes": 52916
+  "bytes": 52916,
+  "hasText": false
  },
  {
   "file": "providers/wwaesthetics__Jamie-Headshot-in-Mount-Juliet-TN.webp",
@@ -717,7 +814,8 @@
   "w": 1366,
   "h": 2049,
   "alt": "",
-  "bytes": 102106
+  "bytes": 102106,
+  "hasText": false
  },
  {
   "file": "providers/wwaesthetics__Meet-our-team-Sophie-Lagueux-MD-in-Mount-Juliet-TN-1638x2048.webp",
@@ -727,7 +825,8 @@
   "w": 1366,
   "h": 1707,
   "alt": "",
-  "bytes": 49148
+  "bytes": 49148,
+  "hasText": false
  },
  {
   "file": "providers/wwaesthetics__Deena-Montgomery-FNP-C-in-Mount-Juliet-TN-1638x2048.webp",
@@ -737,7 +836,8 @@
   "w": 1366,
   "h": 1707,
   "alt": "",
-  "bytes": 55598
+  "bytes": 55598,
+  "hasText": false
  },
  {
   "file": "providers/therefreshroom__076A4947-Enhanced-NR.jpg",
@@ -747,7 +847,8 @@
   "w": 594,
   "h": 892,
   "alt": "",
-  "bytes": 76124
+  "bytes": 76124,
+  "hasText": false
  },
  {
   "file": "providers/therefreshroom__076A4914-Enhanced-NR.jpg",
@@ -757,7 +858,8 @@
   "w": 577,
   "h": 865,
   "alt": "",
-  "bytes": 54106
+  "bytes": 54106,
+  "hasText": false
  },
  {
   "file": "providers/therefreshroom__076A4907-Enhanced-NR.jpg",
@@ -767,7 +869,8 @@
   "w": 594,
   "h": 832,
   "alt": "",
-  "bytes": 52760
+  "bytes": 52760,
+  "hasText": false
  },
  {
   "file": "providers/therefreshroom__076A4884-Enhanced-NR.jpg",
@@ -777,7 +880,9 @@
   "w": 528,
   "h": 739,
   "alt": "",
-  "bytes": 43798
+  "bytes": 43798,
+  "hasText": true,
+  "qcNote": "FIGS logo on pants"
  },
  {
   "file": "providers/secretsaesthetics__SachasProfilePicture-1536x1536.webp",
@@ -787,7 +892,9 @@
   "w": 1366,
   "h": 1366,
   "alt": "",
-  "bytes": 93044
+  "bytes": 93044,
+  "hasText": true,
+  "qcNote": "embroidered name and brand logo"
  },
  {
   "file": "hero/secretsaesthetics__hair-restoration-with-exosomes-secrets-aesthetics-in-orlando.webp",
@@ -797,7 +904,8 @@
   "w": 1366,
   "h": 910,
   "alt": "",
-  "bytes": 48572
+  "bytes": 48572,
+  "hasText": false
  },
  {
   "file": "hero/secretsaesthetics__processed-17E9DE9F-6787-4F94-AD44-EE169B4991FF.webp",
@@ -807,7 +915,8 @@
   "w": 768,
   "h": 1023,
   "alt": "",
-  "bytes": 349806
+  "bytes": 349806,
+  "hasText": false
  },
  {
   "file": "hero/ericksondermatology__dr-erickson-dermatology-office3.jpg",
@@ -817,7 +926,8 @@
   "w": 1000,
   "h": 667,
   "alt": "",
-  "bytes": 42368
+  "bytes": 42368,
+  "hasText": false
  },
  {
   "file": "hero/ericksondermatology__dr-erickson-dermatology-office.jpg",
@@ -827,7 +937,8 @@
   "w": 1000,
   "h": 667,
   "alt": "",
-  "bytes": 50912
+  "bytes": 50912,
+  "hasText": false
  },
  {
   "file": "hero/prettypleaseaesthetics__775243870-916139874880240-29647039871610362-nfull.webp",
@@ -837,7 +948,9 @@
   "w": 640,
   "h": 1136,
   "alt": "",
-  "bytes": 50384
+  "bytes": 50384,
+  "hasText": true,
+  "qcNote": "text overlay about skin care"
  },
  {
   "file": "hero/enchantedmedicalaesthetics__Ormond-Beach.webp",
@@ -847,7 +960,9 @@
   "w": 1200,
   "h": 1500,
   "alt": "",
-  "bytes": 272936
+  "bytes": 272936,
+  "hasText": true,
+  "qcNote": "Book Now! text overlay"
  },
  {
   "file": "hero/enchantedmedicalaesthetics__Deland-Location-Image.webp",
@@ -857,7 +972,9 @@
   "w": 1200,
   "h": 1500,
   "alt": "",
-  "bytes": 102076
+  "bytes": 102076,
+  "hasText": true,
+  "qcNote": "Book Now!"
  },
  {
   "file": "hero/enchantedmedicalaesthetics__About-Us-Enchanted-in-ormond-beach-fl.jpg",
@@ -867,7 +984,8 @@
   "w": 1067,
   "h": 1600,
   "alt": "",
-  "bytes": 94580
+  "bytes": 94580,
+  "hasText": false
  },
  {
   "file": "hero/enchantedmedicalaesthetics__Enchanted-Medical-Aesthetics-in-Palm-Coast.webp",
@@ -877,7 +995,9 @@
   "w": 1122,
   "h": 1402,
   "alt": "",
-  "bytes": 100860
+  "bytes": 100860,
+  "hasText": true,
+  "qcNote": "Book Now! text overlay"
  },
  {
   "file": "hero/enchantedmedicalaesthetics__About-us-1024x819.webp",
@@ -887,7 +1007,9 @@
   "w": 800,
   "h": 639,
   "alt": "",
-  "bytes": 82006
+  "bytes": 82006,
+  "hasText": true,
+  "qcNote": "Best of Florida 2025 badge"
  },
  {
   "file": "hero/agerejuvenation__retatrutide-hero-tampa-fl.webp",
@@ -897,6 +1019,7 @@
   "w": 1536,
   "h": 778,
   "alt": "",
-  "bytes": 88106
+  "bytes": 88106,
+  "hasText": false
  }
 ]

@@ -3,8 +3,8 @@
   "businessId": null,
   "template": "WEBSITE",
   "receivedAt": "2026-08-12T10:23:13.304Z",
-  "betaSiteUrl": "",
-  "betaSiteRepo": "",
+  "betaSiteUrl": "https://nuvoaestheticsclinic.gogroth.com",
+  "betaSiteRepo": "G99agency/nuvoaestheticsclinic.gogroth.com",
   "referenceWebsite": "",
   "existingWebsite": "https://nuvoaestheticsclinic.com",
   "confirmedBrand": null,
@@ -14,6 +14,18 @@
     "services_offered": [
       "Botox",
       "Fillers"
-    ]
+    ],
+    "location": "Sycamore, IL",
+    "phone_for_website": "815-415-0100",
+    "primary_cta": "",
+    "brand_aesthetic": "",
+    "hero_headline": "",
+    "hero_subheadline": "",
+    "why_patients_choose": "",
+    "revenue_services": "",
+    "team_roster": "",
+    "financing_offered": "",
+    "featured_review": "",
+    "seo_keywords": ""
   }
 }

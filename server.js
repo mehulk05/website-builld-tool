@@ -1226,12 +1226,31 @@ function splitPage(html) {
   if (footer) main = main.replace(footer, "");
   return { head: wpRewriteLinks(head), header: wpRewriteLinks(header), footer: wpRewriteLinks(footer), main: wpRewriteLinks(main) };
 }
+// How many distinct photographs a build wants before it stops looking for more.
+// A rich page spends hero + about + 3 cards + a 4-up gallery + contact ≈ 16, so
+// 24 leaves headroom for the sub-pages. Below this we crawl the client's site
+// harder, and only then top up from the curated pool.
+const WEBGEN_POOL_TARGET = Number(process.env.WEBGEN_POOL_TARGET || 24);
+
 // WEBGEN engine — the in-house design engine that replaces Stitch. Composes a
 // structured BrandKit (onboarding + scanned site) and renders the 4 core pages
 // straight into GEN/site/. Shared by runJob AND the manual /api/generate-site route
 // so both entry points use the exact same generator. Output is final (no bind step).
 async function generateWebgenSite({ A = {}, composed = {}, existingUrl = "", pureScrape = false }) {
   const webgen = require("./lib/webgen");
+  // GEN/site is ONE shared directory reused by every build, and nothing ever cleared
+  // it. localizeImages merges into assets/img-map.json rather than replacing it, so
+  // the map accumulated every image of every client ever built on this deployment.
+  // That leaked across clients: compileGitops calls dedupeImages(html, imgMap), whose
+  // "spare" pool is every URL in the map this page is not already using — so a page
+  // with any repeated <img src> had the PREVIOUS client's photograph substituted in.
+  // Builds are sequential and share this directory, so start each one from empty.
+  {
+    const dir = path.join(GEN, "site");
+    try { fs.rmSync(dir, { recursive: true, force: true }); }
+    catch (e) { console.warn("[webgen] could not clear GEN/site:", e.message); }
+    fs.mkdirSync(dir, { recursive: true });
+  }
   const apiKey = (typeof GEMINI_KEYS !== "undefined" && GEMINI_KEYS[0]) || process.env.GEMINI_API_KEY || "";
   const gModel = process.env.GEMINI_MODEL || "gemini-flash-lite-latest";
   // DEFAULT (fast) — onboarding content + browser-free image scrape + Gemini vision relevance.
@@ -1275,6 +1294,21 @@ async function generateWebgenSite({ A = {}, composed = {}, existingUrl = "", pur
   const forced = (process.env.WEBGEN_LAYOUT || "").toLowerCase();
   if (webgen.DESIGN_IDS.includes(forced)) kit.layout = forced;
 
+  // TONE — the four onboarding sliders, finally structural. Until now they only
+  // ever appeared as one line of English inside a Gemini prompt, while the
+  // renderer chose corner radius and spacing by hashing the business name.
+  // deriveTheme turns them into surface treatment, density, accent restraint and
+  // composition; the client's own scraped design language overrides a slider
+  // where the two disagree, because their site is evidence and the slider is an
+  // opinion. Absent sliders default to the midpoint, which is a saner starting
+  // point than the hash it replaces.
+  try {
+    let analysis = null;
+    try { analysis = JSON.parse(fs.readFileSync(path.join(GEN, ".site-analysis.json"), "utf8")); } catch (e) { /* optional */ }
+    kit.tone = require("./lib/webgen/blocks.js").deriveTheme(A, analysis || {});
+    console.log(`[webgen] tone: ${Object.entries(kit.tone).map(([k2, v]) => k2 + "=" + v).join(" ")}`);
+  } catch (e) { console.warn("[webgen] tone derivation skipped:", e.message); }
+
   // Approach B — services & about MIRROR the client's real corresponding page
   // (scraped section flow + copy + images), rendered in the home theme via a
   // blueprint. Home stays as-is (already strong); contact keeps its map/hours
@@ -1308,12 +1342,41 @@ async function generateWebgenSite({ A = {}, composed = {}, existingUrl = "", pur
   // POOL-DEEPEN: the section scrape misses lazy-loaded photos (texture-heavy sites
   // like NUVO leave a thin pool). Crawl home/about/services/team with the lazy-aware
   // multi-page extractor so every slot gets a real photo, not a placeholder.
-  if (existingUrl && imgPool.length < 14) {
+  // The client's OWN photographs are always preferred, so run this crawl far
+  // more eagerly than before. It was gated at <14, which meant a client sitting
+  // on 15 weak images never got the lazy-aware multi-page pass — and scrapeLite
+  // (fetch + regex, no browser) misses lazy-loaded images entirely, which is
+  // most images on a modern WordPress med-spa site. A rich page needs hero +
+  // about + 3 cards + a 4-up gallery + contact ≈ 16 distinct photos, so 24 is
+  // the point past which we genuinely have enough.
+  if (existingUrl && imgPool.length < WEBGEN_POOL_TARGET) {
     try {
       const before = imgPool.length;
       for (const rec of await extractSiteImages(existingUrl, 48)) seedPool(rec.url);
       if (imgPool.length !== before) console.log(`[webgen] image pool deepened via multi-page crawl: ${before} → ${imgPool.length}`);
     } catch (e) { console.warn("[webgen] pool deepen skipped:", e.message); }
+  }
+
+  // STOCK FALLBACK — last resort, and only for what the client's own site could
+  // not cover. image-pool/ holds 90 curated real med-spa photographs and
+  // server.js already serves them at /pool/<file>; nothing had ever called it,
+  // so an image-poor reference site shipped a build with almost no photography
+  // (one observed run: 2 images across all four pages). Every client photo above
+  // still wins — these only fill the remainder.
+  //
+  // Team portraits are deliberately excluded: stock headshots captioned with a
+  // named provider would invent people. Those stay real or render as text cards.
+  const stockUsed = [];
+  if (imgPool.length < WEBGEN_POOL_TARGET) {
+    try {
+      const { stockPick } = require("./lib/webgen/stock.js");
+      const seed = A.business_name || "g99";
+      const need = WEBGEN_POOL_TARGET - imgPool.length;
+      const wide = imgPool.length === 0 ? 2 : 1;   // guarantee a hero-shaped photo
+      for (const im of stockPick("hero", wide, { seed, origin: G99_TOOL_PUBLIC_URL })) { seedPool(im.src); stockUsed.push(im.src); }
+      for (const im of stockPick("services", Math.max(0, need - wide), { seed, origin: G99_TOOL_PUBLIC_URL })) { seedPool(im.src); stockUsed.push(im.src); }
+      if (stockUsed.length) console.log(`[webgen] client site covered ${imgPool.length - stockUsed.length} photo(s) — topped up with ${stockUsed.length} from the curated pool`);
+    } catch (e) { console.warn("[webgen] stock top-up skipped:", e.message); }
   }
 
   // The home hero must never be empty — it is the site's first impression. If the
@@ -1325,7 +1388,12 @@ async function generateWebgenSite({ A = {}, composed = {}, existingUrl = "", pur
     // headshot-looking "Firstname-Lastname" files, only then fall back to pool[0].
     const heroish = (u) => /hero|banner|welcome|main|home|space|interior|lobby|reception|storefront|exterior|clinic-(front|building)|ambien/i.test(u);
     const portraitish = (u) => /[A-Z][a-z]+-[A-Z][a-z]+/.test((u.split("/").pop() || "")) || /headshot|portrait|team|staff|provider/i.test(u);
-    const pickHero = () => imgPool.find(heroish) || imgPool.find((u) => !portraitish(u)) || imgPool[0];
+    // The hero is the most visible place a stock photo can look generic, so the
+    // client's OWN imagery is exhausted at every widening step before the pool
+    // is considered. Ordering already puts client photos first; this states it.
+    const own = imgPool.filter((u) => !stockUsed.includes(u));
+    const pickHero = () => own.find(heroish) || own.find((u) => !portraitish(u)) || own[0]
+      || imgPool.find(heroish) || imgPool.find((u) => !portraitish(u)) || imgPool[0];
     if (!kit.hero.image || !imgPool.includes(kit.hero.image) || (portraitish(kit.hero.image) && imgPool.some(heroish))) kit.hero.image = pickHero();
     if (kit.about && !kit.about.image) kit.about.image = imgPool.find((u) => u !== kit.hero.image) || imgPool[0];
     // HOME specialty cards: all-or-nothing, same as blueprint pages. A 3-card grid
@@ -17581,9 +17649,25 @@ const server = http.createServer(async (req, res) => {
 
       // 1) Existing-site brand theme — reuse passed analysis, else cache, else scan.
       let analysis = body.analysis || null;
-      if (!analysis) { try { analysis = JSON.parse(fs.readFileSync(path.join(GEN, ".site-analysis.json"), "utf8")); } catch (e) {} }
+      // The cache MUST be keyed to the site it describes. It never recorded one, so
+      // it was reused for whatever build ran next: runJob deletes it on every run
+      // (server.js: runJob start), but the manual dashboard flow does not, which
+      // meant switching to a different client silently composed their brand from
+      // the previous client's scan — same palette, same vibe, same fonts.
+      // A cache written before this fix has no sourceUrl, so it re-scans once.
+      if (!analysis) {
+        try {
+          const cached = JSON.parse(fs.readFileSync(path.join(GEN, ".site-analysis.json"), "utf8"));
+          if (cached && cached.sourceUrl && cached.sourceUrl === siteUrl) analysis = cached;
+          else if (cached) console.log(`compose: discarding cached analysis of ${cached.sourceUrl || "an unrecorded site"} — this build targets ${siteUrl || "(no site)"}`);
+        } catch (e) { /* no cache */ }
+      }
       if (!analysis && siteUrl) {
-        try { analysis = await analyzeExistingSite(siteUrl); fs.writeFileSync(path.join(GEN, ".site-analysis.json"), JSON.stringify(analysis, null, 2)); }
+        try {
+          analysis = await analyzeExistingSite(siteUrl);
+          analysis.sourceUrl = siteUrl;
+          fs.writeFileSync(path.join(GEN, ".site-analysis.json"), JSON.stringify(analysis, null, 2));
+        }
         catch (e) { console.warn("compose: site analysis failed:", e.message.slice(0, 120)); }
       }
 
@@ -17732,6 +17816,38 @@ const server = http.createServer(async (req, res) => {
       const { engine, pages, deviceType, theme, stitchKeyOverride } = JSON.parse(await readBody(req) || "{}");
       if (!Array.isArray(pages) || !pages.length) return json(res, 400, { error: "pages[] required" });
       const t0 = Date.now();
+
+      // WEBGEN — the engine a real build actually ships. Without this branch the
+      // dashboard could only ever produce Stitch or Gemini output, so the pages an
+      // operator previewed were NOT the pages the pipeline would publish. runJob
+      // was the only caller of generateWebgenSite; this makes the manual flow use
+      // the same generator, which is what the comment on it always claimed.
+      //
+      // Opt-in by name: runJob's own Stitch branch calls this route with engine:""
+      // and must keep getting Stitch, so the empty default is left untouched.
+      if (engine === "webgen") {
+        const onb = JSON.parse(fs.readFileSync(path.join(DIR, "onboarding.json"), "utf8"));
+        const A = onb.answers || {};
+        const existingUrl = onb.existingWebsite || onb.referenceWebsite || "";
+        try {
+          const { kit, pages: rendered } = await generateWebgenSite({ A, composed: theme || {}, existingUrl });
+          const out = ["home", "services", "about", "contact"].map((k) => ({
+            page: k, pageKey: k, engine: "webgen",
+            htmlBytes: (rendered[k] || "").length,
+            previewUrl: `/preview/${k}`, exportUrl: `/export/${k}`, screenshotUrl: "",
+          }));
+          console.log(`[webgen] /api/generate-site rendered 4 pages in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+          // assembled:true tells the caller there is nothing to bind — webgen pages
+          // already carry their own shared header/footer and cross-links.
+          return json(res, 200, {
+            pages: out, engine: "webgen", assembled: true, siteUrl: "/site/",
+            layout: kit.layout || "", tone: kit.tone || null, ms: Date.now() - t0,
+          });
+        } catch (e) {
+          console.error("[webgen] /api/generate-site failed:", e.message);
+          return json(res, 500, { error: "webgen generation failed: " + e.message });
+        }
+      }
       // Give this client its own slice of the curated photo pool (see CURATED_OFFSET
       // above) so two clients don't ship the same hero. Seeded here — not only in
       // runJob() — because this route is also called directly by the manual
@@ -18328,8 +18444,13 @@ const server = http.createServer(async (req, res) => {
     // after deploy; once active, WP enqueues /themes/g99-<slug>/style.css — that
     // asset path in the homepage HTML is the definitive activation signal.
     if (p === "/api/theme-live" && req.method === "POST") {
-      const { url, slug } = JSON.parse(await readBody(req) || "{}");
-      if (!url || !slug) return json(res, 400, { error: "url and slug required" });
+      const { url, slug, format, businessName } = JSON.parse(await readBody(req) || "{}");
+      // A GitOps deploy has no theme to activate — the MU plugin reconciles pages
+      // instead — so "is it live?" becomes "are OUR pages being served?". Same
+      // check runJob's tail makes (server.js: runThemeActivationTail, gitops branch),
+      // kept here so the manual flow verifies a release the same way a real build does.
+      const gitops = String(format || "").toLowerCase() === "gitops";
+      if (!url || (!slug && !gitops)) return json(res, 400, { error: "url and slug required" });
       // job.liveUrl is stored bare (no scheme) — fetch() throws on a schemeless
       // URL, which this endpoint's catch turned into a silent, permanent "active:
       // false" no matter what the live site actually served.
@@ -18337,7 +18458,10 @@ const server = http.createServer(async (req, res) => {
       try {
         const r = await fetch(fullUrl, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36", "Cache-Control": "no-cache" } });
         const html = r.ok ? await r.text() : "";
-        return json(res, 200, { active: html.includes(`/themes/g99-${slug}/`), httpStatus: r.status });
+        const active = gitops
+          ? /g99-sec|elementor-widget-html/.test(html) && (!businessName || html.includes(String(businessName).slice(0, 12)))
+          : html.includes(`/themes/g99-${slug}/`);
+        return json(res, 200, { active, httpStatus: r.status });
       } catch (e) { return json(res, 200, { active: false, error: e.message.slice(0, 120) }); }
     }
 
@@ -18421,9 +18545,20 @@ const server = http.createServer(async (req, res) => {
 
     const siteM = p.match(/^\/(site(?:-gemini)?)(?:\/(.*))?$/);
     if (siteM) {
-      const rel = (siteM[2] || "index.html").replace(/[^a-z0-9._-]/gi, "") || "index.html";
-      const f = path.join(GEN, siteM[1], rel);
-      if (fs.existsSync(f)) return send(res, 200, MIME[path.extname(f)] || "text/html", fs.readFileSync(f));
+      // The old sanitiser stripped every "/" out of the path, so a request for
+      // site/assets/img/x.webp became "assetsimgx.webp" and 404'd. Nothing noticed
+      // while Stitch hotlinked absolute image URLs; webgen localises images into
+      // assets/img/, so EVERY photo on a generated site silently disappeared
+      // (cover()'s onerror removes the element, so the page just looked text-only).
+      // Resolve properly and contain to the site directory instead.
+      const root = path.resolve(path.join(GEN, siteM[1]));
+      let rel;
+      try { rel = decodeURIComponent(siteM[2] || ""); } catch (e) { rel = siteM[2] || ""; }
+      const f = path.resolve(root, rel || "index.html");
+      if (f !== root && !f.startsWith(root + path.sep)) return send(res, 403, "text/plain", "forbidden");
+      if (fs.existsSync(f) && fs.statSync(f).isFile()) {
+        return send(res, 200, MIME[path.extname(f).toLowerCase()] || "application/octet-stream", fs.readFileSync(f));
+      }
       return send(res, 404, "text/html", "<h1>Site not assembled yet</h1>");
     }
 

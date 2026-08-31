@@ -40,6 +40,15 @@ async function api(path, body) {
 // ---------- state ----------
 let ONB = {}, A = {}, composed = null, croBefore = null, croAfter = null, prUrl = null;
 const PAGES = [{ key: "home", title: "Home" }, { key: "services", title: "Services" }, { key: "about", title: "About" }, { key: "contact", title: "Contact" }];
+// Must track runJob's default (server.js: BUILD_ENGINE || "webgen"). This flow used
+// to hardcode the Stitch path, so the pages an operator reviewed here were not the
+// pages a real build published. Set to "" for Stitch or "gemini" to compare.
+const BUILD_ENGINE = "webgen";
+// Likewise tracks runJob's default (server.js: OUTPUT_FORMAT || "gitops"). This flow
+// used to push a Bedrock PHP theme while real builds shipped Elementor resources/,
+// so the operator deployed a different artefact than the pipeline. "theme" restores
+// the legacy path.
+const OUTPUT_FORMAT = "gitops";
 
 // editable fields: [key, label, type]
 const FIELDS = [
@@ -319,18 +328,20 @@ async function watchPrBuilds(prUrl) {
 
 // ---------- step 6: watch the live site until the mu-plugin activates the theme ----------
 // Signal = /themes/g99-<slug>/ asset path appears in the homepage HTML.
-async function watchThemeLive(slug) {
+async function watchThemeLive(slug, format) {
   const MAX = 40; // 40 × 15s ≈ 10 min
+  const gitops = format === "gitops";
+  const what = gitops ? "Pages" : "Theme";
   for (let i = 0; i < MAX; i++) {
     const url = ($("liveUrl") && $("liveUrl").value || "").trim() || "https://prodteam.gogroth.com/";
     try {
-      const d = await api("/api/theme-live", { url, slug });
+      const d = await api("/api/theme-live", { url, slug, format, businessName: A.business_name });
       if (d.active) {
-        if ($("liveHint")) $("liveHint").textContent = "Theme is live and active ✓";
-        setStep(5, "done", "Theme activated on " + url);
+        if ($("liveHint")) $("liveHint").textContent = gitops ? "Pages are live ✓" : "Theme is live and active ✓";
+        setStep(5, "done", (gitops ? "Pages live on " : "Theme activated on ") + url);
         return true;
       }
-      if ($("liveHint")) $("liveHint").innerHTML = `<span class="spin"></span>Deploy in progress — theme not active yet (check ${i + 1}/${MAX}, HTTP ${d.httpStatus || "?"})…`;
+      if ($("liveHint")) $("liveHint").innerHTML = `<span class="spin"></span>Deploy in progress — ${what.toLowerCase()} not live yet (check ${i + 1}/${MAX}, HTTP ${d.httpStatus || "?"})…`;
     } catch (e) { /* keep polling */ }
     await wait(15000);
   }
@@ -381,38 +392,70 @@ async function buildBetaSite() {
     setStep(2, "done", `Prompt ready (${src}).`);
     out(2, `${brandStrip(composed)}<textarea class="promptbox" id="briefBox">${esc(composed.brief || "")}</textarea><div class="hint">Auto-composed. This exact brief drives generation.</div>`);
 
-    // Step 3 — generate pages (Stitch) with live per-page progress
-    setStep(3, "run", "Generating 4 pages with Stitch…");
+    // Step 3 — generate pages with the SAME engine a real build ships (webgen),
+    // so what is previewed here is what the pipeline publishes. This flow used to
+    // call Stitch, which meant the operator reviewed pages that never went live.
+    setStep(3, "run", "Rendering Home · Services · About · Contact…");
     out(3, progressRows());
     if ($("briefBox")) composed.brief = $("briefBox").value;
     const theme = themeFromComposed();
     const pages = PAGES.map((p) => ({ key: p.key, prompt: `${composed.brief}\n\n${pageSections(p.key)}\n\nReturn one complete, responsive, production-quality HTML page with the SEO requirements applied.` }));
     const poll = setInterval(updateProgressRows, 2000);
     let gen;
-    try { gen = await api("/api/generate-site", { engine: "", deviceType: "DESKTOP", theme, pages }); }
+    try { gen = await api("/api/generate-site", { engine: BUILD_ENGINE, deviceType: "DESKTOP", theme, pages }); }
     finally { clearInterval(poll); await updateProgressRows(); }
     const results = (gen.pages || gen.results || []);
     const okPages = Array.isArray(results) ? results.filter((x) => x && !x.error) : [];
     if (!okPages.length) {
-      const firstErr = ((Array.isArray(results) && results.find((x) => x && x.error)) || {}).error || "Stitch returned no screens";
-      throw new Error(`Stitch generated 0 pages — ${firstErr}. Stitch is flaky/rate-limited; click Build again to retry.`);
+      const firstErr = ((Array.isArray(results) && results.find((x) => x && x.error)) || {}).error || "the generator returned no pages";
+      throw new Error(`Generated 0 pages — ${firstErr}. Click Build again to retry.`);
     }
     const okKeys = new Set(okPages.map((x) => x.page || x.pageKey));
 
-    // Assemble the pages into one coherent site (Gemini AI chrome) + preview link
-    setStep(3, "run", `Generated ${okPages.length}/${PAGES.length} — assembling site with Gemini…`);
-    const bound = await api("/api/bind-site", { engine: "", theme });
-    setStep(3, "done", `Generated ${okPages.length} of ${PAGES.length} pages · site assembled (${bound.chromeSource || "AI chrome"}).`);
-    out(3, `${thumbStrip([...okKeys])}${progressRowsFinal(okKeys)}<div style="margin-top:12px"><a class="prlink" href="${esc(bound.siteUrl || "/site/")}" target="_blank">↗ Preview assembled site</a></div>${okPages.length < PAGES.length ? `<div class="hint">⚠ ${PAGES.length - okPages.length} page(s) failed in Stitch — retry Build for a full set.</div>` : ""}`);
+    // webgen pages already carry their own shared header, footer and cross-links,
+    // so there is nothing to bind. Only the Stitch/Gemini output needs assembling.
+    let siteUrl = gen.siteUrl || "/site/", assembledAs = gen.engine === "webgen" ? `webgen · ${gen.layout || "auto"} layout` : "";
+    if (!gen.assembled) {
+      setStep(3, "run", `Generated ${okPages.length}/${PAGES.length} — assembling site with Gemini…`);
+      const bound = await api("/api/bind-site", { engine: "", theme });
+      siteUrl = bound.siteUrl || "/site/";
+      assembledAs = bound.chromeSource || "AI chrome";
+    }
+    setStep(3, "done", `Generated ${okPages.length} of ${PAGES.length} pages · ${assembledAs}.`);
+    out(3, `${thumbStrip([...okKeys])}${progressRowsFinal(okKeys)}<div style="margin-top:12px"><a class="prlink" href="${esc(siteUrl)}" target="_blank">↗ Preview assembled site</a></div>${okPages.length < PAGES.length ? `<div class="hint">⚠ ${PAGES.length - okPages.length} page(s) failed — retry Build for a full set.</div>` : ""}`);
 
-    // Step 4 — WP theme + PR (site already bound above; skipRebind avoids doing it twice)
-    setStep(4, "run", "Building WordPress theme, pushing, opening PR…");
-    const push = await api("/api/push-wordpress", { theme, skipRebind: true });
+    // Step 4 — push + PR. GitOps (Elementor resources/) is what a real build ships,
+    // so this flow ships it too; the legacy PHP-theme path stays reachable by
+    // setting OUTPUT_FORMAT to "theme".
+    const isGitops = OUTPUT_FORMAT === "gitops";
+    setStep(4, "run", isGitops ? "Compiling Elementor pages, pushing, opening PR…" : "Building WordPress theme, pushing, opening PR…");
+    const push = await api("/api/push-wordpress", { theme, skipRebind: true, format: isGitops ? "gitops" : undefined });
     prUrl = push.prUrl;
     const slug = ((push.themePath || "").match(/g99-([a-z0-9-]+)\//) || [])[1] || "";
     let merged = false;
-    if (!prUrl) {
+    if (push.noChanges) {
+      // Byte-identical output: the repo (and the live site) already hold this exact
+      // build. That is a success, not a failure — nothing to open a PR for.
+      setStep(4, "done", "No changes — repo already matches the generated output.");
+      merged = true;
+    } else if (!prUrl) {
       setStep(4, "done", `Pushed to ${push.branch || "branch"} — no PR URL returned, check GitHub.`);
+    } else if (isGitops) {
+      // A GitOps repo's "Deploy to WordPress" check only succeeds for the branch the
+      // site actually deploys (main), so waiting on PR-branch CI would spin for the
+      // full timeout. runJob merges first and watches main; this does the same, then
+      // verifies against the live site in step 5.
+      out(4, `<a class="prlink" href="${esc(prUrl)}" target="_blank">↗ View pull request</a><div class="hint" id="ciHint"><span class="spin"></span>Merging — GitOps deploys from main…</div>`);
+      setStep(4, "run", "Merging PR (GitOps deploys from main)…");
+      try {
+        await api("/api/pr-merge", { prUrl });
+        merged = true;
+        if ($("ciHint")) $("ciHint").textContent = "Merged ✓ — the WordPress deployment runs from main.";
+        setStep(4, "done", `Merged — ${push.pages ? push.pages.length : 4} Elementor page(s) deploying from main.`);
+      } catch (e) {
+        if ($("ciHint")) $("ciHint").textContent = "Auto-merge failed — merge the PR manually.";
+        setStep(4, "done", "PR opened but auto-merge failed: " + e.message + " — merge manually.");
+      }
     } else {
       out(4, `<a class="prlink" href="${esc(prUrl)}" target="_blank">↗ View pull request</a><div class="hint" id="ciHint"><span class="spin"></span>Watching CI build checks…</div><div id="ciChecks" style="margin-top:8px"></div>`);
       setStep(4, "run", `PR opened — watching CI build checks (every 10s)…`);
@@ -422,11 +465,15 @@ async function buildBetaSite() {
     // Step 5 — after merge, watch the live site for theme activation, then
     // run the after-audit automatically. Manual input stays as fallback.
     out(5, `<div class="urlrow"><input id="liveUrl" placeholder="https://prodteam.gogroth.com/" value="https://prodteam.gogroth.com/"><button class="btn sm" onclick="runAfter()">Run after-audit →</button></div><div class="hint" id="liveHint"></div>`);
-    if (merged && slug) {
-      setStep(5, "run", "Merged — waiting for deploy + theme activation on the live site…");
-      const activated = await watchThemeLive(slug);
+    // GitOps has no theme to activate — the MU plugin reconciles pages — so there
+    // is no slug to wait on, only "are our pages being served yet?".
+    if (merged && (slug || isGitops)) {
+      setStep(5, "run", isGitops
+        ? "Merged — waiting for the deployment to publish the pages…"
+        : "Merged — waiting for deploy + theme activation on the live site…");
+      const activated = await watchThemeLive(slug, isGitops ? "gitops" : "");
       if (activated) { await runAfter(); return; } // runs steps 6 + 7
-      setStep(5, "run", "Theme not detected yet — deploy may still be running. Paste/confirm the URL and click Run after-audit.");
+      setStep(5, "run", `${isGitops ? "Pages" : "Theme"} not detected yet — deploy may still be running. Paste/confirm the URL and click Run after-audit.`);
     } else {
       setStep(5, "run", merged ? "Merged — paste the live URL below." : "Merge & deploy the PR, then paste the live URL below.");
       toast("Pipeline paused at step 5 — confirm the live URL.");
