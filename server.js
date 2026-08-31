@@ -5904,6 +5904,16 @@ function applyReviewLocally(root, target, pagePath, workOrder) {
 // site, which is a thing a person should look at once before it ships.
 async function installReviewPlugin(site, toolUrl) {
   const repo = site.githubRepo;
+  // A GitOps site cannot take a per-repo plugin. Its deployer promotes exactly
+  // two paths as executable code — web/app/mu-plugins/g99-control/ and its
+  // loader — and copies nothing else out of the repository
+  // (MuPluginUpdater::managesRepoPath). A file written beside them merges into
+  // git and never reaches the site, so this used to open a pull request that
+  // looked successful, merged, and changed nothing. Refuse and say where the
+  // widget actually belongs.
+  if (await repoFileExists(repo, "resources/site.json")) {
+    throw new Error(`${site.businessName} is a GitOps site, and its deployer only promotes the g99-control package — a plugin installed beside it would merge but never run. The content-review widget has to ship inside g99-control instead.`);
+  }
   const tmp = path.join(os.tmpdir(), "g99review-" + Date.now());
   try {
     let r = await sh(`gh repo clone ${repo} "${tmp}" -- --depth 1`);
