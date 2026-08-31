@@ -8281,7 +8281,44 @@ async function runJob(job) {
       jobStep(job, 3, "done", "Assembled (webgen engine)");
     }
 
-    if (!isCloneBuild && !isEditorialBuild && !useWebgen) {
+    // ---- DESIGNGEN engine — the design-gen methodology ported in-tool
+    // (scrape a reference URL → deterministic brand tokens → Gemini design brief
+    // → Gemini builds 4 pages against the vendored premium design system → motion
+    // layer). Emits the same GEN/site contract, so the gitops path ships it
+    // unchanged; premium.js rides along as GEN/site/assets/site.js → the
+    // g99-site-js Elementor snippet (compile.js).
+    const useDesigngen = ENGINE === "designgen" && !isCloneBuild;
+    if (useDesigngen) {
+      const { generateDesigngenSite } = require("./lib/designgen");
+      const referenceUrl = (job.payload && (job.payload.referenceWebsite || job.payload.designReference)) || onb.referenceWebsite || onb.existingWebsite;
+      if (!referenceUrl) throw new Error("designgen engine: a referenceWebsite (design reference URL) is required");
+      jobStep(job, 2, "running", `Design-gen: scraping ${String(referenceUrl).replace(/^https?:\/\//, "")} + composing brief…`);
+      const siteDir = path.join(GEN, "site");
+      fs.rmSync(siteDir, { recursive: true, force: true });   // never mix a prior engine's pages
+      const dg = await generateDesigngenSite({ referenceUrl, siteDir, log: (m) => console.log(`[designgen ${job.draftId}] ${m}`) });
+      for (const w of (dg.warnings || [])) console.warn(`[designgen ${job.draftId}] warning: ${w}`);
+      const bytesOf = (k) => (dg.pages[k] || "").length;
+      job.pages = {
+        home: { status: "done", bytes: bytesOf("home"), error: "" },
+        services: { status: "done", bytes: bytesOf("services"), error: "" },
+        about: { status: "done", bytes: bytesOf("about"), error: "" },
+        contact: { status: "done", bytes: bytesOf("contact"), error: "" },
+      };
+      job.homeContent = (composed && composed.brief) || "";
+      job.brandKit = { engine: "designgen", accent: dg.tokens.brand, ink: dg.tokens.ink, tint: dg.tokens.cream };
+      jobStep(job, 2, "done", `4 pages generated (designgen · brand ${dg.tokens.brand})`);
+      pushSubtaskStep(job, "generate_pages", "done", { detail: "4 pages generated (designgen)" });
+      job.siteUrl = `/view/${encodeURIComponent(job.draftId)}/`;
+      try {
+        const snapDir = path.join(GEN, "exports", job.draftId, "site");
+        fs.rmSync(snapDir, { recursive: true, force: true });
+        fs.cpSync(siteDir, snapDir, { recursive: true });
+        job.zipUrl = `/api/export-zip?dir=${encodeURIComponent(`exports/${job.draftId}/site`)}&name=${encodeURIComponent(siteFolderName(job))}`;
+      } catch (e) { console.warn("designgen site snapshot failed (non-fatal):", e.message); }
+      jobStep(job, 3, "done", "Assembled (designgen engine)");
+    }
+
+    if (!isCloneBuild && !isEditorialBuild && !useWebgen && !useDesigngen) {
     // 3 — generate all pages with Stitch
     // TEMPORARY (design-quality dev cycle, DESIGN_QUALITY_PLAN.md): while iterating
     // on the generation prompt, DEV_PAGES=on cuts a build to home only — 1 Stitch
@@ -17963,6 +18000,7 @@ const server = http.createServer(async (req, res) => {
       // four core pages — never .github/, mu-plugins/, or other resources.
       if (body.format === "gitops") {
         const { compileGitops } = require("./lib/gitops/compile");
+        const { ensureMotionChannel, PLUGIN_REL } = require("./lib/gitops/motionChannel");
         // Look at what we are actually deploying INTO before generating: the
         // repo says which theme/templates exist, the live site says which
         // Elementor edition is installed. Both change what we may emit —
@@ -18073,11 +18111,24 @@ const server = http.createServer(async (req, res) => {
             } catch (e) { console.warn("[gitops] front-page wiring skipped:", e.message); }
             fs.writeFileSync(sj, JSON.stringify(site, null, 4));
           } catch (e) { console.warn("[gitops] site.json patch skipped:", e.message); }
+          // Self-heal the motion channel: make sure THIS repo's g99-control can
+          // render the site-wide JS snippet (premium.js). Feature-detected; patches
+          // the plugin in this same PR only when the feature is missing (idempotent,
+          // version-bumped so MuPluginUpdater promotes it). No-op once the canonical
+          // plugin ships these features.
+          let motion = { ready: false, patched: false, notes: [] };
+          try {
+            motion = ensureMotionChannel(tmpG);
+            console.log(`[gitops] motion channel: ${motion.ready ? "ready" : "unavailable"}${motion.patched ? " — self-healed this repo's g99-control" : ""}${motion.notes.length ? " · " + motion.notes.join(" · ") : ""}`);
+          } catch (e) { console.warn("[gitops] motion channel check failed:", e.message); }
           await runG(`git checkout -b "${branchG}"`, tmpG);
           // Stage everything we may have touched under resources/: pages,
           // site.json, and any custom-css.css deletion. A single -A on the dir is
           // robust to files that were removed (inline-CSS mode) or never existed.
           await runG(`git add -A resources`, tmpG);
+          // When the motion channel was self-healed, stage the plugin change too so
+          // it rides in the same PR (MuPluginUpdater promotes it on the next deploy).
+          if (motion.patched) await runG(`git add "${PLUGIN_REL}"`, tmpG);
           // If a re-run produced byte-identical resources, there is genuinely
           // nothing to commit — that is NOT a failure, the repo already holds this
           // exact site. Detect it up front (staged diff empty) and return a clean
@@ -18095,7 +18146,8 @@ const server = http.createServer(async (req, res) => {
           const prBodyG = `Generated **${a.business_name}** pages in G99 GitOps format (\`resources/pages/{${pages.join(",")}}\`).\\n\\n`
             + `Each section is its own Elementor container + \`html\` widget, compiled by the Growth99 Website Build Tool webgen engine.\\n\\n`
             + `**Detected target:** theme \`${target.theme || "?"}\` · Elementor ${target.elementor ? (target.elementorPro ? "Pro" : "free") : "not detected"} · page template \`${target.pageTemplate || "(theme default)"}\` · CSS → ${target.cssTarget}`
-            + (target.notes.length ? `\\n\\n_${target.notes.join(" · ")}_` : "");
+            + (target.notes.length ? `\\n\\n_${target.notes.join(" · ")}_` : "")
+            + (motion.patched ? `\\n\\n**Motion channel self-healed** on this repo's g99-control so premium.js renders site-wide: ${motion.notes.join("; ")}.` : "");
           r = await runG(`gh pr create --repo ${repo} --base main --head "${branchG}" --title "GitOps: ${a.business_name} generated pages" --body "${prBodyG}"`, tmpG);
           const prUrlG = (r.stdout.match(/https:\/\/github\.com\/\S+/) || [""])[0];
           fs.rmSync(tmpG, { recursive: true, force: true });

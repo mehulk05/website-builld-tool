@@ -1,0 +1,132 @@
+/* ============================================================================
+   PREMIUM MOTION + CRAFT LAYER
+   Injected into every generated page. Rule: ENHANCE, NEVER OVERRIDE — this file
+   only adds transitions, transforms and interaction states. It must never set a
+   colour, font, or layout property that would fight the page's own design.
+   Measured problem it solves: generated pages carried ~117 CSS rules and 68
+   hover/transition states; real premium sites carry 10,000 and 610.
+   ========================================================================== */
+
+:root {
+  --pm-ease: cubic-bezier(.22, .61, .36, 1);
+  --pm-out: cubic-bezier(.16, 1, .3, 1);
+  --pm-slow: .95s;
+  --pm-mid: .55s;
+  --pm-fast: .32s;
+}
+
+html { scroll-behavior: smooth; }
+
+/* ---- 1. reveal on scroll (translate + scale + blur, not a flat fade) ---- */
+[data-pm-reveal] {
+  opacity: 0;
+  transform: translate3d(0, 30px, 0) scale(.985);
+  filter: blur(6px);
+  transition:
+    opacity var(--pm-slow) var(--pm-out),
+    transform var(--pm-slow) var(--pm-out),
+    filter var(--pm-slow) var(--pm-out);
+  transition-delay: var(--pm-delay, 0ms);
+  will-change: opacity, transform;
+}
+[data-pm-reveal].pm-in {
+  opacity: 1;
+  transform: none;
+  filter: none;
+}
+
+/* ---- 2. split-text headline reveal (words rise out of a mask) ---- */
+.pm-line { display: inline-block; overflow: hidden; vertical-align: bottom; padding-bottom: .08em; margin-bottom: -.08em; }
+.pm-line > i {
+  display: inline-block;
+  font-style: inherit;
+  transform: translate3d(0, 115%, 0);
+  transition: transform 1.05s var(--pm-out);
+  transition-delay: var(--pm-delay, 0ms);
+}
+.pm-split.pm-in .pm-line > i { transform: none; }
+
+/* ---- 3. images: slow scroll-scale inside their frame ---- */
+[data-pm-scale] { overflow: hidden; }
+[data-pm-scale] > img,
+[data-pm-scale] > picture > img {
+  transform: scale(var(--pm-s, 1.14));
+  transition: transform .18s linear;
+  will-change: transform;
+}
+
+/* ---- 4. hover: image zoom, card lift, link underline draw, button press ---- */
+[data-pm-zoom] { overflow: hidden; }
+[data-pm-zoom] img {
+  transition: transform 1.2s var(--pm-out), filter 1.2s var(--pm-out);
+  will-change: transform;
+}
+[data-pm-zoom]:hover img { transform: scale(1.055); }
+
+[data-pm-card] {
+  transition: transform var(--pm-mid) var(--pm-out), box-shadow var(--pm-mid) var(--pm-out);
+}
+[data-pm-card]:hover { transform: translate3d(0, -7px, 0); }
+
+[data-pm-link] {
+  background-image: linear-gradient(currentColor, currentColor);
+  background-size: 0% 1px;
+  background-position: 0 100%;
+  background-repeat: no-repeat;
+  transition: background-size .5s var(--pm-out), opacity var(--pm-fast);
+  text-decoration: none;
+}
+[data-pm-link]:hover { background-size: 100% 1px; }
+
+[data-pm-btn] {
+  transition: transform var(--pm-fast) var(--pm-ease), box-shadow var(--pm-fast) var(--pm-ease), opacity var(--pm-fast), letter-spacing var(--pm-mid) var(--pm-out);
+  will-change: transform;
+}
+[data-pm-btn]:hover { transform: translate3d(0, -2px, 0); }
+[data-pm-btn]:active { transform: translate3d(0, 0, 0) scale(.985); }
+
+/* ---- 5. nav: hide on scroll-down, elevate once past the hero ---- */
+[data-pm-nav] {
+  transition: transform var(--pm-mid) var(--pm-ease), box-shadow var(--pm-mid) var(--pm-ease);
+  will-change: transform;
+}
+[data-pm-nav].pm-nav-up { transform: translate3d(0, -102%, 0); }
+[data-pm-nav].pm-nav-stuck { box-shadow: 0 10px 40px -18px rgba(0, 0, 0, .35); }
+
+/* ---- 6. section-level parallax for background-image bands ---- */
+[data-pm-parallax] { background-attachment: scroll; will-change: background-position; }
+
+/* ---- 7. craft details: selection, focus, scrollbar, media polish ---- */
+::selection { background: currentColor; color: canvas; }
+:where(a, button, [role=button], input, select, textarea):focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+@supports selector(::-webkit-scrollbar) {
+  ::-webkit-scrollbar { width: 11px; height: 11px; }
+  ::-webkit-scrollbar-thumb { background: currentColor; opacity: .25; border-radius: 99px; border: 3px solid transparent; background-clip: content-box; }
+}
+img, picture, video { -webkit-user-drag: none; }
+
+/* every interactive element gets *some* transition — craft density */
+:where(a, button, [role=button], .btn, [class*=btn], [class*=card], [class*=item] > a) {
+  transition: color var(--pm-fast) var(--pm-ease), background-color var(--pm-fast) var(--pm-ease),
+              border-color var(--pm-fast) var(--pm-ease), opacity var(--pm-fast) var(--pm-ease);
+}
+
+/* ---- 8. counters + marquee ---- */
+[data-pm-count] { font-variant-numeric: tabular-nums; }
+.pm-marquee { display: flex; overflow: hidden; }
+.pm-marquee > * { flex: 0 0 auto; animation: pm-marq var(--pm-marq-dur, 32s) linear infinite; }
+.pm-marquee:hover > * { animation-play-state: paused; }
+@keyframes pm-marq { to { transform: translate3d(-100%, 0, 0); } }
+
+/* ---- 9. accessibility: honour reduced-motion completely ---- */
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  [data-pm-reveal], .pm-line > i { opacity: 1 !important; transform: none !important; filter: none !important; transition: none !important; }
+  [data-pm-scale] > img { transform: none !important; }
+  .pm-marquee > * { animation: none !important; }
+  [data-pm-nav].pm-nav-up { transform: none !important; }
+}

@@ -1,0 +1,424 @@
+/* ============================================================================
+   PREMIUM DESIGN SYSTEM
+   The model was writing ~117 CSS rules per page from scratch — median quality.
+   This file is the craft: fluid type, spacing rhythm, and hand-built components
+   (arched frames, split heroes, editorial bands, marquees, quote slabs).
+   The model only writes SEMANTIC MARKUP using these classes and sets the six
+   brand tokens; it never invents spacing, radii, or component CSS again.
+   ========================================================================== */
+
+/* ---------------------------------------------------------------- tokens -- */
+:root {
+  /* the generated page overrides ONLY these six, from the scraped brand */
+  --ink: #14161c;
+  --bg: #ffffff;
+  --cream: #f4f0ea;
+  --brand: #b08d57;
+  --on-brand: #ffffff;
+  --muted: color-mix(in srgb, var(--ink) 62%, var(--bg));
+
+  --line: color-mix(in srgb, var(--ink) 12%, transparent);
+  --line-soft: color-mix(in srgb, var(--ink) 7%, transparent);
+  --brand-soft: color-mix(in srgb, var(--brand) 12%, transparent);
+  --ink-band: color-mix(in srgb, var(--ink) 96%, #000);
+
+  --font-display: Georgia, "Times New Roman", serif;
+  --font-body: system-ui, -apple-system, "Segoe UI", sans-serif;
+
+  /* fluid type scale — the single biggest "premium" tell after imagery */
+  --t-display: clamp(2.9rem, 1.2rem + 5.4vw, 6.5rem);
+  --t-h1: clamp(2.4rem, 1.3rem + 3.6vw, 4.6rem);
+  --t-h2: clamp(1.9rem, 1.2rem + 2.4vw, 3.4rem);
+  --t-h3: clamp(1.25rem, 1.05rem + .7vw, 1.7rem);
+  --t-lead: clamp(1.05rem, .98rem + .42vw, 1.35rem);
+  --t-body: 1.0625rem;
+  --t-eyebrow: .74rem;
+
+  /* spacing rhythm */
+  /* measured against ruma.com: it clears 8585px with ~10 sections — the luxury
+     signal is emptiness, so bands are deliberately larger than feels necessary */
+  --s-band: clamp(6.5rem, 4rem + 9vw, 14rem);
+  --s-gap: clamp(1.6rem, 1rem + 1.9vw, 3.25rem);
+  --s-gut: clamp(1.25rem, .6rem + 2.6vw, 5rem);
+  --w-page: 1320px;
+  --w-read: 58ch;
+  /* ruma and its peers use square corners and bare images — rounded cards read
+     "template". Radius is opt-in via .u-round, not the default. */
+  --r-soft: 0px;
+  --r-pill: 999px;
+  --ease: cubic-bezier(.16, 1, .3, 1);
+}
+
+/* ------------------------------------------------------------------ base -- */
+.ds *, .ds *::before, .ds *::after { box-sizing: border-box; }
+.ds {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: var(--t-body);
+  line-height: 1.72;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+}
+/* measured on ruma.com: h1 weight 100, h2 weight 500, letter-spacing +1px.
+   Light weight at large size is the single clearest "expensive" typographic tell;
+   heavy + tight tracking is what makes a page read like a template. */
+.ds h1, .ds h2, .ds h3, .ds h4 {
+  font-family: var(--font-display);
+  font-weight: 300;
+  line-height: 1.12;
+  letter-spacing: .012em;
+  margin: 0;
+  text-wrap: balance;
+}
+.ds h1 { font-size: var(--t-h1); font-weight: 200; }
+.ds h2 { font-size: var(--t-h2); }
+.ds h3 { font-size: var(--t-h3); font-weight: 400; line-height: 1.3; letter-spacing: .01em; }
+.ds p { margin: 0; text-wrap: pretty; }
+.ds img { max-width: 100%; display: block; }
+.ds a { color: inherit; }
+
+/* -------------------------------------------------------------- layout ---- */
+.u-wrap { width: 100%; max-width: var(--w-page); margin-inline: auto; padding-inline: var(--s-gut); }
+.u-band { padding-block: var(--s-band); position: relative; }
+.u-band--tight { padding-block: calc(var(--s-band) * .62); }
+.u-cream { background: var(--cream); }
+.u-dark { background: var(--ink-band); color: #fff; }
+.u-dark .u-eyebrow { color: var(--brand); }
+.u-dark .u-sub, .u-dark p { color: color-mix(in srgb, #fff 76%, transparent); }
+.u-read { max-width: var(--w-read); }
+.u-center { text-align: center; margin-inline: auto; }
+.u-stack > * + * { margin-top: var(--s-gap); }
+.u-stack-sm > * + * { margin-top: .9rem; }
+
+.u-grid { display: grid; gap: var(--s-gap); }
+.u-grid--2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.u-grid--3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.u-grid--4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.u-grid--auto { grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr)); }
+
+.u-split { display: grid; gap: clamp(2rem, 1rem + 4vw, 5.5rem); align-items: center; grid-template-columns: 1fr 1fr; }
+.u-split--wide-l { grid-template-columns: 1.15fr .85fr; }
+.u-split--wide-r { grid-template-columns: .85fr 1.15fr; }
+.u-split--flip > :first-child { order: 2; }
+
+/* ------------------------------------------------------------ typography -- */
+/* ACCENT RESTRAINT — measured: ruma.com colours only ~5% of its text nodes with
+   the brand tone. Painting every eyebrow, rule and number gold is what makes a
+   page look like a stock template. Default these to ink; use .u-accent to opt in. */
+.u-eyebrow {
+  display: block;
+  font-family: var(--font-body);
+  font-size: var(--t-eyebrow);
+  font-weight: 500;
+  letter-spacing: .24em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 1.4rem;
+}
+.u-accent { color: var(--brand); }
+.u-display { font-size: var(--t-display); line-height: 1.05; letter-spacing: .008em; font-weight: 200; }
+.u-lead { font-size: var(--t-lead); line-height: 1.65; color: var(--muted); }
+.u-sub { color: var(--muted); }
+.u-em { font-style: italic; }
+.u-rule { width: 54px; height: 1px; background: var(--line); border: 0; margin: 1.8rem 0; }
+.u-center .u-rule { margin-inline: auto; }
+.u-round { border-radius: 14px; overflow: hidden; }
+/* generous internal breathing room for a band's own content */
+.u-air > * + * { margin-top: clamp(1.6rem, 1rem + 2vw, 3.4rem); }
+
+/* -------------------------------------------------------------- buttons --- */
+.c-btn {
+  --_bg: var(--brand); --_fg: var(--on-brand); --_bd: var(--brand);
+  display: inline-flex; align-items: center; justify-content: center; gap: .6rem;
+  padding: 1.06em 2.2em;
+  background: var(--_bg); color: var(--_fg); border: 1px solid var(--_bd);
+  font-family: var(--font-body); font-size: .8rem; font-weight: 600;
+  letter-spacing: .16em; text-transform: uppercase; text-decoration: none;
+  border-radius: var(--r-pill); cursor: pointer;
+  transition: background-color .35s var(--ease), color .35s var(--ease),
+              border-color .35s var(--ease), transform .35s var(--ease), box-shadow .35s var(--ease);
+}
+.c-btn:hover { box-shadow: 0 14px 34px -14px color-mix(in srgb, var(--brand) 75%, transparent); }
+.c-btn--ghost { --_bg: transparent; --_fg: currentColor; --_bd: currentColor; }
+.c-btn--ghost:hover { --_bg: var(--brand); --_fg: var(--on-brand); --_bd: var(--brand); }
+.c-btn--square { border-radius: 2px; }
+.c-btns { display: flex; flex-wrap: wrap; gap: .9rem; }
+.u-center .c-btns { justify-content: center; }
+
+/* ------------------------------------------------------------------ nav --- */
+.c-nav {
+  position: sticky; top: 0; z-index: 60;
+  display: flex; align-items: center; justify-content: space-between; gap: 2rem;
+  padding: 1.1rem var(--s-gut);
+  background: var(--ink-band); color: #fff;
+}
+.c-nav--light { background: var(--bg); color: var(--ink); border-bottom: 1px solid var(--line-soft); }
+.c-nav__logo { display: flex; align-items: center; }
+.c-nav__logo img { height: clamp(30px, 2.4vw, 44px); width: auto; }
+.c-nav__links { display: flex; gap: clamp(1.2rem, 2vw, 2.6rem); list-style: none; margin: 0; padding: 0; }
+.c-nav__links a {
+  font-size: .78rem; font-weight: 600; letter-spacing: .15em; text-transform: uppercase;
+  text-decoration: none; padding-block: .3rem; position: relative;
+}
+.c-nav__links a::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: -2px; height: 1px;
+  background: var(--brand); transform: scaleX(0); transform-origin: right;
+  transition: transform .45s var(--ease);
+}
+.c-nav__links a:hover::after, .c-nav__links a[aria-current]::after { transform: scaleX(1); transform-origin: left; }
+.c-nav__links a[aria-current] { color: var(--brand); }
+.c-nav__toggle { display: none; background: none; border: 0; color: inherit; font-size: 1.6rem; cursor: pointer; }
+
+/* ----------------------------------------------------------------- hero --- */
+.c-hero { position: relative; }
+
+/* full-bleed image hero with scrim */
+.c-hero--full {
+  min-height: clamp(560px, 82vh, 900px);
+  display: grid; align-items: center;
+  color: #fff; overflow: hidden;
+}
+.c-hero--full > .c-hero__media { position: absolute; inset: 0; }
+.c-hero--full .c-hero__media img { width: 100%; height: 100%; object-fit: cover; }
+.c-hero--full::after {
+  content: ""; position: absolute; inset: 0;
+  background: linear-gradient(180deg, rgba(0,0,0,.55) 0%, rgba(0,0,0,.32) 45%, rgba(0,0,0,.68) 100%);
+}
+.c-hero--full .c-hero__body { position: relative; z-index: 2; }
+.c-hero--full .u-lead { color: rgba(255,255,255,.86); }
+.c-hero--full .u-eyebrow { color: color-mix(in srgb, var(--brand) 80%, #fff); }
+
+/* split hero with an arched frame — the signature medspa composition */
+.c-hero--split { padding-block: clamp(3.5rem, 2rem + 6vw, 8rem); }
+.c-hero--split .u-split { align-items: center; }
+
+.c-arch {
+  position: relative; overflow: hidden;
+  border-radius: 50vw 50vw 10px 10px / 42% 42% 10px 10px;
+  aspect-ratio: 4 / 5;
+  background: var(--cream);
+}
+.c-arch img { width: 100%; height: 100%; object-fit: cover; }
+.c-arch--outline::after {
+  content: ""; position: absolute; inset: -14px;
+  border: 1px solid var(--brand); opacity: .5;
+  border-radius: 50vw 50vw 10px 10px / 42% 42% 10px 10px;
+  pointer-events: none;
+}
+.c-frame { position: relative; overflow: hidden; border-radius: var(--r-soft); aspect-ratio: 4 / 3; background: var(--cream); }
+.c-frame img { width: 100%; height: 100%; object-fit: cover; }
+.c-frame--tall { aspect-ratio: 3 / 4; }
+.c-frame--wide { aspect-ratio: 16 / 9; }
+
+/* page header band for inner pages */
+.c-pagehead {
+  position: relative; overflow: hidden;
+  min-height: clamp(300px, 42vh, 460px);
+  display: grid; place-items: center; text-align: center; color: #fff;
+  padding-block: clamp(3rem, 2rem + 4vw, 6rem);
+}
+.c-pagehead__media { position: absolute; inset: 0; }
+.c-pagehead__media img { width: 100%; height: 100%; object-fit: cover; }
+.c-pagehead::after { content: ""; position: absolute; inset: 0; background: linear-gradient(180deg, rgba(0,0,0,.62), rgba(0,0,0,.5)); }
+.c-pagehead__body { position: relative; z-index: 2; }
+.c-pagehead .u-eyebrow { color: color-mix(in srgb, var(--brand) 82%, #fff); }
+.c-crumb { font-size: .74rem; letter-spacing: .2em; text-transform: uppercase; opacity: .8; margin-top: 1rem; }
+
+/* -------------------------------------------------------------- marquee --- */
+.c-marquee {
+  display: flex; overflow: hidden; gap: 0;
+  background: var(--brand); color: var(--on-brand);
+  padding-block: clamp(.9rem, .6rem + .8vw, 1.5rem);
+  user-select: none;
+}
+.c-marquee__row {
+  display: flex; flex: 0 0 auto; gap: 2.5rem; padding-right: 2.5rem;
+  animation: ds-marq 34s linear infinite;
+}
+.c-marquee:hover .c-marquee__row { animation-play-state: paused; }
+.c-marquee span {
+  font-family: var(--font-display); font-size: clamp(1.15rem, .9rem + 1.1vw, 2rem);
+  font-style: italic; white-space: nowrap;
+}
+@keyframes ds-marq { to { transform: translate3d(-100%, 0, 0); } }
+
+/* ---------------------------------------------------------------- cards --- */
+/* BARE BY DEFAULT — an image with type under it, no border/shadow chrome.
+   Card chrome (borders + drop shadows on everything) is the strongest
+   "bootstrap template" signal; .c-card--panel opts back in when a panel is right. */
+.c-card {
+  background: transparent; border: 0;
+  display: flex; flex-direction: column;
+  transition: transform .55s var(--ease);
+}
+.c-card--panel {
+  background: var(--bg); border: 1px solid var(--line-soft);
+  border-radius: var(--r-soft); overflow: hidden;
+  transition: transform .5s var(--ease), box-shadow .5s var(--ease), border-color .5s var(--ease);
+}
+.c-card--panel:hover { box-shadow: 0 26px 60px -34px rgba(0,0,0,.42); border-color: var(--brand-soft); }
+.c-card__media { aspect-ratio: 4 / 5; overflow: hidden; background: var(--cream); }
+.c-card__media img { width: 100%; height: 100%; object-fit: cover; }
+.c-card__body { padding: 1.5rem 0 0; display: flex; flex-direction: column; gap: .7rem; flex: 1; }
+.c-card--panel .c-card__body { padding: clamp(1.4rem, 1rem + 1vw, 2.1rem); }
+.c-card__body .u-eyebrow { margin-bottom: 0; }
+.c-card__link {
+  margin-top: auto; padding-top: .6rem;
+  font-size: .76rem; font-weight: 600; letter-spacing: .17em; text-transform: uppercase;
+  color: var(--brand); text-decoration: none; display: inline-flex; align-items: center; gap: .5rem;
+}
+.c-card__link::after { content: "→"; transition: transform .4s var(--ease); }
+.c-card:hover .c-card__link::after { transform: translateX(5px); }
+
+/* text-only card — used when a grid cannot be fully illustrated */
+.c-card--quiet { background: transparent; border-color: var(--line); }
+.c-card--quiet .c-card__body { padding-inline: 0; }
+
+/* arched pillar card */
+.c-pillar { text-align: center; display: flex; flex-direction: column; gap: 1.1rem; }
+.c-pillar .c-arch { aspect-ratio: 3 / 4; border-radius: 50vw 50vw 8px 8px / 34% 34% 8px 8px; }
+
+/* --------------------------------------------------------- editorial band - */
+.c-editorial + .c-editorial { margin-top: calc(var(--s-band) * .8); }
+.c-editorial__num {
+  font-family: var(--font-display); font-size: clamp(2.6rem, 2rem + 3vw, 5rem);
+  color: var(--brand); opacity: .28; line-height: 1; display: block; margin-bottom: .6rem;
+}
+.c-chips { display: flex; flex-wrap: wrap; gap: .55rem; margin-top: .4rem; }
+.c-chip {
+  border: 1px solid var(--line); border-radius: var(--r-pill);
+  padding: .5em 1.15em; font-size: .82rem; color: var(--muted);
+  transition: border-color .35s var(--ease), color .35s var(--ease), background-color .35s var(--ease);
+}
+.c-chip:hover { border-color: var(--brand); color: var(--ink); background: var(--brand-soft); }
+
+/* menu row — a treatment list that still feels designed */
+.c-menu { border-top: 1px solid var(--line); }
+.c-menu__row {
+  display: grid; grid-template-columns: auto 1fr auto; gap: 1.4rem; align-items: baseline;
+  padding: 1.5rem 0; border-bottom: 1px solid var(--line);
+  transition: padding-inline .45s var(--ease), background-color .45s var(--ease);
+}
+.c-menu__row:hover { background: var(--brand-soft); padding-inline: 1.2rem; }
+.c-menu__name { font-family: var(--font-display); font-size: var(--t-h3); }
+.c-menu__desc { color: var(--muted); font-size: .96rem; }
+.c-menu__price { color: var(--brand); font-weight: 600; white-space: nowrap; }
+
+/* ----------------------------------------------------------- team + quote - */
+.c-member { position: relative; }
+.c-member__media { aspect-ratio: 3 / 4; overflow: hidden; border-radius: var(--r-soft); background: var(--cream); }
+.c-member__media img { width: 100%; height: 100%; object-fit: cover; transition: transform 1.15s var(--ease); }
+.c-member:hover .c-member__media img { transform: scale(1.05); }
+.c-member__name { font-family: var(--font-display); font-size: var(--t-h3); margin-top: 1rem; }
+.c-member__role { font-size: .74rem; letter-spacing: .19em; text-transform: uppercase; color: var(--brand); margin-top: .3rem; }
+
+/* overlay team card — name sits ON the portrait with a corner arrow (ruma pattern) */
+.c-person { position: relative; overflow: hidden; display: block; text-decoration: none; color: #fff; aspect-ratio: 3 / 4; }
+.c-person img { width: 100%; height: 100%; object-fit: cover; transition: transform 1.3s var(--ease); }
+.c-person:hover img { transform: scale(1.055); }
+.c-person::after { content: ""; position: absolute; inset: 0; background: linear-gradient(180deg, rgba(0,0,0,.42) 0%, rgba(0,0,0,.05) 42%, rgba(0,0,0,.55) 100%); }
+.c-person__meta { position: absolute; inset: auto auto 0 0; z-index: 2; padding: 1.6rem; }
+.c-person__name { font-family: var(--font-body); font-weight: 600; font-size: 1.05rem; letter-spacing: .08em; text-transform: uppercase; line-height: 1.25; }
+.c-person__role { font-size: .84rem; opacity: .84; margin-top: .35rem; line-height: 1.4; }
+.c-person__go { position: absolute; top: 1.4rem; right: 1.4rem; z-index: 2; font-size: 1.3rem; opacity: .85; transition: transform .5s var(--ease); }
+.c-person:hover .c-person__go { transform: translate(4px, -4px); }
+
+/* full-bleed image — edge to edge, no chrome. Huge photography is the luxury tell. */
+.c-bleed { width: 100vw; margin-left: 50%; transform: translateX(-50%); overflow: hidden; }
+.c-bleed img { width: 100%; height: clamp(340px, 62vh, 760px); object-fit: cover; }
+.c-bleed--tall img { height: clamp(460px, 86vh, 940px); }
+
+.c-quote { max-width: 68ch; margin-inline: auto; text-align: center; }
+.c-quote__mark { font-family: var(--font-display); font-size: 4.5rem; line-height: .6; color: var(--brand); opacity: .35; }
+.c-quote__text {
+  font-family: var(--font-display); font-size: clamp(1.35rem, 1.05rem + 1.5vw, 2.35rem);
+  line-height: 1.42; font-style: italic; margin-top: 1.2rem;
+}
+.c-quote__by { margin-top: 1.6rem; font-size: .76rem; letter-spacing: .2em; text-transform: uppercase; color: var(--brand); }
+
+/* ---------------------------------------------------------------- stats --- */
+.c-stat { text-align: center; }
+.c-stat__n { font-family: var(--font-display); font-size: clamp(2.4rem, 1.8rem + 2.6vw, 4rem); color: var(--brand); line-height: 1; }
+.c-stat__l { margin-top: .6rem; font-size: .76rem; letter-spacing: .18em; text-transform: uppercase; color: var(--muted); }
+.u-dark .c-stat__l { color: rgba(255,255,255,.66); }
+
+/* ------------------------------------------------------------ accordion --- */
+.c-acc { border-top: 1px solid var(--line); }
+.c-acc__item { border-bottom: 1px solid var(--line); }
+.c-acc__q {
+  width: 100%; background: none; border: 0; cursor: pointer; text-align: left;
+  display: flex; justify-content: space-between; align-items: center; gap: 1.5rem;
+  padding: 1.5rem 0; font-family: var(--font-display); font-size: var(--t-h3); color: inherit;
+  transition: color .35s var(--ease);
+}
+.c-acc__q:hover { color: var(--brand); }
+.c-acc__q::after { content: "+"; font-size: 1.5rem; color: var(--brand); transition: transform .45s var(--ease); }
+.c-acc__item[open] .c-acc__q::after { transform: rotate(45deg); }
+.c-acc__a { padding-bottom: 1.6rem; color: var(--muted); max-width: var(--w-read); }
+
+/* ---------------------------------------------------------------- forms --- */
+.c-field { display: flex; flex-direction: column; gap: .5rem; }
+.c-field label { font-size: .72rem; letter-spacing: .16em; text-transform: uppercase; color: var(--muted); }
+.c-field input, .c-field select, .c-field textarea {
+  font: inherit; font-size: .98rem; color: inherit;
+  padding: .95em 1.1em; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 8px;
+  transition: border-color .35s var(--ease), box-shadow .35s var(--ease);
+}
+.c-field input:focus, .c-field select:focus, .c-field textarea:focus {
+  outline: 0; border-color: var(--brand);
+  box-shadow: 0 0 0 3px var(--brand-soft);
+}
+.c-panel { background: var(--bg); border: 1px solid var(--line-soft); border-radius: var(--r-soft); padding: clamp(1.6rem, 1.1rem + 1.6vw, 2.8rem); }
+.c-map { border-radius: var(--r-soft); overflow: hidden; border: 1px solid var(--line-soft); }
+.c-map iframe { display: block; width: 100%; height: clamp(280px, 38vh, 440px); border: 0; filter: grayscale(1) contrast(.92); transition: filter .6s var(--ease); }
+.c-map:hover iframe { filter: none; }
+
+/* --------------------------------------------------------------- footer --- */
+.c-foot { background: var(--ink-band); color: rgba(255,255,255,.72); padding-block: calc(var(--s-band) * .68) 2.4rem; }
+.c-foot h4 { color: #fff; font-family: var(--font-body); font-size: .75rem; font-weight: 600; letter-spacing: .2em; text-transform: uppercase; margin-bottom: 1.1rem; }
+.c-foot a { color: inherit; text-decoration: none; transition: color .3s var(--ease); }
+.c-foot a:hover { color: var(--brand); }
+.c-foot__logo img { height: 46px; width: auto; }
+.c-foot__bar { margin-top: clamp(2.5rem, 2rem + 2vw, 4rem); padding-top: 1.6rem; border-top: 1px solid rgba(255,255,255,.12); display: flex; flex-wrap: wrap; gap: 1rem; justify-content: space-between; font-size: .82rem; }
+.c-social { display: flex; gap: .7rem; }
+.c-social a {
+  width: 40px; height: 40px; border-radius: 50%; border: 1px solid rgba(255,255,255,.22);
+  display: grid; place-items: center; font-size: .72rem; letter-spacing: .04em;
+  transition: background-color .35s var(--ease), border-color .35s var(--ease), color .35s var(--ease), transform .35s var(--ease);
+}
+.c-social a:hover { background: var(--brand); border-color: var(--brand); color: var(--on-brand); transform: translateY(-3px); }
+
+/* ------------------------------------------------------- floating widget -- */
+.c-book-tab {
+  position: fixed; right: 0; top: 50%; transform: translateY(-50%); z-index: 55;
+  writing-mode: vertical-rl; background: var(--brand); color: var(--on-brand);
+  padding: 1.4rem .8rem; font-size: .74rem; font-weight: 600; letter-spacing: .2em;
+  text-transform: uppercase; text-decoration: none; border-radius: 8px 0 0 8px;
+  transition: padding .4s var(--ease), box-shadow .4s var(--ease);
+}
+.c-book-tab:hover { padding-right: 1.2rem; box-shadow: -8px 0 26px -10px rgba(0,0,0,.4); }
+
+/* ----------------------------------------------------------- responsive -- */
+@media (max-width: 900px) {
+  .u-split, .u-split--wide-l, .u-split--wide-r { grid-template-columns: 1fr; }
+  .u-split--flip > :first-child { order: 0; }
+  .u-grid--3, .u-grid--4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .c-nav__links { display: none; }
+  .c-nav__links.is-open {
+    display: flex; flex-direction: column; gap: 1.2rem;
+    position: absolute; inset: 100% 0 auto; padding: 1.6rem var(--s-gut) 2rem;
+    background: inherit; border-bottom: 1px solid var(--line-soft);
+  }
+  .c-nav { position: sticky; }
+  .c-nav__toggle { display: block; }
+  .c-menu__row { grid-template-columns: 1fr; gap: .4rem; }
+  .c-book-tab { display: none; }
+}
+@media (max-width: 620px) {
+  .u-grid--2, .u-grid--3, .u-grid--4 { grid-template-columns: 1fr; }
+  .c-hero--full { min-height: 78vh; }
+}
