@@ -4960,14 +4960,34 @@ async function resolveClientSite(clientName, hubspotId) {
 // The client's own revision-cycle task, which the request's subtask hangs off.
 // Cached per client because it is stable for the life of an onboarding.
 const TED_PARENTS = new Map();
+// Every top-level task for a client whose title looks like the revision-cycle
+// one, across ALL pages of the client's task list.
+//
+// Paging is not optional here. TED caps a page at 100 rows no matter what
+// pageSize asks for, and it answers hasNext rather than a total, so reading only
+// the first response silently loses the revision task of any client with more
+// than 100 tasks. AgeRejuvenation is exactly that case: its real task (10498) is
+// on page 2, while page 1 carries only the task of a duplicate client record
+// that has no repository — so the one-page read did not merely miss the client,
+// it found the wrong record's task and looked like it had succeeded.
+async function tedClientParentCandidates(clientName) {
+  const out = [];
+  for (let page = 1; page <= 20; page++) {
+    const d = await tedFetchJson(`/api/tasks/all?pageSize=100&page=${page}&client=${encodeURIComponent(clientName)}`);
+    const items = d.items || [];
+    out.push(...items.filter((t) => !t.parentId && TED_PARENT_TITLE_RE.test(t.title || "")));
+    if (!d.hasNext || !items.length) break;
+  }
+  return out;
+}
+
 async function tedRevisionParent(businessName) {
   const cached = TED_PARENTS.get(businessName);
   if (cached && Date.now() - cached.at < 600000) return cached.id;
   const client = await tedClientName(businessName);
-  const d = await tedFetchJson(`/api/tasks/all?pageSize=200&client=${encodeURIComponent(client)}`);
   // The list response strips `automation`, so the key can only be confirmed by
   // fetching each candidate. Narrowing by title first keeps that to one or two.
-  const candidates = (d.items || []).filter((t) => !t.parentId && TED_PARENT_TITLE_RE.test(t.title || ""));
+  const candidates = await tedClientParentCandidates(client);
   for (const c of candidates) {
     const full = await tedFetchJson(`/api/tasks/${c.id}`).catch(() => null);
     if (full && full.automation && full.automation.templateKey === TED_PARENT_KEY) {
@@ -5087,6 +5107,64 @@ async function tedTaskComments(taskId) {
 // Only the deliberate refusals below are marked ignorable.
 function tedSkip(message) { const e = new Error(message); e.ignore = true; return e; }
 
+// Reference images attached to a subtask through TED's "Reference files" box.
+//
+// TED hands the file back inline as a base64 data: URI, not as a URL — one
+// screenshot is a ~950KB JSON response. Two consequences shape this function.
+// It is called only for a subtask that has already passed every skip check and
+// is about to run, never while scanning; and the bytes are written to disk here
+// rather than carried in memory, because the job payload is re-serialised into
+// jobs.json on every status change and base64 in it would add a megabyte per
+// request to a file that is already close to a megabyte.
+//
+// Images only, deliberately. The upload dialog offers PDF, but TED's own
+// developer says PDF is not actually supported, so anything that is not an
+// image is skipped rather than half-handled on a promise that may not hold.
+const MEDIA_EXT = { "image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/gif": ".gif", "image/webp": ".webp" };
+async function tedTaskMedia(taskId) {
+  if (!TED_API_TOKEN) return [];
+  let items;
+  try { items = await tedFetchJson(`/api/tasks/${taskId}/media`); }
+  catch (e) { console.warn(`ted media: could not read task ${taskId}: ${e.message}`); return []; }
+  const list = Array.isArray(items) ? items : (items && (items.items || items.data || items.list)) || [];
+  const out = [];
+  for (const m of list) {
+    if (!m) continue;
+    const uri = String(m.dataUri || "");
+    // contentType is trusted only as a fallback: the data: URI carries the type
+    // the bytes were actually stored as.
+    const mime = ((uri.match(/^data:([^;]+);base64,/) || [])[1] || String(m.contentType || "")).toLowerCase();
+    if (!/^image\//.test(mime)) { console.log(`ted media: skipping ${m.filename || m.id} on ${taskId} — ${mime || "unknown type"} is not an image`); continue; }
+    const comma = uri.indexOf(",");
+    const buf = comma > -1 ? Buffer.from(uri.slice(comma + 1), "base64") : Buffer.alloc(0);
+    if (!buf.length) continue;
+    try {
+      fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+      const name = `ted-${taskId}-${m.id || out.length}${MEDIA_EXT[mime] || ".png"}`;
+      fs.writeFileSync(path.join(UPLOADS_DIR, name), buf);
+      out.push({
+        id: String(m.id || ""), filename: String(m.filename || name), contentType: mime,
+        path: path.join(UPLOADS_DIR, name), url: "/uploads/" + name, bytes: buf.length,
+      });
+    } catch (e) { console.warn(`ted media: could not save ${m.id} from ${taskId}: ${e.message}`); }
+  }
+  return out;
+}
+
+// The image parts for a model call, read back off disk. Returned as Gemini
+// inlineData parts, which is the only way the model actually SEES the picture —
+// a filename in the prompt tells it nothing about where the arrow points.
+function refImageParts(refImages) {
+  const parts = [];
+  for (const im of (refImages || [])) {
+    try {
+      if (!im || !im.path || !fs.existsSync(im.path)) continue;
+      parts.push({ inlineData: { mimeType: im.contentType || "image/png", data: fs.readFileSync(im.path).toString("base64") } });
+    } catch (e) { console.warn(`ref image ${im && im.filename} unreadable: ${e.message}`); }
+  }
+  return parts;
+}
+
 async function tedResolveSubtaskRequest(taskId) {
   // TED calls two different things a subtask, and only one of them is a task.
   // GET /api/tasks/<parent>/subtasks shows both: a real sub-task is a Task record
@@ -5147,7 +5225,10 @@ async function tedResolveSubtaskRequest(taskId) {
 
   const instruction = [task.title, description, ...comments.map((c) => c.text)]
     .map((s) => String(s || "").trim()).filter(Boolean).join("\n\n");
-  return { task, parent, site, clientName, instruction };
+  // Last, and only now: every refusal above returns before this, so a scan of a
+  // board full of subtasks never pulls a megabyte of image down per row.
+  const media = await tedTaskMedia(taskId);
+  return { task, parent, site, clientName, instruction, media };
 }
 
 // Real sub-tasks and checklist rows both come back here; the caller filters.
@@ -5186,7 +5267,8 @@ async function startTedSubtaskRun(taskId, { dryRun = false } = {}) {
   const target = await resolveEditTarget(r.site);
   if (dryRun) {
     return { dryRun: true, taskId, parentId: r.task.parentId, businessName: r.site.businessName,
-      themeSlug: target.themeSlug, instruction: r.instruction };
+      themeSlug: target.themeSlug, instruction: r.instruction,
+      refImages: (r.media || []).map((m) => ({ filename: m.filename, contentType: m.contentType, bytes: m.bytes })) };
   }
   const job = enqueueEditJob({
     jobId: "edit-" + Date.now(),
@@ -5201,6 +5283,9 @@ async function startTedSubtaskRun(taskId, { dryRun = false } = {}) {
     // comment land back where the request was made.
     source: "ted-subtask", requestedBy: r.task.reporterName || "TED",
     tedSubtaskId: String(taskId), liveUrl: r.site.liveUrl || "",
+    // Paths, not bytes — see tedTaskMedia. The files live in generated/uploads/
+    // and are read back only at the moment a model call is made.
+    refImages: (r.media || []).map((m) => ({ filename: m.filename, contentType: m.contentType, path: m.path, url: m.url, bytes: m.bytes })),
   });
   TED_STARTED.add(String(taskId));
   saveTedSeen();
@@ -5211,7 +5296,11 @@ async function startTedSubtaskRun(taskId, { dryRun = false } = {}) {
   tedComment([
     `Picked up by Growth99 Studio - ${r.site.businessName}`,
     `Studio job: ${job.draftId} - building now, held for approval before anything merges.`,
-  ].join("\n"), null, 0, String(taskId));
+    // Says what was read, so a reference file that TED holds but this tool
+    // skipped (a PDF, say) is visible to the person who attached it rather than
+    // silently ignored while the run reports success.
+    (r.media || []).length ? `Reading ${r.media.length} reference image(s): ${r.media.map((m) => m.filename).join(", ")}` : "",
+  ].filter(Boolean).join("\n"), null, 0, String(taskId));
   notify(`📝 TED subtask ${taskId} → *${r.site.businessName}*: ${r.instruction.slice(0, 140)} (needs your approval before merge)`);
   return { jobId: job.draftId, taskId, businessName: r.site.businessName };
 }
@@ -5226,6 +5315,113 @@ async function startTedSubtaskRun(taskId, { dryRun = false } = {}) {
 // Re-running is prevented by the acknowledgement comment rather than by memory,
 // so a redeploy mid-flight cannot cause a second run of the same request.
 const TED_POLL_MS = Number(process.env.TED_SUBTASK_POLL_MS || 180000);
+
+// ---- Who the poller watches -------------------------------------------------
+// Discovery used to start from the site list, which meant a client could only be
+// watched if somebody had first named it in sites.manual.json by hand. But the
+// beta site's repository and URL are written onto the TED client record by the
+// workflow that provisions the site, so TED already knows both — asking TED
+// removes the manual step entirely. A client becomes watchable the moment those
+// two fields appear, and a client that never gets them is simply skipped, which
+// is the correct outcome rather than an error.
+//
+// The site list is still read alongside it, NOT replaced. Neither mcptest2 nor
+// prodteam carries a repository on a TED client record — prodteam has no TED
+// client at all — so TED-only discovery would quietly stop watching two sites
+// that are watched today.
+const TED_DISCOVER_MS = Number(process.env.TED_DISCOVER_MS || 900000);   // 15 min
+let TED_WATCHING = { at: 0, list: [] };
+
+// Every TED client whose record names a repository. One /info call per client,
+// which is why the result is cached for far longer than the poll interval: the
+// field is written once when the site is provisioned and never again.
+async function tedClientsWithSites() {
+  const list = await tedClients();
+  const out = [];
+  let i = 0;
+  const worker = async () => {
+    while (i < list.length) {
+      const c = list[i++];
+      const info = await tedGetClientInfo(c.id);            // null on any failure, never throws
+      if (!info) continue;
+      const repo = parseRepoSlug(info.githubRepo || "") || String(info.githubRepo || "").trim();
+      if (!repo) continue;                                  // not provisioned yet — fine, skip it
+      out.push({
+        clientId: String(c.id),
+        clientName: String(info.name || c.name || "").trim(),
+        hubspotId: c.hubspotId ? String(c.hubspotId) : "",
+        repo, betaUrl: String(info.betaSiteUrl || "").trim(),
+      });
+    }
+  };
+  await Promise.all(Array.from({ length: 6 }, worker));
+  return out;
+}
+
+// The revision-cycle task belonging to ONE client record, identified by id.
+//
+// Deliberately not tedRevisionParent(), which matches on the client's name: TED
+// holds several records under one name ("AgeRejuvenation" is three of them) and
+// the name-scoped task query returns all of their tasks together. Matching on
+// the name alone therefore hands back whichever record's task happens to come
+// first — which is how a client whose repository is filled in on one record ends
+// up watched through a duplicate record that has none. hubspotId is unique
+// across the client list, so it is what confirms the task belongs to this record.
+async function tedRevisionParentForClient(client) {
+  const candidates = await tedClientParentCandidates(client.clientName);
+  for (const c of candidates) {
+    if (client.hubspotId && c.hubspotId && String(c.hubspotId) !== client.hubspotId) continue;
+    // The list response strips `automation`, so the key can only be confirmed by
+    // fetching the task itself. Narrowing by title and hubspotId first keeps that
+    // to one or two fetches per client.
+    const full = await tedFetchJson(`/api/tasks/${c.id}`).catch(() => null);
+    if (full && full.automation && full.automation.templateKey === TED_PARENT_KEY) return String(full.id);
+  }
+  return null;
+}
+
+// The parent tasks to poll: TED's own clients first, the site list behind them,
+// de-duplicated by parent id so a client reachable both ways is watched once.
+// On a failure of both sources the previous list is returned rather than an empty
+// one — "TED did not answer" must not read as "nobody is watched any more".
+async function tedWatchList() {
+  if (TED_WATCHING.list.length && Date.now() - TED_WATCHING.at < TED_DISCOVER_MS) return TED_WATCHING.list;
+  const seen = new Set();
+  const watch = [];
+  let tedOk = false, listOk = false;
+
+  try {
+    const clients = await tedClientsWithSites();
+    tedOk = true;
+    for (const c of clients) {
+      let parentId = null;
+      try { parentId = await tedRevisionParentForClient(c); }
+      catch (e) { continue; }                               // no revision task for this record
+      if (!parentId || seen.has(parentId)) continue;
+      seen.add(parentId);
+      watch.push({ parentId, label: `${c.clientName} (TED client ${c.clientId})`, clientId: c.clientId });
+    }
+  } catch (e) { console.warn("subtask poll: TED client discovery failed:", e.message); }
+
+  try {
+    const sites = await getWebsites(false);
+    listOk = true;
+    for (const site of sites) {
+      let parentId = null;
+      try { parentId = await tedRevisionParent(site.businessName); }
+      catch (e) { continue; }
+      if (!parentId || seen.has(parentId)) continue;
+      seen.add(parentId);
+      watch.push({ parentId, label: site.businessName, clientId: null });
+    }
+  } catch (e) { console.warn("subtask poll: site list unavailable:", e.message); }
+
+  if (!tedOk && !listOk) return TED_WATCHING.list;
+  TED_WATCHING = { at: Date.now(), list: watch };
+  console.log(`subtask poll: watching ${watch.length} revision-cycle task(s) — ${watch.map((w) => w.parentId).join(", ") || "none"}`);
+  return watch;
+}
+
 async function pollTedSubtasks() {
   if (!TED_API_TOKEN || !TED_SUBTASKS) return;
   // First boot on a deployment: adopt whatever is already there without acting on
@@ -5233,23 +5429,21 @@ async function pollTedSubtasks() {
   // rows — and starting a build for each one because the tool had just learned to
   // look would be indefensible. Only what appears afterwards is acted on.
   const seeding = !TED_SEEN_LOADED && !loadTedSeen();
-  let sites = [];
-  try { sites = await getWebsites(false); } catch (e) { return console.warn("subtask poll: NocoDB unavailable:", e.message); }
+  const watching = await tedWatchList();
   if (seeding) {
-    for (const site of sites) {
+    for (const w of watching) {
       try {
-        const pid = await tedRevisionParent(site.businessName);
-        (await tedListSubtasks(pid)).forEach((s) => s && s.id && TED_STARTED.add(String(s.id)));
-      } catch (e) { /* a client with no revision task contributes nothing to seed */ }
+        (await tedListSubtasks(w.parentId)).forEach((s) => s && s.id && TED_STARTED.add(String(s.id)));
+      } catch (e) { /* a task that cannot be listed contributes nothing to seed */ }
     }
     TED_SEEN_LOADED = true;
     saveTedSeen();
     console.log(`subtask poll: adopted ${TED_STARTED.size} existing subtask(s) without running them; new ones from here on`);
     return;
   }
-  for (const site of sites) {
-    let parentId, subs;
-    try { parentId = await tedRevisionParent(site.businessName); } catch (e) { continue; }   // no revision task for this client
+  for (const w of watching) {
+    const parentId = w.parentId;
+    let subs;
     try { subs = await tedListSubtasks(parentId); } catch (e) { console.warn(`subtask poll: could not list ${parentId}:`, e.message); continue; }
     for (const s of subs) {
       const id = String((s && s.id) || "");
@@ -8963,9 +9157,10 @@ async function editPlan(manifest, req, ai) {
     `\nCHANGE REQUEST, VERBATIM:\n-----\n${req.prompt}\n-----`,
     req.workOrder ? "\n" + req.workOrder : "",
     `\nEvery item in the request needs a file entry, and nothing that was not asked for gets one. Each "instruction" must stand on its own — the model writing that file sees only it — and must repeat any exact wording the sender gave.`,
+    req.imageCount ? `\n${req.imageCount} REFERENCE IMAGE(S) ARE ATTACHED. They are screenshots of the CURRENT site, marked up to show what to change — an arrow, circle or box points at the element the request is about. Use them to identify WHICH element is meant. They are not artwork: never add them to the site, and never reference their filenames.` : "",
     `\nReturn ONLY minified JSON: {"summary":"one line of what you'll change","files":[{"path":"web/app/…","op":"create|modify|delete","instruction":"precise instruction for THIS file"}]}`,
   ].filter(Boolean).join("\n");
-  const raw = await aiCall([{ text: p }], { ...(ai || {}), temperature: 0.2, maxOutputTokens: 3000, timeoutMs: 60000, json: true });
+  const raw = await aiCall([{ text: p }, ...(req.images || [])], { ...(ai || {}), temperature: 0.2, maxOutputTokens: 3000, timeoutMs: 60000, json: true });
   return JSON.parse((stripFence(raw).match(/\{[\s\S]*\}/) || ["{}"])[0]);
 }
 async function editFileContent(op, path_, instruction, currentContent, planContext, ai, req) {
@@ -8982,6 +9177,7 @@ async function editFileContent(op, path_, instruction, currentContent, planConte
     (req && req.workOrder) ? "\n" + req.workOrder : "",
     op === "modify" ? `\nCURRENT CONTENT:\n-----\n${currentContent}\n-----` : "",
     `\nDO THIS TO ${path_}:\n${instruction}`,
+    (req && req.imageCount) ? `\n${req.imageCount} REFERENCE IMAGE(S) ARE ATTACHED — screenshots of the current site marked up (arrow, circle or box) to show which element the request means. Read them to locate the element. They are not artwork: do not add them to the page and do not reference their filenames.` : "",
     op === "modify"
       // Spelled out because the plausible-sounding version of this failure is
       // the common one: asked to change one heading from 30 to 40, the model
@@ -8990,7 +9186,7 @@ async function editFileContent(op, path_, instruction, currentContent, planConte
       ? `\nReturn the full modified file.\n\nCHANGE NOTHING ELSE. Not other text that now disagrees with the change, not wording you think reads better, not formatting, not indentation, not blank lines, not the trailing newline. If another number or phrase in this file contradicts the change once you have made it, leave it contradicting — reconciling it is the client's decision to ask for, not yours to take. Every byte you were not explicitly asked to change must come back exactly as it went in.`
       : `\nReturn the full new file.`,
   ].filter(Boolean).join("\n");
-  return stripFence(await aiCall([{ text: p }], { ...(ai || {}), temperature: 0.2, maxOutputTokens: 16000, timeoutMs: 90000 }));
+  return stripFence(await aiCall([{ text: p }, ...((req && req.images) || [])], { ...(ai || {}), temperature: 0.2, maxOutputTokens: 16000, timeoutMs: 90000 }));
 }
 
 // ---- 4. Did it actually do what was asked? ----------------------------------
@@ -9363,7 +9559,14 @@ async function runEditJob(job) {
     // The site model travels with the brief, so the planner and every file
     // writer are told the same story about what they are editing.
     const conventions = gitops ? GITOPS_CONVENTIONS : THEME_CONVENTIONS;
-    const brief = { prompt: P.prompt, businessName: P.businessName, workOrder: workOrderText(forAi), gitops, conventions };
+    // Reference images ride along as real image parts, not as a filename in the
+    // text. A TED reference image is almost always an ANNOTATED SCREENSHOT — an
+    // arrow drawn at the thing to change — which is the opposite of the edit
+    // chat's attachments, where an image is artwork to place ON the page. Both
+    // prompts below say which of the two this is, because a model told only
+    // "reference image" will cheerfully embed the screenshot into the site.
+    const brief = { prompt: P.prompt, businessName: P.businessName, workOrder: workOrderText(forAi), gitops, conventions,
+      images: refImageParts(P.refImages), imageCount: (P.refImages || []).length };
     const allowed = (rel) => rel === P.muPath || rel.startsWith(P.themePath + "/");
 
     // With no work order there is only the raw prompt, so the model still runs.
@@ -9458,6 +9661,9 @@ async function runEditJob(job) {
         const scan = scanTheme();     // the files as the first pass left them
         const retryBrief = {
           prompt: P.prompt, businessName: P.businessName, gitops, conventions,
+          // The retry is the same request, so it needs the same picture: without
+          // this the second pass is the one that cannot see where the arrow points.
+          images: brief.images, imageCount: brief.imageCount,
           workOrder: workOrderText(retryWo) + "\n\nAn earlier attempt at this same request already made its other changes. Do ONLY the items above and leave everything else exactly as it now stands.",
         };
         const plan2 = await editPlan(scan.manifest, {
@@ -18583,6 +18789,8 @@ module.exports = {
   tedClients, tedClientIdFor, tedSiteFields, tedRepoUsable, withTedFields, resolveClientSite,
   tedResolveSubtaskRequest, tedTaskComments, isEmailSubtask, TED_EMAIL_SUFFIX, TED_AUTOMATION_MARK,
   tedListSubtasks, startTedSubtaskRun, pollTedSubtasks,
+  tedClientsWithSites, tedRevisionParentForClient, tedWatchList,
+  tedTaskMedia, refImageParts,
   OUTCOME, OUTCOME_LABEL, resolveFindingOutcomes, replaceInTextNodes, fixBusinessName,
   imageSources, findingsImages, readSeoPages, synthMuSource, pageText,
   fixFavicon, fixSocialImage, fix404, fixCallNow, fixBlvd, fixBlogLinkColor, fixClickable,
