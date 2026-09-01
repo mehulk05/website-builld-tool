@@ -5380,6 +5380,18 @@ async function startTedSubtaskRun(taskId, { dryRun = false } = {}) {
 // so a redeploy mid-flight cannot cause a second run of the same request.
 const TED_POLL_MS = Number(process.env.TED_SUBTASK_POLL_MS || 180000);
 
+// Whether TED has ever actually called us. The webhook is the fast path and the
+// poll is the backstop, and when the webhook is not registered on TED's side
+// nothing says so: requests still get picked up, just minutes later, and the
+// only visible symptom is a delay nobody is measuring. Worse, the poll cannot
+// substitute for it completely — it skips any subtask it has already started, so
+// detail added to an existing request reaches the webhook or reaches nothing.
+//
+// So the poller says once, the first time it does a job the webhook should have
+// done, that the webhook appears not to be wired up.
+let TED_WEBHOOK_SEEN = false;
+let TED_WEBHOOK_WARNED = false;
+
 // ---- Who the poller watches -------------------------------------------------
 // Discovery used to start from the site list, which meant a client could only be
 // watched if somebody had first named it in sites.manual.json by hand. But the
@@ -5515,7 +5527,16 @@ async function pollTedSubtasks() {
       if (!id || /^sub_/i.test(id) || TED_STARTED.has(id)) continue;
       try {
         const out = await startTedSubtaskRun(id);
-        if (out && out.jobId && !out.dedupe) console.log(`subtask poll: started ${out.jobId} for TED subtask ${id} (${out.businessName})`);
+        if (out && out.jobId && !out.dedupe) {
+          console.log(`subtask poll: started ${out.jobId} for TED subtask ${id} (${out.businessName})`);
+          // The webhook should have delivered this one within seconds of it
+          // being created. If it never has, say so — once — because the symptom
+          // otherwise is only that everything is a few minutes late.
+          if (!TED_WEBHOOK_SEEN && !TED_WEBHOOK_WARNED) {
+            TED_WEBHOOK_WARNED = true;
+            console.warn(`subtask poll: TED has not called /api/webhook/ted-subtask once this process — the webhook looks unregistered on TED's side, so requests arrive up to ${Math.round(TED_POLL_MS / 1000)}s late and a comment added to an already-started subtask will not be seen at all`);
+          }
+        }
       } catch (e) {
         // Logged either way — silence here is indistinguishable from a poller
         // that never looked, which is the doubt this feature exists to remove.
@@ -16799,8 +16820,28 @@ const server = http.createServer(async (req, res) => {
     // template key, the client, whether it is one of ours — is read back from
     // TED rather than trusted from the payload.
     if (p === "/api/webhook/ted-subtask" && req.method === "POST") {
+      // Refuses outright when no secret is configured, rather than running open
+      // — the same rule /api/webhook/email-change and
+      // /api/webhook/onboarding-submitted have always followed.
+      //
+      // This one used to accept an unauthenticated POST whenever the variable
+      // was unset, which is how it was actually deployed: a public URL where
+      // anyone who guessed a task id could start a run that merges to a client's
+      // repository. Task ids are small consecutive integers. The other checks
+      // downstream (the parent must be a revision-cycle task, the subtask must
+      // carry a request, the tool must not have spoken last) stop an attacker
+      // writing their own instruction, but not replaying somebody else's.
+      //
+      // Failing closed costs nothing here: unset means no caller is
+      // authenticating, which means no legitimate caller is configured yet.
       const secret = (process.env.TED_SUBTASK_WEBHOOK_SECRET || "").trim();
-      if (secret && (req.headers["x-webhook-secret"] || "") !== secret) return json(res, 401, { error: "bad webhook secret" });
+      if (!secret) {
+        console.warn("ted-subtask webhook: refused — TED_SUBTASK_WEBHOOK_SECRET is not set, so this endpoint cannot tell TED from anyone else");
+
+        return json(res, 401, { error: "webhook not configured on this deployment" });
+      }
+      if ((req.headers["x-webhook-secret"] || "") !== secret) return json(res, 401, { error: "bad webhook secret" });
+      TED_WEBHOOK_SEEN = true;
       let body = {};
       try { body = JSON.parse(await readBody(req) || "{}"); } catch (e) { return json(res, 400, { error: "bad json" }); }
       // TED wraps task events as { event, timestamp, source, data, subscriptionId }
@@ -18844,6 +18885,14 @@ if (require.main === module) {
   // stopped is owed it still, and the person waiting on it has no other way to
   // find out what happened to their request.
   flushOwedTedOutcomes().catch((e) => console.error("owed TED outcomes could not be flushed:", e.message));
+  // Whether the fast path is even available, said plainly at boot. An
+  // unregistered webhook is invisible from here — TED simply never calls — so
+  // the one thing this side can report is whether it would accept the call.
+  if (TED_API_TOKEN && TED_SUBTASKS) {
+    console.log((process.env.TED_SUBTASK_WEBHOOK_SECRET || "").trim()
+      ? `TED subtask webhook: armed at ${G99_TOOL_PUBLIC_URL || "(G99_TOOL_PUBLIC_URL unset)"}/api/webhook/ted-subtask — TED must send x-webhook-secret`
+      : "TED subtask webhook: DISABLED — TED_SUBTASK_WEBHOOK_SECRET is not set, so the endpoint refuses every caller and requests arrive only via the poll");
+  }
   // Say which mode content review is in, at boot, every time. The one thing that
   // must never be ambiguous is whether a reviewer's correction ends up in a local
   // checkout or in a pull request against a client's repository.
