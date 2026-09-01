@@ -16463,7 +16463,29 @@ const server = http.createServer(async (req, res) => {
       const status = dig("status", "taskStatus", "newStatus");
       const targetTask = tgt.id || tgt.taskId || dig("targetTaskId", "id");
       if (!clientId && !clientName) {
+        // TED's "Test Webhook" button sends a skeleton — event, timestamp,
+        // source, subscriptionId and an empty data — with no client on it,
+        // because there is no event to describe. Answering 422 to that made the
+        // one control an operator has for checking their wiring report a fault
+        // when the wiring was correct, which is how this endpoint came to look
+        // broken while it was working.
+        //
+        // So a payload carrying NO identifying field at all is treated as the
+        // reachability check it is: 200, and a body that says plainly that
+        // nothing was done and what a real event must carry. This is not a
+        // silent success — no work was owed, none was dropped, and the response
+        // says so. A payload that names a client and cannot be resolved is still
+        // a 409 further down, as it should be.
+        if (!targetTask && !templateKey) {
+          console.log("pre-release webhook: reachability check (no client, no task, no template key) — answered 200");
+
+          return json(res, 200, {
+            ok: true, test: true,
+            message: "Endpoint reachable and authenticated. This payload carries no client, so nothing was done — a real event carries trigger.clientId or a client name.",
+          });
+        }
         console.warn("pre-release webhook: no client on the event. payload:", JSON.stringify(body).slice(0, 1200));
+
         return json(res, 422, { error: "no client id or name in payload", seen: Object.keys(body), hint: "expected trigger.clientId" });
       }
       // TED's UI offers "All Events", which would fire this on every comment and
@@ -16920,6 +16942,20 @@ const server = http.createServer(async (req, res) => {
         || (body.task && body.task.id) || (body.comment && body.comment.taskId) || body.id || ""
       ).trim();
       if (!taskId) {
+        // Same as the pre-release hook: TED's "Test Webhook" button sends a
+        // skeleton with an empty `data`, and answering 422 to it makes a
+        // correctly wired endpoint report a fault. An empty data object is a
+        // reachability check; a populated one that still hides the id is a real
+        // payload we failed to read, and that must stay loud.
+        const dataEmpty = !dat || typeof dat !== "object" || !Object.keys(dat).length;
+        if (dataEmpty) {
+          console.log("ted-subtask webhook: reachability check (no task id, empty data) — answered 200");
+
+          return json(res, 200, {
+            ok: true, test: true,
+            message: "Endpoint reachable and authenticated. This payload carries no task, so nothing was done — a real event carries the sub-task id at data.id.",
+          });
+        }
         console.warn("ted-subtask webhook: no task id. payload:", JSON.stringify(body).slice(0, 1200));
         // Report the nested keys too. The top-level ones alone said only that
         // everything lives under `data`, which cost a round of testing to learn.

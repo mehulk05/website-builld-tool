@@ -115,10 +115,24 @@ const post = (headers, body) => fetch(`http://127.0.0.1:${PORT}/api/webhook/ted-
     });
 
     await t("a caller with the right header gets past the gate", async () => {
-      // 422: past authentication, and correctly rejected for carrying no task id.
-      // That is the shape of a genuine TED test delivery.
-      const r = await post({ "x-webhook-secret": "s3cret-value" }, {});
-      assert.strictEqual(r.status, 422, "the right secret must reach the handler proper");
+      // TED's "Test Webhook" button sends exactly this: the envelope with an
+      // empty data. It is a reachability check, so it answers 200 and says
+      // nothing was done — otherwise the one control an operator has for
+      // verifying their wiring reports a fault when the wiring is correct.
+      const r = await post({ "x-webhook-secret": "s3cret-value" },
+        { event: "SUBTASK_CREATED", timestamp: new Date().toISOString(), source: "ted", subscriptionId: "abc", data: {} });
+      assert.strictEqual(r.status, 200, "the right secret must reach the handler proper");
+      const body = await r.json();
+      assert.strictEqual(body.test, true);
+      assert.match(body.message, /nothing was done/i, "200 must not read as work having happened");
+    });
+
+    await t("a populated payload that still hides the task id is a real failure", async () => {
+      // Not a ping: data has content, so failing to find the id means we could
+      // not read a genuine event, and that must stay loud.
+      const r = await post({ "x-webhook-secret": "s3cret-value" },
+        { event: "SUBTASK_CREATED", data: { somethingElse: "45385" } });
+      assert.strictEqual(r.status, 422);
       assert.match((await r.json()).error, /no task id/i);
     });
 
@@ -167,16 +181,32 @@ const post = (headers, body) => fetch(`http://127.0.0.1:${PORT}/api/webhook/ted-
       // TED's Secret Auth tab sends X-TED-Webhook-Secret; a header typed on the
       // Parameter tab is whatever was typed. Reading only one means the day
       // somebody fills in the wrong tab, every delivery 401s silently.
+      // What is being asserted is "not 401" — the body is an empty ping, so
+      // anything that gets past the gate lands on the 200 reachability answer.
       for (const h of ["x-ted-webhook-secret", "x-webhook-secret", "x-ted-secret"]) {
         const r = await prePost({ [h]: "pre-s3cret" }, {});
-        assert.strictEqual(r.status, 422, `${h} should have been accepted as the secret`);
+        assert.strictEqual(r.status, 200, `${h} should have been accepted as the secret`);
       }
       const r = await prePost({ authorization: "Bearer pre-s3cret" }, {});
-      assert.strictEqual(r.status, 422, "a bearer token should be accepted too");
+      assert.strictEqual(r.status, 200, "a bearer token should be accepted too");
     });
 
-    await t("pre-release: past the gate, a payload with no client is refused clearly", async () => {
-      const r = await prePost({ "x-webhook-secret": "pre-s3cret" }, {});
+    await t("pre-release: TED's Test button gets a 200 that says nothing was done", async () => {
+      // The exact skeleton TED sends: seen keys were
+      // ["timestamp","source","data","subscriptionId","event"].
+      const r = await prePost({ "x-webhook-secret": "pre-s3cret" },
+        { event: "TASK_STATUS_CHANGED", timestamp: new Date().toISOString(), source: "ted", subscriptionId: "abc", data: {} });
+      assert.strictEqual(r.status, 200, "a reachability check on a correctly wired endpoint must not report a fault");
+      const body = await r.json();
+      assert.strictEqual(body.test, true);
+      assert.match(body.message, /nothing was done/i);
+    });
+
+    await t("pre-release: a real event naming no client is still refused", async () => {
+      // A template key means TED thought it had something to say, so a missing
+      // client is a genuine problem rather than a ping.
+      const r = await prePost({ "x-webhook-secret": "pre-s3cret" },
+        { event: "TASK_STATUS_CHANGED", trigger: { templateKey: "beta_site.release_approval", status: "Completed" } });
       assert.strictEqual(r.status, 422);
       assert.match((await r.json()).error, /no client id or name/i);
     });
