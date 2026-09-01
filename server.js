@@ -5229,6 +5229,14 @@ function refImageParts(refImages) {
   return parts;
 }
 
+// The comments a person actually wrote. Same test as the "who spoke last" guard
+// in tedResolveSubtaskRequest, deliberately: if the two ever disagreed about
+// which comments are ours, one of them would be wrong about whether a request
+// is new.
+function commentsFromPeople(comments) {
+  return (comments || []).filter((c) => c && !c.aiGenerated && !String(c.text || "").includes(TED_AUTOMATION_MARK));
+}
+
 async function tedResolveSubtaskRequest(taskId) {
   // TED calls two different things a subtask, and only one of them is a task.
   // GET /api/tasks/<parent>/subtasks shows both: a real sub-task is a Task record
@@ -5287,7 +5295,20 @@ async function tedResolveSubtaskRequest(taskId) {
     }
   }
 
-  const instruction = [task.title, description, ...comments.map((c) => c.text)]
+  // The tool's own comments are not part of the request. Every comment used to
+  // go in, so a subtask that had already been run fed the model its own status
+  // chatter — the acknowledgement, the outcome, any correction posted since —
+  // as though the client had written it.
+  //
+  // That is not merely untidy. The outcome comment describes what the last run
+  // changed, in the form '"#bf9664" "#1f2124" in elementor.json::doc x8'. Handed
+  // back as part of the instruction it reads as an instruction to do exactly
+  // that again, everywhere — which is the site-wide replace this pipeline was
+  // just taught not to make.
+  //
+  // Same test as the "who spoke last" guard above, so the two cannot disagree
+  // about which comments are ours.
+  const instruction = [task.title, description, ...commentsFromPeople(comments).map((c) => c.text)]
     .map((s) => String(s || "").trim()).filter(Boolean).join("\n\n");
   // Last, and only now: every refusal above returns before this, so a scan of a
   // board full of subtasks never pulls a megabyte of image down per row.
@@ -19004,7 +19025,7 @@ module.exports = {
   tedResolveSubtaskRequest, tedTaskComments, isEmailSubtask, TED_EMAIL_SUFFIX, TED_AUTOMATION_MARK,
   tedListSubtasks, startTedSubtaskRun, pollTedSubtasks,
   tedClientsWithSites, tedRevisionParentForClient, tedWatchList,
-  tedTaskMedia, refImageParts,
+  tedTaskMedia, refImageParts, commentsFromPeople,
   OUTCOME, OUTCOME_LABEL, resolveFindingOutcomes, replaceInTextNodes, fixBusinessName,
   imageSources, findingsImages, readSeoPages, synthMuSource, pageText,
   fixFavicon, fixSocialImage, fix404, fixCallNow, fixBlvd, fixBlogLinkColor, fixClickable,
