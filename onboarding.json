@@ -1,19 +1,23 @@
 {
-  "draftId": "hover-1786530193",
+  "draftId": "nuvo-chrome-unify-3",
   "businessId": null,
   "template": "WEBSITE",
-  "receivedAt": "2026-08-12T10:23:13.304Z",
-  "betaSiteUrl": "",
-  "betaSiteRepo": "",
-  "referenceWebsite": "",
-  "existingWebsite": "https://nuvoaestheticsclinic.com",
+  "receivedAt": "2026-09-01T08:26:03.853Z",
+  "betaSiteUrl": "https://nuvoaestheticsclinic.gogroth.com",
+  "betaSiteRepo": "G99agency/nuvoaestheticsclinic.gogroth.com",
+  "referenceWebsite": "https://ruma.com",
+  "existingWebsite": "",
   "confirmedBrand": null,
   "logoUrl": null,
   "answers": {
     "business_name": "NUVO Aesthetics Clinic",
+    "location": "Peoria, AZ",
     "services_offered": [
       "Botox",
-      "Fillers"
+      "Dermal Fillers",
+      "Facials",
+      "Laser Treatments",
+      "Weight Loss"
     ]
   }
 }
