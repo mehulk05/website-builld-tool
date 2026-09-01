@@ -209,6 +209,188 @@ ok("the beta review bar never reaches WordPress", () => {
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+console.log("native Elementor widgets");
+
+// Visible text of the rendered page, normalised — the invariant that matters
+// most: converting markup to widgets must never drop a word of content.
+const visibleText = (html) => html
+  .replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "")
+  .replace(/<[^>]+>/g, " ").replace(/&amp;/g, "&").replace(/&quot;/g, '"')
+  .replace(/&nbsp;/g, " ").replace(/&#\d+;/g, " ").replace(/\s+/g, " ").trim();
+
+function compileFixture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "webgen-widgets-"));
+  const pages = wg.renderPages(kitFor(ELRA));
+  fs.writeFileSync(path.join(dir, "index.html"), pages.home);
+  fs.writeFileSync(path.join(dir, "services.html"), pages.services);
+  fs.writeFileSync(path.join(dir, "about.html"), pages.about);
+  fs.writeFileSync(path.join(dir, "contact.html"), pages.contact);
+  const { files } = compileGitops(dir, ELRA, () => null, { pageTemplate: "elementor_canvas", cssInline: true });
+  fs.rmSync(dir, { recursive: true, force: true });
+  return { files, pages };
+}
+
+const widgetCounts = (els, acc = {}) => {
+  for (const e of els || []) {
+    const k = e.elType === "widget" ? e.widgetType : "container";
+    acc[k] = (acc[k] || 0) + 1;
+    widgetCounts(e.elements, acc);
+  }
+  return acc;
+};
+// Every string a widget puts on the page, in tree order.
+const widgetText = (els, out = []) => {
+  for (const e of els || []) {
+    const s = e.settings || {};
+    for (const key of ["html", "title", "editor", "text"]) if (typeof s[key] === "string") out.push(s[key]);
+    widgetText(e.elements, out);
+  }
+  return out;
+};
+
+ok("real widgets replace the code textareas", () => {
+  const { files } = compileFixture();
+  for (const slug of ["home", "services", "about", "contact"]) {
+    const doc = JSON.parse(files.get(`resources/pages/${slug}/elementor.json`));
+    const c = widgetCounts(doc.elements);
+    const native = (c.heading || 0) + (c["text-editor"] || 0) + (c.button || 0) + (c.image || 0);
+    assert.ok(native > 0, `${slug}: no native widget was emitted`);
+    assert.ok(c.heading > 0, `${slug}: headings are still code`);
+    // The whole point: more real widgets than code blocks.
+    assert.ok(native > (c.html || 0), `${slug}: ${native} native vs ${c.html} html — code still dominates`);
+  }
+});
+
+ok("every design converts — not just the tone-derived default", () => {
+  // The first version of this only exercised one design and missed that
+  // minimal/services shipped more code boxes than widgets (9 native / 10 html),
+  // almost all of them 22-byte decorative <div class="hr"> hairlines.
+  for (const id of wg.DESIGN_IDS) {
+    const kit = kitFor(ELRA);
+    kit.layout = id;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "webgen-design-"));
+    try {
+      const pages = wg.renderPages(kit);
+      fs.writeFileSync(path.join(dir, "index.html"), pages.home);
+      fs.writeFileSync(path.join(dir, "services.html"), pages.services);
+      fs.writeFileSync(path.join(dir, "about.html"), pages.about);
+      fs.writeFileSync(path.join(dir, "contact.html"), pages.contact);
+      const { files } = compileGitops(dir, ELRA, () => null, { pageTemplate: "elementor_canvas", cssInline: true });
+      for (const slug of ["home", "services", "about", "contact"]) {
+        const c = widgetCounts(JSON.parse(files.get(`resources/pages/${slug}/elementor.json`)).elements);
+        const native = (c.heading || 0) + (c["text-editor"] || 0) + (c.button || 0) + (c.image || 0);
+        assert.ok(c.heading > 0, `${id}/${slug}: no heading widget`);
+        assert.ok(native > (c.html || 0), `${id}/${slug}: ${native} native vs ${c.html} html — code still dominates`);
+      }
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+ok("grid markup ships verbatim — converting it broke the live layout", () => {
+  // Not a nice-to-have: `.cards` as an Elementor container picks up its
+  // `e-con e-parent` flex rules, which beat our `display:grid`. On the live site
+  // the three cards stacked vertically and `.card-img` collapsed to 0px. This
+  // test is what stops that being re-enabled by widening OPAQUE_DIV.
+  const { files } = compileFixture();
+  const doc = JSON.parse(files.get("resources/pages/home/elementor.json"));
+  const htmlBlobs = [];
+  (function walk(els) { for (const e of els || []) { if (e.widgetType === "html") htmlBlobs.push(e.settings.html || ""); walk(e.elements); } })(doc.elements);
+  const gridBlob = htmlBlobs.find((h) => /class="cards"/.test(h));
+  assert.ok(gridBlob, "the card grid must ship as one html widget, markup intact");
+  // The cells and their aspect-ratio wrappers must still be inside that markup.
+  // A card with no photo renders class="card card--text", so match the prefix.
+  assert.match(gridBlob, /class="card[ "]/, "card cells left the grid markup");
+  // When the kit has photos, the aspect-ratio wrapper must stay inside too.
+  if (/<img/.test(gridBlob)) assert.match(gridBlob, /class="card-img"/, "card image wrapper left the grid markup");
+  // And no container may claim the grid class.
+  (function noGridContainer(els) {
+    for (const e of els || []) {
+      if (e.elType === "container") {
+        const c = String((e.settings || {}).css_classes || "");
+        assert.ok(!/cards/.test(c), "a container claimed the .cards grid — layout will break");
+      }
+      noGridContainer(e.elements);
+    }
+  })(doc.elements);
+});
+
+ok("a label keeps its own tag and class, not a wrapper's", () => {
+  // The eyebrow regressed on the live site when a Heading widget moved
+  // class="eyebrow" onto a wrapper div: `.eyebrow{letter-spacing:.36em}` then
+  // resolved against the wrapper's 11px instead of the text's 18.24px, and the
+  // global kit reached the inner <p> with Roboto 600 in blue.
+  const { files } = compileFixture();
+  const doc = JSON.parse(files.get("resources/pages/home/elementor.json"));
+  const editors = [];
+  (function walk(els) { for (const e of els || []) { if (e.widgetType === "text-editor") editors.push(e.settings.editor || ""); walk(e.elements); } })(doc.elements);
+  const eyebrow = editors.find((h) => /class="eyebrow"/.test(h));
+  assert.ok(eyebrow, "the eyebrow must ship as a text editor carrying its own <p class=\"eyebrow\">");
+  // No heading widget may carry the class on its wrapper instead.
+  (function noClassedHeading(els) {
+    for (const e of els || []) {
+      if (e.widgetType === "heading") {
+        assert.ok(!/eyebrow/.test(String((e.settings || {})._css_classes || "")),
+          "eyebrow became a heading widget again — its tracking and colour will break");
+      }
+      noClassedHeading(e.elements);
+    }
+  })(doc.elements);
+});
+
+ok("no word of page content is lost in conversion", () => {
+  const { files, pages } = compileFixture();
+  const src = { home: pages.home, services: pages.services, about: pages.about, contact: pages.contact };
+  for (const slug of ["home", "services", "about", "contact"]) {
+    const doc = JSON.parse(files.get(`resources/pages/${slug}/elementor.json`));
+    const got = visibleText(widgetText(doc.elements).join(" "));
+    // Compare word multisets: order within a section can shift, presence cannot.
+    const missing = [];
+    const bag = new Map();
+    for (const w of got.split(" ")) bag.set(w, (bag.get(w) || 0) + 1);
+    // Only the <body> ships to WordPress: the compiler drops <head> by design.
+    const body = (src[slug].match(/<body[^>]*>([\s\S]*)<\/body>/i) || [, src[slug]])[1];
+    for (const w of visibleText(body).split(" ")) {
+      if (!w) continue;
+      const n = bag.get(w) || 0;
+      if (n === 0) missing.push(w); else bag.set(w, n - 1);
+    }
+    assert.deepStrictEqual(missing, [], `${slug}: content lost in widget conversion`);
+  }
+});
+
+ok("buttons carry WordPress links, not .html files", () => {
+  const { files } = compileFixture();
+  const doc = JSON.parse(files.get("resources/pages/home/elementor.json"));
+  const buttons = [];
+  (function walk(els) { for (const e of els || []) { if (e.widgetType === "button") buttons.push(e); walk(e.elements); } })(doc.elements);
+  assert.ok(buttons.length > 0, "no button widget emitted");
+  for (const b of buttons) {
+    const url = (b.settings.link || {}).url || "";
+    assert.ok(!/\.html/.test(url), `button link still points at ${url}`);
+    assert.ok(url, "button widget has no link");
+  }
+});
+
+ok("the css bridge lifts our rules without touching declarations", () => {
+  const { bridgeCss } = require("./lib/gitops/widgets.js");
+  const css = ":root{--a:1}html{margin:0}body{background:#fff}h2{line-height:1.08}.center>p{font-size:17px}"
+    + "@media (max-width:900px){h2{font-size:34px}body{padding:0}}@keyframes marq{to{transform:translateX(-50%)}}";
+  const out = bridgeCss(css);
+  // Our own selectors gain exactly one class, so they outrank Elementor's
+  // .elementor-heading-title while keeping their order relative to each other.
+  assert.ok(out.includes(".elementor.elementor h2{line-height:1.08}"), "h2 rule was not lifted");
+  assert.ok(out.includes(".elementor.elementor .center p{"), ".center>p was not relaxed for the widget wrapper");
+  // Anything outside the .elementor wrapper must stay as it is.
+  assert.ok(out.includes(":root{--a:1}"), ":root must not be prefixed");
+  assert.ok(out.includes("html{margin:0}"), "html must not be prefixed");
+  assert.ok(out.includes("body{background:#fff}"), "body must not be prefixed");
+  assert.ok(/@media \(max-width:900px\)\{\.elementor\.elementor h2\{/.test(out), "rules inside @media must still be lifted");
+  assert.ok(out.includes("body{padding:0}"), "body inside @media must not be prefixed");
+  // A prefixed keyframe step silently kills the animation.
+  assert.ok(out.includes("to{transform:translateX(-50%)}"), "keyframe step must not be prefixed");
+  assert.ok(!out.includes(".elementor.elementor to{"), "keyframe step was prefixed");
+});
+
 console.log("colour comes from the brand, not from constants");
 
 const PALETTES = {
