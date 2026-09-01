@@ -5540,12 +5540,23 @@ function tedOutcomeComment(job, outcome) {
   const head = outcome.ok
     ? `Change is live — ${P.businessName || "site"}`
     : `Change could not be completed — ${P.businessName || "site"}`;
+  // A swap held back for being too widespread is worth saying out loud. The
+  // change still went ahead — the planner handled it — but "this would have been
+  // applied in 10 places" is exactly the detail that tells someone their request
+  // was broader than they meant, or that the result deserves a second look.
+  const declined = (job && job.swapDeclined) || [];
+  const held = declined.length
+    ? "\nHeld back from a blanket replace, and left to the planner instead:\n"
+      + declined.map((d) => `- "${String(d.replaces).slice(0, 60)}" appears ${d.hits} times on this site`).join("\n")
+    : "";
+
   return [
     head,
     `Studio job: ${job.draftId}`,
     outcome.ok && P.liveUrl ? P.liveUrl : "",
     "",
     outcome.detail,
+    held,
   ].filter((l, i) => l !== "" || i === 3).join("\n");
 }
 
@@ -9051,6 +9062,14 @@ function visibleHits(content, find, wordSafe) {
 //                reads the sender's own "where" and is how "on the home page"
 //                stops a shared sentence being rewritten on every other page
 //                that happens to contain it.
+// The ceiling for an ordinary edit's exact-pair swaps. Deliberately looser than
+// the review path's 5, because an edit is a description of a change rather than
+// one person's character-exact correction, and a phrase legitimately repeated
+// across a few pages should still swap. The number matters less than its being
+// set at all: applyTextSwaps only consults its single-token rule — the one that
+// holds a bare word or a hex colour to a single occurrence — when a ceiling
+// exists, and that rule is what actually catches this class of mistake.
+const EDIT_SWAP_MAX_HITS = Number(process.env.EDIT_SWAP_MAX_HITS || 6);
 function applyTextSwaps(workOrder, files, rootAbs, opts) {
   const O = opts || {};
   const done = [];
@@ -9090,9 +9109,16 @@ function applyTextSwaps(workOrder, files, rootAbs, opts) {
       if (O.refused) {
         O.refused.push({
           n: i + 1, what: c.what, replaces: c.replaces, literal: c.literal, hits: total,
-          reason: oneWord
-            ? `"${c.replaces}" appears ${total} times on this page — a single word can only be changed where it is unique. Select the whole phrase around it.`
-            : `"${c.replaces}" appears ${total} times — too many places to change safely in one go.`,
+          // Two different readers. A reviewer typed this correction themselves
+          // and can retype it more specifically, so they are told how. An edit
+          // is not refused at all — it goes on to the planner — so saying
+          // "select the whole phrase" there would describe an action nobody is
+          // being asked to take.
+          reason: O.advisory
+            ? `"${c.replaces}" appears ${total} times — too many to change blindly, so this was left to the planner rather than replaced everywhere.`
+            : oneWord
+              ? `"${c.replaces}" appears ${total} times on this page — a single word can only be changed where it is unique. Select the whole phrase around it.`
+              : `"${c.replaces}" appears ${total} times — too many places to change safely in one go.`,
         });
       }
       return;
@@ -9586,14 +9612,34 @@ async function runEditJob(job) {
       if (!slug) return null;                       // no page named: unrestricted, as before
       return source.filter((f) => f.rel.startsWith(`resources/pages/${slug}/`)).map((f) => f.rel);
     };
+    // Every path gets a ceiling, not only review. Without maxHits the ceiling in
+    // applyTextSwaps is Infinity, so an exact-pair swap rewrites every occurrence
+    // it can find. That is how "change this one button from #bf9664 to #1f2124"
+    // recoloured all ten occurrences of the brand tan on the NUVO home page,
+    // six of which were not buttons — while the request said, in those words, to
+    // leave everything else alone. The single-token rule inside applyTextSwaps
+    // was written for exactly this shape of mistake; it just never fired here,
+    // because it is only consulted when a ceiling is set at all.
+    //
+    // A declined swap is NOT a declined change. A review correction is a
+    // character-exact instruction from a person, so it is reported back rather
+    // than approximated. An edit is a description, and the planner below can see
+    // the reference image and is told to change nothing else — so these are kept
+    // apart from reviewRefused, never added to `blocked`, and fall through to it.
+    const swapDeclined = [];
     const swapBase = gitops ? { write: srcWrite, scope: scopeFor } : {};
     const swapOpts = P.reviewPath ? {
       ...swapBase,
       tiers: reviewSwapTiers(P.reviewPath, (source.find((f) => f.rel === P.muPath) || {}).content, P.themePath, gitops),
       maxHits: 5, visibleOnly: true, wordSafe: true, refused: reviewRefused,
-    } : (gitops ? swapBase : undefined);
+    } : { ...swapBase, maxHits: EDIT_SWAP_MAX_HITS, refused: swapDeclined, advisory: true };
     const swaps = workOrder ? applyTextSwaps(workOrder, source, tmp, swapOpts) : [];
     job.textSwaps = swaps;
+    // Recorded on the job so the outcome can say a blind swap was declined.
+    // Silence here would be the same failure in a quieter form: the change still
+    // happens, and nobody learns it was nearly made in six places too many.
+    job.swapDeclined = swapDeclined;
+    for (const d of swapDeclined) console.warn(`edit job ${job.draftId}: not swapping "${d.replaces}" -> "${d.literal}" blindly (${d.hits} occurrences) — leaving it to the planner`);
     const swapped = new Set(swaps.map((s) => s.n));
 
     // Nothing from a review reaches the planner. These runs merge themselves, so
@@ -18859,6 +18905,7 @@ module.exports = {
   closeSupersededPerformPrs,
   tedComment, tedUpdateTask, tedAiComment, tedHtml, closeTedTaskIfFinal,
   noteOwedOutcome, settleOwedOutcome, flushOwedTedOutcomes, tedPostOutcome, tedOutcomeComment,
+  applyTextSwaps, swapsText, EDIT_SWAP_MAX_HITS,
   tedCreateSubtask, tedRevisionParent, tedClientName, tedSubtaskTitle, tedNorm,
   tedClients, tedClientIdFor, tedSiteFields, tedRepoUsable, withTedFields, resolveClientSite,
   tedResolveSubtaskRequest, tedTaskComments, isEmailSubtask, TED_EMAIL_SUFFIX, TED_AUTOMATION_MARK,
