@@ -134,7 +134,11 @@
   --_bg: var(--brand); --_fg: var(--on-brand); --_bd: var(--brand);
   display: inline-flex; align-items: center; justify-content: center; gap: .6rem;
   padding: 1.06em 2.2em;
-  background: var(--_bg); color: var(--_fg); border: 1px solid var(--_bd);
+  /* !important: pages ship as Elementor html-widgets, and the site's own kit
+     CSS carries a more specific `a` rule (e.g. `.elementor-widget-container a`)
+     that otherwise beats a plain `.c-btn`/`.c-btn--ghost` class and turns a
+     ghost button's `currentColor` text black on a dark CTA band. */
+  background: var(--_bg) !important; color: var(--_fg) !important; border: 1px solid var(--_bd) !important;
   font-family: var(--font-body); font-size: .8rem; font-weight: 600;
   letter-spacing: .16em; text-transform: uppercase; text-decoration: none;
   border-radius: var(--r-pill); cursor: pointer;
