@@ -4709,15 +4709,20 @@ function tedComment(text, image = null, attempt = 0, taskId = null) {
     body = JSON.stringify({ text });
   }
 
-  fetch(`${TED_BASE}/api/tasks/${target}/comments`, { method: "POST", headers, body })
+  // Returns whether the comment actually landed. Callers that post and walk away
+  // can still ignore it, but a caller holding an undelivered outcome has to be
+  // able to tell "posted" from "gave up" — see tedPostOutcome.
+  return fetch(`${TED_BASE}/api/tasks/${target}/comments`, { method: "POST", headers, body })
     .then((r) => {
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       // TED serves its Angular shell for any /api route it does not register —
       // index.html with a 200, not a 404. Without this check a missing endpoint
       // looks like a successful post and the comment is silently dropped.
       if (/html/i.test(r.headers.get("content-type") || "")) throw new Error("endpoint not deployed (got the TED web app, not the API)");
+
+      return true;
     })
-    .catch((e) => {
+    .catch(async (e) => {
       // Losing the screenshot must never cost us the message: an upload that
       // fails is retried once as text, which is the part that actually matters.
       if (image) {
@@ -4728,11 +4733,70 @@ function tedComment(text, image = null, attempt = 0, taskId = null) {
       // retrying three more times would only delay the log line that says so.
       const fatal = /HTTP 40[13]|not deployed/.test(e.message);
       if (!fatal && attempt < G99_RETRY_DELAYS_MS.length) {
-        setTimeout(() => tedComment(text, null, attempt + 1, target), G99_RETRY_DELAYS_MS[attempt]);
-      } else {
-        console.error(`TED comment on task ${TED_REVISIONS_TASK_ID} failed:`, e.message);
+        // Awaited rather than fired into a timer, so the promise this function
+        // returns resolves on the FINAL result. Left as a bare setTimeout it
+        // resolved undefined the moment the first attempt failed, and a caller
+        // waiting on the answer would record a success that had not happened yet.
+        await new Promise((r) => setTimeout(r, G99_RETRY_DELAYS_MS[attempt]));
+
+        return tedComment(text, null, attempt + 1, target);
       }
+      console.error(`TED comment on task ${target} failed:`, e.message);
+
+      return false;
     });
+}
+
+// ---- Outcomes that are owed but not yet delivered ---------------------------
+// A finished run's outcome is decided immediately and posted a minute later, so
+// the screenshot is taken after the deploy has landed. For that minute the only
+// record that a client's task is owed an answer is a setTimeout — and a
+// redeploy, a crash, or the free plan spinning the instance down inside that
+// window takes the timer with it. The run has already merged to the client's
+// repository by then, so what is lost is not the change but every trace that it
+// happened: the task simply never hears back.
+//
+// That is not hypothetical. Job edit-1788256772764 merged PR #100 to
+// nuvoaestheticsclinic on 2026-09-01 and task 45384 was never told; the change
+// was found days later only because someone went looking at the repository.
+//
+// So the debt is written onto the job, which is persisted, and settled only when
+// TED confirms the post. Anything still owed at boot is delivered by
+// flushOwedTedOutcomes() below.
+function noteOwedOutcome(job, taskId, text) {
+  if (!job || !taskId || !text) return;
+  job.tedOwed = { taskId: String(taskId), text, since: Date.now(), attempts: 0 };
+  try { saveJobs(); } catch (e) { console.warn("could not persist the owed TED outcome:", e.message); }
+}
+function settleOwedOutcome(job, delivered) {
+  if (!job || !job.tedOwed) return;
+  if (delivered) delete job.tedOwed;
+  else job.tedOwed.attempts = (job.tedOwed.attempts || 0) + 1;
+  try { saveJobs(); } catch (e) { console.warn("could not persist the owed TED outcome:", e.message); }
+}
+// Capped, because a permanently undeliverable comment must not be retried on
+// every boot forever. Five attempts then a loud line: at that point the problem
+// is the token or the route, and no further attempt will change it.
+const TED_OWED_MAX_ATTEMPTS = 5;
+async function flushOwedTedOutcomes() {
+  if (!TED_API_TOKEN) return;
+  const owed = [...JOBS.values()].filter((j) => j && j.tedOwed && j.tedOwed.taskId && j.tedOwed.text);
+  if (!owed.length) return;
+  console.log(`TED: ${owed.length} outcome(s) were still owed when this process last stopped — delivering now`);
+  for (const job of owed) {
+    const o = job.tedOwed;
+    if ((o.attempts || 0) >= TED_OWED_MAX_ATTEMPTS) {
+      console.error(`TED: giving up on the outcome for ${job.draftId} on task ${o.taskId} after ${o.attempts} attempts — deliver it by hand`);
+      continue;
+    }
+    // Text only. The screenshot window closed when the process did, and a late
+    // comment saying what happened is worth far more than a picture of a page
+    // that has since moved on.
+    const ok = await tedComment(o.text, null, 0, o.taskId);
+    if (ok) console.log(`TED: outcome for ${job.draftId} delivered late to task ${o.taskId} (owed ${Math.round((Date.now() - o.since) / 60000)} min)`);
+    else console.error(`TED: outcome for ${job.draftId} on task ${o.taskId} still will not post`);
+    settleOwedOutcome(job, ok);
+  }
 }
 
 // Hand the ticket back: mark it as done by the AI rather than leaving a human to
@@ -5590,7 +5654,12 @@ function tedPostOutcome(job, outcome) {
   // could not be made (or subtasks are off), and tedComment then falls back to
   // TED_REVISIONS_TASK_ID as before.
   const taskId = P.tedSubtaskId || P.tedTaskId || null;
-  if (!outcome.ok || !TED_SCREENSHOTS || !P.liveUrl) return tedComment(text, null, 0, taskId);
+  // Recorded before either path runs, not after. The point of the record is to
+  // survive the process, so it has to exist while the process still might not.
+  noteOwedOutcome(job, taskId, text);
+  if (!outcome.ok || !TED_SCREENSHOTS || !P.liveUrl) {
+    return tedComment(text, null, 0, taskId).then((ok) => settleOwedOutcome(job, ok));
+  }
   setTimeout(async () => {
     let image = null;
     try {
@@ -5601,7 +5670,7 @@ function tedPostOutcome(job, outcome) {
     // Say so explicitly. The comment still goes out either way, and a picture
     // that is merely absent looks identical to one that was never wanted.
     if (!image) console.warn(`TED outcome for ${job.draftId} posting without a screenshot — both microlink and mShots came back empty`);
-    tedComment(text, image, 0, taskId);
+    settleOwedOutcome(job, await tedComment(text, image, 0, taskId));
   }, TED_SHOT_DELAY_MS);
 }
 
@@ -18725,6 +18794,10 @@ const server = http.createServer(async (req, res) => {
 });
 if (require.main === module) {
   server.listen(PORT, () => console.log(`G99 Website Build Tool → http://localhost:${PORT}`));
+  // Before anything else: a task that was owed an answer when this process last
+  // stopped is owed it still, and the person waiting on it has no other way to
+  // find out what happened to their request.
+  flushOwedTedOutcomes().catch((e) => console.error("owed TED outcomes could not be flushed:", e.message));
   // Say which mode content review is in, at boot, every time. The one thing that
   // must never be ambiguous is whether a reviewer's correction ends up in a local
   // checkout or in a pull request against a client's repository.
@@ -18785,6 +18858,7 @@ module.exports = {
   writeRedirectMap, readRedirectMap, fixUrlStructure, findingsInternalLinks, bestRedirectTarget, fixInternalLinks, themeChromePages,
   closeSupersededPerformPrs,
   tedComment, tedUpdateTask, tedAiComment, tedHtml, closeTedTaskIfFinal,
+  noteOwedOutcome, settleOwedOutcome, flushOwedTedOutcomes, tedPostOutcome, tedOutcomeComment,
   tedCreateSubtask, tedRevisionParent, tedClientName, tedSubtaskTitle, tedNorm,
   tedClients, tedClientIdFor, tedSiteFields, tedRepoUsable, withTedFields, resolveClientSite,
   tedResolveSubtaskRequest, tedTaskComments, isEmailSubtask, TED_EMAIL_SUFFIX, TED_AUTOMATION_MARK,
