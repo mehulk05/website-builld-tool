@@ -5229,6 +5229,14 @@ function refImageParts(refImages) {
   return parts;
 }
 
+// The comments a person actually wrote. Same test as the "who spoke last" guard
+// in tedResolveSubtaskRequest, deliberately: if the two ever disagreed about
+// which comments are ours, one of them would be wrong about whether a request
+// is new.
+function commentsFromPeople(comments) {
+  return (comments || []).filter((c) => c && !c.aiGenerated && !String(c.text || "").includes(TED_AUTOMATION_MARK));
+}
+
 async function tedResolveSubtaskRequest(taskId) {
   // TED calls two different things a subtask, and only one of them is a task.
   // GET /api/tasks/<parent>/subtasks shows both: a real sub-task is a Task record
@@ -5287,7 +5295,20 @@ async function tedResolveSubtaskRequest(taskId) {
     }
   }
 
-  const instruction = [task.title, description, ...comments.map((c) => c.text)]
+  // The tool's own comments are not part of the request. Every comment used to
+  // go in, so a subtask that had already been run fed the model its own status
+  // chatter — the acknowledgement, the outcome, any correction posted since —
+  // as though the client had written it.
+  //
+  // That is not merely untidy. The outcome comment describes what the last run
+  // changed, in the form '"#bf9664" "#1f2124" in elementor.json::doc x8'. Handed
+  // back as part of the instruction it reads as an instruction to do exactly
+  // that again, everywhere — which is the site-wide replace this pipeline was
+  // just taught not to make.
+  //
+  // Same test as the "who spoke last" guard above, so the two cannot disagree
+  // about which comments are ours.
+  const instruction = [task.title, description, ...commentsFromPeople(comments).map((c) => c.text)]
     .map((s) => String(s || "").trim()).filter(Boolean).join("\n\n");
   // Last, and only now: every refusal above returns before this, so a scan of a
   // board full of subtasks never pulls a megabyte of image down per row.
@@ -5379,6 +5400,18 @@ async function startTedSubtaskRun(taskId, { dryRun = false } = {}) {
 // Re-running is prevented by the acknowledgement comment rather than by memory,
 // so a redeploy mid-flight cannot cause a second run of the same request.
 const TED_POLL_MS = Number(process.env.TED_SUBTASK_POLL_MS || 180000);
+
+// Whether TED has ever actually called us. The webhook is the fast path and the
+// poll is the backstop, and when the webhook is not registered on TED's side
+// nothing says so: requests still get picked up, just minutes later, and the
+// only visible symptom is a delay nobody is measuring. Worse, the poll cannot
+// substitute for it completely — it skips any subtask it has already started, so
+// detail added to an existing request reaches the webhook or reaches nothing.
+//
+// So the poller says once, the first time it does a job the webhook should have
+// done, that the webhook appears not to be wired up.
+let TED_WEBHOOK_SEEN = false;
+let TED_WEBHOOK_WARNED = false;
 
 // ---- Who the poller watches -------------------------------------------------
 // Discovery used to start from the site list, which meant a client could only be
@@ -5515,7 +5548,16 @@ async function pollTedSubtasks() {
       if (!id || /^sub_/i.test(id) || TED_STARTED.has(id)) continue;
       try {
         const out = await startTedSubtaskRun(id);
-        if (out && out.jobId && !out.dedupe) console.log(`subtask poll: started ${out.jobId} for TED subtask ${id} (${out.businessName})`);
+        if (out && out.jobId && !out.dedupe) {
+          console.log(`subtask poll: started ${out.jobId} for TED subtask ${id} (${out.businessName})`);
+          // The webhook should have delivered this one within seconds of it
+          // being created. If it never has, say so — once — because the symptom
+          // otherwise is only that everything is a few minutes late.
+          if (!TED_WEBHOOK_SEEN && !TED_WEBHOOK_WARNED) {
+            TED_WEBHOOK_WARNED = true;
+            console.warn(`subtask poll: TED has not called /api/webhook/ted-subtask once this process — the webhook looks unregistered on TED's side, so requests arrive up to ${Math.round(TED_POLL_MS / 1000)}s late and a comment added to an already-started subtask will not be seen at all`);
+          }
+        }
       } catch (e) {
         // Logged either way — silence here is indistinguishable from a poller
         // that never looked, which is the doubt this feature exists to remove.
@@ -16374,7 +16416,21 @@ const server = http.createServer(async (req, res) => {
       // somebody fills in the wrong tab, every delivery 401s and the pre-release
       // run silently stops happening.
       const secret = (process.env.PRE_RELEASE_WEBHOOK_SECRET || "").trim();
-      if (secret) {
+      if (!secret) {
+        // Fails closed, like every other webhook here. This endpoint clones,
+        // audits, opens and MERGES a pull request against a client's repository,
+        // so an unauthenticated caller is worse here than anywhere else in this
+        // file — and "no secret set" meant exactly that until now.
+        //
+        // Unlike the TED subtask hook, this subscription is live in TED and
+        // delivering, so switching it off at this end is visible: set
+        // PRE_RELEASE_WEBHOOK_SECRET here and the same value on the
+        // subscription's Secret Auth tab, and it resumes.
+        console.warn("pre-release: refused — PRE_RELEASE_WEBHOOK_SECRET is not set, so this endpoint cannot tell TED from anyone else");
+
+        return json(res, 401, { error: "webhook not configured on this deployment (PRE_RELEASE_WEBHOOK_SECRET unset)" });
+      }
+      {
         const sent = String(req.headers["x-ted-webhook-secret"] || req.headers["x-webhook-secret"]
           || req.headers["x-ted-secret"]
           || String(req.headers["authorization"] || "").replace(/^Bearer\s+/i, "")).trim();
@@ -16400,11 +16456,36 @@ const server = http.createServer(async (req, res) => {
       };
       const clientId = dig("clientId", "client_id");
       const clientName = dig("clientName", "client_name", "client", "customerName", "businessName");
+      // The stronger key when a name repeats across clones, and the one TED puts
+      // on both the task and the client row. Unique across all 151 clients.
+      const hubspotId = dig("hubspotId", "hubspot_id", "hubspotDealId", "dealId");
       const templateKey = dig("templateKey", "template_key", "taskTemplateKey");
       const status = dig("status", "taskStatus", "newStatus");
       const targetTask = tgt.id || tgt.taskId || dig("targetTaskId", "id");
       if (!clientId && !clientName) {
+        // TED's "Test Webhook" button sends a skeleton — event, timestamp,
+        // source, subscriptionId and an empty data — with no client on it,
+        // because there is no event to describe. Answering 422 to that made the
+        // one control an operator has for checking their wiring report a fault
+        // when the wiring was correct, which is how this endpoint came to look
+        // broken while it was working.
+        //
+        // So a payload carrying NO identifying field at all is treated as the
+        // reachability check it is: 200, and a body that says plainly that
+        // nothing was done and what a real event must carry. This is not a
+        // silent success — no work was owed, none was dropped, and the response
+        // says so. A payload that names a client and cannot be resolved is still
+        // a 409 further down, as it should be.
+        if (!targetTask && !templateKey) {
+          console.log("pre-release webhook: reachability check (no client, no task, no template key) — answered 200");
+
+          return json(res, 200, {
+            ok: true, test: true,
+            message: "Endpoint reachable and authenticated. This payload carries no client, so nothing was done — a real event carries trigger.clientId or a client name.",
+          });
+        }
         console.warn("pre-release webhook: no client on the event. payload:", JSON.stringify(body).slice(0, 1200));
+
         return json(res, 422, { error: "no client id or name in payload", seen: Object.keys(body), hint: "expected trigger.clientId" });
       }
       // TED's UI offers "All Events", which would fire this on every comment and
@@ -16445,16 +16526,43 @@ const server = http.createServer(async (req, res) => {
         console.log(`pre-release: TED client ${clientId} has no beta site URL — falling back to the site list`);
         site = null;
       }
+      // The event does not always carry a client id — the live subscription is
+      // scoped by template key and sends a name. Without one, the block above
+      // never asks TED at all and the request falls straight through to a
+      // hand-written list of three sites, which is how a client TED knows
+      // perfectly well came back as "no NocoDB site matches". The name plus the
+      // hubspot id identify the client in TED exactly as they do everywhere
+      // else, so ask there before giving up. See tedClientIdFor: it refuses to
+      // choose between two clients of the same name rather than guessing.
+      if (!site && clientName) {
+        const tedId = await tedClientIdFor(clientName, hubspotId).catch(() => null);
+        if (tedId) {
+          site = await tedClientSite(tedId, clientName).catch((e) => {
+            console.log(`pre-release: TED client ${tedId} ("${clientName}") not usable (${e.message})`);
+            return null;
+          });
+          if (site && !site.liveUrl) {
+            console.log(`pre-release: TED client ${tedId} ("${clientName}") has no beta site URL`);
+            site = null;
+          }
+        }
+      }
       if (!site) {
         if (!clientName) return json(res, 409, { error: `TED client ${clientId} has no usable repository or beta site, and the event carried no client name to fall back to` });
-        let sites; try { sites = await getWebsites(true); } catch (e) { return json(res, 502, { error: "NocoDB lookup failed: " + e.message }); }
+        let sites; try { sites = await getWebsites(true); } catch (e) { return json(res, 502, { error: "site list lookup failed: " + e.message }); }
         const norm = (s) => String(s || "").toLowerCase().replace(/\(.*?\)/g, "").replace(/[^a-z0-9]+/g, " ").trim();
         const want = norm(clientName);
         const exact = sites.filter((s) => norm(s.businessName) === want);
         const loose = exact.length ? exact : sites.filter((s) => norm(s.businessName).includes(want) || want.includes(norm(s.businessName)));
         if (loose.length !== 1) {
           return json(res, 409, {
-            error: loose.length ? `"${clientName}" matches ${loose.length} sites` : `no NocoDB site matches "${clientName}"`,
+            // Names what was actually consulted. The old wording said "NocoDB",
+            // which has been off behind a flag since 2026-08-27 — so the one
+            // line telling somebody why their release stalled pointed them at a
+            // system that had not been asked.
+            error: loose.length
+              ? `"${clientName}" matches ${loose.length} sites`
+              : `no site matches "${clientName}" — TED has no client of that name with both a repository and a beta site URL, and it is not in the hand-named site list either`,
             candidates: loose.map((s) => s.businessName).slice(0, 5),
           });
         }
@@ -16799,8 +16907,28 @@ const server = http.createServer(async (req, res) => {
     // template key, the client, whether it is one of ours — is read back from
     // TED rather than trusted from the payload.
     if (p === "/api/webhook/ted-subtask" && req.method === "POST") {
+      // Refuses outright when no secret is configured, rather than running open
+      // — the same rule /api/webhook/email-change and
+      // /api/webhook/onboarding-submitted have always followed.
+      //
+      // This one used to accept an unauthenticated POST whenever the variable
+      // was unset, which is how it was actually deployed: a public URL where
+      // anyone who guessed a task id could start a run that merges to a client's
+      // repository. Task ids are small consecutive integers. The other checks
+      // downstream (the parent must be a revision-cycle task, the subtask must
+      // carry a request, the tool must not have spoken last) stop an attacker
+      // writing their own instruction, but not replaying somebody else's.
+      //
+      // Failing closed costs nothing here: unset means no caller is
+      // authenticating, which means no legitimate caller is configured yet.
       const secret = (process.env.TED_SUBTASK_WEBHOOK_SECRET || "").trim();
-      if (secret && (req.headers["x-webhook-secret"] || "") !== secret) return json(res, 401, { error: "bad webhook secret" });
+      if (!secret) {
+        console.warn("ted-subtask webhook: refused — TED_SUBTASK_WEBHOOK_SECRET is not set, so this endpoint cannot tell TED from anyone else");
+
+        return json(res, 401, { error: "webhook not configured on this deployment" });
+      }
+      if ((req.headers["x-webhook-secret"] || "") !== secret) return json(res, 401, { error: "bad webhook secret" });
+      TED_WEBHOOK_SEEN = true;
       let body = {};
       try { body = JSON.parse(await readBody(req) || "{}"); } catch (e) { return json(res, 400, { error: "bad json" }); }
       // TED wraps task events as { event, timestamp, source, data, subscriptionId }
@@ -16814,6 +16942,20 @@ const server = http.createServer(async (req, res) => {
         || (body.task && body.task.id) || (body.comment && body.comment.taskId) || body.id || ""
       ).trim();
       if (!taskId) {
+        // Same as the pre-release hook: TED's "Test Webhook" button sends a
+        // skeleton with an empty `data`, and answering 422 to it makes a
+        // correctly wired endpoint report a fault. An empty data object is a
+        // reachability check; a populated one that still hides the id is a real
+        // payload we failed to read, and that must stay loud.
+        const dataEmpty = !dat || typeof dat !== "object" || !Object.keys(dat).length;
+        if (dataEmpty) {
+          console.log("ted-subtask webhook: reachability check (no task id, empty data) — answered 200");
+
+          return json(res, 200, {
+            ok: true, test: true,
+            message: "Endpoint reachable and authenticated. This payload carries no task, so nothing was done — a real event carries the sub-task id at data.id.",
+          });
+        }
         console.warn("ted-subtask webhook: no task id. payload:", JSON.stringify(body).slice(0, 1200));
         // Report the nested keys too. The top-level ones alone said only that
         // everything lives under `data`, which cost a round of testing to learn.
@@ -18844,6 +18986,14 @@ if (require.main === module) {
   // stopped is owed it still, and the person waiting on it has no other way to
   // find out what happened to their request.
   flushOwedTedOutcomes().catch((e) => console.error("owed TED outcomes could not be flushed:", e.message));
+  // Whether the fast path is even available, said plainly at boot. An
+  // unregistered webhook is invisible from here — TED simply never calls — so
+  // the one thing this side can report is whether it would accept the call.
+  if (TED_API_TOKEN && TED_SUBTASKS) {
+    console.log((process.env.TED_SUBTASK_WEBHOOK_SECRET || "").trim()
+      ? `TED subtask webhook: armed at ${G99_TOOL_PUBLIC_URL || "(G99_TOOL_PUBLIC_URL unset)"}/api/webhook/ted-subtask — TED must send x-webhook-secret`
+      : "TED subtask webhook: DISABLED — TED_SUBTASK_WEBHOOK_SECRET is not set, so the endpoint refuses every caller and requests arrive only via the poll");
+  }
   // Say which mode content review is in, at boot, every time. The one thing that
   // must never be ambiguous is whether a reviewer's correction ends up in a local
   // checkout or in a pull request against a client's repository.
@@ -18911,7 +19061,7 @@ module.exports = {
   tedResolveSubtaskRequest, tedTaskComments, isEmailSubtask, TED_EMAIL_SUFFIX, TED_AUTOMATION_MARK,
   tedListSubtasks, startTedSubtaskRun, pollTedSubtasks,
   tedClientsWithSites, tedRevisionParentForClient, tedWatchList,
-  tedTaskMedia, refImageParts,
+  tedTaskMedia, refImageParts, commentsFromPeople,
   OUTCOME, OUTCOME_LABEL, resolveFindingOutcomes, replaceInTextNodes, fixBusinessName,
   imageSources, findingsImages, readSeoPages, synthMuSource, pageText,
   fixFavicon, fixSocialImage, fix404, fixCallNow, fixBlvd, fixBlogLinkColor, fixClickable,
