@@ -16395,7 +16395,21 @@ const server = http.createServer(async (req, res) => {
       // somebody fills in the wrong tab, every delivery 401s and the pre-release
       // run silently stops happening.
       const secret = (process.env.PRE_RELEASE_WEBHOOK_SECRET || "").trim();
-      if (secret) {
+      if (!secret) {
+        // Fails closed, like every other webhook here. This endpoint clones,
+        // audits, opens and MERGES a pull request against a client's repository,
+        // so an unauthenticated caller is worse here than anywhere else in this
+        // file — and "no secret set" meant exactly that until now.
+        //
+        // Unlike the TED subtask hook, this subscription is live in TED and
+        // delivering, so switching it off at this end is visible: set
+        // PRE_RELEASE_WEBHOOK_SECRET here and the same value on the
+        // subscription's Secret Auth tab, and it resumes.
+        console.warn("pre-release: refused — PRE_RELEASE_WEBHOOK_SECRET is not set, so this endpoint cannot tell TED from anyone else");
+
+        return json(res, 401, { error: "webhook not configured on this deployment (PRE_RELEASE_WEBHOOK_SECRET unset)" });
+      }
+      {
         const sent = String(req.headers["x-ted-webhook-secret"] || req.headers["x-webhook-secret"]
           || req.headers["x-ted-secret"]
           || String(req.headers["authorization"] || "").replace(/^Bearer\s+/i, "")).trim();
@@ -16421,6 +16435,9 @@ const server = http.createServer(async (req, res) => {
       };
       const clientId = dig("clientId", "client_id");
       const clientName = dig("clientName", "client_name", "client", "customerName", "businessName");
+      // The stronger key when a name repeats across clones, and the one TED puts
+      // on both the task and the client row. Unique across all 151 clients.
+      const hubspotId = dig("hubspotId", "hubspot_id", "hubspotDealId", "dealId");
       const templateKey = dig("templateKey", "template_key", "taskTemplateKey");
       const status = dig("status", "taskStatus", "newStatus");
       const targetTask = tgt.id || tgt.taskId || dig("targetTaskId", "id");
@@ -16466,16 +16483,43 @@ const server = http.createServer(async (req, res) => {
         console.log(`pre-release: TED client ${clientId} has no beta site URL — falling back to the site list`);
         site = null;
       }
+      // The event does not always carry a client id — the live subscription is
+      // scoped by template key and sends a name. Without one, the block above
+      // never asks TED at all and the request falls straight through to a
+      // hand-written list of three sites, which is how a client TED knows
+      // perfectly well came back as "no NocoDB site matches". The name plus the
+      // hubspot id identify the client in TED exactly as they do everywhere
+      // else, so ask there before giving up. See tedClientIdFor: it refuses to
+      // choose between two clients of the same name rather than guessing.
+      if (!site && clientName) {
+        const tedId = await tedClientIdFor(clientName, hubspotId).catch(() => null);
+        if (tedId) {
+          site = await tedClientSite(tedId, clientName).catch((e) => {
+            console.log(`pre-release: TED client ${tedId} ("${clientName}") not usable (${e.message})`);
+            return null;
+          });
+          if (site && !site.liveUrl) {
+            console.log(`pre-release: TED client ${tedId} ("${clientName}") has no beta site URL`);
+            site = null;
+          }
+        }
+      }
       if (!site) {
         if (!clientName) return json(res, 409, { error: `TED client ${clientId} has no usable repository or beta site, and the event carried no client name to fall back to` });
-        let sites; try { sites = await getWebsites(true); } catch (e) { return json(res, 502, { error: "NocoDB lookup failed: " + e.message }); }
+        let sites; try { sites = await getWebsites(true); } catch (e) { return json(res, 502, { error: "site list lookup failed: " + e.message }); }
         const norm = (s) => String(s || "").toLowerCase().replace(/\(.*?\)/g, "").replace(/[^a-z0-9]+/g, " ").trim();
         const want = norm(clientName);
         const exact = sites.filter((s) => norm(s.businessName) === want);
         const loose = exact.length ? exact : sites.filter((s) => norm(s.businessName).includes(want) || want.includes(norm(s.businessName)));
         if (loose.length !== 1) {
           return json(res, 409, {
-            error: loose.length ? `"${clientName}" matches ${loose.length} sites` : `no NocoDB site matches "${clientName}"`,
+            // Names what was actually consulted. The old wording said "NocoDB",
+            // which has been off behind a flag since 2026-08-27 — so the one
+            // line telling somebody why their release stalled pointed them at a
+            // system that had not been asked.
+            error: loose.length
+              ? `"${clientName}" matches ${loose.length} sites`
+              : `no site matches "${clientName}" — TED has no client of that name with both a repository and a beta site URL, and it is not in the hand-named site list either`,
             candidates: loose.map((s) => s.businessName).slice(0, 5),
           });
         }

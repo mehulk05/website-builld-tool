@@ -128,6 +128,60 @@ const post = (headers, body) => fetch(`http://127.0.0.1:${PORT}/api/webhook/ted-
     });
   } finally { s.child.kill(); }
 
+  // ---- /api/webhook/pre-release --------------------------------------------
+  // The same fail-open shape, and its own comment said it was copied from the
+  // TED one. It matters more here: this endpoint clones, audits, opens and
+  // MERGES a pull request against a client's repository. Unlike the TED subtask
+  // hook it is genuinely registered in TED and delivering, so the fix is
+  // deliberately loud about what to set.
+  const prePost = (headers, body) => fetch(`http://127.0.0.1:${PORT}/api/webhook/pre-release`, {
+    method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body || {}),
+  });
+
+  s = boot({ PRE_RELEASE_WEBHOOK_SECRET: "", TED_SUBTASK_WEBHOOK_SECRET: "x" });
+  try {
+    await ready();
+
+    await t("pre-release: with no secret configured, an anonymous caller is refused", async () => {
+      const r = await prePost({}, { trigger: { clientName: "Nashville Wellness & IV" } });
+      assert.strictEqual(r.status, 401, "an endpoint that merges to client repos must not run open");
+      assert.match((await r.json()).error, /PRE_RELEASE_WEBHOOK_SECRET/,
+        "the 401 must name the variable, because this subscription is live and someone has to fix it fast");
+    });
+
+    await t("pre-release: the refusal happens before any client lookup", async () => {
+      const r = await prePost({}, { trigger: { clientId: "1534", clientName: "NUVO" } });
+      assert.strictEqual(r.status, 401);
+    });
+  } finally { s.child.kill(); }
+
+  s = boot({ PRE_RELEASE_WEBHOOK_SECRET: "pre-s3cret", TED_SUBTASK_WEBHOOK_SECRET: "x" });
+  try {
+    await ready();
+
+    await t("pre-release: a wrong secret is refused", async () => {
+      assert.strictEqual((await prePost({ "x-webhook-secret": "nope" }, {})).status, 401);
+    });
+
+    await t("pre-release: every header TED might send it under is accepted", async () => {
+      // TED's Secret Auth tab sends X-TED-Webhook-Secret; a header typed on the
+      // Parameter tab is whatever was typed. Reading only one means the day
+      // somebody fills in the wrong tab, every delivery 401s silently.
+      for (const h of ["x-ted-webhook-secret", "x-webhook-secret", "x-ted-secret"]) {
+        const r = await prePost({ [h]: "pre-s3cret" }, {});
+        assert.strictEqual(r.status, 422, `${h} should have been accepted as the secret`);
+      }
+      const r = await prePost({ authorization: "Bearer pre-s3cret" }, {});
+      assert.strictEqual(r.status, 422, "a bearer token should be accepted too");
+    });
+
+    await t("pre-release: past the gate, a payload with no client is refused clearly", async () => {
+      const r = await prePost({ "x-webhook-secret": "pre-s3cret" }, {});
+      assert.strictEqual(r.status, 422);
+      assert.match((await r.json()).error, /no client id or name/i);
+    });
+  } finally { s.child.kill(); }
+
   console.log(`\n${pass} passed, ${fail} failed\n`);
   process.exitCode = fail ? 1 : 0;
 })();
