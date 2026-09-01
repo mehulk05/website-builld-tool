@@ -1,4 +1,68 @@
-# Plan: Output G99 GitOps `resources/` format instead of PHP theme  (started 2026-08-21)
+# Plan: Designer feedback loop on beta sites  (started 2026-09-01)
+
+Goal: an authorised designer selects a live beta-site element, batches page-specific feedback,
+and submits once; the build tool safely resolves, patches, verifies, auto-merges, deploys and
+reports each item without a human approval step.
+
+## Architecture decision
+
+Extend the first-party review system already present in `public/review-widget.js`,
+`review-plugin.js`, and the `runEditJob` GitOps pipeline. Do not build a second widget, token
+system, queue, PR implementation, or WPCode delivery path.
+
+The mutation unit is a **section patch bundle**: one targeted Elementor HTML widget plus only
+the scoped CSS needed for that section. The stable Elementor id locates the section; a clicked
+descendant fingerprint identifies the exact button/link/image inside it. The submission also
+records the current Git commit and fragment hash, so a queued item can detect drift instead of
+silently modifying a different section.
+
+| # | Task | Files / area | Status | Notes |
+|---|------|--------------|--------|-------|
+| 1 | Define annotation contract | lib/feedback/schema.js (new), public/review-widget.js, review-plugin.js | ⏳ pending | Browser sends page, Elementor id, note, clicked tag/text/attributes/relative path, viewport and rect; backend adds current Git SHA + fragment hash. Browser HTML is a hint, never the source of truth. |
+| 2 | Add durable feedback ledger | lib/feedback/store.js (new), server.js, .env.example | ⏳ pending | Persist batches/items/status/attempts/PR/deploy SHA through the existing NocoDB integration; `jobs.json` stays an execution cache because local disk is not restart-safe. Add an idempotency key. |
+| 3 | Extend element picker UI | public/review-widget.js | ⏳ pending | Keep exact-text review mode; add Design mode with hover outline, click-to-pin, note box, queued markers, page-level Submit, Escape and mobile-safe controls. Resolve the nearest Elementor HTML-widget wrapper. |
+| 4 | Forward batches securely | review-plugin.js, server.js | ⏳ pending | Reuse signed `?g99r=` redemption, HttpOnly cookie, same-origin WP REST proxy and `/api/webhook/review/feedback`; extend validation/limits instead of exposing the build-tool API or secrets to browser JS. |
+| 5 | Resolve against Git HEAD | lib/feedback/resolve.js (new), gitops-json.js | ⏳ pending | Require one matching widget id. Record main SHA/hash. Missing, duplicate, retyped or fingerprint-mismatched targets become item-level `conflict`; never guess from coordinates. |
+| 6 | Coalesce section feedback | lib/feedback/patch.js (new), server.js | ⏳ pending | Group by repo + page + widget id. All notes on one section go into one Gemini call, while separate sections are committed atomically in one submitted-batch PR. |
+| 7 | Patch HTML and scoped CSS | lib/feedback/patch.js (new), gitops-json.js | ⏳ pending | Return `{html, scopedCss, addressedItemIds}`. Apply deterministic text/href edits directly; use Gemini for layout/style/reorder. Prefix CSS with `.elementor-element-<id>` and write via the existing page CSS/carrier channel. Never regenerate a page. |
+| 8 | Add automatic patch gates | lib/feedback/validate.js (new), gitops-json.js, server.js | ⏳ pending | JSON parses; id survives; only allowed widget/page CSS changes; notes have diff evidence; byte/DOM caps pass; safe URL schemes only; no scripts, event handlers or iframes. A failed item is not merged. |
+| 9 | Serialize repo revisions | lib/feedback/store.js (new), server.js | ⏳ pending | One active mutation per repo. Re-fetch/rebase on latest `main` before commit; stale batches re-resolve by id + hash. One submission creates one PR, not one PR per note. |
+| 10 | Reuse PR/deploy pipeline | server.js | ⏳ pending | Extend `runEditJob`, GitOps virtual views and existing GitHub App clone → branch → PR → auto-merge. PR lists every note, target id, validation result and before/after hash. |
+| 11 | Add visual safety/rollback | lib/feedback/visualCheck.js (new), server.js | ⏳ pending | Playwright desktop/mobile pre-merge smoke rejects blank/overflow/broken output. After exact deploy SHA succeeds, verify live target; deterministic regression triggers conditional auto-revert only when main has not moved past our lineage. Ignore the known transient deploy access-denied flake. |
+| 12 | Report item outcomes | public/review-widget.js, public/job.js, server.js | ⏳ pending | Show queued/running/live/conflict/failed per item. Durable ledger + PR provide audit after restarts; ambiguous feedback is explicit, never silently dropped. |
+| 13 | Test resolver and drift | test-feedback.js (new), test-gitops-json.js | ⏳ pending | Cover exact/child id, same-section multi-note, reorder, missing/duplicate id, concurrent batch, CSS/link edit, unsafe output, retry idempotency and conditional rollback. |
+| 14 | Run staged Nuvo E2E | public/review-widget.js, server.js, resources/pages/home/elementor.json | ⏳ pending | Dry-run → local checkout → live beta. Submit padding + footer-link + reorder notes; prove one PR, merge, deploy SHA, browser result, persistence and no widget for normal visitors. |
+| 15 | Persist the queue across page navigation | public/review-widget.js | ⏳ pending | Found reading the SHIPPED widget: `queue` is an in-memory JS array only — a real page load (no SPA here) reruns the script fresh, so unsubmitted items are silently lost the moment the reviewer clicks to another page without hitting Apply first. The panel's own copy ("add changes across as many pages as you like") already promises this and isn't true yet. Fix: `localStorage`-back the queue, tag each item with the page it was added on, hydrate on load so the launch-button counter is correct immediately. Per-page early-submit stays available — this only stops navigation from being a trap. |
+| 16 | Multi-page batch → one job/PR | public/review-widget.js, review-plugin.js, server.js (`reviewWorkOrder`:5817, `enqueueEditJob`:7168, `reviewSwapTiers`:5836) | ⏳ pending | A global "Submit N across M pages" button sends one batch spanning pages. Correction to an earlier claim in this plan: `reviewSwapTiers` already scopes a swap strictly to the ONE page's file (gitops: `resources/pages/<slug>/elementor.json`; classic: that page's template + the header/footer tier) — it does NOT search the whole repo. So a multi-page batch is not a scope-widening risk: group items by page client- and server-side, call the existing per-page swap/tier logic once per distinct page in the batch, still one PR. `changes[]` gains a per-item `path` (today `path` is one top-level field for the whole request). |
+| 17 | Session overview panel (group by page → section) | public/review-widget.js | ⏳ pending | Restructure `showQueue()`: group queued items under a "Page: /slug (N)" heading, then under each page group show section/element label (human name resolved from the Elementor id, not the raw hash) + note text + thumbnail if a screenshot was attached + × remove — before submit, across the whole persisted (task 15) session, not just the current page. Launch-button badge shows the total across all pages. |
+| 18 | Optional per-item screenshot | public/review-widget.js, review-plugin.js, server.js, lib/feedback (new store target) | ⏳ pending | On "Add change"/note, rasterize just the target element's bounding box to a PNG (a small vendored DOM-rasterization lib — html2canvas-class, no permission prompt, unlike a real screen-capture API). Optional per item, not mandatory. Save the crop to disk (same pattern as existing downloaded-image handling) and store a reference in the ledger, not a base64 blob inline — keeps ledger rows small. Also handed to Gemini as extra visual context at patch time (task 7/6), which helps most on vague notes ("this looks off") a text-only diff can't disambiguate. |
+
+## Automatic conflict policy
+
+- Unchanged unique id + fragment hash: patch normally.
+- Changed fragment: rebase only if the clicked descendant fingerprint still resolves uniquely.
+- Missing/duplicated id, ambiguous target, cross-page request, unsafe output or failed visual gate:
+  mark that item `conflict`/`failed`; do not guess and do not merge it.
+
+## Not in v1
+
+Sitewide/global design-system feedback ("every button everywhere"),
+native Elementor widget editing, arbitrary element deletion, and a human approval queue. Internal
+screenshots used by automated validation are in scope; they are not reviewer attachments.
+(Cross-PAGE batching of one reviewer's own notes — task 16 — is now in v1; it is a narrower thing
+than sitewide feedback: still one reviewer's own session, still resolved per-page, just submitted
+together instead of one page at a time.)
+
+## Post-submit review gap (also found reading the shipped widget, not yet a task)
+
+After Apply, the widget polls status and shows step progress then "Your changes are live" (or the
+`refused` list with reasons) — but no before/after diff of what actually landed, and nothing
+persists past that panel for the reviewer to look back at later. Worth a task if Mehul wants it;
+holding off since it wasn't asked for yet.
+
+## Archive
+
+### Plan: Output G99 GitOps `resources/` format instead of PHP theme  (started 2026-08-21 → done)
 
 Goal: a build job produces a repo in the **mcptest2.gogroth.com template format** — a `resources/` tree
 (pages as Elementor JSON + resource.json + seo.json, media binaries + ref JSON, menus/site config) that
@@ -48,9 +112,19 @@ the same as today's theme output. TED event log diff vs a normal build = empty.
 Blog posts, products, astra-portfolios, popups, per-service pages, Elementor native-widget mapping (option B),
 WordPress→Git reverse sync (plugin handles that).
 
-## Archive
-
 ### Plan: Use the medspa-tool process inside the build tool (2026-08-15 → done ~2026-08-19)
 Shipped as the `webgen` engine (lib/webgen/*): scrape → BrandKit → code-rendered pages, blueprint designs,
 deterministic site-derived theming, localized images, premium contact/footer, TED event parity proven.
 Full original table recoverable from git history of PLAN.md.
+
+### Plan: designgen polish — remove floating book-tab, fix invisible ghost-button text (2026-09-01 → done)
+Two live bugs on nuvo (job nuvo-cta-fix-1): (1) a fixed side "Book a Visit" tab (`.c-book-tab`) the
+user didn't want — removed the prompt line that told Gemini to use it, plus a defensive strip of any
+`.c-book-tab` element Gemini emits anyway (`lib/designgen/index.js`, per-page loop). (2) CTA-band ghost
+buttons ("CONTACT US"/"BOOK NOW" on a dark band) rendered BLACK text, invisible — root cause: pages ship
+as Elementor html-widgets, and the site's own kit CSS has a more specific `a` rule (`.elementor-widget-container a`,
+specificity 0-1-1) that beats our plain `.c-btn`/`.c-btn--ghost` class rules (0-1-0 each) and overrides
+the button's `currentColor` text to Elementor's default. Fix: `background`/`color`/`border` on the base
+`.c-btn` rule in `lib/designgen/assets/system.css` now carry `!important` — vendored framework CSS, so
+every future generation gets it automatically. Verified live on all 4 pages: no floating tab, every
+CTA/ghost button white text, footer parity fix (previous entry) still intact.
