@@ -822,3 +822,62 @@ function twoInOne() {
   ok("a removal the words agree with still goes through", c.kind === "structure" && c.op === "remove");
   ok("and keeps the target the words found", c.target === "services");
 })();
+
+// ---- one vocabulary for "this note changes what is there" -------------------
+// patch.js kept its own word list for deciding whether the element counts may
+// move, and the two lists disagreed. "Take the photo out from the bottom of
+// this section" was carried out correctly and then rejected for dropping an
+// <img> "the feedback did not ask to remove" — a sentence the reviewer cannot
+// act on, about their own words.
+{
+  const asks = (n) => INTENT.asksForStructure(n);
+  ok("reads a split verb", asks("Take the photo out from the bottom of this section"));
+  ok("and the plain ones", asks("remove the our services section") && asks("get rid of the testimonials"));
+  ok("and an addition", asks("add another card saying botox"));
+  ok("and a replacement", asks("replace this image with the one attached"));
+  // Styling notes must NOT unlock it, or a rewrite may quietly drop content.
+  ok("a colour note does not", !asks("change the button colour to navy"));
+  ok("nor a spacing note", !asks("give this heading more space above it"));
+  // Negation is masked here too: permission comes from what was asked for.
+  ok("a forbidden removal grants nothing", !asks("dont remove the hero, just recolour it"));
+  ok("nor does 'without removing'", !asks("without removing anything, make the text darker"));
+
+  // The guard is looser than the classifier ON PURPOSE. The classifier picks an
+  // operation and can take a whole band off a live page; this only unlocks a
+  // check on markup a model already wrote. So the same sentence reads as a
+  // section edit and still allows the counts to move.
+  const v = INTENT.classify("Take the photo out from the bottom of this section — keep the three cards as they are.");
+  ok("the same note is still a section edit, not a removal", v.kind === "section");
+}
+
+// ---- the note #137 refused, put back through the checker --------------------
+// Not a test of the word list — a test of the failure it caused. The model's
+// rewrite was correct and the guard threw it away, so the shape below is the
+// one that actually shipped: a band of cards with one picture under them, and a
+// note asking for that picture to go.
+{
+  const before = '<section class="g99-sec u-band"><div class="u-wrap">'
+    + '<span class="u-eyebrow">Curated Therapies</span><h2>Featured Medical Service</h2>'
+    + '<div class="u-grid"><div class="c-card"><h3>One</h3><a href="/a/">Learn</a></div>'
+    + '<div class="c-card"><h3>Two</h3><a href="/b/">Learn</a></div>'
+    + '<div class="c-card"><h3>Three</h3><a href="/c/">Learn</a></div></div>'
+    + '<img src="https://tool.example/feedback-uploads/x.jpg" alt="" loading="lazy">'
+    + '</div></section>';
+  const after = before.replace(/<img\b[^>]*>/i, "");
+  const note = "Take the photo out from the bottom of this section — keep the three cards as they are.";
+
+  // What #137 ran: patch.js's own list, which had never heard of "take it out".
+  const oldList = /\b(remove|delete|drop|add|insert|extra|another|duplicate|reorder|move|swap|split|merge)\b/i;
+  const wasRefused = V.checkHtml(before, after, { allowStructural: oldList.test(note) });
+  ok("the old word list refused a note that asked for exactly this",
+    !wasRefused.ok && /did not ask to remove/.test(wasRefused.reason || ""), wasRefused.reason);
+
+  const now = V.checkHtml(before, after, { allowStructural: INTENT.asksForStructure(note) });
+  ok("the shared vocabulary lets it through", now.ok === true, now.reason);
+
+  // And the guard still holds where it should: the same rewrite, from a note
+  // that only asked about colour, is still a picture disappearing unasked.
+  const styling = V.checkHtml(before, after,
+    { allowStructural: INTENT.asksForStructure("make the card headings navy") });
+  ok("a styling note still may not drop a picture", styling.ok === false);
+}

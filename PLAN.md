@@ -81,8 +81,14 @@ the case it was built against but not for the case a designer will actually hit.
 | H2 | A note carrying a file skips the classifier | ✅ done | run.js — the model answering "image" routed it to the branch that refuses image notes for having no image attached |
 | H3 | Publish an attached picture end to end | ✅ done | proved on the deployed tool: #136 added one where the band had none and swapped one where it did. Over a free ngrok tunnel the render gate refused it — correctly, since ngrok serves browsers an interstitial instead of the file |
 | H4 | Show the pictures on the run page | ✅ done | job.js — "markup adjusted" is a true and useless answer to "did my photo go on". Before/after for a swap, one thumbnail for an addition |
+| H5 | One vocabulary for a structural note | ✅ done | patch.js kept its own word list and had never heard of "take it out"; the note was carried out and then rejected for doing it. The guard now asks intent.js |
+| H6 | Attached pictures die on every deploy | 🚫 blocked | render's disk is ephemeral, so every picture a reviewer has attached 404s on the next release. Seen live: #136's photo was already dead. Nuvo cleaned by #138. The fix is F9 |
 
-Totals: 37 done, 2 partial, 6 pending, 2 blocked on infra.
+Totals: 38 done, 2 partial, 6 pending, 3 blocked.
+
+H6 is the one to read: the picture handling is correct and the place those
+pictures live is not. Until F9 lands, an attached photo is good until the
+tool's next deploy and no longer.
 
 G1-G4 are the three bugs #130 shipped to the live site, plus the mislabelling that
 hid the worst of them. All four are fixed, covered by tests, and proven on the live
