@@ -54,6 +54,21 @@
   // ---- shell ---------------------------------------------------------------
   var css = ""
     + ".g99r-hide{display:none!important}"
+    // Outline, not a fill: the reviewer needs to still see the section they are
+    // describing. Offset so it reads as an annotation rather than a border the
+    // designer might mistake for part of the page.
+    + ".g99r-outline{outline:2px dashed #7c5cff!important;outline-offset:-4px!important}"
+    + "#g99r-panel .g99r-picklabel{font-size:11px;font-weight:700;text-transform:uppercase;"
+    + "letter-spacing:.04em;color:#666;margin:10px 0 5px}"
+    + "#g99r-panel .g99r-pick{display:flex;flex-direction:column;gap:2px;border:1px solid #e6e6e6;"
+    + "border-radius:8px;overflow:hidden}"
+    + "#g99r-panel .g99r-rung{display:flex;gap:7px;align-items:center;padding:7px 9px;font-size:12px;"
+    + "cursor:pointer;background:#fff}"
+    + "#g99r-panel .g99r-rung:hover{background:#faf9ff}"
+    + "#g99r-panel .g99r-rung.on{background:#f3f0ff;color:#4b3fa8;font-weight:600}"
+    + "#g99r-panel .g99r-rung input{margin:0;flex:0 0 auto}"
+    + "#g99r-panel .g99r-sec{font-size:12px;color:#4b3fa8;background:#f3f0ff;border-radius:6px;"
+    + "padding:5px 8px;margin-top:6px;font-weight:600}"
     + "#g99r-chip{position:fixed;z-index:2147483000;padding:6px 12px;border-radius:999px;border:0;"
     + "background:#111;color:#fff;font:600 13px/1.2 system-ui,sans-serif;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.28)}"
     + "#g99r-launch{position:fixed;right:20px;bottom:20px;z-index:2147483000;display:flex;align-items:center;gap:8px;"
@@ -95,6 +110,12 @@
     // The picker's own highlight. outline rather than border so nothing reflows
     // under the cursor while the reviewer is aiming at it.
     + ".g99r-target{outline:2px solid #2f6df6!important;outline-offset:-2px!important;cursor:crosshair!important}"
+    // The section gets a quieter outline than the element: both are on screen at
+    // once and the element under the cursor is the one being aimed at.
+    + ".g99r-secline{outline:1px dashed rgba(124,92,255,.85)!important;outline-offset:-1px!important}"
+    + "#g99r-hovertag{position:absolute;z-index:2147483001;pointer-events:none;display:none;"
+    + "background:#7c5cff;color:#fff;font:600 11px/1.4 system-ui,sans-serif;padding:3px 8px;"
+    + "border-radius:0 0 6px 0;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.25)}"
     + "#g99r-hint button{border:0;background:rgba(255,255,255,.22);color:#fff;border-radius:999px;"
     + "padding:3px 10px;font:600 12px system-ui,sans-serif;cursor:pointer;margin:0 2px}"
     + "#g99r-hint{position:fixed;left:50%;transform:translateX(-50%);top:16px;z-index:2147483000;"
@@ -234,6 +255,124 @@
     return null;
   }
 
+  // The chain of things a click could plausibly have meant, from the element
+  // itself out to the section.
+  //
+  // One click can mean four different things and the tool cannot tell which:
+  // "make this button gold" is about the button, "remove this card" is about
+  // one of three cards, "remove this section" is about the band all three sit
+  // in. Until now the widget picked one for the reviewer, silently, and it
+  // picked the section — which is how "remove this" took a whole band off a
+  // live page when a single card was meant.
+  //
+  // Only rungs a person would recognise are offered. Every <div> between a
+  // heading and its section is a rung the DOM has and nobody wants.
+  function targetChain(clicked, section) {
+    var out = [];
+    var n = clicked;
+    var SEMANTIC = /^(a|button|img|h1|h2|h3|h4|p|li|blockquote|figure|article|section|nav|footer)$/i;
+    while (n && n !== document.body && out.length < 6) {
+      var tag = (n.tagName || "").toLowerCase();
+      var cls = String((n.className && n.className.baseVal !== undefined ? n.className.baseVal : n.className) || "");
+      // A rung is worth offering if it is a semantic element, or if it carries a
+      // class that looks deliberate — a card, a quote, a grid item.
+      // Repeated things a reviewer points at — one of three cards, one quote,
+      // one tile. NOT layout wrappers: 'u-wrap' and 'c-hero__body' are rungs the
+      // DOM has and nobody means, and offering them buries the two that matter.
+      // 'service' and 'feature' were in this list and matched 'service-grid',
+      // the wrapper holding all three cards — a rung that reads like one card
+      // and is not. A wrapper offered next to the thing it wraps is a trap.
+      var named = /\b[a-z-]*(card|tile|quote|testimonial|item)\b/i.test(cls);
+      if (SEMANTIC.test(tag) || named) {
+        out.push({ node: n, tag: tag, label: rungLabel(n, tag, cls) });
+      }
+      if (section && n === section) break;
+      n = n.parentElement;
+    }
+    if (section && !out.some(function (r) { return r.node === section; })) {
+      out.push({ node: section, tag: "section", label: "This whole section" });
+    }
+    return out;
+  }
+
+  function rungLabel(n, tag, cls) {
+    var text = (n.textContent || "").replace(/\s+/g, " ").trim();
+    if (tag === "section") {
+      var sec = sectionOf(n);
+      return "This whole section" + (sec && sec.label ? " — " + sec.label : "");
+    }
+    if (tag === "img") return "This image";
+    if (tag === "a") return "This link" + (text ? " — " + clip(text, 30) : "");
+    if (tag === "button") return "This button" + (text ? " — " + clip(text, 30) : "");
+    if (/^h[1-4]$/.test(tag)) return "This heading — " + clip(text, 34);
+    if (/\b(card|tile|item|quote|box)\b/.test(cls)) return "This card — " + clip(text, 30);
+    if (tag === "li") return "This list item — " + clip(text, 30);
+    if (tag === "p") return "This paragraph — " + clip(text, 30);
+    return "This <" + tag + ">" + (text ? " — " + clip(text, 26) : "");
+  }
+
+  // A floating name for whatever the cursor is over. Follows the top-left of
+  // the section rather than the cursor: a label that chases the pointer is
+  // harder to read than one that sits still on the thing it names.
+  var hoverTag = null;
+  function showHoverLabel(sec) {
+    if (!sec) { if (hoverTag) hoverTag.style.display = "none"; return; }
+    if (!hoverTag) {
+      hoverTag = document.createElement("div");
+      hoverTag.id = "g99r-hovertag";
+      document.body.appendChild(hoverTag);
+    }
+    var r = sec.node.getBoundingClientRect();
+    hoverTag.textContent = sec.label || "Section";
+    hoverTag.style.display = "block";
+    hoverTag.style.top = Math.max(4, r.top + window.scrollY) + "px";
+    hoverTag.style.left = Math.max(4, r.left + window.scrollX) + "px";
+    if (hoverSec !== sec.node) {
+      if (hoverSec) hoverSec.classList.remove("g99r-secline");
+      hoverSec = sec.node;
+      hoverSec.classList.add("g99r-secline");
+    }
+  }
+  var hoverSec = null;
+  function clearHover() {
+    if (hoverTag) hoverTag.style.display = "none";
+    if (hoverSec) { hoverSec.classList.remove("g99r-secline"); hoverSec = null; }
+  }
+
+  // The section a click landed in, and what it is called.
+  //
+  // elementorTarget returns the NEAREST element carrying an id, which is right
+  // for "make this button gold" and dangerously incomplete for "remove this
+  // section": a click three levels inside a band removes the whole band, and
+  // until now the panel said only what was under the cursor. Someone aiming at
+  // the services block, clicking a paragraph, and reading back the paragraph's
+  // own text had nothing to tell them a different section was about to go.
+  //
+  // The name is read the same way the build tool reads it, so what the panel
+  // promises and what the report says afterwards are the same words: the small
+  // eyebrow label first, because it is written to name the section, then the
+  // heading.
+  function sectionOf(node) {
+    if (!node) return null;
+    // Look both ways. A click inside a section finds it by walking UP; but the
+    // node this is called with is the nearest element carrying an Elementor id,
+    // and Elementor WRAPS each section in that element — so from there the
+    // section is a descendant, not an ancestor. Only checking upwards found
+    // nothing on every real page.
+    var sec = (node.closest && node.closest("section"))
+      || (node.querySelector && node.querySelector("section"));
+    if (!sec) return null;
+    var eyebrow = sec.querySelector(".u-eyebrow");
+    var heading = sec.querySelector("h1, h2, h3");
+    var text = (eyebrow && eyebrow.textContent) || (heading && heading.textContent) || "";
+    text = text.replace(/\s+/g, " ").trim();
+    // Shouting an all-caps eyebrow back reads as an error, not as a place.
+    if (text && text === text.toUpperCase() && text.length > 3) {
+      text = text.toLowerCase().replace(/\b[a-z]/g, function (c) { return c.toUpperCase(); });
+    }
+    return { node: sec, label: text.slice(0, 48) };
+  }
+
   // Where the clicked node sits inside its section, as child indexes. Lets the
   // tool tell one of four identical buttons from the others without trusting a
   // selector the page could have changed under it.
@@ -270,6 +409,7 @@
     picking = on;
     hint.classList.toggle("g99r-hide", !on);
     if (!on && hovered) { hovered.classList.remove("g99r-target"); hovered = null; }
+    if (!on) clearHover();
     if (on) panel.classList.add("g99r-hide");
     paintLaunch();
   }
@@ -282,6 +422,11 @@
     if (hovered) hovered.classList.remove("g99r-target");
     hovered = node;
     if (hovered) hovered.classList.add("g99r-target");
+    // Say which section is under the cursor, before the click rather than
+    // after. An outline alone tells you something is selected; it does not tell
+    // you WHAT, and on this site a click three levels inside a band selects the
+    // band. That gap removed the wrong section from a live site twice.
+    showHoverLabel(hit && sectionOf(hit.node));
   }, true);
 
   document.addEventListener("click", function (e) {
@@ -293,7 +438,8 @@
     e.stopPropagation();
     if (!hit) return;
     setPicking(false);
-    openNoteEditor(hit.id, describe(e.target, hit.node), hit.node);
+    clearHover();
+    openNoteEditor(hit.id, describe(e.target, hit.node), hit.node, e.target);
   }, true);
 
   document.addEventListener("keydown", function (e) {
@@ -376,7 +522,7 @@
     });
   }
 
-  function openNoteEditor(elementId, target, node) {
+  function openNoteEditor(elementId, target, node, clickedNode) {
     panel.innerHTML = "";
     panel.appendChild(el("h4", null, "What should be different here?"));
     panel.appendChild(el("p", { class: "g99r-sub" }, esc(CFG.reviewer) + " · " + esc(CFG.path)));
@@ -385,15 +531,68 @@
     panel.appendChild(el("div", { class: "g99r-where" },
       "Selected: " + what + (target.text ? " · " + esc(clip(target.text, 60)) : "")));
 
+    // Which section this sits in, said plainly and outlined on the page while
+    // the panel is open. A note that turns out to be structural acts on THIS,
+    // not on the element above, and that is worth knowing before writing it
+    // rather than after reading the report.
+    var sec = sectionOf(node);
+    if (sec) {
+      sec.node.classList.add("g99r-outline");
+      outlined = sec.node;
+    }
+
+    // What this note is about. The reviewer picks; the tool no longer guesses.
+    // The narrowest rung is selected by default, because that is what a person
+    // means by "this" most of the time and because the wide reading is the one
+    // that costs a whole section when it is wrong.
+    var chain = targetChain(clickedNode || node, sec && sec.node);
+    var chosen = chain[0] || { node: node, tag: (target.tag || ""), label: "This element" };
+    var picker = el("div", { class: "g99r-pick" });
+    chain.forEach(function (rung, i) {
+      var row = el("label", { class: "g99r-rung" + (i === 0 ? " on" : "") });
+      var radio = el("input", { type: "radio", name: "g99r-rung" });
+      if (i === 0) radio.checked = true;
+      row.appendChild(radio);
+      row.appendChild(el("span", null, esc(rung.label)));
+      radio.addEventListener("change", function () {
+        chosen = rung;
+        target = describe(rung.node, (sec && sec.node) || rung.node);
+        [].forEach.call(picker.children, function (c) { c.classList.remove("on"); });
+        row.classList.add("on");
+        // Outline what is actually selected, so the page agrees with the panel.
+        if (outlined) outlined.classList.remove("g99r-outline");
+        rung.node.classList.add("g99r-outline");
+        outlined = rung.node;
+      });
+      picker.appendChild(row);
+    });
+    if (chain.length > 1) {
+      panel.appendChild(el("div", { class: "g99r-picklabel" }, "This note is about:"));
+      panel.appendChild(picker);
+    } else if (sec) {
+      panel.appendChild(el("div", { class: "g99r-sec" },
+        "In section: " + esc(sec.label || "(unnamed)")));
+    }
+
     var note = el("textarea", { rows: "4", placeholder: "e.g. make this button rounded, or point this link at /contact" });
     panel.appendChild(note);
 
-    // Picture swap. Offered on an image, or on anything containing one — a
-    // reviewer aiming at a hero usually hits the section, not the <img>.
+    // Picture swap, and picture ADD.
+    //
+    // This used to appear only when the clicked thing already contained an
+    // <img>, on the reading that the control replaces a picture. The pipeline
+    // behind it does more than that: handed a file for a section with no image
+    // at all, it places one. That path existed and could not be reached, because
+    // the only way to attach a file was to click something that already had a
+    // picture — so "put a photo in this band" was refused for want of an upload
+    // the reviewer was never offered.
+    //
+    // Offered on anything now. The wording changes with what is there, because
+    // "Replace the picture" over a band with no picture reads as a bug.
     var innerImg = node && node.tagName === "IMG" ? node : (node && node.querySelector ? node.querySelector("img") : null);
     var picked = null;
-    if (innerImg) {
-      panel.appendChild(el("label", null, "Replace the picture (optional)"));
+    {
+      panel.appendChild(el("label", null, innerImg ? "Replace the picture (optional)" : "Add a picture (optional)"));
       var drop = el("div", { class: "g99r-drop" }, "Choose an image from your computer");
       var file = el("input", { type: "file", accept: "image/*", style: "display:none" });
       var thumb = el("img", { class: "g99r-thumb g99r-hide" });
@@ -438,6 +637,11 @@
       }
       queue.push({
         kind: "note", page: CFG.path, elementId: elementId, note: v, target: target,
+        // The section the reviewer was shown when they wrote this. Sent so the
+        // report can name it even for notes that are turned down before the page
+        // is ever read — those never reach the markup, so the tool cannot work
+        // it out for itself, and "on /" is not an answer anybody can act on.
+        section: (sectionOf(node) || {}).label || "",
         image: picked || null,
       });
       persist(); paintLaunch();
@@ -505,6 +709,7 @@
   }
 
   function showQueue() {
+    clearOutline();
     setPicking(false);
     panel.innerHTML = "";
     panel.appendChild(el("h4", null, "Review"));
@@ -604,6 +809,7 @@
   }
 
   function status(msg, note, refused) {
+    clearOutline();
     panel.innerHTML = "";
     panel.appendChild(el("h4", null, "Review"));
     panel.appendChild(el("p", { class: "g99r-sub" }, esc(CFG.reviewer)));
@@ -628,6 +834,12 @@
     return "b" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   }
   var submitKey = null;
+  // The section currently outlined on the page. Held so it can be un-outlined:
+  // a highlight the reviewer cannot get rid of is worse than no highlight.
+  var outlined = null;
+  function clearOutline() {
+    if (outlined) { outlined.classList.remove("g99r-outline"); outlined = null; }
+  }
 
   function submit() {
     var batch = queue.slice();
@@ -653,6 +865,7 @@
         notes: notes.map(function (c) {
           return {
             elementId: c.elementId, note: c.note, target: c.target, page: c.page || "/",
+            section: c.section || "",
             image: c.image ? { dataUrl: c.image.dataUrl, filename: c.image.filename } : null,
           };
         }),

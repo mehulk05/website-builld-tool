@@ -16,6 +16,12 @@ const P = require("./lib/feedback/patch");
 const R = require("./lib/feedback/resolve");
 const ST = require("./lib/feedback/store");
 const RUN = require("./lib/feedback/run");
+const SCOPE = require("./lib/feedback/scope");
+const INTENT = require("./lib/feedback/intent");
+const STRUCT = require("./lib/feedback/structure");
+const IMG = require("./lib/feedback/image");
+const WR = require("./lib/feedback/writers");
+const AI = require("./lib/feedback/intentAI");
 const G = require("./gitops-json");
 
 let pass = 0, fail = 0;
@@ -468,3 +474,351 @@ console.log("\npatch (model)");
   ok("refuses a file whose bytes are not an image",
     U2.store({ dataUrl: "data:image/png;base64," + Buffer.from("nope").toString("base64"), filename: "x.png" }, "https://t") === null);
 }
+
+
+// ---- scope gate --------------------------------------------------------------
+// Both directions matter equally. A request wrongly refused costs one rephrase;
+// a request wrongly accepted gets quietly reinterpreted and reported as done,
+// which is what this gate exists to stop.
+{
+  const refuses = (label, note, kind) => {
+    const v = SCOPE.outOfScope(note);
+    ok("refuses " + label, !!v && v.kind === kind);
+  };
+  const allows = (label, note) => ok("allows " + label, SCOPE.outOfScope(note) === null);
+
+  // The note from PR #114, which was carried out as something else entirely.
+  refuses("a new section above a container",
+    "Add another section above this container where we show testimonials", "structure:add");
+  refuses("a new band between two", "insert a new band between these two", "structure:add");
+  refuses("reordering", "Move this section above the hero", "structure:move");
+  refuses("deleting a whole section", "Delete this whole section", "structure:remove");
+  refuses("a new page", "Create a new page for pricing", "page:new");
+  refuses("nav edits", "the main menu should say Services", "nav");
+  refuses("metadata", "update the meta description for this page", "seo");
+  refuses("a site-wide change", "Make this button red on all pages", "global");
+
+  // Everything below is squarely in scope and must not be caught.
+  allows("a colour change", "Make button color to red");
+  allows("adding content inside a section", "Add a testimonial quote in this block");
+  allows("removing one element", "remove this button");
+  allows("a link change", "point this link at /contact");
+  // "header" is not a nav word: this is an ordinary section edit.
+  allows("header text", "make the header text bigger");
+  // Nor is a bare "menu" — a services menu rendered as text is section content.
+  allows("the word menu as content", "This section needs a menu of services listed as text");
+
+  const part = SCOPE.partition([
+    { localId: "i1", note: "Make button color to red" },
+    { localId: "i2", note: "Add a new section below this" },
+  ]);
+  eq("partition keeps what it can do", part.keep.length, 1);
+  eq("partition turns down what it cannot", part.refuse.length, 1);
+  ok("the refusal explains itself", /new section/.test(part.refuse[0].reason));
+}
+
+
+// ---- intent routing ----------------------------------------------------------
+// The bug this replaces: everything was a section edit, so "add a section above
+// this" was handed to the section rewriter, which put the content inside and
+// reported it applied. Structural notes must now route, not be reinterpreted.
+{
+  const is = (label, note, kind, detail) => {
+    const v = INTENT.classify(note);
+    const got = v.kind === "structure" ? v.op + (v.position ? "/" + v.position : "")
+              : v.kind === "refuse" ? v.why : "";
+    ok(label, v.kind === kind && got === detail);
+  };
+  is("routes 'add a section above' to insert", "Add another section above this container", "structure", "insert/before");
+  is("routes 'add a band below' to insert", "add a new band below this", "structure", "insert/after");
+  is("routes deleting a section", "Delete this whole section", "structure", "remove");
+  is("routes a move with a direction", "Move this section above the hero", "structure", "move/before");
+  is("turns down a move with no direction", "move this section up", "refuse", "structure:move-vague");
+  is("still refuses nav", "the main menu should say Services", "refuse", "nav");
+  is("still refuses a new page", "Create a new page for pricing", "refuse", "page:new");
+
+  // Section edits must stay section edits. "add" and "remove" alone are not
+  // structural — they are the two most common things done INSIDE a section.
+  is("a colour change is a section edit", "Make button color to red", "section", "");
+  is("adding content is a section edit", "Add a testimonial quote in this block", "section", "");
+  is("removing an element is a section edit", "remove this button", "section", "");
+
+  const r = INTENT.route([
+    { localId: "i1", note: "Make button color to red" },
+    { localId: "i2", note: "Add a section below this" },
+    { localId: "i3", note: "update the meta description" },
+  ]);
+  eq("route sorts section edits", r.section.length, 1);
+  eq("route sorts structural notes", r.structure.length, 1);
+  eq("route sorts refusals", r.refuse.length, 1);
+}
+
+// ---- structural operations ---------------------------------------------------
+{
+  const mk = () => ({ document_settings: {}, elements: ["a", "b", "c"].map((n) => ({
+    id: "sec" + n, elType: "container", elements: [
+      { id: "w" + n, elType: "widget", widgetType: "html", settings: { html: "<section>" + n + "</section>" }, elements: [] }],
+  })) });
+  const order = (d) => d.elements.map((e) => e.id).join(" ");
+
+  // A note carries the WIDGET id, because that is what the DOM exposes.
+  eq("finds a section by its widget id", STRUCT.sectionIndexOf(mk().elements, "wb"), 1);
+  eq("finds a section by its container id", STRUCT.sectionIndexOf(mk().elements, "secb"), 1);
+
+  {
+    const d = mk(); const before = STRUCT.allIds(d.elements);
+    const r = STRUCT.insertSection(d, { nearId: "wb", position: "before", html: "<section>new</section>" });
+    ok("inserts before the clicked section", r.ok && order(d) === "seca " + r.sectionId + " secb secc");
+    ok("the insert survives the node-set check",
+      V.checkNodeSet(before, STRUCT.allIds(d.elements), { added: [r.sectionId, r.widgetId] }).ok);
+  }
+  {
+    const d = mk();
+    const r = STRUCT.insertSection(d, { nearId: "wb", position: "after", html: "<section>new</section>" });
+    ok("inserts after the clicked section", r.ok && order(d) === "seca secb " + r.sectionId + " secc");
+  }
+  {
+    const d = mk(); const before = STRUCT.allIds(d.elements);
+    const r = STRUCT.removeSection(d, { id: "wb" });
+    ok("removes the clicked section", r.ok && order(d) === "seca secc");
+    ok("the removal survives the node-set check",
+      V.checkNodeSet(before, STRUCT.allIds(d.elements), { removed: r.removedIds }).ok);
+  }
+  ok("will not empty the page",
+    STRUCT.removeSection({ elements: [mk().elements[0]] }, { id: "wa" }).ok === false);
+  {
+    const d = mk(); const before = STRUCT.allIds(d.elements);
+    // Moving to an earlier index: the naive version reads the target index
+    // before lifting the node out and lands one place off.
+    const r = STRUCT.moveSection(d, { id: "secc", nearId: "seca", position: "before" });
+    ok("moves to the right position", r.ok && order(d) === "secc seca secb");
+    ok("a move is allowed only when a reorder was intended",
+      V.checkNodeSet(before, STRUCT.allIds(d.elements), { reordered: true }).ok
+      && V.checkNodeSet(before, STRUCT.allIds(d.elements), {}).ok === false);
+  }
+  ok("leaves a page it does not recognise alone",
+    STRUCT.insertSection({ elements: [{ id: "x", elType: "widget" }] },
+      { nearId: "x", position: "after", html: "<section/>" }).ok === false);
+
+  // The guard on its own.
+  ok("catches a section lost silently", V.checkNodeSet(["a", "b", "c"], ["a", "c"], {}).ok === false);
+  ok("catches a section added silently", V.checkNodeSet(["a", "b"], ["a", "b", "z"], {}).ok === false);
+  ok("accepts an untouched page", V.checkNodeSet(["a", "b"], ["a", "b"], {}).ok);
+}
+
+
+// ---- F1: moving to a section the reviewer named ------------------------------
+{
+  const named = (note, pos, target) => {
+    const v = INTENT.classify(note);
+    ok("reads " + JSON.stringify(target) + " out of the note",
+      v.kind === "structure" && v.op === "move" && v.position === pos && v.target === target);
+  };
+  named("Move this section above the pricing section", "before", "pricing");
+  named("move this block below the testimonials", "after", "testimonials");
+  // No landmark named: still a move, just a one-position one.
+  named("Move this section above", "before", "");
+}
+
+// ---- F2: adding an image where the section has none ---------------------------
+{
+  const URL = "https://tool.test/feedback-uploads/photo.png";
+  const wrap = '<section class="u-band"><div class="u-wrap"><h2>Team</h2></div></section>';
+  const r = IMG.insertImage(wrap, URL);
+  ok("adds an image to a section that has none", !!r && r.html.includes(URL));
+  ok("puts it inside the wrapper, not after the section",
+    !!r && r.html.indexOf("<img") < r.html.indexOf("</div></section>"));
+  // The wrapper's own closing tag, not the first one that happens to come along.
+  const nested = '<section><div class="u-wrap"><div class="u-split"><div><p>A</p></div></div></div></section>';
+  const r2 = IMG.insertImage(nested, URL);
+  ok("closes the outer wrapper, not an inner div",
+    !!r2 && r2.html.indexOf("<img") > r2.html.indexOf("<p>A</p>")
+         && r2.html.indexOf("<img") < r2.html.lastIndexOf("</div>"));
+  ok("refuses a url that is not http", IMG.insertImage(wrap, "javascript:alert(1)") === null);
+}
+
+// ---- F3: reading a note with a model, keywords as the floor ------------------
+{
+  const t = (label, reply, want) => AI.classify("anything", { ai: async () => reply })
+    .then((v) => ok(label, v.kind === want));
+  // Everything below is synchronous in effect: the stub resolves immediately.
+  const seen = [];
+  const check = (label, reply, want) => {
+    AI.classify("Move this section above the hero", { ai: async () => reply })
+      .then((v) => seen.push([label, v.kind === want]));
+  };
+  check("takes a well-formed answer", '{"kind":"sitecss"}', "sitecss");
+  check("falls back when the model invents a kind", '{"kind":"teleport"}', "structure");
+  check("falls back on unparseable prose", "I think this is a move?", "structure");
+  check("falls back when a move names no side", '{"kind":"structure","op":"move"}', "structure");
+  setTimeout(() => { for (const [l, o] of seen) ok(l, o); }, 0);
+}
+
+// ---- F4 / F7 / F8: the writers ----------------------------------------------
+{
+  const os = require("os"), fs2 = require("fs"), path2 = require("path");
+  const root = fs2.mkdtempSync(path2.join(os.tmpdir(), "g99w-"));
+  fs2.mkdirSync(path2.join(root, "resources", "pages", "home"), { recursive: true });
+  fs2.writeFileSync(path2.join(root, "resources", "pages", "home", "seo.json"),
+    JSON.stringify({ schema_version: 1, provider: "rank_math", fields: { rank_math_title: "T", rank_math_description: "D" } }));
+  // A donor page. createPage copies the chrome from one, because on these sites
+  // there is no shared template: each page carries its own stylesheet, nav and
+  // footer inline. A page written without them is an unstyled fragment.
+  const sec = (id, html) => ({ id, elType: "container", settings: {},
+    elements: [{ id: id + "w", elType: "widget", widgetType: "html", settings: { html }, elements: [] }] });
+  fs2.writeFileSync(path2.join(root, "resources", "pages", "home", "elementor.json"),
+    JSON.stringify({ schema_version: 1, elementor_version: "3",
+      document_settings: { custom_css: ".c-btn{color:red}" },
+      elements: [
+        sec("aaa1111", '<div hidden data-g99-css><style>.a{color:red}</style></div>'),
+        sec("bbb2222", '<nav class="c-nav"><a href="/">Home</a></nav>'),
+        sec("ccc3333", '<section><h2>Hello</h2></section>'),
+        sec("ddd4444", '<footer class="c-foot">Footer</footer>'),
+      ] }));
+
+  // F4 — the carrier is identified by its attribute, not by being first.
+  const carrier = '<div hidden data-g99-css><style>.a{color:red}</style></div>';
+  const w1 = WR.writeSiteCss(carrier, ".c-btn{border-radius:999px}");
+  ok("writes site css into the carrier", !!w1 && w1.html.includes("border-radius:999px"));
+  ok("keeps the rules that were already there", !!w1 && w1.html.includes(".a{color:red}"));
+  const w2 = WR.writeSiteCss(w1.html, ".c-btn{border-radius:4px}");
+  ok("a second run replaces its own block rather than stacking",
+    !!w2 && !w2.html.includes("999px") && w2.html.includes("4px")
+         && (w2.html.match(/g99 feedback: site-wide/g) || []).length === 1);
+  ok("refuses a section that is not the carrier",
+    WR.writeSiteCss("<section><h2>Hi</h2></section>", ".x{color:red}") === null);
+
+  // F7
+  const s1 = WR.writeSeo(root, "home", { description: "New description." });
+  ok("writes the meta description", s1.ok && s1.changed.includes("description"));
+  eq("and it lands in the file",
+    JSON.parse(fs2.readFileSync(path2.join(root, "resources", "pages", "home", "seo.json"), "utf8")).fields.rank_math_description,
+    "New description.");
+  ok("says so when the note names neither field", WR.writeSeo(root, "home", {}).ok === false);
+  ok("says so when the page has no seo file", WR.writeSeo(root, "nowhere", { title: "x" }).ok === false);
+
+  // F8
+  const p1 = WR.createPage(root, { title: "Pricing", html: "<section><h2>Pricing</h2></section>" });
+  ok("creates a page", p1.ok && p1.slug === "pricing");
+  ok("with all three of its files", p1.ok && p1.files.length === 3
+    && p1.files.every((f) => fs2.existsSync(path2.join(root, f))));
+  // The chrome question: a page with only its content section renders as
+  // unstyled text with no way in and no way out. Seen live.
+  const made = JSON.parse(fs2.readFileSync(path2.join(root, "resources", "pages", "pricing", "elementor.json"), "utf8"));
+  const htmlOf = (e) => (e.elements[0].settings.html || "");
+  ok("carries the stylesheet carrier", made.elements.some((e) => /data-g99-css/.test(htmlOf(e))));
+  ok("carries the navigation", made.elements.some((e) => /<nav\b/.test(htmlOf(e))));
+  ok("carries the footer", made.elements.some((e) => /<footer\b/.test(htmlOf(e))));
+  ok("puts the content between them", /Pricing/.test(htmlOf(made.elements[2])));
+  ok("brings the page stylesheet with it", (made.document_settings.custom_css || "").includes(".c-btn"));
+  // Ids must not be shared: two pages holding one id gives the reconciler two
+  // homes for the same node.
+  const donor = JSON.parse(fs2.readFileSync(path2.join(root, "resources", "pages", "home", "elementor.json"), "utf8"));
+  ok("regenerates ids rather than copying them",
+    !made.elements.some((e) => donor.elements.some((d) => d.id === e.id)));
+  const p2 = WR.createPage(root, { title: "Pricing", html: "<section><h2>Again</h2></section>" });
+  ok("does not overwrite a page that already exists", p2.ok && p2.slug === "pricing-2");
+  ok("refuses a page with no title", WR.createPage(root, { title: "", html: "<section/>" }).ok === false);
+  ok("refuses a reserved address", WR.freeSlug(root, "wp-admin") === "");
+  try { fs2.rmSync(root, { recursive: true, force: true }); } catch (e) { /* temp */ }
+}
+
+
+// ---- a removal that names a section ------------------------------------------
+// Twice on a live site, "Remove our services section" removed a different
+// section, because the code read the click and ignored the words. The words are
+// the more deliberate signal: a cursor lands somewhere, a sentence is typed.
+{
+  const t = (label, note, target) => {
+    const v = INTENT.classify(note);
+    ok(label, v.kind === "structure" && v.op === "remove" && (v.target || "") === target);
+  };
+  t("reads the section a removal names", "Remove our services section", "services");
+  t("reads it past a determiner", "remove the pricing band", "pricing");
+  t("reads it from other phrasings", "get rid of the testimonials section", "testimonials");
+  // "this" points at the click, and that stays the click's case.
+  t("leaves 'this section' to the click", "Delete this whole section", "");
+  t("and the note that started all this", "Remove this section. This is lookg pathetic", "");
+}
+
+
+// ---- the three things PR #130 got wrong on a live site -----------------------
+// One batch of notes removed two sections when it had been asked for one, named
+// a section in the report that the reviewer had never clicked, and read "don't
+// remove clinical excellence" as an instruction to remove it. Each of those is
+// a separate mistake with a separate cause, so each gets its own test.
+
+// A container holding two html widgets. This is the shape the code assumed could
+// not exist, taken from the page where it did: c076a1e held both the services
+// band and the one below it.
+function twoInOne() {
+  return {
+    elements: [
+      { id: "aaa0001", elType: "container", settings: {}, elements: [
+        { id: "w0", elType: "widget", widgetType: "html", settings: { html: '<section><p class="u-eyebrow">Hero</p></section>' }, elements: [] },
+      ]},
+      { id: "c076a1e", elType: "container", settings: {}, elements: [
+        { id: "5c36517", elType: "widget", widgetType: "html", settings: { html: '<section><p class="u-eyebrow">Our Services</p><h2>What we do</h2></section>' }, elements: [] },
+        { id: "686470c", elType: "widget", widgetType: "html", settings: { html: '<section><h2>TRUE BEAUTY STARTS FROM WITHIN</h2></section>' }, elements: [] },
+      ]},
+      { id: "aaa0002", elType: "container", settings: {}, elements: [
+        { id: "w2", elType: "widget", widgetType: "html", settings: { html: '<section><p class="u-eyebrow">Testimonials</p></section>' }, elements: [] },
+      ]},
+    ],
+  };
+}
+
+{
+  const doc = twoInOne();
+  ok("counts sections a reviewer can see, not containers",
+    doc.elements.reduce((n, c) => n + STRUCT.widgetsIn(c).length, 0) === 4);
+  ok("finds the widget an id belongs to",
+    (STRUCT.widgetFor(doc.elements, "686470c") || {}).id === "686470c");
+
+  const out = STRUCT.removeSection(doc, { id: "5c36517" });
+  ok("removes one section, not the container", out.ok === true);
+  ok("its neighbour in the same container survives",
+    !!STRUCT.widgetFor(doc.elements, "686470c"));
+  ok("and the removed one is gone",
+    !STRUCT.widgetFor(doc.elements, "5c36517"));
+  ok("the container stays, still holding the survivor",
+    doc.elements.length === 3 && doc.elements[1].elements.length === 1);
+}
+
+{
+  // The container is only removed when taking the widget would empty it.
+  const doc = twoInOne();
+  STRUCT.removeSection(doc, { id: "w2" });
+  ok("an empty container goes with its only section", doc.elements.length === 2);
+}
+
+{
+  // Bug C: a sentence that forbids a removal is not a removal.
+  const kind = (n) => { const v = INTENT.classify(n); return v.kind + (v.op ? "/" + v.op : ""); };
+  ok("'but dont remove X' is not a removal",
+    kind("add testimonials section. but dont remove clinical excellence") !== "structure/remove");
+  ok("nor is 'without removing'",
+    kind("please add a section above, without removing the hero") !== "structure/remove");
+  ok("a real removal still reads as one",
+    kind("remove the our services section") === "structure/remove");
+  ok("even alongside a negated one",
+    kind("delete the pricing band, do not remove anything else") === "structure/remove");
+  ok("the mask leaves the note itself alone",
+    INTENT.maskNegations("dont remove the hero").indexOf("hero") > -1);
+}
+
+// Bug A: the model may not talk the pipeline into a removal on its own.
+(async () => {
+  const says = (o) => async () => JSON.stringify(o);
+  const removeAll = says({ kind: "structure", op: "remove", target: "Our Services" });
+
+  const a = await AI.classify("Remove this card", { ai: removeAll });
+  ok("a card is not a section, whatever the model says", a.kind === "section");
+
+  const b = await AI.classify("add testimonials section. but dont remove clinical excellence", { ai: removeAll });
+  ok("nor is a note that forbids removing", b.kind === "section");
+
+  const c = await AI.classify("remove the our services section", { ai: says({ kind: "structure", op: "remove", target: "" }) });
+  ok("a removal the words agree with still goes through", c.kind === "structure" && c.op === "remove");
+  ok("and keeps the target the words found", c.target === "services");
+})();
