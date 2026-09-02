@@ -112,3 +112,31 @@ across the fleet, each tied to a person's account.
 Nothing is broken right now. Nuvo carries 30 images, all hotlinked from
 `ruma.com`, and none from the build tool. The next reviewer who attaches a photo
 is the one who hits this.
+
+---
+
+## The same question from the other side
+
+Trying to sync WordPress → git on nuvo is refused, correctly:
+
+> The repository already describes a website: …@main holds 31 file(s) under
+> `resources/`. Importing onto the deploy branch would replace all of it with
+> this site's current content.
+
+That is the one-time adoption path, not a sync, and nuvo was built in git so it
+does not need it. But it does raise the asymmetry:
+
+* **git → WordPress** runs on every merge and works. It does **not** create media.
+* **WordPress → git** is the direction that would carry media, and it is the one
+  a GitOps-built site is not meant to run.
+
+So media appears to move in the direction we cannot use, and not in the one we
+can. If that is wrong, we would like to be told what we are missing.
+
+While looking: **no `cpt.json` in this repo carries a `taxonomies` key.** WPCode
+keeps a snippet's code type and location as taxonomy terms, so the review
+widget currently works only because its location was set by hand in the WPCode
+admin, and that setting lives in WordPress and not in git. The repository is
+therefore not yet a complete description of the site, which matters for anyone
+reading an import diff before merging it. This is the same gap already raised
+about the taxonomies block being stripped by admin sync.
