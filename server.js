@@ -9848,6 +9848,22 @@ async function runFeedbackJob(job) {
     // after, not the model's account of itself — so "styling added" means the
     // stylesheet really grew, and a note that changed nothing cannot describe
     // itself as though it had.
+    // A picture change is the one outcome a sentence cannot report.
+    //
+    // "markup adjusted" is true and useless when the note was "replace this
+    // image": the only question the reviewer has is which picture is there now,
+    // and whether it is the one they chose. So an item that carried a file also
+    // carries the pictures — the one they attached, and, where they were
+    // replacing rather than adding, the one it went over.
+    //
+    // `was` is the src the widget recorded under the click, so it is present for
+    // a replacement and absent for an addition. The page uses that difference to
+    // decide between showing a before/after pair and showing one new picture.
+    const pics = (item) => {
+      if (!item.imageUrl) return {};
+      const was = String(((item.target || {}).attrs || {}).src || "");
+      return { imageNow: item.imageUrl, imageWas: was || "", imageName: item.imageName || "" };
+    };
     job.feedbackItems = [
       ...out.applied.map((a) => ({
         ok: true, id: a.item.localId || "", page: a.item.page || "/",
@@ -9856,11 +9872,13 @@ async function runFeedbackJob(job) {
         // question someone reading this actually has.
         section: a.section || "", element: a.item.elementId || "",
         note: a.item.note || "", outcome: a.what || "applied",
+        ...pics(a.item),
       })),
       ...out.refused.map((r) => ({
         ok: false, id: r.item.localId || "", page: r.item.page || "/",
         section: r.section || "", element: r.item.elementId || "",
         note: r.item.note || "", outcome: r.reason || "not applied",
+        ...pics(r.item),
       })),
     ].sort((x, y) => (x.id > y.id ? 1 : x.id < y.id ? -1 : 0));
     saveJobs();
