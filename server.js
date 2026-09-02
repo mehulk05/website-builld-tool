@@ -9838,10 +9838,31 @@ async function runFeedbackJob(job) {
     for (const a of out.applied) byId[a.item.id] = { status: "running", detail: a.what, screenshotRef: a.screenshot || "" };
     for (const r of out.refused) byId[r.item.id] = { status: "conflict", detail: r.reason };
     FB.store.updateItems(batch.id, byId);
+    // What the run detail page shows. The note, the page it was left on, and
+    // what became of it are kept as separate fields rather than one joined
+    // string: the two questions someone opens this page to answer are "which of
+    // my notes landed" and "why not", and a sentence that concatenates all three
+    // answers neither.
+    //
+    // `outcome` for an applied note is describeChange's reading of the before and
+    // after, not the model's account of itself — so "styling added" means the
+    // stylesheet really grew, and a note that changed nothing cannot describe
+    // itself as though it had.
     job.feedbackItems = [
-      ...out.applied.map((a) => ({ ok: true, what: `${a.item.page} · ${a.item.note}`, detail: "" })),
-      ...out.refused.map((r) => ({ ok: false, what: `${r.item.page} · ${r.item.note}`, detail: r.reason })),
-    ];
+      ...out.applied.map((a) => ({
+        ok: true, id: a.item.localId || "", page: a.item.page || "/",
+        // The section's own name, taken from its markup. An element id answers
+        // "which node"; this answers "which part of my page", which is the
+        // question someone reading this actually has.
+        section: a.section || "", element: a.item.elementId || "",
+        note: a.item.note || "", outcome: a.what || "applied",
+      })),
+      ...out.refused.map((r) => ({
+        ok: false, id: r.item.localId || "", page: r.item.page || "/",
+        section: r.section || "", element: r.item.elementId || "",
+        note: r.item.note || "", outcome: r.reason || "not applied",
+      })),
+    ].sort((x, y) => (x.id > y.id ? 1 : x.id < y.id ? -1 : 0));
     saveJobs();
 
     if (!out.filesTouched.length) {

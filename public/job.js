@@ -74,13 +74,57 @@ function stepEvents(j, i, s) {
     </div>`).join("")}</div>`;
 }
 
+// "/" is a path, not a place. Everywhere else in this tool a page is called by
+// its name, and a report that says a note was left on "/" makes the reader do a
+// translation the page could have done for them.
+function pageName(p) {
+  const s = String(p || "/").replace(/^\/+|\/+$/g, "");
+  if (!s) return "Home";
+  const last = s.split("/").pop();
+  return last.replace(/-/g, " ").replace(/ [a-z]/g, (c) => c.toUpperCase());
+}
+
 function stepper(j) {
+// One row per note: what was asked, which part of which page it was left on,
+// and what became of it.
+//
+// The outcome text is written by the engine, not summarised here — a refusal
+// says what could not be done and often what to do instead, and shortening that
+// would throw away the only part the reviewer can act on.
+//
+// The section is named, not numbered. "Testimonials" is a place on the page the
+// reviewer recognises; an element id is not.
+function noteRows(j) {
+  const items = Array.isArray(j.feedbackItems) ? j.feedbackItems : [];
+  if (!items.length) return "";
+  return `<div class="fblist">${items.map((x) => `<div class="fbrow ${x.ok ? "is-ok" : "is-refused"}">`
+    + `<span class="vk ${x.ok ? "yes" : "no"}">${x.ok ? svg("check", 11, 3.4) : svg("close", 11, 3.4)}</span>`
+    + `<div class="fbcontent">`
+    + `<div class="fbtitle">${esc(x.note || "(no wording)")}</div>`
+    + (x.outcome ? `<div class="fbout">${esc(x.outcome)}</div>` : "")
+    + `</div>`
+    + `<div class="fbmeta">`
+    + `<span class="fbtag">${esc(pageName(x.page))}${x.section ? " · " + esc(x.section) : ""}</span>`
+    + `<span class="fbpill ${x.ok ? "good" : "bad"}">${x.ok ? "Applied" : "Refused"}</span>`
+    + `</div></div>`).join("")}</div>`;
+}
+
   const ic = { done: svg("check", 13, 3), running: `<span class="spin" style="margin:0;border-color:var(--accent);border-top-color:transparent"></span>`, error: svg("close", 13, 3), pending: "" };
   const isBuild = j.type === "build";
   return `<div class="steps">${(j.steps || []).map((s, i) => {
     let extra = "";
     if (isBuild && i === 1 && s.status !== "pending") extra = brandBlock(j);
     if (isBuild && i === 2 && s.status !== "pending") extra = pageRows(j, s.status === "running");
+    // A feedback run's whole point is which notes landed and which did not, but
+    // keeping it inside a collapsible disclosure keeps the stepper timeline clean.
+    if (j.type === "feedback" && i === 1 && s.status !== "pending") {
+      const items = Array.isArray(j.feedbackItems) ? j.feedbackItems : [];
+      if (items.length) {
+        const done = items.filter((x) => x.ok).length;
+        const key = "fb-step-notes";
+        extra = `<details class="brief" data-k="${key}"${OPEN.has(key) ? " open" : ""}><summary>View note breakdown (${done} of ${items.length} applied)</summary>${noteRows(j)}</details>`;
+      }
+    }
     extra += stepEvents(j, i, s);
     // A build most often stalls waiting on the mu-plugin to flip the live theme —
     // let that one step retry on its own (PR is already merged; no need to
@@ -98,6 +142,7 @@ function stepper(j) {
     </div>`;
   }).join("")}</div>`;
 }
+
 
 // What the tool understood the request to mean, before it went looking for
 // files. Shown next to the request itself so a misread is obvious at a glance —
