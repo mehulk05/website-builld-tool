@@ -1,6 +1,87 @@
-# What anchors a media file in `resources/media/`?
+# One change to g99-control, for the whole fleet
 
-**Asked because:** a designer reviewing a beta site can attach a photo to a note.
+**Ask:** make the deploy import files under `resources/media/` even when nothing
+in the repository references them.
+
+That is the whole request. Everything below is why it is the right shape, and
+what we ruled out.
+
+---
+
+## Why this one
+
+A designer reviewing a beta site can attach a photo to a note. The build tool
+has nowhere durable to put it, so today it writes the file to its own disk and
+hotlinks it. Render replaces that disk on every release, so the photo 404s the
+next time the tool ships — and that has already put a broken image, and once a
+fabricated URL over a founder's headshot, on a live client site.
+
+The file should go where a human would put it: the site's own media library,
+referenced by the site's own URL. Six probes on
+`nuvoaestheticsclinic.gogroth.com` (g99-control 1.8.3) established that this
+almost works already.
+
+| Probe | Result |
+|---|---|
+| file + sidecar in `resources/media/`, unreferenced | not imported |
+| referenced from a **published** page's `featured_image` | **imported**, served at `/wp-content/uploads/2026/09/<file>` |
+| listed in a `cpt.json` `media` **array** | deploy refused: `references media:0 but resources/media/0.json does not exist` |
+| referenced from a **draft** post | post created, media not imported |
+| `{url,id}` image object in an invented widget setting | ignored, no trace |
+| `rank_math_facebook_image_id` in `seo.json` | ignored, no trace |
+
+So: import works, the sidecar shape is right, and **the URL is predictable** —
+`/wp-content/uploads/<YYYY>/<MM>/<filename>`, with the filename kept exactly and
+no `-scaled` suffix below WordPress's threshold. That last point is what makes a
+single commit enough: the tool can write the file and the markup that points at
+it together.
+
+The only thing standing in the way is that an unreferenced file is skipped.
+
+## Why not the alternatives
+
+**`featured_image` as an anchor.** It works, and we are not going to use it. It
+would mean quietly writing a review photo into a real content field on a
+thousand client sites, one page at a time, so that a file already sitting in the
+repository gets picked up. Anything that later reads featured images — a theme,
+an SEO plugin, a social preview — would surface it.
+
+**An application password per site.** `POST /wp/v2/media` answers
+`401 rest_cannot_create`, so the endpoint works and only auth is missing. But
+that is a thousand credentials, each tied to a person's account, to store,
+rotate and revoke.
+
+**A new `POST /g99-control/v1/media` endpoint.** Clean, and more work than the
+ask above: a route, auth, upload handling, a response contract. Worth doing if
+the import path cannot be changed, but it is the larger of the two.
+
+## Why the ask is small
+
+`resources/media/` is already a directory the **exporter writes** and the
+**importer ignores**. A file can sit there through a deployment the plugin
+reports as successful and simply not arrive. Making deploy carry it closes that
+asymmetry rather than adding anything new — and the admin page already offers
+Media as a managed feature, switched on.
+
+## What we are not asking for
+
+Nothing about the URL. We can predict it, and we verify it after the deploy by
+reading it back, so a month boundary between commit and deploy is caught rather
+than shipped.
+
+---
+
+## Scope
+
+Nothing is broken today. Nuvo carries 30 images, all hotlinked from `ruma.com`.
+The next reviewer who attaches a photo is the one who hits this, on whichever
+site they are reviewing.
+
+---
+
+## Appendix — the original notes
+
+
 The build tool has nowhere durable to put that photo, so today it writes the file
 to its own disk and hotlinks it. Render replaces that disk on every release, so
 the photo 404s on the next deploy of the tool — and it has already happened on a
