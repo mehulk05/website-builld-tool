@@ -323,7 +323,12 @@ ok("a label keeps its own tag and class, not a wrapper's", () => {
   const doc = JSON.parse(files.get("resources/pages/home/elementor.json"));
   const editors = [];
   (function walk(els) { for (const e of els || []) { if (e.widgetType === "text-editor") editors.push(e.settings.editor || ""); walk(e.elements); } })(doc.elements);
-  const eyebrow = editors.find((h) => /class="eyebrow"/.test(h));
+  // Word-boundary, not an exact attribute: the renderer now appends a
+  // `g99--…` anchor class to every addressable element, so the eyebrow ships as
+  // class="eyebrow g99--hero__eyebrow". The guarantee this test exists for is
+  // that the class sits on the eyebrow's OWN <p>, not on a wrapper — which the
+  // check below still enforces.
+  const eyebrow = editors.find((h) => /<p[^>]*\bclass="[^"]*\beyebrow\b/.test(h));
   assert.ok(eyebrow, "the eyebrow must ship as a text editor carrying its own <p class=\"eyebrow\">");
   // No heading widget may carry the class on its wrapper instead.
   (function noClassedHeading(els) {
