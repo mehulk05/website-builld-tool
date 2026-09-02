@@ -71,7 +71,7 @@ the case it was built against but not for the case a designer will actually hit.
 | F6 | Menu writer | ✅ done | nav is inlined per page; rewritten once and copied, link count may not fall |
 | F7 | SEO writer | ✅ done | writers.js writeSeo, Rank Math and Yoast field maps |
 | F8 | Page creator | ✅ done | copies the donor's chrome and page CSS, else the page renders unstyled |
-| F9 | Media library upload | ⏳ pending | images are hotlinked from the build tool and die with it |
+| F9 | Media library upload | ⏳ pending | NOT blocked by the reconciler, as long assumed. Uploading to the live site at note time returns the real wp-content URL, which is written into the markup like any other absolute src — the same shape as the ruma.com hotlinks already there, so nothing has to resolve a media ref. The only blocker is a credential: POST /wp/v2/media answers 401 rest_cannot_create, not "unsupported" |
 | G1 | A model may not force a removal | ✅ done | intentAI.js — "Remove this card" took a whole band off a live site. A removal now needs the words to agree |
 | G2 | Remove one section, not its container | ✅ done | structure.js — c076a1e held two bands; removing one took both. Now removes the widget, container only if emptied |
 | G3 | "don't remove X" is not a removal | ✅ done | intent.js maskNegations — the one failure that turned a note into its opposite |
@@ -82,11 +82,11 @@ the case it was built against but not for the case a designer will actually hit.
 | H3 | Publish an attached picture end to end | ✅ done | proved on the deployed tool: #136 added one where the band had none and swapped one where it did. Over a free ngrok tunnel the render gate refused it — correctly, since ngrok serves browsers an interstitial instead of the file |
 | H4 | Show the pictures on the run page | ✅ done | job.js — "markup adjusted" is a true and useless answer to "did my photo go on". Before/after for a swap, one thumbnail for an addition |
 | H5 | One vocabulary for a structural note | ✅ done | patch.js kept its own word list and had never heard of "take it out"; the note was carried out and then rejected for doing it. The guard now asks intent.js |
-| H6 | Attached pictures die on every deploy | 🚫 blocked | render's disk is ephemeral, so every picture a reviewer has attached 404s on the next release. Seen live: #136's photo was already dead. Nuvo cleaned by #138. The fix is F9 |
+| H6 | Attached pictures die on every deploy | ⏳ pending | render's disk is ephemeral, so every picture a reviewer has attached 404s on the next release. Seen live: #136's photo was already dead. Nuvo carries none today — 30 images, all ruma.com — so a deploy breaks nothing until the next upload. F9 is the fix; a render persistent disk is the stopgap |
 | H7 | An unplaceable picture must not reach the model | ✅ done | patch.js — a photo attached to a band holding four of them fell through to the model, which invented a filename, replaced a founder's headshot with a URL nobody created, ignored the upload, and reported it applied. Now refused, with the way out |
 | H8 | The render gate trusts HTTP 200 | ⏳ pending | ruma.com answers a missing file with its 404 page under 200, so a broken picture passed. Check the content type, not just the status |
 
-Totals: 39 done, 2 partial, 7 pending, 3 blocked.
+Totals: 39 done, 2 partial, 8 pending, 2 blocked.
 
 H6 is the one to read: the picture handling is correct and the place those
 pictures live is not. Until F9 lands, an attached photo is good until the
