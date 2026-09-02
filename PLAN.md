@@ -57,7 +57,7 @@ the case it was built against but not for the case a designer will actually hit.
 | B1 | Page-level structural operations | ✅ done | insert, remove and move all complete; move takes a named target (F1) and remove acts on one section (G2) |
 | B2 | Safety check for a changed node set | ✅ done | — |
 | B3 | Generate one new section's markup | ✅ done | — |
-| D1 | Deploy the tool to onrender | ⚠ partial | render still runs this morning's commit. A1-A8, B1-B3, F1-F8 and G1-G4 are all uncommitted — nuvo was tested against a local server over ngrok |
+| D1 | Deploy the tool to onrender | ✅ done | merged as #57; render serves the new widget and ran the image batch that became #136 |
 | D2 | Emit the review cpt from compile.js | ⏳ pending | worth little until D4/D6 |
 | D3 | Backfill the widget to existing sites | ⏳ pending | — |
 | D4 | Carry taxonomy terms in cpt.json | 🚫 blocked | infra say the importer is fixed; UNVERIFIED — no deploy has touched resources/cpt since |
@@ -79,9 +79,10 @@ the case it was built against but not for the case a designer will actually hit.
 | G5 | Say when an earlier note removed the section | ⏳ pending | i1/i3 in #130 got a bare "no longer on the page" and no reason |
 | H1 | Offer the picture control where there is no picture | ✅ done | review-widget.js — insertImage existed and could not be reached; the upload only appeared over an existing <img>. Shipped to nuvo as #135 |
 | H2 | A note carrying a file skips the classifier | ✅ done | run.js — the model answering "image" routed it to the branch that refuses image notes for having no image attached |
-| H3 | Publish an attached picture end to end | ⚠ partial | markup is correct for both add and replace; the picture is hotlinked from the tool, and a free ngrok tunnel serves browsers an interstitial instead of the file, so the render gate refuses. Needs D1 |
+| H3 | Publish an attached picture end to end | ✅ done | proved on the deployed tool: #136 added one where the band had none and swapped one where it did. Over a free ngrok tunnel the render gate refused it — correctly, since ngrok serves browsers an interstitial instead of the file |
+| H4 | Show the pictures on the run page | ✅ done | job.js — "markup adjusted" is a true and useless answer to "did my photo go on". Before/after for a swap, one thumbnail for an addition |
 
-Totals: 34 done, 4 partial, 6 pending, 2 blocked on infra.
+Totals: 37 done, 2 partial, 6 pending, 2 blocked on infra.
 
 G1-G4 are the three bugs #130 shipped to the live site, plus the mislabelling that
 hid the worst of them. All four are fixed, covered by tests, and proven on the live

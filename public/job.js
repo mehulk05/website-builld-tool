@@ -94,6 +94,37 @@ function stepper(j) {
 //
 // The section is named, not numbered. "Testimonials" is a place on the page the
 // reviewer recognises; an element id is not.
+/**
+ * A picture note, shown as pictures.
+ *
+ * "markup adjusted" is a true and useless answer to "did my photo go on".
+ * The reviewer chose a file; the only thing they want back is whether that
+ * file is what is on the page now, and — when they were replacing rather than
+ * adding — what it went over.
+ *
+ * `imageWas` is the src the widget recorded under the click, so it exists for a
+ * replacement and not for an addition. That is the whole difference between the
+ * two shapes here, and it is read from the data rather than from the wording of
+ * the note, which could say anything.
+ */
+function notePics(x) {
+  if (!x.imageNow) return "";
+  const shot = (src, cap, cls) => `<div class="fbpic ${cls || ""}">`
+    + `<img src="${esc(src)}" alt="" loading="lazy">`
+    + `<span class="fbcap">${esc(cap)}</span></div>`;
+  if (x.imageWas) {
+    return `<div class="fbpics">${shot(x.imageWas, "Before", "gone")}`
+      + `<span class="fbarrow">&rarr;</span>${shot(x.imageNow, "After")}</div>`;
+  }
+  // No "before" recorded. Usually that means there was none — the band had no
+  // picture and one was added. But a click on the SECTION of a band that does
+  // have a picture also records no src, and patch.js swaps it anyway, so the
+  // outcome is asked rather than assumed: calling a replacement "Added" would
+  // tell the reviewer their old photo is still somewhere on the page.
+  const replaced = /replac/i.test(String(x.outcome || ""));
+  return `<div class="fbpics">${shot(x.imageNow, replaced ? "Now on the page" : "Added")}</div>`;
+}
+
 function noteRows(j) {
   const items = Array.isArray(j.feedbackItems) ? j.feedbackItems : [];
   if (!items.length) return "";
@@ -102,6 +133,7 @@ function noteRows(j) {
     + `<div class="fbcontent">`
     + `<div class="fbtitle">${esc(x.note || "(no wording)")}</div>`
     + (x.outcome ? `<div class="fbout">${esc(x.outcome)}</div>` : "")
+    + notePics(x)
     + `</div>`
     + `<div class="fbmeta">`
     + `<span class="fbtag">${esc(pageName(x.page))}${x.section ? " · " + esc(x.section) : ""}</span>`
