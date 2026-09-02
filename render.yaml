@@ -51,13 +51,15 @@ services:
         value: content.approval    # the task the link is posted on
       - key: TED_REVIEW_TTL_MIN
         value: "10080"       # 7 days — it waits in a task, unlike a hand-minted link
-      # The link only posts corrections if this deployment is allowed to publish
-      # them. Left unset ON PURPOSE: without it a reviewer's Apply is refused,
-      # which is the safe failure. Set it to "on" in the dashboard when the flow
-      # is meant to open real PRs against client repos and auto-merge them.
-      # Posting the link and publishing the correction are two separate consents.
+      # A reviewer's Apply publishes for real by default: it opens a pull request
+      # against the client repository and auto-merges it. This used to be the
+      # other way round, so that deploying the tool did not by itself grant that
+      # permission; it was inverted deliberately.
+      #
+      # Set this to "off" on any deployment that should collect feedback without
+      # writing to anyone's repository. "off", "0", "false" and "no" all work.
       - key: REVIEW_LIVE
-        sync: false          # set to "on" in dashboard to publish; unset = refuse
+        sync: false          # unset = publishes; set to "off" to collect only
       # Screenshots (TED outcome comments + CRO audit). Optional and PAID:
       # microlink's keyless tier is 25/day per calling IP and Render's egress IP
       # is shared, so it runs out here. Unset, captures fall back to WordPress

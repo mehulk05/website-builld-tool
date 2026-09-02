@@ -10,6 +10,12 @@ node_modules/
 test-full.js
 test-invalid.js
 jobs.json
+# design-feedback ledger: runtime state, same as jobs.json
+feedback-ledger.json
+# Scratch from running the review pipeline by hand. .apptok holds a live
+# GitHub App installation token with write access to client repositories.
+.apptok
+.prnum
 registry.json
 reaudit.json
 site-audits.json

@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Growth99 · Review links</title>
+<link rel="stylesheet" href="/theme.css?v=10">
+<style>
+  .wrap { max-width: 900px; margin: 0 auto; padding: 30px 34px 90px; display: flex; flex-direction: column; gap: 18px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .fld { display: flex; flex-direction: column; gap: 5px; }
+  .fld label { font-size: 11.5px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .fld input, .fld select { padding: 9px 11px; border: 1px solid var(--line-2); border-radius: 8px; font: inherit; font-size: 13.5px; min-width: 220px; background: var(--bg); color: var(--ink); }
+  .site { display: flex; align-items: center; gap: 12px; padding: 13px 0; border-top: 1px solid var(--line-2); }
+  .site .nm { font-size: 13.5px; font-weight: 700; }
+  .site .sub { font-size: 11.5px; color: var(--muted); margin-top: 2px; word-break: break-all; }
+  .site .act { margin-left: auto; display: flex; gap: 7px; align-items: center; }
+  .lnk { font-family: var(--mono); font-size: 11px; color: var(--muted); background: var(--bg-2); padding: 7px 9px;
+         border-radius: 7px; margin-top: 7px; word-break: break-all; display: none; }
+  .lnk.on { display: block; }
+  .msg { font-size: 12.5px; padding: 9px 11px; border-radius: 8px; display: none; }
+  .msg.on { display: block; }
+  .msg.err { background: #fdecec; color: #8a1c1c; }
+  .msg.ok { background: #eaf7ee; color: #14622c; }
+  .hint { font-size: 12.5px; color: var(--muted); line-height: 1.55; }
+</style>
+</head>
+<body>
+<div id="nav"></div>
+<div class="wrap">
+  <div>
+    <h1 style="margin:0 0 4px;font-size:20px">Review links</h1>
+    <p class="hint" style="margin:0">
+      A review link opens the client's beta site with the comment widget switched on, for one named
+      reviewer. Every link is signed and tied to a single site — a designer holding one for client A
+      cannot leave feedback on client B. Links expire; mint a fresh one when they do.
+    </p>
+  </div>
+
+  <div class="row">
+    <div class="fld">
+      <label for="reviewer">Reviewer name</label>
+      <input id="reviewer" placeholder="e.g. Priya (Design)" autocomplete="off">
+    </div>
+    <div class="fld">
+      <label for="minutes">Valid for</label>
+      <select id="minutes">
+        <option value="120">2 hours</option>
+        <option value="480" selected>8 hours</option>
+        <option value="1440">24 hours</option>
+        <option value="10080">7 days</option>
+      </select>
+    </div>
+  </div>
+
+  <div id="msg" class="msg"></div>
+  <div id="list"></div>
+</div>
+<script src="/nav.js"></script>
+<script src="/review-links.js"></script>
+</body>
+</html>
