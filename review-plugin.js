@@ -149,19 +149,45 @@ function g99_review_feedback($request)
     $session = g99_review_session();
     $body    = $request->get_json_params();
     $changes = isset($body['changes']) && is_array($body['changes']) ? $body['changes'] : [];
-    if (! $changes) {
+    $notes   = isset($body['notes']) && is_array($body['notes']) ? $body['notes'] : [];
+    if (! $changes && ! $notes) {
         return new WP_REST_Response(['ok' => false, 'error' => 'no changes in this batch'], 400);
     }
 
+    // Exact text pairs. Each carries the page it was made on, so one submission
+    // can span pages — a reviewer works through a site, not a single URL.
     $clean = [];
     foreach (array_slice($changes, 0, 40) as $c) {
         $original    = isset($c['original']) ? (string) $c['original'] : '';
         $replacement = isset($c['replacement']) ? (string) $c['replacement'] : '';
         if ($original !== '' && $replacement !== '' && $original !== $replacement) {
-            $clean[] = ['original' => $original, 'replacement' => $replacement];
+            $clean[] = [
+                'original'    => $original,
+                'replacement' => $replacement,
+                'page'        => isset($c['page']) ? (string) $c['page'] : '/',
+            ];
         }
     }
-    if (! $clean) {
+
+    // Design notes. Passed through with only length and shape checked: the tool
+    // re-validates everything, and this plugin ships to every client repository,
+    // so it must not need editing each time the annotation format grows a field.
+    $cleanNotes = [];
+    foreach (array_slice($notes, 0, 40) as $n) {
+        $elementId = isset($n['elementId']) ? (string) $n['elementId'] : '';
+        $note      = isset($n['note']) ? (string) $n['note'] : '';
+        if ($elementId === '' || $note === '' || ! preg_match('/^[A-Za-z0-9_-]{4,32}$/', $elementId)) {
+            continue;
+        }
+        $cleanNotes[] = [
+            'elementId' => $elementId,
+            'note'      => mb_substr($note, 0, 1000),
+            'page'      => isset($n['page']) ? (string) $n['page'] : '/',
+            'target'    => isset($n['target']) && is_array($n['target']) ? $n['target'] : [],
+        ];
+    }
+
+    if (! $clean && ! $cleanNotes) {
         return new WP_REST_Response(['ok' => false, 'error' => 'nothing usable in this batch'], 400);
     }
 
@@ -174,6 +200,10 @@ function g99_review_feedback($request)
             'url'         => isset($body['url']) ? (string) $body['url'] : home_url(),
             'activeTheme' => get_stylesheet(),
             'changes'     => $clean,
+            'notes'       => $cleanNotes,
+            // The widget's own retry key. Carried through untouched so the tool
+            // can tell a resubmission from a second batch.
+            'key'         => isset($body['key']) ? (string) $body['key'] : '',
         ]),
     ]);
     if (is_wp_error($res)) {

@@ -478,6 +478,10 @@ module.exports = {
   SEP, isGitopsRoot, expandResources, isVirtual, splitVirtual,
   readVirtual, writeVirtual, existsVirtual, selectorsFor,
   isVirtualAbs, readVirtualAbs, writeVirtualAbs, realPath,
+  // The feedback resolver needs to find one element by its Elementor id and
+  // read/replace that node's own settings, which is a narrower thing than the
+  // ::doc text view — it must not rewrite the whole page to change one section.
+  findById, setSetting, readJson, writeJson,
   // exported for tests
   collectDoc, collectBlocks, applyDoc, renderDoc, renderAudit,
 };

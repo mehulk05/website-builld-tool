@@ -4533,6 +4533,27 @@ function newEditJob(payload) {
     createdAt: new Date().toISOString(), startedAt: null, finishedAt: null,
   };
 }
+// Design feedback: an element id and a sentence, resolved against the page's
+// Elementor JSON and patched one section at a time. Distinct from an edit job
+// because nothing here plans across files — the target is already known, and
+// the only question is whether the rewrite of that one fragment is safe.
+const FEEDBACK_STEPS = [
+  "Pull latest content", "Resolve what was clicked", "Rewrite those sections",
+  "Check it still renders", "Push + open PR", "CI checks → auto-merge", "Confirm on the live site",
+];
+function newFeedbackJob(payload) {
+  return {
+    type: "feedback",
+    draftId: String(payload.jobId), businessId: null,
+    businessName: payload.businessName || payload.siteId || "Site",
+    status: "queued", currentStep: 0,
+    steps: FEEDBACK_STEPS.map((label) => ({ label, status: "pending", detail: "" })),
+    payload, prUrl: null, branch: null, siteUrl: null,
+    batchId: null, feedbackItems: null, error: null,
+    cost: { gemini: 0, stitch: 0 }, cancelRequested: false, awaitingApproval: false,
+    createdAt: new Date().toISOString(), startedAt: null, finishedAt: null,
+  };
+}
 const RESTORE_STEPS = ["Pull latest code", "Roll the theme back", "Push + open PR", "CI checks → auto-merge", "Sync registry"];
 function newRestoreJob(payload) {
   return {
@@ -5868,6 +5889,21 @@ function pushSubtaskStep(job, stepKey, status, extra = {}) {
 // the WordPress side. Nothing about the reviewer is trusted from the browser —
 // the name shown in the widget comes back out of the token, not off the page.
 const { reviewPluginSource } = require("./review-plugin.js");
+// Whether a reviewer's Submit may actually publish.
+//
+// This used to default OFF, so that deploying the tool did not by itself grant
+// permission to open and auto-merge pull requests into client repositories —
+// posting a review link and publishing what it collects were two separate
+// consents. That is now inverted at the owner's request: a deployment reviews
+// for real unless someone says otherwise.
+//
+// The switch still exists, and it is the one to reach for when a deployment
+// should be able to collect feedback without writing to anyone's repository.
+const REVIEW_OFF = new Set(["off", "0", "false", "no"]);
+function reviewPublishAllowed() {
+  return !REVIEW_OFF.has(String(process.env.REVIEW_LIVE || "").trim().toLowerCase());
+}
+
 const REVIEW_SECRET = process.env.REVIEW_SECRET || process.env.WEBHOOK_SECRET || process.env.ADMIN_PASSWORD || "";
 const REVIEW_TTL_MIN = Number(process.env.REVIEW_TTL_MIN || 120);
 const REVIEW_PLUGIN_PATH = "web/app/mu-plugins/g99-content-review.php";
@@ -5909,11 +5945,53 @@ function verifyTedSsoTicket(token) {
 // link sits in a comment for days, and the correction that comes back has no
 // other way to say which thread it is answering. A link minted by hand has no
 // task and simply carries none.
-function mintReviewToken({ siteId, themeSlug, reviewer, email, dept, minutes, taskId, kind }) {
+// A token that will be held in a browser cannot be long-lived. The classic path
+// keeps the token server-side and swaps it for an HttpOnly cookie, so a long
+// expiry there costs little; on a GitOps site the widget itself holds it, and a
+// week-long credential sitting in sessionStorage on a client site is not a trade
+// worth making. TED links default to seven days, which is exactly the case this
+// cap exists to catch.
+const REVIEW_BROWSER_TTL_MAX_MIN = Number(process.env.REVIEW_BROWSER_TTL_MAX_MIN || 120);
+
+// Where the widget should send its work.
+//
+// Normally nowhere — the snippet on the site names the deployed tool and that is
+// that. This exists for one case: running a real review against a build tool on
+// someone's laptop, reached through a tunnel, without redeploying and without
+// touching the client site every time the tunnel hands out a new address.
+//
+// It rides INSIDE the signature rather than in the URL or the snippet, so only a
+// holder of REVIEW_SECRET can point a widget anywhere, and a token minted for a
+// tunnel stops working when it expires like any other. Anyone who could forge
+// this could already mint tokens outright, so it adds no new authority — but
+// it is still a redirect, so it is refused unless it is an https origin with
+// nothing but a host.
+function reviewToolOverride(url) {
+  const raw = String(url || "").trim();
+  if (!raw) return "";
+  let u;
+  try { u = new URL(raw); } catch (e) { throw new Error(`tool must be a URL, got "${raw}"`); }
+  if (u.protocol !== "https:") throw new Error("tool must be https — the widget runs on an https page and the browser would block it");
+  if (u.pathname !== "/" || u.search || u.hash) throw new Error("tool must be a bare origin, with no path or query");
+  return u.origin;
+}
+
+function mintReviewToken({ siteId, themeSlug, reviewer, email, dept, minutes, taskId, kind, origin, tool }) {
   if (!REVIEW_SECRET) throw new Error("REVIEW_SECRET not set (falls back to WEBHOOK_SECRET or ADMIN_PASSWORD) — cannot mint review links");
-  const exp = Date.now() + Math.max(5, Number(minutes) || REVIEW_TTL_MIN) * 60000;
+  let mins = Math.max(5, Number(minutes) || REVIEW_TTL_MIN);
+  // `origin` is only set for the direct-to-browser transport, so it doubles as
+  // the signal for "this token will live in JavaScript".
+  if (origin) mins = Math.min(mins, REVIEW_BROWSER_TTL_MAX_MIN);
+  const exp = Date.now() + mins * 60000;
   const body = Buffer.from(JSON.stringify({
     v: 1, siteId, themeSlug, reviewer, email: email || "", dept: dept || "", exp,
+    // The one origin this token may be used from. Carried in the signature so
+    // the CORS decision is a signature check rather than a database lookup, and
+    // so a token stolen from one site is useless when replayed from anywhere
+    // else — including a page the thief controls.
+    ...(origin ? { origin } : {}),
+    // Only present on links minted for a tunnelled build tool; see above.
+    ...(tool ? { tool } : {}),
     // Which site model this link is for. A token minted before this existed has
     // no kind and is treated as a classic theme, which is what it was.
     ...(kind ? { kind } : {}),
@@ -5964,11 +6042,75 @@ function verifyReviewToken(token) {
   let d = null;
   try { d = JSON.parse(Buffer.from(body, "base64url").toString("utf8")); } catch (e) { return null; }
   if (!d || !d.exp || Date.now() > d.exp) return null;
+  // Checked here rather than at each caller so a route added later cannot
+  // forget it: every path that trusts a token comes through this function.
+  if (REVIEW_REVOKED.has(reviewSig(token))) return null;
   return d;
 }
 
 // Which job belongs to which session, without keeping the token itself around.
 const reviewSig = (token) => crypto.createHash("sha256").update(String(token)).digest("hex").slice(0, 16);
+
+// Sessions that must stop working before they expire.
+//
+// Until now there was no way to end a review session early: a link was valid
+// until its own clock ran out and nothing could shorten that. That was tolerable
+// while the token never left the server. Once the widget holds it in a browser,
+// "we think that link leaked" has to have an answer, so this is that answer.
+//
+// Keyed by signature, never by the token, so the process holds nothing that
+// could be replayed if a heap dump or a log ever escaped. In memory only: the
+// entries outlive the tokens they revoke only if the process outlives them, and
+// a restart drops both the ledger of revocations and every short-lived token it
+// was covering.
+const REVIEW_REVOKED = new Map();          // sig -> { at, by, reason }
+
+function revokeReviewSession(token, by, reason) {
+  const sig = reviewSig(token);
+  REVIEW_REVOKED.set(sig, { at: Date.now(), by: by || "unknown", reason: reason || "" });
+  // Whatever that session had in flight should not land either.
+  for (const [, j] of JOBS) {
+    if (j && j.payload && j.payload.reviewSig === sig && (j.status === "queued" || j.status === "running")) {
+      j.status = "error";
+      j.error = "this review session was revoked";
+    }
+  }
+  return sig;
+}
+
+// How many batches one session may ever submit.
+//
+// The existing limit only counts batches still being applied, which stops a
+// reviewer double-submitting but does nothing about a session used over and over
+// — finish three, start three more, indefinitely. A real reviewer does not
+// need hundreds; a stolen token used to grind changes into a client's site
+// would.
+const REVIEW_MAX_BATCHES = Number(process.env.REVIEW_MAX_BATCHES || 60);
+const REVIEW_BATCH_COUNT = new Map();      // sig -> number
+
+function reviewBatchAllowed(sig) {
+  const n = (REVIEW_BATCH_COUNT.get(sig) || 0) + 1;
+  REVIEW_BATCH_COUNT.set(sig, n);
+  return n <= REVIEW_MAX_BATCHES;
+}
+
+// The CORS answer for a browser calling the tool directly.
+//
+// Deliberately not "*", and deliberately not "whatever Origin you sent me". The
+// only origin allowed is the one inside the token's own signature, so a token
+// lifted off one site cannot be replayed from another page — the browser
+// refuses to hand the response back. A token with no origin belongs to the
+// classic proxied path, which no browser should be calling cross-origin at all,
+// so it gets nothing.
+function reviewCors(req, res, d) {
+  const want = d && d.origin ? String(d.origin).replace(/\/+$/, "") : "";
+  if (!want) return false;
+  const got = String(req.headers.origin || "").replace(/\/+$/, "");
+  if (got && got !== want) return false;
+  res.setHeader("Access-Control-Allow-Origin", want);
+  res.setHeader("Vary", "Origin");
+  return true;
+}
 
 // WordPress texturises quotes and dashes on the way out, so the sentence a
 // reviewer selected on screen ("don't") is often not the sentence in the
@@ -6133,10 +6275,16 @@ async function tedPostReviewLink({ clientId, clientName, hubspotId, taskId, revi
 function reviewWorkOrder(changes, { reviewer, pagePath }) {
   const items = changes.slice(0, 40).map((c) => ({
     what: `Replace "${String(c.original).slice(0, 70)}" with "${String(c.replacement).slice(0, 70)}"`,
-    where: pagePath,
+    where: c.page || pagePath,
     replaces: String(c.original),
     literal: String(c.replacement),
     variants: reviewTextVariants(c.original),
+    // Which copies to change. A phrase that appears five times is a decision
+    // only the person reading the page can make — "all" is the old behaviour
+    // and stays the default; "one" carries the index they highlighted.
+    scope: c.scope === "one" ? "one" : "all",
+    nth: c.scope === "one" ? Math.max(1, Number(c.nth) || 0) : 0,
+    sawOccurrences: Math.max(0, Number(c.occurrences) || 0),
   }));
   return {
     summary: `${items.length} content correction${items.length > 1 ? "s" : ""} from ${reviewer} on ${pagePath}`,
@@ -6150,7 +6298,12 @@ function reviewWorkOrder(changes, { reviewer, pagePath }) {
 // Shared chrome is a second tier rather than a peer, so a footer edit still
 // works while a body edit can never reach the footer by accident.
 function reviewSwapTiers(pagePath, muSrc, themePath, gitops) {
-  const slug = String(pagePath || "/").replace(/^\/+|\/+$/g, "").split("/")[0].toLowerCase();
+  // Last segment, not the first. GitOps stores pages flat (resources/pages/<slug>/)
+  // and a WordPress child page's slug is the last part of its URL, so
+  // /services/botox/ is the page `botox`. Taking the first segment sent every
+  // correction made under /services/ into the services listing page instead.
+  const parts = String(pagePath || "/").split("?")[0].split("#")[0].split("/").filter(Boolean);
+  const slug = (parts.length ? parts[parts.length - 1] : "").toLowerCase();
   // On a GitOps site the page IS the tier. Header and footer are inlined into
   // each page's own HTML blocks rather than living in shared templates, so
   // there is no second tier to fall through to — and no way for a correction
@@ -7467,7 +7620,7 @@ async function processJobQueue() {
   if (!id) return;
   JOB_RUNNING = true;
   const job = JOBS.get(id);
-  const RUNNER = { edit: runEditJob, restore: runRestoreJob, enrich: runEnrichJob, seo: runSeoJob, "pre-release": runPreReleaseJob, "perform-pr": runPerformPrJob, "wireframe-audit": runWireframeAudit };
+  const RUNNER = { edit: runEditJob, feedback: runFeedbackJob, restore: runRestoreJob, enrich: runEnrichJob, seo: runSeoJob, "pre-release": runPreReleaseJob, "perform-pr": runPerformPrJob, "wireframe-audit": runWireframeAudit };
   try { await ((job && RUNNER[job.type] ? RUNNER[job.type] : runJob)(job)); }
   catch (e) { console.error("job runner crashed:", e); }
   finally {
@@ -7490,6 +7643,13 @@ function enqueueEditJob(payload) {
 }
 function enqueueRestoreJob(payload) {
   const job = newRestoreJob(payload);
+  JOBS.set(job.draftId, job);
+  JOB_QUEUE.push(job.draftId); saveJobs();
+  processJobQueue();
+  return job;
+}
+function enqueueFeedbackJob(payload) {
+  const job = newFeedbackJob(payload);
   JOBS.set(job.draftId, job);
   JOB_QUEUE.push(job.draftId); saveJobs();
   processJobQueue();
@@ -9184,7 +9344,10 @@ function applyTextSwaps(workOrder, files, rootAbs, opts) {
     if (!chosen) return;                              // not here: the planner may still try
 
     const total = chosen.reduce((n, x) => n + x.count, 0);
-    if (total > ceiling) {
+    // The ceiling exists to stop a blind replace-everywhere. Someone who picked
+    // ONE copy has already answered that question, so it does not apply to them.
+    const narrowed = c.scope === "one" && c.nth > 0 && O.visibleOnly && chosen.length === 1;
+    if (total > ceiling && !narrowed) {
       if (O.refused) {
         O.refused.push({
           n: i + 1, what: c.what, replaces: c.replaces, literal: c.literal, hits: total,
@@ -9203,12 +9366,38 @@ function applyTextSwaps(workOrder, files, rootAbs, opts) {
       return;
     }
 
+    // "Only the one I selected" — the reviewer chose which copy of a repeated
+    // phrase to change, and sent its index in document order. Trusted only when
+    // this side counts the same number of copies they were shown: a different
+    // count means the page moved under them, and replacing the Nth of a
+    // different set is how the wrong sentence gets rewritten.
+    let onlyIndex = 0;
+    if (c.scope === "one" && c.nth > 0 && O.visibleOnly) {
+      const seen = chosen.reduce((n, x) => n + x.count, 0);
+      // The index counts copies on ONE page as the reviewer saw them. Spread
+      // across several files it addresses nothing, so it is refused rather than
+      // applied to the Nth of each.
+      if (chosen.length === 1 && (!c.sawOccurrences || c.sawOccurrences === seen)) {
+        if (c.nth <= seen) onlyIndex = c.nth;
+      }
+      if (!onlyIndex) {
+        if (O.refused) {
+          O.refused.push({
+            n: i + 1, what: c.what, replaces: c.replaces, literal: c.literal, hits: seen,
+            reason: `"${c.replaces}" — you asked to change only one copy, but the page has changed since (it now has ${seen}). Nothing was changed, so the wrong one could not be.`,
+          });
+        }
+        return;
+      }
+    }
+
     const touched = [];
     for (const { f, form, at, count } of chosen) {
       if (O.visibleOnly) {
         // Right to left, so earlier offsets stay valid as the string changes.
         let s = f.content;
-        for (let k = at.length - 1; k >= 0; k--) s = s.slice(0, at[k]) + c.literal + s.slice(at[k] + form.length);
+        const targets = onlyIndex ? [at[onlyIndex - 1]].filter((x) => x != null) : at;
+        for (let k = targets.length - 1; k >= 0; k--) s = s.slice(0, targets[k]) + c.literal + s.slice(targets[k] + form.length);
         f.content = s;
       } else {
         f.content = f.content.split(form).join(c.literal);
@@ -9546,6 +9735,235 @@ async function runLocalReviewEdit(job) {
     console.error(`local review job ${job.draftId} failed:`, e.message);
   } finally {
     job.finishedAt = new Date().toISOString(); saveJobs(); COST_SINK = null;
+  }
+}
+
+// Design feedback, end to end.
+//
+// The safety argument is the order: the repository is locked for the whole run,
+// every target is resolved against the tree we just cloned (never against what
+// the browser sent), each rewrite passes the validate.js gates before it is
+// written, and the patched pages are rendered before the branch is pushed. Only
+// then does it merge itself — which is the whole point, and only defensible
+// because of everything above it.
+async function runFeedbackJob(job) {
+  job.status = "running";
+  job.startedAt = new Date().toISOString(); COST_SINK = job.cost;
+  const P = job.payload;
+  const FB = {
+    store: require("./lib/feedback/store"),
+    run: require("./lib/feedback/run"),
+    resolve: require("./lib/feedback/resolve"),
+    vis: require("./lib/feedback/visualCheck"),
+  };
+  const localRepo = (P.localApply || "").trim();
+  // A local rehearsal writes into a checkout and never names a repository, so
+  // it must not inherit the tool's default one — recording WP_REPO against a run
+  // that could not possibly touch it makes the ledger lie about what happened.
+  const repo = localRepo ? `(local) ${localRepo}` : (P.githubRepo || WP_REPO);
+  const tmp = localRepo || path.join(os.tmpdir(), "g99fb-" + Date.now());
+  const run = async (cmd, cwd) => sh(cmd, cwd);
+  const runRetry = async (cmd, cwd, n = 3) => { let r; for (let i = 1; i <= n; i++) { r = await run(cmd, cwd); if (!r.code) return r; await sleep(3000 * i); } return r; };
+
+  // The ledger row exists before any work does, so a crash between "accepted"
+  // and "queued" still leaves a record of what was owed.
+  const { batch, duplicate } = FB.store.createBatch({
+    siteId: P.siteId, repo, reviewer: P.reviewer, sessionSig: P.reviewSig,
+    items: P.notes, idempotencyKey: P.idempotencyKey,
+  });
+  job.batchId = batch.id;
+  if (duplicate && batch.jobId && batch.jobId !== job.draftId) {
+    // The widget resent a batch already in flight — the WordPress proxy times
+    // out long before this pipeline finishes, so that is routine rather than a
+    // mistake. Nothing to do twice.
+    job.status = "done";
+    for (const i of [0, 1, 2, 3, 4, 5, 6]) jobStep(job, i, "done", "Already applied by an earlier submission");
+    saveJobs();
+    return;
+  }
+  FB.store.updateBatch(batch.id, { jobId: job.draftId, status: "running", attempts: (batch.attempts || 0) + 1 });
+
+  // One run per repository. Two batches patching the same page at once is the
+  // one race where both would report success and one would silently lose.
+  if (!FB.store.acquireRepoLock(repo, batch.id)) {
+    job.status = "error";
+    job.error = "another batch is being applied to this site right now — try again in a few minutes";
+    jobStep(job, 0, "error", job.error);
+    FB.store.updateBatch(batch.id, { status: "error" });
+    saveJobs();
+    return;
+  }
+  const keepLock = setInterval(() => FB.store.touchRepoLock(repo, batch.id), 60e3);
+
+  try {
+    // 1 — the tree as it is now
+    if (localRepo) {
+      if (!fs.existsSync(localRepo)) throw new Error(`REVIEW_LOCAL_REPO points at ${localRepo}, which does not exist`);
+      jobStep(job, 0, "running", "Using local checkout");
+    } else {
+      jobStep(job, 0, "running", "Cloning " + repo);
+      let r = await runRetry(`gh repo clone ${repo} "${tmp}" -- --depth 1`);
+      const cloneUrl = await ghCloneUrl(repo);
+      if (r.code) r = await runRetry(`git clone --depth 1 "${cloneUrl}" "${tmp}"`);
+      if (r.code) throw new Error("clone failed: " + r.stderr.slice(-200));
+      if (/x-access-token:/.test(cloneUrl)) await run(`git remote set-url origin "${cloneUrl}"`, tmp);
+    }
+    if (!GJ.isGitopsRoot(tmp)) throw new Error("this site is not a GitOps content site, so an element note has nothing to resolve against");
+    jobStep(job, 0, "done", localRepo ? "Local checkout" : "Latest content pulled");
+
+    // A copy of the pages as they are, so the render check has a baseline to
+    // compare against rather than only an absolute judgement.
+    const pristine = path.join(os.tmpdir(), "g99fb-base-" + Date.now());
+    fs.cpSync(path.join(tmp, "resources"), path.join(pristine, "resources"), { recursive: true });
+
+    // 2 + 3 — resolve and rewrite
+    jobStep(job, 1, "running", `Resolving ${P.notes.length} note(s)…`);
+    const out = await FB.run.applyNotes({
+      root: tmp,
+      items: batch.items,
+      liveUrl: P.liveUrl || "",
+      log: (m) => console.log(`[feedback ${job.draftId}] ${m}`),
+      // One model call per section. The screenshot rides along when there is
+      // one — a note like "this looks cramped" is hard to act on from markup.
+      ai: async (prompt, imagePart) => geminiCall(
+        imagePart ? [{ text: prompt }, imagePart] : [{ text: prompt }],
+        { temperature: 0.25, maxOutputTokens: 12000, timeoutMs: 60000 }),
+    });
+    jobStep(job, 1, "done", `${out.applied.length} resolved · ${out.refused.length} could not be`);
+    jobStep(job, 2, out.applied.length ? "done" : "done",
+      out.applied.length ? `${out.filesTouched.length} page(s) rewritten` : "Nothing to rewrite");
+
+    // Every item's outcome, recorded before anything is pushed.
+    const byId = {};
+    for (const a of out.applied) byId[a.item.id] = { status: "running", detail: a.what, screenshotRef: a.screenshot || "" };
+    for (const r of out.refused) byId[r.item.id] = { status: "conflict", detail: r.reason };
+    FB.store.updateItems(batch.id, byId);
+    job.feedbackItems = [
+      ...out.applied.map((a) => ({ ok: true, what: `${a.item.page} · ${a.item.note}`, detail: "" })),
+      ...out.refused.map((r) => ({ ok: false, what: `${r.item.page} · ${r.item.note}`, detail: r.reason })),
+    ];
+    saveJobs();
+
+    if (!out.filesTouched.length) {
+      for (const i of [3, 4, 5, 6]) jobStep(job, i, "done", "Nothing to publish");
+      job.status = "done";
+      job.error = null;
+      FB.store.updateBatch(batch.id, { status: "done" });
+      const reasons = out.refused.map((r) => r.reason);
+      job.reviewRefused = out.refused.map((r) => ({ reason: r.reason }));
+      saveJobs();
+      console.log(`feedback job ${job.draftId}: nothing applied — ${reasons.join("; ") || "no usable notes"}`);
+      return;
+    }
+
+    // 4 — does it still render? This is what stands in for a human looking at
+    // the pull request, so a failure here stops the run rather than warning.
+    jobStep(job, 3, "running", "Rendering the patched pages…");
+    const smoke = await FB.run.smokeTouchedPages(pristine, tmp, out.filesTouched,
+      (m) => console.log(`[feedback ${job.draftId}] ${m}`));
+    fs.rmSync(pristine, { recursive: true, force: true });
+    if (!smoke.ok) {
+      jobStep(job, 3, "error", smoke.problems.slice(0, 2).join(" · "));
+      throw new Error("the rewritten pages did not render correctly, so nothing was published: " + smoke.problems.join("; "));
+    }
+    jobStep(job, 3, "done", "Renders on desktop and mobile");
+
+    // A local rehearsal stops here: everything above is real, only git is absent.
+    if (localRepo) {
+      for (const i of [4, 5, 6]) jobStep(job, i, "done", "Skipped — local rehearsal");
+      job.status = "done";
+      job.localRehearsal = localRepo;
+      FB.store.updateBatch(batch.id, { status: "done" });
+      FB.store.updateItems(batch.id, Object.fromEntries(out.applied.map((a) => [a.item.id, { status: "live", detail: "local rehearsal" }])));
+      saveJobs();
+      return;
+    }
+
+    // 5 — one branch, one PR, for the whole submission
+    jobStep(job, 4, "running", "Pushing + opening PR…");
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
+    const branch = `g99/feedback-${String(P.siteId || "site").replace(/[^A-Za-z0-9_-]/g, "")}-${stamp}`;
+    await run(`git checkout -b "${branch}"`, tmp);
+    await run(`git add -A resources`, tmp);
+    let r = await run(`git -c user.email="tools@growth99.com" -c user.name="Growth99 Bot" commit -m "Design feedback: ${out.applied.length} change(s) from ${(P.reviewer || "review").replace(/"/g, "")}"`, tmp);
+    if (r.code) throw new Error("commit failed (nothing changed?): " + (r.stderr || r.stdout).slice(-160));
+    r = await runRetry(`git push -u origin "${branch}"`, tmp);
+    if (r.code) throw new Error("push failed: " + r.stderr.slice(-200));
+
+    const bodyFile = path.join(tmp, ".g99-pr-body.md");
+    fs.writeFileSync(bodyFile, FB.run.prBody({
+      reviewer: P.reviewer, applied: out.applied, refused: out.refused,
+      batchId: batch.id, siteName: P.businessName,
+    }));
+    r = await runRetry(`gh pr create --repo ${repo} --base main --head "${branch}" `
+      + `--title "Design feedback: ${out.applied.length} change(s) on ${P.businessName || P.siteId}" `
+      + `--body-file "${bodyFile}"`, tmp);
+    job.prUrl = (r.stdout.match(/https:\/\/github\.com\/\S+/) || [""])[0];
+    job.branch = branch;
+    if (!job.prUrl) throw new Error("PR create failed: " + r.stderr.slice(-200));
+    FB.store.updateBatch(batch.id, { prUrl: job.prUrl });
+    jobStep(job, 4, "done", job.prUrl);
+
+    // 6 — merge on green. A red check on a GitOps site means the deployment
+    // validated the resource tree and rejected it; that is a content problem an
+    // auto-fixer cannot reason about, so it stops rather than guessing.
+    jobStep(job, 5, "running", "Watching CI…");
+    let merged = false;
+    for (let i = 0; i < 240 && !merged; i++) {
+      let st; try { st = await localApi("/api/pr-status", { prUrl: job.prUrl }); } catch (e) { await sleep(10000); continue; }
+      jobStep(job, 5, "running", (st.checks || []).map((c) => `${c.name}:${c.status}`).join(" ") || "CI starting…");
+      if (st.allPass) {
+        if (!job.mergedExternally) await localApi("/api/pr-merge", { prUrl: job.prUrl });
+        merged = true;
+        jobStep(job, 5, "done", job.mergedExternally ? "Merged on GitHub" : "Merged");
+        break;
+      }
+      if (st.anyFail) throw new Error("the deployment check failed on this change — it needs a look rather than an automatic retry: " + job.prUrl);
+      await sleep(10000);
+    }
+    if (!merged) throw new Error("CI watch timed out after ~40 min — " + job.prUrl);
+
+    // 7 — and is it actually out there? Reported, never fatal: the change is
+    // merged by now, and a flaky check must not make a landed edit read as lost.
+    jobStep(job, 6, "running", "Checking the live page…");
+    let liveNote = "Merged — live once the deploy lands";
+    if (P.liveUrl) {
+      const firstPage = (out.applied[0] && out.applied[0].item.page) || "/";
+      const url = P.liveUrl.replace(/\/$/, "") + (firstPage === "/" ? "/" : firstPage + "/");
+      const live = await FB.vis.liveCheck(url).catch(() => null);
+      if (live && live.inconclusive) liveNote = "Merged — the live page could not be checked from here";
+      else if (live && !live.ok) liveNote = "Merged, but the live page looks wrong: " + live.problems.slice(0, 2).join(" · ");
+      else if (live) liveNote = "Live and rendering";
+    }
+    jobStep(job, 6, "done", liveNote);
+
+    FB.store.updateItems(batch.id, Object.fromEntries(out.applied.map((a) => [a.item.id, { status: "live", detail: a.what }])));
+    FB.store.updateBatch(batch.id, { status: "done" });
+    job.reviewRefused = out.refused.map((r2) => ({ reason: r2.reason }));
+    job.status = "done";
+    saveJobs();
+    notify(`🎨 Design feedback live — *${P.businessName}* · ${out.applied.length} applied`
+      + (out.refused.length ? `, ${out.refused.length} refused` : ""));
+  } catch (e) {
+    job.status = "error";
+    job.error = String(e.message || e).slice(0, 400);
+    const at = (job.steps || []).findIndex((s) => s.status === "running");
+    if (at > -1) jobStep(job, at, "error", job.error);
+    FB.store.updateBatch(batch.id, { status: "error" });
+    // An item that was never reported as live is not live. Say so rather than
+    // leaving it reading "running" forever in the ledger.
+    FB.store.updateItems(batch.id, Object.fromEntries(
+      (FB.store.getBatch(batch.id) || { items: [] }).items
+        .filter((i) => i.status === "running" || i.status === "queued")
+        .map((i) => [i.id, { status: "failed", detail: job.error }])));
+    saveJobs();
+    console.error(`feedback job ${job.draftId} failed:`, e.message);
+  } finally {
+    clearInterval(keepLock);
+    FB.store.releaseRepoLock(repo, batch.id);
+    if (!localRepo) { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e2) { /* temp dir */ } }
+    job.finishedAt = new Date().toISOString();
+    saveJobs();
   }
 }
 
@@ -16205,6 +16623,15 @@ const server = http.createServer(async (req, res) => {
     if (p === "/dashboard" || p === "/dashboard.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "dashboard.html")));
     if (p === "/dashboard.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "dashboard.js")));
     if (p === "/nav.js") return sendNoCache(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "nav.js")));
+    if (p === "/review-links.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "review-links.js")));
+    // The widget script for GitOps sites, which pull it straight from here.
+    // Public on purpose: it is the same file every classic site already ships
+    // and it holds no secret — it does nothing at all until a page hands it a
+    // token that this server has already verified.
+    if (p === "/review-widget.js") {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "review-widget.js")));
+    }
     if (p === "/theme.css") return send(res, 200, "text/css", fs.readFileSync(path.join(DIR, "public", "theme.css")));
     if (p === "/job" || p === "/job.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "job.html")));
     if (p === "/login" || p === "/login.html") return sendNoCache(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "login.html")));
@@ -16749,11 +17176,18 @@ const server = http.createServer(async (req, res) => {
       if (!reviewer) return json(res, 400, { error: "reviewer name required — it is shown in the widget and recorded on the change" });
       try {
         const { site, target } = await resolveReviewSite(body.site || body.siteId || body.businessName);
+        if (!/^https?:\/\//i.test(site.liveUrl || "")) throw new Error(`${site.businessName} has no beta site URL in NocoDB — there is nowhere to send the reviewer`);
+        // A GitOps site has no plugin to redeem the token server-side, so the
+        // widget holds it and calls the tool directly. Binding the token to the
+        // site's origin is what makes that safe to allow through CORS, and it is
+        // also what shortens the expiry — see mintReviewToken.
+        const siteOrigin = new URL(site.liveUrl).origin;
         const { token, exp } = mintReviewToken({
           siteId: site.siteId, themeSlug: target.themeSlug, kind: target.kind, reviewer,
           email: body.email, dept: body.dept || "Content", minutes: body.minutes,
+          ...(target.kind === "gitops" ? { origin: siteOrigin } : {}),
+          ...(body.tool ? { tool: reviewToolOverride(body.tool) } : {}),
         });
-        if (!/^https?:\/\//i.test(site.liveUrl || "")) throw new Error(`${site.businessName} has no beta site URL in NocoDB — there is nowhere to send the reviewer`);
         const link = new URL(site.liveUrl);
         link.searchParams.set("g99r", token);
         return json(res, 200, {
@@ -16761,6 +17195,30 @@ const server = http.createServer(async (req, res) => {
           siteId: site.siteId, businessName: site.businessName, themeSlug: target.themeSlug, reviewer,
         });
       } catch (e) { return json(res, 400, { error: String(e.message || e) }); }
+    }
+
+    // End a review session early. Behind the admin key, because the person who
+    // needs it is whoever just learned a link leaked, not the reviewer holding
+    // it. Takes the link or the raw token, so it can be used by pasting exactly
+    // what was shared.
+    if (p === "/api/review/revoke" && req.method === "POST") {
+      let body = {};
+      try { body = JSON.parse(await readBody(req) || "{}"); } catch (e) { return json(res, 400, { error: "bad json" }); }
+      let token = String(body.token || body.url || "").trim();
+      if (/^https?:\/\//i.test(token)) {
+        try { token = new URL(token).searchParams.get("g99r") || ""; } catch (e) { token = ""; }
+      }
+      if (!token) return json(res, 400, { error: "pass the review link or the token itself" });
+      // Report what the token WAS before revoking, so the caller can see they
+      // killed the session they meant to. Read first: after the revoke, the
+      // verifier deliberately refuses to tell anyone anything about it.
+      const was = verifyReviewToken(token);
+      const sig = revokeReviewSession(token, "admin", String(body.reason || ""));
+      return json(res, 200, {
+        ok: true, sig,
+        revoked: was ? { siteId: was.siteId, reviewer: was.reviewer, expiresAt: new Date(was.exp).toISOString() } : null,
+        note: was ? "this link no longer works" : "that token was already expired or invalid — recorded anyway",
+      });
     }
 
     // Put the review plugin into a site's repository (PR only — a file that runs
@@ -16778,9 +17236,31 @@ const server = http.createServer(async (req, res) => {
     // Called by the beta site, server-side, to redeem a link. Outside the admin
     // gate because the token IS the credential. Answers only what the widget has
     // to render — never the email, the site's repository or anything else.
+    // A GitOps site's widget calls these three routes from the browser, so they
+    // have to answer a preflight. The token is in the query or the body, not a
+    // header, so nothing here needs Allow-Headers beyond Content-Type.
+    if (p.startsWith("/api/webhook/review/") && req.method === "OPTIONS") {
+      const d = verifyReviewToken(u.searchParams.get("t"));
+      // Cannot see the token on a preflight for a POST — the body is not sent —
+      // so allow the preflight itself and let the real request be judged on its
+      // own token. Nothing is disclosed by permitting the preflight: the POST
+      // still fails without a valid, origin-matching token.
+      const origin = String(req.headers.origin || "");
+      if (d && !reviewCors(req, res, d)) return json(res, 403, { ok: false });
+      if (!d && origin) { res.setHeader("Access-Control-Allow-Origin", origin); res.setHeader("Vary", "Origin"); }
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      // ngrok-skip-browser-warning is what stops a free tunnel answering the
+      // widget's fetch with its own HTML interstitial instead of JSON. Harmless
+      // everywhere else; the widget sends it unconditionally.
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, ngrok-skip-browser-warning");
+      res.setHeader("Access-Control-Max-Age", "600");
+      return send(res, 204, "text/plain", "");
+    }
+
     if (p === "/api/webhook/review/verify") {
       const d = verifyReviewToken(u.searchParams.get("t"));
       if (!d) return json(res, 200, { ok: false });
+      if (d.origin && !reviewCors(req, res, d)) return json(res, 403, { ok: false });
       return json(res, 200, { ok: true, reviewer: d.reviewer, siteId: d.siteId, themeSlug: d.themeSlug, exp: d.exp });
     }
 
@@ -16790,6 +17270,10 @@ const server = http.createServer(async (req, res) => {
       try { body = JSON.parse(await readBody(req) || "{}"); } catch (e) { return json(res, 400, { error: "bad json" }); }
       const d = verifyReviewToken(body.token);
       if (!d) return json(res, 401, { ok: false, error: "this review session has expired — ask for a fresh link" });
+      if (d.origin && !reviewCors(req, res, d)) return json(res, 403, { ok: false, error: "this review link does not belong to this site" });
+      if (!reviewBatchAllowed(reviewSig(body.token))) {
+        return json(res, 429, { ok: false, error: "this review link has submitted as many batches as it is allowed — ask for a fresh one" });
+      }
 
       // Several beta sites share one WordPress install and differ only by which
       // theme is active. Without this check a session minted for one client
@@ -16808,14 +17292,28 @@ const server = http.createServer(async (req, res) => {
         return json(res, 409, { ok: false, error: "this site is not serving the theme this review link was made for" });
       }
 
+      // Exact text pairs. `page` is new and optional: the widget now keeps its
+      // queue across navigation, so one submission can carry corrections made on
+      // several pages. An older widget sends none, and the batch's own path is
+      // then right for every item in it.
       const changes = (Array.isArray(body.changes) ? body.changes : [])
-        .map((c) => ({ original: String((c && c.original) || ""), replacement: String((c && c.replacement) || "") }))
+        .map((c) => ({
+          original: String((c && c.original) || ""),
+          replacement: String((c && c.replacement) || ""),
+          page: String((c && c.page) || body.path || "/"),
+        }))
         .filter((c) => c.original && c.replacement && c.original !== c.replacement)
         .slice(0, 40);
-      if (!changes.length) return json(res, 400, { ok: false, error: "no usable changes in this batch" });
+
+      // Design notes — an element id and a sentence about it. Normalised by the
+      // annotation contract rather than here, so the shape lives in one place.
+      const FBS = require("./lib/feedback/schema");
+      const notes = FBS.normaliseBatch(Array.isArray(body.notes) ? body.notes : []).items;
+
+      if (!changes.length && !notes.length) return json(res, 400, { ok: false, error: "no usable changes in this batch" });
 
       const sig = reviewSig(body.token);
-      const inFlight = [...JOBS.values()].filter((j) => j.type === "edit" && j.payload
+      const inFlight = [...JOBS.values()].filter((j) => (j.type === "edit" || j.type === "feedback") && j.payload
         && j.payload.reviewSig === sig && (j.status === "queued" || j.status === "running"));
       if (inFlight.length >= 3) return json(res, 429, { ok: false, error: "three of your batches are still being applied — give them a moment" });
 
@@ -16833,13 +17331,17 @@ const server = http.createServer(async (req, res) => {
           const cached = await getWebsites(false).catch(() => []);
           const known = cached.find((s) => s.siteId === d.siteId);
           if (known) site = { ...site, businessName: known.businessName, liveUrl: known.liveUrl || "" };
-        } else if (String(process.env.REVIEW_LIVE || "").toLowerCase() !== "on") {
+        } else if (!reviewPublishAllowed()) {
           // Publishing to a client repository is opt-in, explicitly. It used to be
           // the fallback whenever REVIEW_LOCAL_REPO was absent, which meant a
           // restart that forgot one variable silently turned a local rehearsal
           // into a pull request that auto-merged to a real site. It did exactly
           // that once. A missing setting must refuse, not ship.
-          console.warn(`review: refused — neither REVIEW_LOCAL_REPO nor REVIEW_LIVE=on is set (${changes.length} correction(s) from ${d.reviewer} on ${pagePath})`);
+          // body.path, not pagePath: this line runs before pagePath is declared
+          // below, so naming it here threw a ReferenceError that the outer catch
+          // turned into an opaque 500 — the reviewer was told "could not be
+          // queued" when the real answer was "this tool is not set up to publish".
+          console.warn(`review: refused — REVIEW_LIVE is switched off and no REVIEW_LOCAL_REPO is set (${changes.length} correction(s), ${notes.length} note(s) from ${d.reviewer} on ${String(body.path || "/").slice(0, 200)})`);
           return json(res, 409, {
             ok: false,
             error: "this build tool is not set up to publish changes — nothing was applied. Ask an engineer to start it in local or live mode.",
@@ -16865,9 +17367,45 @@ const server = http.createServer(async (req, res) => {
         //   neither — the live run: clone, PR, CI, auto-merge, deploy.
         const localRoot = (process.env.REVIEW_LOCAL_REPO || "").trim();
         if (!localRoot && String(process.env.REVIEW_DRY_RUN || "").toLowerCase() === "on") {
-          console.log(`[review dry-run] ${site.businessName} ${pagePath} — ${changes.length} change(s) by ${d.reviewer}:\n`
-            + workOrder.changes.map((c, i) => `  ${i + 1}. "${c.replaces}" -> "${c.literal}" (${c.variants.length} variant spellings)`).join("\n"));
-          return json(res, 200, { ok: true, jobId: "dry-run-" + Date.now(), changes: changes.length, dryRun: true });
+          console.log(`[review dry-run] ${site.businessName} ${pagePath} — ${changes.length} change(s), ${notes.length} note(s) by ${d.reviewer}:\n`
+            + workOrder.changes.map((c, i) => `  ${i + 1}. "${c.replaces}" -> "${c.literal}" (${c.variants.length} variant spellings)`).join("\n")
+            + notes.map((n, i) => `\n  note ${i + 1}. ${n.page} ${n.elementId}: ${n.note}`).join(""));
+          return json(res, 200, { ok: true, jobId: "dry-run-" + Date.now(), changes: changes.length, notes: notes.length, dryRun: true });
+        }
+
+        // Design notes go to their own runner: resolving an element id in
+        // Elementor JSON and patching that one fragment is a different job from
+        // an exact text swap, and folding it into the edit planner would put a
+        // model in charge of files nobody asked it to touch. A batch that
+        // carries both kinds runs the notes here and the text pairs as an edit
+        // job, so each is applied by the machinery built for it.
+        if (notes.length) {
+          // Write any attached pictures to disk now and carry only the URL into
+          // the job. A multi-megabyte data URL has no business travelling
+          // through the job record, the ledger, or a Gemini prompt.
+          const UP = require("./lib/feedback/upload");
+          for (const n of notes) {
+            if (!n.image) continue;
+            const stored = UP.store(n.image, G99_TOOL_PUBLIC_URL);
+            n.imageUrl = stored ? stored.url : null;
+            n.imageName = stored ? stored.name : null;
+            if (!stored) console.warn(`review: dropped an unreadable attachment on ${n.page} ${n.elementId}`);
+            delete n.image;
+          }
+          const fb = enqueueFeedbackJob({
+            jobId: "fb-" + Date.now(),
+            siteId: site.siteId, businessName: site.businessName, githubRepo: site.githubRepo,
+            kind: target.kind, themeSlug: target.themeSlug, themePath: target.themePath,
+            notes, changes,
+            reviewer: d.reviewer, reviewSig: sig, reviewPath: pagePath,
+            liveUrl: site.liveUrl || "",
+            idempotencyKey: String(body.key || "").slice(0, 64) || null,
+            localApply: localRoot || null,
+            tedTaskId: d.taskId || null,
+          });
+          notify(`🎨 Design review — *${site.businessName}* · ${notes.length} note(s)`
+            + (changes.length ? ` + ${changes.length} text change(s)` : "") + ` from ${d.reviewer}`);
+          return json(res, 200, { ok: true, jobId: fb.draftId, changes: changes.length, notes: notes.length });
         }
 
         const job = enqueueEditJob({
@@ -16903,6 +17441,7 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/webhook/review/status") {
       const d = verifyReviewToken(u.searchParams.get("t"));
       if (!d) return json(res, 401, { ok: false, error: "expired" });
+      if (d.origin && !reviewCors(req, res, d)) return json(res, 403, { ok: false, error: "wrong site" });
       // A dry run has no job to report on, and leaving the widget spinning on
       // "Applying…" for a change that will never be applied is a lie the person
       // reviewing has no way to see through.
@@ -16930,6 +17469,10 @@ const server = http.createServer(async (req, res) => {
         // What the run declined to do and why. Without this the reviewer is told
         // "live" while one of their corrections was quietly dropped.
         refused: (job.reviewRefused || []).map((r) => r.reason),
+        // Per-item outcomes, so a design batch can show a tick or a cross against
+        // each note rather than one verdict for the lot. Present only on a
+        // feedback run; a text batch has no per-item state to report.
+        items: Array.isArray(job.feedbackItems) ? job.feedbackItems.slice(0, 40) : null,
       });
     }
 
@@ -17578,6 +18121,7 @@ const server = http.createServer(async (req, res) => {
     if (p === "/clients" || p === "/clients.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "clients.html")));
     if (p === "/clients.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "clients.js")));
     if (p === "/coverage" || p === "/coverage.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "coverage.html")));
+    if (p === "/review-links" || p === "/review-links.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "review-links.html")));
     if (p === "/coverage.js") return send(res, 200, "text/javascript", fs.readFileSync(path.join(DIR, "public", "coverage.js")));
 
     // The durable client pool: every onboarding that reached this tool, with its page
@@ -17807,6 +18351,14 @@ const server = http.createServer(async (req, res) => {
       const name = `${Date.now()}-${safeBase}.${kind.ext}`;
       fs.writeFileSync(path.join(UPLOADS_DIR, name), buf);
       return json(res, 200, { url: "/uploads/" + name, filename: name, kind: kind.kind, bytes: buf.length });
+    }
+    // Pictures a reviewer attached, served back so the patched page can point at
+    // them. Same arrangement the generated sites already use for every photo
+    // taken from the reference site — an absolute URL this tool serves.
+    if (p.startsWith("/feedback-uploads/")) {
+      const got = require("./lib/feedback/upload").read(p.slice("/feedback-uploads/".length));
+      if (!got) return send(res, 404, "text/plain", "not found");
+      return send(res, 200, got.mime, got.buf);
     }
     if (p.startsWith("/uploads/")) {
       const name = p.slice("/uploads/".length);
@@ -19000,6 +19552,34 @@ const server = http.createServer(async (req, res) => {
       return res.end(fs.readFileSync(zip));
     }
 
+    // What a designer will actually see on a GitOps site, before it is shipped
+    // there. Fetches the live page and injects the very snippet that will be
+    // pushed as the WPCode resource, pointed at THIS server rather than the
+    // deployed one — same loader, same widget, same element ids, so what works
+    // here is what will work on the site.
+    //
+    // A rehearsal surface, not a product: it exists so the delivery path can be
+    // proven before a thousand client sites are asked to run it.
+    if (p === "/preview/gitops-review") {
+      const site = u.searchParams.get("site") || "https://nuvoaestheticsclinic.gogroth.com";
+      const page = u.searchParams.get("page") || "/";
+      let html;
+      try {
+        const r = await fetch(new URL(page, site).toString());
+        html = await r.text();
+      } catch (e) { return json(res, 502, { error: "could not fetch " + site + ": " + e.message }); }
+      const { reviewSnippetSource } = require("./lib/feedback/loader");
+      // The FULL snippet, widget included — the same bytes the site gets, so
+      // what is proven here is what ships.
+      const snippet = reviewSnippetSource({ toolUrl: `http://localhost:${PORT}`, siteId: "preview" });
+      // <base> so the page's own relative assets still resolve to the real site,
+      // and the loader last so it sees the finished DOM.
+      const head = `<base href="${new URL(page, site).toString()}">`;
+      html = html.replace(/<head([^>]*)>/i, `<head$1>${head}`);
+      html = html.replace(/<\/body>/i, `<script>${snippet}</script></body>`);
+      return send(res, 200, "text/html", html);
+    }
+
     if (p.startsWith("/preview/")) {
       const f = path.join(GEN, p.slice(9).replace(/[^a-z0-9_-]/gi, "") + ".html");
       if (fs.existsSync(f)) return send(res, 200, "text/html", fs.readFileSync(f));
@@ -19033,6 +19613,30 @@ const server = http.createServer(async (req, res) => {
   }
 });
 if (require.main === module) {
+  // A batch is marked running before the work starts and terminal only when it
+  // ends, so a process that dies mid-run leaves one running forever — holding
+  // that site's lock, refusing every later batch with "another batch is being
+  // applied", and leaving the reviewer's panel polling a job nobody is working
+  // on. The lock does time out after fifteen minutes, but the batch never does.
+  //
+  // Nothing that was running can have survived this process starting, so on boot
+  // every such batch is dead by definition and is closed out here.
+  (function reapOrphanedFeedbackBatches() {
+    try {
+      const store = require("./lib/feedback/store");
+      const orphans = store.unfinishedBatches();
+      for (const b of orphans) {
+        store.updateBatch(b.id, { status: "error", error: "the build tool restarted while this batch was being applied" });
+        if (b.repo) store.releaseRepoLock(b.repo, b.id);
+      }
+      if (orphans.length) {
+        console.log(`feedback: closed ${orphans.length} batch(es) left running by a previous process`);
+      }
+    } catch (e) {
+      console.warn("feedback: could not check for interrupted batches — " + e.message);
+    }
+  })();
+
   server.listen(PORT, () => console.log(`G99 Website Build Tool → http://localhost:${PORT}`));
   // Before anything else: a task that was owed an answer when this process last
   // stopped is owed it still, and the person waiting on it has no other way to
@@ -19051,12 +19655,12 @@ if (require.main === module) {
   // checkout or in a pull request against a client's repository.
   {
     const localRepo = (process.env.REVIEW_LOCAL_REPO || "").trim();
-    const live = String(process.env.REVIEW_LIVE || "").toLowerCase() === "on";
+    const live = reviewPublishAllowed();
     console.log(localRepo
       ? `content review: LOCAL — corrections written to ${localRepo}; nothing is cloned, pushed or merged`
       : live
         ? "content review: LIVE — corrections open a pull request and auto-merge to the client repository"
-        : "content review: OFF — submissions are refused (set REVIEW_LOCAL_REPO for a local run, or REVIEW_LIVE=on to publish)");
+        : "content review: OFF — REVIEW_LIVE is switched off, so submissions are refused (unset it to publish, or set REVIEW_LOCAL_REPO for a local run)");
   }
   // The same must never be ambiguous for a typed request. Printed loudly because
   // this mode makes every edit stop short of the repository — useful for a
