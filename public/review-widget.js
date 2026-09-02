@@ -577,12 +577,22 @@
     var note = el("textarea", { rows: "4", placeholder: "e.g. make this button rounded, or point this link at /contact" });
     panel.appendChild(note);
 
-    // Picture swap. Offered on an image, or on anything containing one — a
-    // reviewer aiming at a hero usually hits the section, not the <img>.
+    // Picture swap, and picture ADD.
+    //
+    // This used to appear only when the clicked thing already contained an
+    // <img>, on the reading that the control replaces a picture. The pipeline
+    // behind it does more than that: handed a file for a section with no image
+    // at all, it places one. That path existed and could not be reached, because
+    // the only way to attach a file was to click something that already had a
+    // picture — so "put a photo in this band" was refused for want of an upload
+    // the reviewer was never offered.
+    //
+    // Offered on anything now. The wording changes with what is there, because
+    // "Replace the picture" over a band with no picture reads as a bug.
     var innerImg = node && node.tagName === "IMG" ? node : (node && node.querySelector ? node.querySelector("img") : null);
     var picked = null;
-    if (innerImg) {
-      panel.appendChild(el("label", null, "Replace the picture (optional)"));
+    {
+      panel.appendChild(el("label", null, innerImg ? "Replace the picture (optional)" : "Add a picture (optional)"));
       var drop = el("div", { class: "g99r-drop" }, "Choose an image from your computer");
       var file = el("input", { type: "file", accept: "image/*", style: "display:none" });
       var thumb = el("img", { class: "g99r-thumb g99r-hide" });
