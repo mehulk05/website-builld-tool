@@ -85,9 +85,9 @@ the case it was built against but not for the case a designer will actually hit.
 | H6 | Attached pictures die on every deploy | ⏳ pending | render's disk is ephemeral, so every picture a reviewer has attached 404s on the next release. Seen live: #136's photo was already dead. Nuvo carries none today — 30 images, all ruma.com — so a deploy breaks nothing until the next upload. F9 is the fix; a render persistent disk is the stopgap |
 | H7 | An unplaceable picture must not reach the model | ✅ done | patch.js — a photo attached to a band holding four of them fell through to the model, which invented a filename, replaced a founder's headshot with a URL nobody created, ignored the upload, and reported it applied. Now refused, with the way out |
 | H8 | The render gate trusts HTTP 200 | ⏳ pending | ruma.com answers a missing file with its 404 page under 200, so a broken picture passed. Check the content type, not just the status |
-| H9 | Media through git | 🚫 blocked | tested, not assumed: resources/media in the mcptest2 shape deployed successfully on nuvo (deploy-20260902-145843, g99-control 1.8.3, features[media] on) and produced no attachment and no file under uploads. And even if import lands, the URL carries a date folder and a -scaled suffix chosen at import time, which the markup cannot know in the same commit. Question written up in INFRA-media-on-deploy.md |
+| H9 | Media through git | ⚠ partial | it works, tested four ways. An unreferenced file is skipped; a PUBLISHED page's featured_image imports it and it serves at /wp-content/uploads/YYYY/MM/<filename> with the name kept, so the URL can go in the same commit. A draft anchor does not carry media. cpt.json's media field IS read and IS resolved, but it is a map keyed by ref, not a list — that shape is the one thing left, and it is the only anchor that does not cost a published page per photo |
 
-Totals: 39 done, 2 partial, 8 pending, 3 blocked.
+Totals: 39 done, 3 partial, 8 pending, 2 blocked.
 
 H6 is the one to read: the picture handling is correct and the place those
 pictures live is not. Until F9 lands, an attached photo is good until the

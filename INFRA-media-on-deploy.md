@@ -1,4 +1,4 @@
-# Does `resources/media/` import on deploy?
+# What anchors a media file in `resources/media/`?
 
 **Asked because:** a designer reviewing a beta site can attach a photo to a note.
 The build tool has nowhere durable to put that photo, so today it writes the file
@@ -11,6 +11,52 @@ media library and the markup points at the site's own URL. We would like to do
 that **through git**, since that is the channel the tool already has.
 
 ---
+
+## Superseded
+
+The first version of this note asked whether media imports at all, having seen
+one unreferenced file do nothing. **It does import.** Four probes on
+`nuvoaestheticsclinic.gogroth.com` (g99-control 1.8.3) narrowed it to one
+remaining question, which is at the end.
+
+| Probe | Shape | Result |
+|---|---|---|
+| 1 | file + sidecar, referenced by nothing | not imported |
+| 2 | referenced from a **published** page's `featured_image` | **imported**, served at `/wp-content/uploads/2026/09/g99-media-probe.webp`, 200 `image/webp` |
+| 3 | listed in a `cpt.json` `media` **array** | **deploy refused** — `references media:0 but resources/media/0.json does not exist` |
+| 4 | referenced from a **draft** post's `featured_image` | post created, **media not imported** |
+
+What that establishes:
+
+* An unreferenced file is skipped, so a reference is required.
+* `featured_image` on a **published** resource works, and the filename is kept
+  exactly — `Functional-Wellness-1.webp` stays capitalised, and there is no
+  `-scaled` suffix below WordPress's threshold. So the URL is
+  `‹site›/wp-content/uploads/‹YYYY›/‹MM›/‹filename›` and is predictable enough
+  to write into markup in the **same commit** as the file.
+* The `media` field on `cpt.json` **is** read and its refs **are** resolved
+  against `resources/media/‹ref›.json` — the validator said so. Given a list it
+  took the array **index** as the ref, so it is a map keyed by ref.
+* Draft resources do not carry their media across.
+* Validation fails closed: nothing is applied, and the site simply stays on the
+  previous commit until the bad ref is removed.
+
+---
+
+## The one thing still missing
+
+**What is the exact shape of `media` on a `cpt.json`?**
+
+It is the only anchor that would not cost a published page or post per photo,
+and a reviewer can attach several photos to one page. Every guess costs a
+refused deployment on a live client site, so we would rather be told than keep
+probing.
+
+Everything else on the tool side is ready to build the moment that is answered.
+
+---
+
+## The original probe, for the record
 
 ## What we tried
 
