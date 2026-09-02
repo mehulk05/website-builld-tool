@@ -122,7 +122,7 @@ function noteRows(j) {
       if (items.length) {
         const done = items.filter((x) => x.ok).length;
         const key = "fb-step-notes";
-        extra = `<details class="brief" data-k="${key}"${OPEN.has(key) ? " open" : ""}><summary>View note breakdown (${done} of ${items.length} applied)</summary>${noteRows(j)}</details>`;
+        extra = `<details class="brief notes-d" data-k="${key}"${OPEN.has(key) ? " open" : ""}><summary>View note breakdown (${done} of ${items.length} applied)</summary>${noteRows(j)}</details>`;
       }
     }
     extra += stepEvents(j, i, s);

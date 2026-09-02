@@ -19606,6 +19606,12 @@ const server = http.createServer(async (req, res) => {
         const r = await fetch(new URL(page, site).toString());
         html = await r.text();
       } catch (e) { return json(res, 502, { error: "could not fetch " + site + ": " + e.message }); }
+      // Strip the site's own copy of the widget first. This preview exists to
+      // exercise the CURRENT code, and now that the widget ships to real sites
+      // the fetched page brings its own — an older one, which loads first,
+      // claims the DOM and quietly makes every test here a test of what is
+      // already deployed.
+      html = html.replace(/<script\b[^>]*>(?:(?!<\/script>)[\s\S])*?Growth99 review loader[\s\S]*?<\/script>/gi, "");
       const { reviewSnippetSource } = require("./lib/feedback/loader");
       // The FULL snippet, widget included — the same bytes the site gets, so
       // what is proven here is what ships.

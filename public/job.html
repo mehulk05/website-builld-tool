@@ -160,6 +160,14 @@
     border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-top: 8px;
     max-height: 280px; overflow: auto; background: var(--surface-2);
   }
+  /* details.brief exists for AI prompt text: it scrolls inside 280px and treats
+     whitespace as significant. A list of notes wants neither — four rows in a
+     scroll box hides the other five, which are the ones someone is looking for. */
+  details.brief.notes-d > div {
+    white-space: normal; max-height: none; overflow: visible;
+    border: none; padding: 0; background: none;
+  }
+
   /* The copy button floats over the scroll box, so it stays reachable without scrolling
      to the end of a 2,500-character prompt. */
   details.brief .briefwrap { position: relative; }
