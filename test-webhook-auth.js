@@ -127,6 +127,24 @@ const post = (headers, body) => fetch(`http://127.0.0.1:${PORT}/api/webhook/ted-
       assert.match(body.message, /nothing was done/i, "200 must not read as work having happened");
     });
 
+    await t("the secret is accepted under any of the four header spellings TED might use", async () => {
+      // Which label TED puts the secret behind is set on its side, not ours, and
+      // this subscription has never delivered — so a header mismatch would have
+      // been indistinguishable from the TED-side bug. /api/webhook/pre-release
+      // and /api/webhook/ted-content-review already accept all four; this one
+      // did not, and that gap could only ever cost a debugging round trip.
+      const ping = { event: "SUBTASK_CREATED", timestamp: new Date().toISOString(), source: "ted", subscriptionId: "abc", data: {} };
+      for (const headers of [
+        { "x-ted-webhook-secret": "s3cret-value" },
+        { "x-webhook-secret": "s3cret-value" },
+        { "x-ted-secret": "s3cret-value" },
+        { authorization: "Bearer s3cret-value" },
+      ]) {
+        const r = await post(headers, ping);
+        assert.strictEqual(r.status, 200, `${Object.keys(headers)[0]} should be accepted`);
+      }
+    });
+
     await t("a populated payload that still hides the task id is a real failure", async () => {
       // Not a ping: data has content, so failing to find the id means we could
       // not read a genuine event, and that must stay loud.

@@ -17507,7 +17507,24 @@ const server = http.createServer(async (req, res) => {
 
         return json(res, 401, { error: "webhook not configured on this deployment" });
       }
-      if ((req.headers["x-webhook-secret"] || "") !== secret) return json(res, 401, { error: "bad webhook secret" });
+      {
+        // The same four spellings /api/webhook/pre-release and
+        // /api/webhook/ted-content-review accept. This endpoint used to insist on
+        // x-webhook-secret alone, which meant a correctly configured Secret Auth
+        // tab could still 401 purely because TED labelled the header differently
+        // — on the one subscription that has never delivered, so nobody would
+        // have been able to tell that apart from the TED-side bug we are waiting
+        // on. Widening it costs nothing: an unset secret still refuses outright,
+        // and a wrong value still fails.
+        const sent = String(req.headers["x-ted-webhook-secret"] || req.headers["x-webhook-secret"]
+          || req.headers["x-ted-secret"]
+          || String(req.headers["authorization"] || "").replace(/^Bearer\s+/i, "")).trim();
+        if (sent !== secret) {
+          // Which header arrived is what makes a 401 debuggable; the value is never logged.
+          console.warn(`ted-subtask webhook: bad secret (headers seen: ${Object.keys(req.headers).filter((h) => /secret|auth/i.test(h)).join(", ") || "none"})`);
+          return json(res, 401, { error: "bad webhook secret" });
+        }
+      }
       TED_WEBHOOK_SEEN = true;
       let body = {};
       try { body = JSON.parse(await readBody(req) || "{}"); } catch (e) { return json(res, 400, { error: "bad json" }); }
