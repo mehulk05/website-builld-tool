@@ -881,3 +881,61 @@ function twoInOne() {
     { allowStructural: INTENT.asksForStructure("make the card headings navy") });
   ok("a styling note still may not drop a picture", styling.ok === false);
 }
+
+// ---- every way a picture note can arrive ------------------------------------
+// Run as one live batch on nuvo (#141) after a run that only ever tested one
+// case at a time. Four of the five behaved. The fifth is the reason this block
+// exists, and it is the worst kind of failure: it reported success.
+{
+  const band = (imgs) => '<section class="g99-sec"><div class="u-wrap"><h2>Team</h2>'
+    + imgs.map((s, i) => `<div class="c-person"><img src="${s}" alt="p${i}"></div>`).join("")
+    + "</div></section>";
+  const UP = "https://tool.example/feedback-uploads/new.jpg";
+
+  // A: no picture in the band, one attached — placed.
+  const addOut = P.deterministicEdit(band([]), { imageUrl: UP, target: { tag: "section" } });
+  ok("a picture is placed where the band had none",
+    !!addOut && (addOut.html.match(/<img/gi) || []).length === 1 && addOut.html.includes(UP));
+
+  // B: the click landed on the picture itself — that one is swapped.
+  const one = band(["https://old.example/a.webp"]);
+  const byImg = P.deterministicEdit(one, { imageUrl: UP, target: { tag: "img", attrs: { src: "https://old.example/a.webp" } } });
+  ok("the clicked picture is the one swapped", !!byImg && byImg.html.includes(UP));
+
+  // C: the click landed on a SECTION holding exactly one picture — no ambiguity.
+  const bySection = P.deterministicEdit(one, { imageUrl: UP, target: { tag: "section" } });
+  ok("a lone picture is swapped from a section click", !!bySection && bySection.html.includes(UP));
+
+  // D: the click landed on a section holding FOUR. Nothing here can know which,
+  // and the model cannot help — it never sees the URL. On the live run it
+  // invented "SHELBY-NEW-HEADSHOT.webp", replaced a founder's headshot with a
+  // file that does not exist, ignored the reviewer's upload, and reported the
+  // note as applied. The page passed the render check because the host serves
+  // its 404 page under HTTP 200.
+  const four = band(["a.webp", "b.webp", "c.webp", "d.webp"]);
+  const ambiguous = P.deterministicEdit(four, { imageUrl: UP, target: { tag: "section" } });
+  ok("four pictures and a section click cannot be resolved", ambiguous === null);
+
+  // …and that must become a refusal the reviewer can act on, never a trip to
+  // the model. The AI here throws, because reaching it at all is the failure —
+  // and the throw is caught rather than left to reject, or removing the guard
+  // would make these three assertions vanish instead of fail.
+  (async () => {
+    let out = null, threw = "";
+    try {
+      out = await P.patchSection({
+        html: four,
+        items: [{ localId: "i1", note: "Replace the picture here with the one attached.", imageUrl: UP, target: { tag: "section" } }],
+        containerId: "c1",
+        page: "/",
+        ai: async () => { throw new Error("the model was asked to place an upload it cannot see"); },
+      });
+    } catch (e) { threw = e.message; }
+    ok("an unplaceable picture never reaches the model", !threw, threw);
+    const v = out && out.verdicts && out.verdicts[0];
+    ok("an unplaceable picture is refused, not guessed", !!v && v.ok === false);
+    ok("and the refusal says which way out",
+      /which one to replace|leave the note on the picture/.test((v && v.reason) || ""), v && v.reason);
+    ok("the markup is left exactly as it was", !!out && out.html === four);
+  })();
+}

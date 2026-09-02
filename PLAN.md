@@ -83,8 +83,10 @@ the case it was built against but not for the case a designer will actually hit.
 | H4 | Show the pictures on the run page | ✅ done | job.js — "markup adjusted" is a true and useless answer to "did my photo go on". Before/after for a swap, one thumbnail for an addition |
 | H5 | One vocabulary for a structural note | ✅ done | patch.js kept its own word list and had never heard of "take it out"; the note was carried out and then rejected for doing it. The guard now asks intent.js |
 | H6 | Attached pictures die on every deploy | 🚫 blocked | render's disk is ephemeral, so every picture a reviewer has attached 404s on the next release. Seen live: #136's photo was already dead. Nuvo cleaned by #138. The fix is F9 |
+| H7 | An unplaceable picture must not reach the model | ✅ done | patch.js — a photo attached to a band holding four of them fell through to the model, which invented a filename, replaced a founder's headshot with a URL nobody created, ignored the upload, and reported it applied. Now refused, with the way out |
+| H8 | The render gate trusts HTTP 200 | ⏳ pending | ruma.com answers a missing file with its 404 page under 200, so a broken picture passed. Check the content type, not just the status |
 
-Totals: 38 done, 2 partial, 6 pending, 3 blocked.
+Totals: 39 done, 2 partial, 7 pending, 3 blocked.
 
 H6 is the one to read: the picture handling is correct and the place those
 pictures live is not. Until F9 lands, an attached photo is good until the
