@@ -939,3 +939,27 @@ function twoInOne() {
     ok("the markup is left exactly as it was", !!out && out.html === four);
   })();
 }
+
+// ---- where an attached picture is stored ------------------------------------
+// The default path is inside the checkout, which is wrong on any host that
+// replaces its disk between releases. Render does, and it took every picture a
+// reviewer had attached with it — including one already on a client's page.
+{
+  const UP = require("./lib/feedback/upload");
+  const path = require("path");
+  ok("uploads default inside the checkout",
+    UP.DIR.split(path.sep).join("/").endsWith("generated/feedback-uploads"));
+
+  // Reloaded rather than read, because the directory is chosen at require time
+  // — which is the point: turning this on is a host setting, not a release.
+  const before = process.env.FEEDBACK_UPLOAD_DIR;
+  process.env.FEEDBACK_UPLOAD_DIR = path.join("/", "srv", "g99-uploads");
+  delete require.cache[require.resolve("./lib/feedback/upload")];
+  const moved = require("./lib/feedback/upload");
+  ok("and follow FEEDBACK_UPLOAD_DIR when it is set",
+    moved.DIR.split(path.sep).join("/").endsWith("/srv/g99-uploads"), moved.DIR);
+
+  if (before === undefined) delete process.env.FEEDBACK_UPLOAD_DIR;
+  else process.env.FEEDBACK_UPLOAD_DIR = before;
+  delete require.cache[require.resolve("./lib/feedback/upload")];
+}
