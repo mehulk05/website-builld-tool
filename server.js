@@ -202,6 +202,21 @@ const NOCODB_TOKEN = process.env.NOCODB_TOKEN || "";
 const NOCODB_TABLE = process.env.NOCODB_TABLE || "mp8nfno2six11yi";
 // TED — where an inbound email request is logged for the delivery team. Off
 // until TED_API_TOKEN is set, so nothing changes for a deployment without one.
+// One value can cover every webhook. /api/webhook/email-change and
+// /api/webhook/email-outbox have always read WEBHOOK_SECRET when their own
+// variable was absent; the two TED endpoints never got the same fallback, so
+// standing them up meant a new environment variable each, on a service that
+// already carries thirty. A per-endpoint name still wins where one is set, for
+// anyone who wants to rotate a single subscription on its own.
+//
+// This does not loosen anything: with neither name set the caller is still
+// refused outright, and a wrong value still fails. The endpoint that genuinely
+// runs open — /api/webhook/ted-content-review — is deliberately left alone, so
+// giving it a shared secret cannot silently start 401ing the one subscription
+// TED has ever delivered to.
+function webhookSecret(name) {
+  return String(process.env[name] || process.env.WEBHOOK_SECRET || "").trim();
+}
 const TED_BASE = (process.env.TED_BASE || "https://ted.growth99.com").replace(/\/$/, "");
 const TED_API_TOKEN = process.env.TED_API_TOKEN || "";
 // SSO handoff: a browser that's logged out here gets bounced to TED's login page (nav.js), and a
@@ -16918,7 +16933,7 @@ const server = http.createServer(async (req, res) => {
       // tool uses X-Webhook-Secret. Reading only one of those means the day
       // somebody fills in the wrong tab, every delivery 401s and the pre-release
       // run silently stops happening.
-      const secret = (process.env.PRE_RELEASE_WEBHOOK_SECRET || "").trim();
+      const secret = webhookSecret("PRE_RELEASE_WEBHOOK_SECRET");
       if (!secret) {
         // Fails closed, like every other webhook here. This endpoint clones,
         // audits, opens and MERGES a pull request against a client's repository,
@@ -16929,9 +16944,9 @@ const server = http.createServer(async (req, res) => {
         // delivering, so switching it off at this end is visible: set
         // PRE_RELEASE_WEBHOOK_SECRET here and the same value on the
         // subscription's Secret Auth tab, and it resumes.
-        console.warn("pre-release: refused — PRE_RELEASE_WEBHOOK_SECRET is not set, so this endpoint cannot tell TED from anyone else");
+        console.warn("pre-release: refused — neither PRE_RELEASE_WEBHOOK_SECRET nor WEBHOOK_SECRET is set, so this endpoint cannot tell TED from anyone else");
 
-        return json(res, 401, { error: "webhook not configured on this deployment (PRE_RELEASE_WEBHOOK_SECRET unset)" });
+        return json(res, 401, { error: "webhook not configured on this deployment (set PRE_RELEASE_WEBHOOK_SECRET or WEBHOOK_SECRET)" });
       }
       {
         const sent = String(req.headers["x-ted-webhook-secret"] || req.headers["x-webhook-secret"]
@@ -17540,9 +17555,9 @@ const server = http.createServer(async (req, res) => {
       //
       // Failing closed costs nothing here: unset means no caller is
       // authenticating, which means no legitimate caller is configured yet.
-      const secret = (process.env.TED_SUBTASK_WEBHOOK_SECRET || "").trim();
+      const secret = webhookSecret("TED_SUBTASK_WEBHOOK_SECRET");
       if (!secret) {
-        console.warn("ted-subtask webhook: refused — TED_SUBTASK_WEBHOOK_SECRET is not set, so this endpoint cannot tell TED from anyone else");
+        console.warn("ted-subtask webhook: refused — neither TED_SUBTASK_WEBHOOK_SECRET nor WEBHOOK_SECRET is set, so this endpoint cannot tell TED from anyone else");
 
         return json(res, 401, { error: "webhook not configured on this deployment" });
       }
@@ -19708,9 +19723,9 @@ if (require.main === module) {
   // unregistered webhook is invisible from here — TED simply never calls — so
   // the one thing this side can report is whether it would accept the call.
   if (TED_API_TOKEN && TED_SUBTASKS) {
-    console.log((process.env.TED_SUBTASK_WEBHOOK_SECRET || "").trim()
+    console.log(webhookSecret("TED_SUBTASK_WEBHOOK_SECRET")
       ? `TED subtask webhook: armed at ${G99_TOOL_PUBLIC_URL || "(G99_TOOL_PUBLIC_URL unset)"}/api/webhook/ted-subtask — TED must send x-webhook-secret`
-      : "TED subtask webhook: DISABLED — TED_SUBTASK_WEBHOOK_SECRET is not set, so the endpoint refuses every caller and requests arrive only via the poll");
+      : "TED subtask webhook: DISABLED — neither TED_SUBTASK_WEBHOOK_SECRET nor WEBHOOK_SECRET is set, so the endpoint refuses every caller and requests arrive only via the poll");
   }
   // Say which mode content review is in, at boot, every time. The one thing that
   // must never be ambiguous is whether a reviewer's correction ends up in a local
