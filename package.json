@@ -8,7 +8,9 @@
   },
   "license": "UNLICENSED",
   "dependencies": {
+    "cheerio": "^1.2.0",
     "jimp": "^1.6.1",
+    "pg": "^8.23.0",
     "playwright": "^1.62.1"
   }
 }
