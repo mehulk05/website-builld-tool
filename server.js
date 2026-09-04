@@ -6911,6 +6911,39 @@ async function runWireframeAudit(job) {
 // source of truth. Fail-soft with a few retries — a build must never break because G99 is briefly down.
 const G99_STATUS_URL = process.env.G99_STATUS_CALLBACK_URL || "";
 const G99_STATUS_SECRET = process.env.G99_STATUS_SECRET || process.env.WEBHOOK_SECRET || "";
+
+// Generation history — optional Postgres record of every build (schema in
+// migrations/). With BUILDTOOL_DATABASE_URL unset or the RDS unreachable it is
+// a set of no-ops and the tool behaves exactly as before it existed.
+const HISTORY = require("./lib/history/record");
+const HISTORY_DB = require("./lib/history/db");
+const HISTORY_PREVIEW = require("./lib/history/preview");
+
+/**
+ * A preview URL that resolves to nothing, explained in the tab it opened in.
+ *
+ * Previews open in a new tab, so a JSON body would leave the reader staring at
+ * `{"error":…}` with no way back. The two arguments are trusted as HTML — every
+ * caller either passes a literal or escapes first.
+ */
+function previewError(title, detail) {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>${title} — preview</title>
+<style>:root{color-scheme:light dark}body{margin:0;min-height:100vh;display:grid;place-items:center;
+background:#faf9f8;color:#1a1a1a;font:400 16px/1.6 ui-sans-serif,system-ui,-apple-system,sans-serif}
+@media(prefers-color-scheme:dark){body{background:#141414;color:#ededed}}
+main{max-width:34rem;padding:2.5rem;text-align:center}h1{margin:0 0 .75rem;font-size:1.35rem;font-weight:500;letter-spacing:-.01em}
+p{margin:0 0 1.5rem;opacity:.72}a{color:inherit;text-decoration:none;border:1px solid currentColor;
+border-radius:2rem;padding:.5rem 1.25rem;font-size:.9rem;opacity:.72}a:hover{opacity:1}</style></head>
+<body><main><h1>${title}</h1><p>${detail}</p><a href="/history">Back to generation history</a></main></body></html>`;
+}
+if (HISTORY_DB.enabled()) {
+  HISTORY_DB.migrate().then((ok) => console.log(ok
+    ? "generation history: ON (postgres reachable, schema current)"
+    : "generation history: OFF — " + HISTORY_DB.whyDisabled()));
+} else {
+  console.log("generation history: OFF — " + HISTORY_DB.whyDisabled());
+}
 const G99_RETRY_DELAYS_MS = [2000, 10000, 30000];
 
 // job.siteUrl / job.reportUrl are paths on THIS server ("/site/", "/reports/81.html"). G99 renders them
@@ -8535,6 +8568,9 @@ async function recontentTemplate(html, A) {
 async function runJob(job) {
   job.status = "running";
   job.startedAt = new Date().toISOString(); COST_SINK = job.cost;
+  // Open this build's history row (V<n> for its client). Fire-and-caught: a
+  // database problem is a log line, never a failed build.
+  HISTORY.onJobStart(job, GEN).catch(() => {});
   postStatus(job);   // "running"
   mirrorPool(job);
   const P = job.payload;
@@ -9072,6 +9108,10 @@ async function runJob(job) {
     }
   } finally {
     job.finishedAt = new Date().toISOString(); saveJobs(); COST_SINK = null;
+    // Store whatever pages this run produced and close its history row. Awaited
+    // is deliberate here: the queue is single-file, and the next job will
+    // overwrite GEN/site — the read has to happen before that.
+    try { await HISTORY.onJobFinish(job, GEN); } catch (e) { /* logged inside */ }
     postStatus(job);   // terminal: done | error | cancelled (+ siteUrl/prUrl/scores)
     mirrorPool(job);   // flushed immediately — this is the row that must survive a redeploy
   }
@@ -18426,6 +18466,126 @@ const server = http.createServer(async (req, res) => {
         pagesPending: all.reduce((n, r) => n + (r.pagesPending || 0), 0),
       };
       return json(res, 200, { rows: all, totals, poolError, storedIn: poolError ? "memory only" : "NocoDB" });
+    }
+
+    // ---- generation history --------------------------------------------------
+    // Who: anyone with the admin key (these sit behind the same gate as the rest
+    // of /api and the dashboard). What: every version a client's callbacks have
+    // produced, and any stored page rendered back as it was generated.
+    //   /history/<clientKey>                versions for one client (JSON)
+    //   /history/<clientKey>/v<N>           one version's pages (JSON)
+    //   /history/<clientKey>/v<N>/<slug>    the stored HTML itself
+    // Every client we hold history for — the history browser's landing data.
+    if (p === "/api/history/clients") {
+      if (!HISTORY_DB.enabled()) return json(res, 503, { error: "generation history is off: " + HISTORY_DB.whyDisabled() });
+      return json(res, 200, { clients: await HISTORY_DB.listClients() });
+    }
+
+    // One client's versions, for the browser's detail pane. Same data as
+    // /history/<key> but with preview URLs instead of raw-HTML URLs.
+    if (p.startsWith("/api/history/client/")) {
+      if (!HISTORY_DB.enabled()) return json(res, 503, { error: "generation history is off: " + HISTORY_DB.whyDisabled() });
+      const key = decodeURIComponent(p.slice("/api/history/client/".length));
+      if (!key) return json(res, 400, { error: "client key required" });
+      const versions = await HISTORY_DB.listVersions(key);
+      if (!versions.length) return json(res, 404, { error: `no generations recorded for "${key}"` });
+      return json(res, 200, {
+        client: key,
+        betaSiteUrl: versions[0].beta_site_url,
+        existingSite: versions[0].existing_site,
+        versions: versions.map((v) => ({
+          version: v.version, engine: v.engine, status: v.status, job: v.job_draft_id,
+          createdAt: v.created_at, finishedAt: v.finished_at,
+          // A version with no stored pages cannot be previewed at all — the UI
+          // greys those out, so it needs to be able to tell without guessing
+          // from the status (a failed run can still have stored its pages).
+          previewable: v.pages.length > 0,
+          previewUrl: v.pages.length ? HISTORY_PREVIEW.previewUrl(key, v.version, "home") : null,
+          // History outlives the job list — Render's disk is ephemeral and jobs
+          // get pruned — so say whether the job detail page will actually resolve
+          // rather than letting the UI offer a row that leads to "job not found".
+          jobUrl: (v.job_draft_id && JOBS.get(v.job_draft_id)) ? `/job?id=${encodeURIComponent(v.job_draft_id)}` : null,
+          pages: v.pages.map((pg) => ({
+            slug: pg.slug, size: pg.size,
+            url: HISTORY_PREVIEW.previewUrl(key, v.version, pg.slug),
+          })),
+        })),
+      });
+    }
+
+    // A stored generation served back as a browsable website:
+    //   /preview/<clientKey>/v<n>/          → that version's home page
+    //   /preview/<clientKey>/v<n>/<slug>    → any other stored page
+    //
+    // The bytes are the archive's, untouched except for the site-root nav links,
+    // which are re-pointed at this same version so the four pages walk between
+    // each other instead of leaving for the live site. Everything that makes the
+    // page look right — CSS, JS, images, fonts — is already inside the document
+    // or on an absolute URL, so there is nothing else to serve.
+    if (p === "/preview" || p.startsWith("/preview/")) {
+      if (!HISTORY_DB.enabled()) return send(res, 503, "text/html", previewError("Generation history is off", HISTORY_DB.whyDisabled()));
+      const rest = p.slice("/preview".length).replace(/^\//, "");
+      const seg = rest.split("/");
+      const key = decodeURIComponent(seg.shift() || "");
+      const vm = String(seg.shift() || "").match(/^v(\d+)$/i);
+      if (!key || !vm) {
+        return send(res, 400, "text/html", previewError("Not a preview URL",
+          "Preview links look like /preview/&lt;beta-site-host&gt;/v3/ — open one from the history browser at /history."));
+      }
+      const version = Number(vm[1]);
+      const slug = HISTORY_PREVIEW.slugForPath(seg.join("/")) || "home";
+      const versions = await HISTORY_DB.listVersions(key);
+      const v = versions.find((x) => x.version === version);
+      if (!v) {
+        return send(res, 404, "text/html", previewError(`No V${version} for ${escHtml(key)}`,
+          versions.length ? `This client has V${versions.map((x) => x.version).join(", V")}.` : "No generations are recorded for this client."));
+      }
+      const have = v.pages.map((pg) => pg.slug);
+      const stored = await HISTORY_DB.readPage(key, version, slug);
+      if (stored == null) {
+        return send(res, 404, "text/html", previewError(`V${version} has no "${escHtml(slug)}" page`,
+          have.length ? `It stored: ${have.join(", ")}.` : "This version stored no pages — the run failed before the pages were written."));
+      }
+      const { html } = HISTORY_PREVIEW.rewriteNav(stored, key, version, have);
+      // noindex because these are client sites, and no-store because a version's
+      // bytes are immutable but the version a link points at is not worth caching
+      // across a redeploy.
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "X-Robots-Tag": "noindex, nofollow",
+        "Cache-Control": "no-store",
+      });
+      return res.end(html);
+    }
+
+    if (p === "/history" || p === "/history.html") return send(res, 200, "text/html", fs.readFileSync(path.join(DIR, "public", "history.html")));
+
+    if (p.startsWith("/history/")) {
+      if (!HISTORY_DB.enabled()) return json(res, 503, { error: "generation history is off: " + HISTORY_DB.whyDisabled() });
+      const parts = p.slice("/history/".length).split("/").filter(Boolean).map(decodeURIComponent);
+      const key = parts[0] || "";
+      if (!key) return json(res, 400, { error: "client key required — the beta site host, e.g. /history/mcptest2.gogroth.com" });
+      const versions = await HISTORY_DB.listVersions(key);
+      if (parts.length === 1) {
+        if (!versions.length) return json(res, 404, { error: `no generations recorded for "${key}"` });
+        return json(res, 200, { client: key, betaSiteUrl: versions[0].beta_site_url, existingSite: versions[0].existing_site,
+          versions: versions.map((v) => ({ version: v.version, engine: v.engine, status: v.status,
+            job: v.job_draft_id, createdAt: v.created_at, finishedAt: v.finished_at,
+            pages: v.pages.map((pg) => ({ slug: pg.slug, size: pg.size, url: `/history/${encodeURIComponent(key)}/v${v.version}/${pg.slug}` })) })) });
+      }
+      const vm = String(parts[1] || "").match(/^v(\d+)$/i);
+      if (!vm) return json(res, 400, { error: "version looks like v1, v2, …" });
+      const version = Number(vm[1]);
+      if (parts.length === 2) {
+        const v = versions.find((x) => x.version === version);
+        if (!v) return json(res, 404, { error: `no V${version} for "${key}"` });
+        return json(res, 200, { client: key, version, status: v.status,
+          pages: v.pages.map((pg) => ({ slug: pg.slug, size: pg.size, url: `/history/${encodeURIComponent(key)}/v${version}/${pg.slug}` })) });
+      }
+      const html = await HISTORY_DB.readPage(key, version, parts[2]);
+      if (html == null) return json(res, 404, { error: `no stored page "${parts[2]}" in V${version} for "${key}"` });
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "X-Robots-Tag": "noindex" });
+      return res.end(html);
     }
 
     if (p === "/api/sites") {

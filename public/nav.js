@@ -530,6 +530,7 @@
     { href: "/sites", label: "Sites", icon: "sites" },
     { href: "/dashboard", label: "Build a site", icon: "plus" },
     { href: "/jobs", label: "Activity", icon: "activity" },
+    { href: "/history", label: "Generation history", icon: "activity" },
     { href: "/coverage", label: "Page coverage", icon: "panel" },
     { href: "/review-links", label: "Review links", icon: "panel" },
   ];

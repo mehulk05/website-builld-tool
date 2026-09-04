@@ -6,48 +6,115 @@
 <title>Growth99 · Clients</title>
 <link rel="stylesheet" href="/theme.css?v=10">
 <style>
-  .wrap { max-width: 1180px; margin: 0 auto; padding: 30px 34px 90px; display: flex; flex-direction: column; gap: 18px; }
+  /* Layout ------------------------------------------------------------- */
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 28px 34px 90px; display: flex; flex-direction: column; gap: 20px; }
 
-  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 10px; }
-  .tile { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 15px 17px; box-shadow: var(--shadow-sm); }
-  .tile b { display: block; font-size: 26px; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; }
-  .tile span { display: block; font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 700; margin-top: 6px; }
-  .tile.good b { color: var(--good); }
-  .tile.warn b { color: var(--warn-strong); }
-  .tile.bad b { color: var(--bad); }
-  .tile.accent b { color: var(--accent); }
+  /* Header: title on the left, search on the right, on one line. */
+  .head { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
+  .head h1 { margin: 0; font-size: 24px; font-weight: 800; letter-spacing: -.02em; }
+  .head p { margin: 6px 0 0; color: var(--ink-3); font-size: 13.5px; max-width: 58ch; }
 
-  .store { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--muted); }
-  .store .dot { width: 7px; height: 7px; border-radius: 99px; background: var(--good); }
+  /* Search ------------------------------------------------------------- */
+  .search { position: relative; flex: none; width: 300px; max-width: 100%; }
+  .search svg { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); width: 15px; height: 15px; color: var(--muted); pointer-events: none; }
+  .search input {
+    width: 100%; height: 38px; padding: 0 34px 0 34px; font: 500 13px/1 var(--sans); color: var(--ink);
+    background: var(--surface); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow-sm);
+    transition: border-color var(--transition), box-shadow var(--transition);
+  }
+  .search input::placeholder { color: var(--muted); font-weight: 400; }
+  .search input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .search .clear {
+    position: absolute; right: 6px; top: 50%; transform: translateY(-50%); width: 24px; height: 24px;
+    display: none; place-items: center; border: 0; border-radius: 7px; background: none; cursor: pointer;
+    color: var(--muted); font-size: 15px; line-height: 1;
+  }
+  .search.has .clear { display: grid; }
+  .search .clear:hover { background: var(--surface-2); color: var(--ink); }
+
+  /* Summary figures: one quiet strip, not six competing cards. --------- */
+  .sum { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow-sm); overflow: hidden; }
+  .sum > div { padding: 14px 22px; flex: 1 1 0; min-width: 118px; border-left: 1px solid var(--line-2); }
+  .sum > div:first-child { border-left: 0; }
+  .sum b { display: block; font-size: 22px; font-weight: 800; line-height: 1.1; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+  .sum span { display: block; font-size: 11px; color: var(--muted); font-weight: 600; margin-top: 5px; }
+  .sum .good b { color: var(--good); }
+  .sum .accent b { color: var(--accent); }
+  .sum .bad b { color: var(--bad); }
+
+  .store { display: flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--muted); }
+  .store .dot { width: 6px; height: 6px; border-radius: 99px; background: var(--good); flex: none; }
+  .store.degraded { color: var(--warn-ink); }
   .store.degraded .dot { background: var(--warn); }
 
-  .card-t { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow-sm); overflow: hidden; }
+  /* Table -------------------------------------------------------------- */
+  .card-t { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow-sm); overflow: hidden; }
+  .card-t > header { display: flex; align-items: center; gap: 10px; padding: 12px 18px; border-bottom: 1px solid var(--line-2); }
+  .card-t > header h2 { margin: 0; font-size: 12.5px; font-weight: 700; letter-spacing: -.01em; }
+  .card-t > header .count { margin-left: auto; font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
   .tablewrap { overflow-x: auto; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 700; padding: 10px 15px; background: var(--surface-2); white-space: nowrap; }
-  td { padding: 11px 15px; border-top: 1px solid var(--line-2); vertical-align: middle; }
-  tr:hover td { background: var(--surface-2); }
-  td.client b { display: block; font-weight: 700; }
-  td.client small { color: var(--muted); font-size: 11px; font-family: var(--mono); }
-  td.mono { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); }
-  td.nowrap { white-space: nowrap; }
+  /* Fixed layout so the client name gets the room and the long URLs give it
+     up — with auto layout the repo column was taking three times the width of
+     the column people actually read. */
+  /* Fixed widths in pixels, and min-width is their sum — 970px.
+     Percentages were the bug: the actions column resolved to 108px while its
+     three buttons need 176px, and a flex row with justify-content:flex-end
+     overflows LEFT, so the buttons drew on top of the "Arrived" column. A
+     column can only be trusted at a width that actually fits its contents;
+     below the total the wrapper scrolls. */
+  table { width: 100%; min-width: 1000px; border-collapse: collapse; table-layout: fixed; font-size: 13px; }
+  col.c-client { width: 254px; }
+  col.c-site   { width: 202px; }
+  col.c-status { width: 100px; }
+  col.c-pages  { width: 140px; }
+  col.c-when   { width: 88px; }   /* "51m ago" needs 48px + 36px of cell padding */
+  col.c-acts   { width: 216px; }  /* 176px of buttons + 36px of cell padding, plus headroom */
 
-  .pgbar { width: 108px; height: 7px; border-radius: 99px; background: var(--line-2); overflow: hidden; }
-  .pgbar i { display: block; height: 100%; background: var(--good); }
-  .pgtxt { font-size: 11.5px; color: var(--ink-2); font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 4px; }
-  .pgnone { color: var(--muted); font-size: 11.5px; }
+  th { text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 700; padding: 9px 18px; background: var(--surface-2); white-space: nowrap; }
+  td { padding: 12px 18px; border-top: 1px solid var(--line-2); vertical-align: middle; }
+  tbody tr:hover td { background: var(--surface-2); }
 
-  .acts { display: flex; gap: 6px; justify-content: flex-end; }
-  .acts a { font-size: 11.5px; padding: 5px 10px; border-radius: 8px; border: 1px solid var(--line); color: var(--ink-2); text-decoration: none; font-weight: 600; white-space: nowrap; }
-  .acts a:hover { background: var(--surface-2); border-color: var(--line); color: var(--ink); }
-  .acts a.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  /* Every cell truncates rather than wrapping — a row is one line tall. */
+  td > *, td { min-width: 0; }
+  .trunc { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-  .live { display: inline-flex; align-items: center; gap: 5px; }
-  .live .pulse { width: 6px; height: 6px; border-radius: 99px; background: var(--accent); animation: pulse 1.4s ease-in-out infinite; }
+  td.client b { font-weight: 700; font-size: 13.5px; }
+  td.client small { color: var(--muted); font-size: 11px; font-family: var(--mono); margin-top: 2px; }
+  td.site a { color: var(--ink-2); text-decoration: none; font-size: 12.5px; }
+  td.site a:hover { color: var(--accent); text-decoration: underline; }
+  td.site small { color: var(--muted); font-size: 11px; font-family: var(--mono); margin-top: 2px; }
+  td.site small a { color: inherit; font-size: inherit; }
+  td.when { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+
+  .live { display: inline-flex; align-items: center; gap: 5px; margin-top: 4px; font-size: 11px; color: var(--muted); }
+  .live .pulse { width: 6px; height: 6px; border-radius: 99px; background: var(--accent); animation: pulse 1.4s ease-in-out infinite; flex: none; }
   @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .3 } }
 
-  .empty { color: var(--muted); text-align: center; padding: 46px 0; font-size: 13px; }
-  .foot { font-size: 11.5px; color: var(--muted); }
+  .pgbar { width: 100%; max-width: 120px; height: 5px; border-radius: 99px; background: var(--line-2); overflow: hidden; }
+  .pgbar i { display: block; height: 100%; background: var(--good); border-radius: 99px; }
+  .pgtxt { font-size: 11px; color: var(--ink-2); font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 5px; white-space: nowrap; }
+  .pgnone { color: var(--muted); font-size: 11.5px; }
+
+  /* Full strength, always. Fading them until hover made a filled dark "Open"
+     button read as disabled, which is worse than the visual noise it saved. */
+  .acts { display: flex; gap: 5px; justify-content: flex-end; min-width: 0; }
+  .acts a { font-size: 11.5px; padding: 5px 10px; border-radius: 8px; border: 1px solid var(--line); color: var(--ink-2); text-decoration: none; font-weight: 600; white-space: nowrap; background: var(--surface); }
+  .acts a:hover { background: var(--surface-2); border-color: var(--ink-3); color: var(--ink); }
+  .acts a.primary { background: var(--ink-btn); border-color: var(--ink-btn); color: var(--ink-btn-ink); font-weight: 700; }
+  .acts a.primary:hover { filter: brightness(1.2); color: var(--ink-btn-ink); }
+
+  tr.rowlink { cursor: pointer; }
+  tr.rowlink:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+  .empty { color: var(--muted); text-align: center; padding: 52px 20px; font-size: 13px; line-height: 1.7; }
+  .empty b { color: var(--ink-2); }
+  .foot { font-size: 11.5px; color: var(--muted); line-height: 1.7; }
+
+  @media (max-width: 720px) {
+    .wrap { padding: 22px 18px 80px; }
+    .search { width: 100%; }
+  }
 </style>
 </head>
 <body data-title="Clients">
