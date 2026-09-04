@@ -202,6 +202,21 @@ const NOCODB_TOKEN = process.env.NOCODB_TOKEN || "";
 const NOCODB_TABLE = process.env.NOCODB_TABLE || "mp8nfno2six11yi";
 // TED — where an inbound email request is logged for the delivery team. Off
 // until TED_API_TOKEN is set, so nothing changes for a deployment without one.
+// One value can cover every webhook. /api/webhook/email-change and
+// /api/webhook/email-outbox have always read WEBHOOK_SECRET when their own
+// variable was absent; the two TED endpoints never got the same fallback, so
+// standing them up meant a new environment variable each, on a service that
+// already carries thirty. A per-endpoint name still wins where one is set, for
+// anyone who wants to rotate a single subscription on its own.
+//
+// This does not loosen anything: with neither name set the caller is still
+// refused outright, and a wrong value still fails. The endpoint that genuinely
+// runs open — /api/webhook/ted-content-review — is deliberately left alone, so
+// giving it a shared secret cannot silently start 401ing the one subscription
+// TED has ever delivered to.
+function webhookSecret(name) {
+  return String(process.env[name] || process.env.WEBHOOK_SECRET || "").trim();
+}
 const TED_BASE = (process.env.TED_BASE || "https://ted.growth99.com").replace(/\/$/, "");
 const TED_API_TOKEN = process.env.TED_API_TOKEN || "";
 // SSO handoff: a browser that's logged out here gets bounced to TED's login page (nav.js), and a
@@ -15314,6 +15329,184 @@ function cdnWebpUrl(src, width = IMG_TARGET_WIDTH) {
 // bound to themeAbs and everything else undefined, throwing on facts.city.
 // Confirmed live, 2026-08-06: "Cannot read properties of undefined (reading 'city')"
 // at this line, reproduced by calling fixImages(html) exactly as generate-site does.
+// ---- images on a GitOps site -------------------------------------------------
+// A Model B page keeps its photos as absolute URLs inside raw Elementor HTML,
+// pointing at whatever site the page was generated from — so the pilot's pages
+// currently serve another client's images off another client's domain. Renaming
+// or recompressing them was impossible for exactly one reason: MediaResolver
+// resolved a "media:<ref>" only when it was a whole string value or an Elementor
+// {id, url} pair, never one sitting inside markup, so a localised copy in
+// resources/media had no URL the HTML could point at. The resolver now rewrites
+// refs inside strings as well, which is what makes this a fix rather than a
+// report.
+//
+// SVG is left alone deliberately: WordPress refuses the upload by default, so a
+// localised copy would be a broken image where a working hotlink used to be.
+const IMG_SKIP_HOSTS = /fonts\.(?:googleapis|gstatic)\.com|googletagmanager\.com|google-analytics\.com|gravatar\.com/i;
+let sharpModule = null, sharpLoaded = false;
+function imageCodec() {
+  if (!sharpLoaded) {
+    sharpLoaded = true;
+    try { sharpModule = require("sharp"); }
+    catch (e) { sharpModule = null; console.warn("pre-release: sharp not installed — images can be renamed but not recompressed"); }
+  }
+  return sharpModule;
+}
+// Step the width down until the encode fits the weight budget, and only drop
+// quality once the smallest sensible width still overshoots: a soft 700px photo
+// looks worse than a crisp one at q60.
+async function webpUnderBudget(buf, maxBytes) {
+  const sharp = imageCodec();
+  if (!sharp) return null;
+  const meta = await sharp(buf).metadata().catch(() => null);
+  if (!meta || !meta.width) return null;
+  const widths = [Math.min(meta.width, IMG_TARGET_WIDTH), 1200, 900, 700]
+    .filter((w, i, a) => w > 0 && a.indexOf(w) === i);
+  let last = null;
+  for (const quality of [72, 60]) {
+    for (const width of widths) {
+      const out = await sharp(buf).resize({ width, withoutEnlargement: true })
+        .webp({ quality }).toBuffer().catch(() => null);
+      if (!out || !out.length) continue;
+      last = { buf: out, width, quality };
+      if (out.length <= maxBytes) return last;
+    }
+  }
+  return last;
+}
+// Every <img src> in the document tree, first occurrence only, with the tag it
+// came from so the rename can read its alt text.
+function gitopsImageTargets(doc, pageSlug, seen) {
+  const out = [];
+  const visit = (v) => {
+    if (typeof v === "string") {
+      for (const tag of v.match(/<img\b[^>]*>/gi) || []) {
+        const src = (tag.match(/\ssrc\s*=\s*"([^"]*)"/i) || [])[1] || "";
+        if (!/^https?:\/\//i.test(src) || seen.has(src)) continue;
+        seen.add(src);
+        out.push({ src, tag, pageSlug });
+      }
+      return;
+    }
+    if (Array.isArray(v)) { v.forEach(visit); return; }
+    if (v && typeof v === "object") { Object.values(v).forEach(visit); }
+  };
+  visit(doc);
+  return out;
+}
+// srcset and sizes are dropped from a rewritten tag on purpose: they still name
+// the old host, at higher priority than src, so leaving them in means the browser
+// keeps loading the foreign image and the fix changes nothing anyone can see.
+function gitopsRewriteImages(v, refs) {
+  if (typeof v === "string") {
+    if (!/<img\b/i.test(v)) return v;
+    return v.replace(/<img\b[^>]*>/gi, (tag) => {
+      const src = (tag.match(/\ssrc\s*=\s*"([^"]*)"/i) || [])[1] || "";
+      const ref = refs.get(src);
+      if (!ref) return tag;
+      return tag
+        .replace(/\s(?:srcset|data-srcset|sizes)\s*=\s*"[^"]*"/gi, "")
+        .replace(/(\ssrc\s*=\s*")[^"]*(")/i, `$1media:${ref}$2`);
+    });
+  }
+  if (Array.isArray(v)) return v.map((x) => gitopsRewriteImages(x, refs));
+  if (v && typeof v === "object") {
+    const out = {};
+    for (const [k, val] of Object.entries(v)) out[k] = gitopsRewriteImages(val, refs);
+    return out;
+  }
+  return v;
+}
+async function gitopsFixImages(resAbs, pages, businessName, facts) {
+  const mediaDir = path.join(resAbs, "media");
+  const bizSlug = prSlugify(businessName).split("-").slice(0, 3).join("-");
+  const loc = facts.city ? `in-${prSlugify(facts.city)}${facts.region ? "-" + prSlugify(facts.region) : ""}` : "";
+  const taken = new Set(fs.existsSync(mediaDir)
+    ? fs.readdirSync(mediaDir).filter((f) => f.endsWith(".json")).map((f) => f.slice(0, -5))
+    : []);
+
+  // Pass 1: what the whole site points at, deduplicated — one photo used on four
+  // pages is one download and one media resource, not four.
+  const docs = [];
+  const seen = new Set();
+  const targets = [];
+  for (const pg of pages) {
+    if (!pg.dir) continue;
+    const abs = path.join(resAbs, "pages", pg.dir, "elementor.json");
+    const raw = readIf(abs);
+    if (!raw) continue;
+    let doc;
+    try { doc = JSON.parse(raw); } catch (_) { continue; }
+    docs.push({ abs, doc, slug: pg.slug, dir: pg.dir });
+    targets.push(...gitopsImageTargets(doc, pg.slug, seen));
+  }
+  if (!docs.length) return { changed: [], skipped: true, swaps: [], note: "no Elementor documents to read images from" };
+
+  // Pass 2: localise each distinct image once.
+  const refs = new Map();
+  const changed = [], swaps = [], notLocalised = [];
+  let bytesBefore = 0, bytesAfter = 0;
+  for (const t of targets) {
+    if (IMG_SKIP_HOSTS.test(t.src)) continue;
+    if (/\.svg(?:$|[?#])/i.test(t.src)) { notLocalised.push("SVG"); continue; }
+    let buf = null, was = 0;
+    // The body of a rejected response has to be cancelled explicitly: undici keeps
+    // the socket alive waiting for a read, and a live handle at process exit trips
+    // a libuv assertion rather than exiting cleanly.
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 30000);
+    try {
+      const r = await fetch(t.src, { signal: ctrl.signal, redirect: "follow", headers: { "User-Agent": "G99PerformPR/1.0" } });
+      if (!r.ok) {
+        try { await r.body?.cancel(); } catch (_) { /* already drained */ }
+        notLocalised.push(`HTTP ${r.status}`);
+        continue;
+      }
+      buf = Buffer.from(await r.arrayBuffer());
+      was = buf.length;
+    } catch (e) { notLocalised.push("unreachable"); continue; }
+    finally { clearTimeout(timer); }
+    if (!buf || !buf.length) { notLocalised.push("empty"); continue; }
+    const encoded = await webpUnderBudget(buf, IMG_MAX_BYTES);
+    if (!encoded) { notLocalised.push("could not be re-encoded"); continue; }
+    const alt = (t.tag.match(/\b(?:data-)?alt\s*=\s*["']([^"']+)["']/i) || [])[1] || "";
+    const extra = alt.toLowerCase().replace(/[^a-z0-9\s-]/g, " ").split(/\s+/)
+      .filter((w) => w.length > 2 && !IMG_STOPWORDS.has(w)).slice(4, 9);
+    const base = [imageSubject(t.tag, t.pageSlug, businessName), bizSlug, loc].filter(Boolean).join("-").slice(0, 90);
+    const ref = uniqueImageName(base, taken, extra);
+    fs.mkdirSync(mediaDir, { recursive: true });
+    fs.writeFileSync(path.join(mediaDir, ref + ".webp"), encoded.buf);
+    fs.writeFileSync(path.join(mediaDir, ref + ".json"),
+      JSON.stringify({ ref, file: ref + ".webp", alt, caption: "" }, null, 4) + "\n");
+    changed.push(`resources/media/${ref}.webp`, `resources/media/${ref}.json`);
+    refs.set(t.src, ref);
+    bytesBefore += was; bytesAfter += encoded.buf.length;
+    swaps.push({ page: t.pageSlug, from: t.src, to: `resources/media/${ref}.webp`, wasBytes: was, nowBytes: encoded.buf.length });
+  }
+  if (!refs.size) {
+    const why = notLocalised.length
+      ? `${notLocalised.length} image(s) could not be localised (${[...new Set(notLocalised)].join(", ")})`
+      : "no remote images to localise";
+    return { changed: [], skipped: true, swaps: [], note: why };
+  }
+
+  // Pass 3: point the markup at the media refs.
+  for (const d of docs) {
+    const before = JSON.stringify(d.doc);
+    const after = gitopsRewriteImages(d.doc, refs);
+    if (JSON.stringify(after) === before) continue;
+    fs.writeFileSync(d.abs, JSON.stringify(after, null, 4) + "\n");
+    changed.push(`resources/pages/${d.dir}/elementor.json`);
+  }
+  const saved = bytesBefore && bytesAfter ? Math.round((1 - bytesAfter / bytesBefore) * 100) : 0;
+  const tail = notLocalised.length
+    ? ` \u00b7 ${notLocalised.length} left hotlinked (${[...new Set(notLocalised)].join(", ")})`
+    : "";
+  return {
+    changed: [...new Set(changed)], swaps,
+    note: `${refs.size} image(s) localised into resources/media as WebP \u00b7 ${Math.round(bytesBefore / 1024)}KB \u2192 ${Math.round(bytesAfter / 1024)}KB${saved > 0 ? ` (\u2212${saved}%)` : ""}${tail}`,
+  };
+}
 async function performPrFixImages(themeAbs, pages, businessName, facts, themePath) {
   // A GitOps page is Elementor content, and its photos sit inside raw HTML. The
   // fleet's media resolver only rewrites a "media:<ref>" that is a whole string
@@ -15322,7 +15515,20 @@ async function performPrFixImages(themeAbs, pages, businessName, facts, themePat
   // Renaming and recompressing stays a report on this model. (An image WIDGET
   // could be repointed; no site emitted by the Design Engine uses one.)
   if (pages.some((p) => GJ.isVirtual(p.file))) {
-    return { changed: [], skipped: true, swaps: [], note: "images live in raw Elementor HTML — a repo-local copy has no resolvable URL on a GitOps site, so naming and weight are reported for the media library" };
+    // Gated the same way PERFORM_PR_RENAME_SLUGS is, and for a harder reason:
+    // localising an image rewrites its src to "media:<ref>", and a fleet whose
+    // MediaResolver cannot yet resolve a ref inside markup will ship that string
+    // to the browser verbatim — every photo on the page broken — while its
+    // Validator rejects the same refs and aborts the reconcile outright. So the
+    // fix is correct and unsafe at the same time, until g99-control carries both
+    // changes. Turn this on in the same deploy that ships them.
+    if (String(process.env.PERFORM_PR_LOCALISE_IMAGES || "").toLowerCase() !== "on") {
+      return {
+        changed: [], skipped: true, swaps: [],
+        note: "image localising is switched off (PERFORM_PR_LOCALISE_IMAGES) — it needs the MediaResolver/Validator fixes in g99-control first, so naming and weight are reported only",
+      };
+    }
+    return await gitopsFixImages(themeAbs, pages, businessName, facts);
   }
   const bizSlug = prSlugify(businessName).split("-").slice(0, 3).join("-");
   const loc = facts.city ? `in-${prSlugify(facts.city)}${facts.region ? "-" + prSlugify(facts.region) : ""}` : "";
@@ -15516,27 +15722,19 @@ function fixBlogSidebar(themeAbs) {
 // elements into an empty template would not ADD a call bar or a 404, it would
 // replace the live footer with one. So these say what is missing, precisely
 // enough to act on, and change nothing.
-function fixGitops404(root) {
-  const found = GP.notFoundTemplate(root);
-  if (found) return { changed: [], note: `templates/${found} handles 404s` };
-  return {
-    changed: [], skipped: true,
-    note: "no 404 theme part in resources/templates — build one in Elementor with an Error 404 display condition, and it will export here",
-  };
+// Kept as a thin wrapper so the checklist reads the same on both models; the work
+// (and the reasoning about why writing this resource is safe) is in
+// gitops-prerelease.js.
+function fixGitops404(root, brand, businessName) {
+  return GP.fix404(root, brand, businessName);
 }
-function fixGitopsCallNow(root, pages, chrome, phone) {
-  const st = GP.callNowState(root, pages, chrome);
-  if (st.ok) return { changed: [], note: st.how };
-  if (!phone) return { changed: [], skipped: true, note: "no phone number on the site to call" };
-  return {
-    changed: [], skipped: true,
-    note: `no sticky Call Now bar. It belongs in the footer theme part, which WordPress still owns on this site — add it there pointing at ${phone}`,
-  };
+// Both are thin wrappers now, for the same reason as fixGitops404: the checklist
+// reads the same on both models and the Model B work lives in gitops-prerelease.js.
+function fixGitopsCallNow(root, pages, chrome, phone, brand) {
+  return GP.fixCallNow(root, pages, chrome, phone, brand);
 }
 function fixGitopsBlogSidebar(root) {
-  const blog = GP.blogState(root);
-  if (!blog.has) return { changed: [], note: "this site has no blog — sidebar not applicable", skipped: true };
-  return { changed: [], skipped: true, note: `blog present (${blog.templates.join(", ") || "posts only"}); the sidebar widget is a WordPress-side setting, not a resource` };
+  return GP.fixBlogSidebar(root);
 }
 function fixClickable(themeAbs, pages, themePath) {
   const changed = [];
@@ -16396,8 +16594,8 @@ async function runPerformPrJob(job) {
     }
     record("Favicon", gitops ? GP.fixFavicon(tmp) : fixFavicon(themeAbs, contentPages, P.themePath, siteHost), "favicon");
     record("Social sharing image", gitops ? GP.fixSocialImage(tmp, pages) : fixSocialImage(themeAbs, contentPages, P.themePath, siteHost));
-    record("Custom 404", gitops ? fixGitops404(tmp) : fix404(themeAbs, P.themePath, brand));
-    record("Call Now", gitops ? fixGitopsCallNow(tmp, contentPages, chrome, facts.phone) : fixCallNow(themeAbs, P.themePath, facts.phone, brand));
+    record("Custom 404", gitops ? fixGitops404(tmp, brand, contentName) : fix404(themeAbs, P.themePath, brand));
+    record("Call Now", gitops ? fixGitopsCallNow(tmp, contentPages, chrome, facts.phone, brand) : fixCallNow(themeAbs, P.themePath, facts.phone, brand));
     record("BLVD button ID", fixBlvd(themeAbs, contentPages, P.themePath));
     record("Blog sidebar widget", gitops ? fixGitopsBlogSidebar(tmp) : fixBlogSidebar(themeAbs));
     record("Blog link colour", gitops ? GP.fixBlogLinkColor(tmp, brand, PR_MARK) : fixBlogLinkColor(themeAbs, P.themePath, brand));
@@ -16408,7 +16606,7 @@ async function runPerformPrJob(job) {
     job.prFixedTasks = [...fixedTasks];
     // Kept on the job for the same reason as prFixedTasks: the report re-resolves
     // outcomes when it renders, including a re-render months later.
-    job.prNotHere = gitops ? ["image-naming", "image-format", "image-weight"] : [];
+    job.prNotHere = [];
     resolveFindingOutcomes(job.prFindings, fixedTasks, new Set(job.prNotHere));
     job.prChanged = [...new Set(job.prChanged)];
     job.editPlan = job.prChanged.map((p2) => ({ path: p2, op: "modify" }));
@@ -16958,7 +17156,7 @@ const server = http.createServer(async (req, res) => {
       // tool uses X-Webhook-Secret. Reading only one of those means the day
       // somebody fills in the wrong tab, every delivery 401s and the pre-release
       // run silently stops happening.
-      const secret = (process.env.PRE_RELEASE_WEBHOOK_SECRET || "").trim();
+      const secret = webhookSecret("PRE_RELEASE_WEBHOOK_SECRET");
       if (!secret) {
         // Fails closed, like every other webhook here. This endpoint clones,
         // audits, opens and MERGES a pull request against a client's repository,
@@ -16969,9 +17167,9 @@ const server = http.createServer(async (req, res) => {
         // delivering, so switching it off at this end is visible: set
         // PRE_RELEASE_WEBHOOK_SECRET here and the same value on the
         // subscription's Secret Auth tab, and it resumes.
-        console.warn("pre-release: refused — PRE_RELEASE_WEBHOOK_SECRET is not set, so this endpoint cannot tell TED from anyone else");
+        console.warn("pre-release: refused — neither PRE_RELEASE_WEBHOOK_SECRET nor WEBHOOK_SECRET is set, so this endpoint cannot tell TED from anyone else");
 
-        return json(res, 401, { error: "webhook not configured on this deployment (PRE_RELEASE_WEBHOOK_SECRET unset)" });
+        return json(res, 401, { error: "webhook not configured on this deployment (set PRE_RELEASE_WEBHOOK_SECRET or WEBHOOK_SECRET)" });
       }
       {
         const sent = String(req.headers["x-ted-webhook-secret"] || req.headers["x-webhook-secret"]
@@ -17580,9 +17778,9 @@ const server = http.createServer(async (req, res) => {
       //
       // Failing closed costs nothing here: unset means no caller is
       // authenticating, which means no legitimate caller is configured yet.
-      const secret = (process.env.TED_SUBTASK_WEBHOOK_SECRET || "").trim();
+      const secret = webhookSecret("TED_SUBTASK_WEBHOOK_SECRET");
       if (!secret) {
-        console.warn("ted-subtask webhook: refused — TED_SUBTASK_WEBHOOK_SECRET is not set, so this endpoint cannot tell TED from anyone else");
+        console.warn("ted-subtask webhook: refused — neither TED_SUBTASK_WEBHOOK_SECRET nor WEBHOOK_SECRET is set, so this endpoint cannot tell TED from anyone else");
 
         return json(res, 401, { error: "webhook not configured on this deployment" });
       }
@@ -19868,9 +20066,9 @@ if (require.main === module) {
   // unregistered webhook is invisible from here — TED simply never calls — so
   // the one thing this side can report is whether it would accept the call.
   if (TED_API_TOKEN && TED_SUBTASKS) {
-    console.log((process.env.TED_SUBTASK_WEBHOOK_SECRET || "").trim()
+    console.log(webhookSecret("TED_SUBTASK_WEBHOOK_SECRET")
       ? `TED subtask webhook: armed at ${G99_TOOL_PUBLIC_URL || "(G99_TOOL_PUBLIC_URL unset)"}/api/webhook/ted-subtask — TED must send x-webhook-secret`
-      : "TED subtask webhook: DISABLED — TED_SUBTASK_WEBHOOK_SECRET is not set, so the endpoint refuses every caller and requests arrive only via the poll");
+      : "TED subtask webhook: DISABLED — neither TED_SUBTASK_WEBHOOK_SECRET nor WEBHOOK_SECRET is set, so the endpoint refuses every caller and requests arrive only via the poll");
   }
   // Say which mode content review is in, at boot, every time. The one thing that
   // must never be ambiguous is whether a reviewer's correction ends up in a local
@@ -19948,5 +20146,6 @@ module.exports = {
   detectAttachmentKind, unzipEntry, extractDocxText, extractPdfText, isLegacyOfficeFile,
   PRE_RELEASE_CHECKLIST, checklistVerdict, checklistItemReport,
   srcRead, srcWrite, findingsGitopsFavicon, fixGitops404, fixGitopsCallNow, fixGitopsBlogSidebar,
+  gitopsFixImages, gitopsImageTargets, gitopsRewriteImages, webpUnderBudget,
   waitForGitopsDeployment,
 };

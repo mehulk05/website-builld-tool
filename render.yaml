@@ -9,6 +9,14 @@ services:
     startCommand: node server.js
     healthCheckPath: /api/auth-check
     envVars:
+      # Where Playwright looks for its browser. render-build.sh installs Chromium
+      # with this same value, which puts it inside node_modules rather than
+      # ~/.cache so it survives into the running service — and Playwright only
+      # finds it if install time and run time agree. Changing one without the
+      # other silently hides the browser and the engine loses its screenshots
+      # and its bot-wall fallback.
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: "0"
       - key: STITCH_API_KEY
         sync: false          # set in dashboard
       - key: GEMINI_KEYS

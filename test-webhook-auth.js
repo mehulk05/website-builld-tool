@@ -41,6 +41,12 @@ function boot(env) {
       REAUDIT_HOURS: "0",
       ADMIN_PASSWORD: "",
       NOCODB_TOKEN: "",
+      // Cleared on purpose: WEBHOOK_SECRET is now a fallback for both endpoints,
+      // so a value in the developer's own .env would leak in and quietly turn
+      // every "nothing is configured" case into a configured one.
+      WEBHOOK_SECRET: "",
+      TED_SUBTASK_WEBHOOK_SECRET: "",
+      PRE_RELEASE_WEBHOOK_SECRET: "",
       ...env,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -98,6 +104,52 @@ const post = (headers, body) => fetch(`http://127.0.0.1:${PORT}/api/webhook/ted-
     await t("boot says plainly that the fast path is off", async () => {
       assert.match(s.log(), /TED subtask webhook: DISABLED/,
         "an unregistered webhook is invisible from this side; the least it can do is say it would refuse");
+    });
+  } finally { s.child.kill(); }
+
+  // ---- one shared secret covers both endpoints -----------------------------
+  // Asked for by Mehul: a variable per webhook is a lot of environment to carry
+  // on a service that already has thirty, and TED holds the same value in each
+  // subscription's Secret Auth tab anyway.
+  s = boot({ WEBHOOK_SECRET: "shared-value" });
+  try {
+    await ready();
+    const ping = { event: "SUBTASK_CREATED", timestamp: new Date().toISOString(), source: "ted", subscriptionId: "abc", data: {} };
+
+    await t("WEBHOOK_SECRET alone arms the sub-task webhook", async () => {
+      const r = await post({ "x-webhook-secret": "shared-value" }, ping);
+      assert.strictEqual(r.status, 200, "the shared value must reach the handler proper");
+    });
+
+    await t("WEBHOOK_SECRET alone arms pre-release too", async () => {
+      const r = await fetch(`http://127.0.0.1:${PORT}/api/webhook/pre-release`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-webhook-secret": "shared-value" },
+        body: JSON.stringify({ event: "TASK_STATUS_CHANGED", timestamp: new Date().toISOString(), source: "ted", subscriptionId: "abc", data: {} }),
+      });
+      assert.strictEqual(r.status, 200);
+    });
+
+    await t("a wrong value is still refused under the shared name", async () => {
+      assert.strictEqual((await post({ "x-webhook-secret": "nope" }, ping)).status, 401);
+    });
+
+    await t("boot reports armed, reading the same way the endpoint does", async () => {
+      assert.match(s.log(), /TED subtask webhook: armed/,
+        "the banner must not say DISABLED while the endpoint would accept a caller");
+    });
+  } finally { s.child.kill(); }
+
+  // ---- a per-endpoint name still wins --------------------------------------
+  s = boot({ WEBHOOK_SECRET: "shared-value", TED_SUBTASK_WEBHOOK_SECRET: "specific-value" });
+  try {
+    await ready();
+    const ping = { event: "SUBTASK_CREATED", timestamp: new Date().toISOString(), source: "ted", subscriptionId: "abc", data: {} };
+
+    await t("the endpoint's own variable takes precedence, so one hook can be rotated alone", async () => {
+      assert.strictEqual((await post({ "x-webhook-secret": "specific-value" }, ping)).status, 200);
+      assert.strictEqual((await post({ "x-webhook-secret": "shared-value" }, ping)).status, 401,
+        "the shared value must stop working on an endpoint that named its own");
     });
   } finally { s.child.kill(); }
 

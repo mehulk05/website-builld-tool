@@ -1,5 +1,7 @@
 // Pre-release on a GitOps JSON site. Pure functions and a temp fixture — no
-// network, no GitHub, no API keys.
+// network, no GitHub, no API keys. The image fixture points at an .invalid host
+// on purpose: the download path runs to its failure branch without a socket ever
+// being opened, which is what keeps this suite offline and its exit clean.
 //
 //   node test-gitops-prerelease.js                       # fixture only
 //   node test-gitops-prerelease.js ../local-mcptest2     # + a real checkout, read-only
@@ -36,7 +38,7 @@ const HOME_HTML = [
   `<section class="cta"><h2>Book your consultation</h2><p>Call us today.</p><a href="tel:+17065550134">706-555-0134</a><a class="blvd-book" href="https://blvd.example/book">Book online</a></section>`,
 ].join("");
 const ABOUT_HTML = `<section class="about"><h2>About Brew Aesthetic</h2><p>Recieve expert care. Reach us on 706-555-0134.</p></section>`;
-const BOTOX_HTML = `<section><h2>Botox</h2><p>Brew Aesthetic offers Botox.</p><img src="https://images.unsplash.com/photo-12345?w=2000" alt="a very soft close up shot"></section>`;
+const BOTOX_HTML = `<section><h2>Botox</h2><p>Brew Aesthetic offers Botox.</p><img src="https://images.unsplash.invalid/photo-12345?w=2000" alt="a very soft close up shot"></section>`;
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "g99gp-"));
@@ -78,6 +80,14 @@ function fixture() {
 
   w("posts/a-post/resource.json", { schema_version: 1, git_id: "post-a-6", type: "post", slug: "a-post", title: "A post", status: "publish", content: "<p>body</p>" });
   w("templates/footer/elementor.json", doc([]));
+  // A real export always writes resource.json beside it, and "footer" is an
+  // Elementor Pro Theme Builder type — which is how the 404 fix knows the site
+  // can serve a template-driven 404 at all.
+  w("templates/footer/resource.json", {
+    schema_version: 1, git_id: "template-footer-9", type: "elementor_library", slug: "footer",
+    title: "Footer", elementor_template_type: "footer", status: "publish",
+    publication_approved: true, conditions: ["include/general"], is_active_kit: false,
+  });
   return root;
 }
 const rmrf = (p) => { try { fs.rmSync(p, { recursive: true, force: true }); } catch (_) {} };
@@ -286,11 +296,40 @@ async function imageChecks() {
     const f = S.findingsImages(S.imageSources(pages), "Brew Aesthetics");
     assert.ok(f.length, "a photo-12345 filename is reported");
   });
+  ok("every remote <img> is found once, however often it is used", () => {
+    const seen = new Set();
+    const found = S.gitopsImageTargets(readJ(root, "pages/botox/elementor.json"), "botox", seen);
+    assert.strictEqual(found.length, 1);
+    assert.ok(found[0].src.includes("images.unsplash.invalid"));
+    // a second document quoting the same photo adds nothing
+    assert.strictEqual(S.gitopsImageTargets(readJ(root, "pages/botox/elementor.json"), "botox", seen).length, 0);
+  });
+  ok("a rewritten tag points at the media ref and loses its srcset", () => {
+    const before = { settings: { html: '<img src="https://cdn.example/a.jpg" srcset="https://cdn.example/a-2x.jpg 2x" sizes="100vw" alt="chair">' } };
+    const after = S.gitopsRewriteImages(before, new Map([["https://cdn.example/a.jpg", "treatment-chair-brew"]]));
+    assert.ok(after.settings.html.includes('src="media:treatment-chair-brew"'), after.settings.html);
+    assert.ok(!/srcset|sizes=/.test(after.settings.html), "srcset and sizes would out-rank src and keep loading the old host");
+    assert.ok(after.settings.html.includes('alt="chair"'), "alt text survives");
+  });
+  ok("an unknown src is left exactly as it was", () => {
+    const before = { html: '<img src="https://cdn.example/b.jpg" alt="x">' };
+    assert.deepStrictEqual(S.gitopsRewriteImages(before, new Map()), before);
+  });
+  // The fixture's photo does not exist, so this exercises the failure path with
+  // no working network: it must report why and leave the document untouched.
+  ok("with the switch off, localising is declined and says what it is waiting for", async () => {
+    delete process.env.PERFORM_PR_LOCALISE_IMAGES;
+    const off = await S.performPrFixImages(path.join(root, "resources"), pages, "Brew Aesthetics", { city: "Evans" }, "resources");
+    assert.ok(off.skipped && !off.changed.length);
+    assert.ok(/PERFORM_PR_LOCALISE_IMAGES/.test(off.note), off.note);
+    assert.ok(/g99-control/.test(off.note), "and names what has to ship first");
+  });
+  process.env.PERFORM_PR_LOCALISE_IMAGES = "on";
   const r = await S.performPrFixImages(path.join(root, "resources"), pages, "Brew Aesthetics", { city: "Evans" }, "resources");
-  ok("localising declines, says why, and downloads nothing", () => {
+  ok("an image it cannot fetch is reported, and the page is left alone", () => {
     assert.ok(r.skipped && !r.changed.length, r.note);
-    assert.ok(/no resolvable URL/.test(r.note), r.note);
-    assert.ok(readJ(root, "pages/botox/elementor.json").elements[0].elements[0].settings.html.includes("images.unsplash.com"),
+    assert.ok(/could not be localised/.test(r.note), r.note);
+    assert.ok(readJ(root, "pages/botox/elementor.json").elements[0].elements[0].settings.html.includes("images.unsplash.invalid"),
       "the page still points at the original photo");
   });
   rmrf(root);
@@ -398,22 +437,65 @@ head("redirects, slugs and the site-level fixes");
 }
 {
   const root = fixture();
-  ok("no 404 theme part is reported with what to build", () => {
-    const r = S.fixGitops404(root);
-    assert.ok(r.skipped && !r.changed.length);
-    assert.ok(/Error 404 display condition/.test(r.note), r.note);
+  ok("a branded 404 Theme Builder template is created, once", () => {
+    const r = S.fixGitops404(root, "#7d4a2b", "Brew Aesthetic");
+    assert.deepStrictEqual(r.changed, ["resources/templates/404/resource.json", "resources/templates/404/elementor.json"]);
+    const meta = readJ(root, "templates/404/resource.json");
+    assert.strictEqual(meta.elementor_template_type, "error-404");
+    assert.deepStrictEqual(meta.conditions, ["include/general"]);
+    assert.strictEqual(meta.status, "publish");
+    const html = readJ(root, "templates/404/elementor.json").elements[0].elements[0].settings.html;
+    assert.ok(html.includes("#7d4a2b"), "the brand colour is used");
+    assert.ok(html.includes("Brew Aesthetic"), "and the site is named");
+    assert.ok(html.includes("{{SITE_URL}}/"), "home link is portable, not the exporting site");
+    const again = S.fixGitops404(root, "#7d4a2b", "Brew Aesthetic");
+    assert.ok(!again.changed.length, "a second run finds it and writes nothing");
   });
-  ok("Call Now names the number to use rather than inventing a footer", () => {
+  ok("without Elementor Pro it is reported instead — the template would never be served", () => {
+    const bare = fixture();
+    rmrf(path.join(bare, "resources", "templates"));
+    const r = S.fixGitops404(bare, "#7d4a2b", "Brew Aesthetic");
+    assert.ok(r.skipped && !r.changed.length);
+    assert.ok(/Elementor Pro/.test(r.note), r.note);
+    assert.ok(!fs.existsSync(path.join(bare, "resources", "templates", "404")), "and writes no template");
+    rmrf(bare);
+  });
+  ok("Call Now rides the site-wide snippet, since this model has no theme footer", () => {
     const pages = GP.readPages(root, { pageText: S.pageText }).pages;
-    const r = S.fixGitopsCallNow(root, pages, GP.chromePages(root), "706-555-0134");
-    assert.ok(r.skipped && !r.changed.length);
-    assert.ok(r.note.includes("706-555-0134"), r.note);
+    const r = S.fixGitopsCallNow(root, pages, GP.chromePages(root), "706-555-0134", "#7d4a2b");
+    assert.deepStrictEqual(r.changed, ["resources/cpt/elementor_snippet/g99-site-js/cpt.json"]);
+    const snip = readJ(root, "cpt/elementor_snippet/g99-site-js/cpt.json");
+    assert.strictEqual(snip.type, "elementor_snippet");
+    assert.strictEqual(snip.slug, "g99-site-js");
+    assert.ok(snip.content.includes("g99-call-now"), snip.content.slice(0, 120));
+    assert.ok(snip.content.includes('a.href = "tel:7065550134"'), "the number is dialable");
+    assert.ok(snip.content.includes("#7d4a2b"), "and brand-coloured");
+    const again = S.fixGitopsCallNow(root, pages, GP.chromePages(root), "706-555-0134", "#7d4a2b");
+    assert.ok(!again.changed.length, "a second run sees its own bar and adds nothing");
   });
-  ok("blog link colour refuses to invent the site's stylesheet", () => {
+  ok("a sticky side rail plus a phone number somewhere is NOT a call bar", () => {
+    // The old check asked "is anything fixed?" and "is there a tel: link?" of the
+    // whole site separately, so every generated page passed on a Book-a-visit rail.
+    assert.strictEqual(GP.fixedCallLink('<style>.rail{position:fixed;right:0}</style><div class="rail">Book</div><a href="tel:7065550134">call us</a>'), "");
+    assert.ok(GP.fixedCallLink('<style>.bar{position:fixed;bottom:0}</style><a class="bar" href="tel:7065550134">Call</a>'));
+    assert.ok(GP.fixedCallLink('<a style="position:fixed;bottom:0" href="tel:7065550134">Call</a>'));
+  });
+  ok("the blog sidebar answers from widgets.json rather than deferring", () => {
+    const r = GP.fixBlogSidebar(root);
+    assert.ok(!r.changed.length);
+    assert.ok(/no widget areas|sidebars_widgets/.test(r.note), r.note);
+  });
+  ok("blog link colour creates the stylesheet when the site has none", () => {
+    // Absent means absent: the exporter writes this file from the Customizer and
+    // deletes it when there is nothing to write, so there is no CSS to lose.
     const r = GP.fixBlogLinkColor(root, "#7d4a2b", "g99-perform-pr");
-    assert.ok(r.skipped && !r.changed.length);
-    assert.ok(/Additional CSS/.test(r.note), r.note);
-    assert.ok(!fs.existsSync(path.join(root, "resources", "custom-css.css")), "and writes no file");
+    assert.deepStrictEqual(r.changed, ["resources/custom-css.css"]);
+    const css = fs.readFileSync(path.join(root, "resources", "custom-css.css"), "utf8");
+    assert.ok(css.startsWith("/*"), "no leading blank lines");
+    assert.ok(css.includes("#7d4a2b"));
+    const again = GP.fixBlogLinkColor(root, "#7d4a2b", "g99-perform-pr");
+    assert.ok(!again.changed.length, "and is not written twice");
+    fs.rmSync(path.join(root, "resources", "custom-css.css"));
   });
   ok("where the stylesheet is a resource, it is appended to once", () => {
     fs.writeFileSync(path.join(root, "resources", "custom-css.css"), ".x{color:red}\n");
