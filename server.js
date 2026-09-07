@@ -15334,8 +15334,22 @@ async function webpUnderBudget(buf, maxBytes) {
   }
   return last;
 }
-// Every <img src> in the document tree, first occurrence only, with the tag it
-// came from so the rename can read its alt text.
+// An Elementor media control — {url, id, size, alt, source} — as it appears on
+// settings.image, settings.background_image, background_image_mobile and
+// background_overlay_image. This shape is the ONE place g99-control's
+// MediaResolver already rewrites a ref: resolvePlaceholders() matches either a
+// whole string beginning "media:" or an object whose `id` does, and for the
+// object it also refreshes `url` to wp_get_attachment_url(). A ref inside markup
+// is never matched — str_starts_with() cannot see into the middle of a string —
+// which is why an image localised here needs no plugin change and one localised
+// in markup needs one.
+function isMediaControl(v) {
+  return !!v && typeof v === "object" && !Array.isArray(v)
+    && typeof v.url === "string" && /^https?:\/\//i.test(v.url) && "id" in v;
+}
+// Every image in the document tree, first occurrence only: <img src> inside raw
+// markup, and Elementor media controls. `tag` is what the rename reads alt text
+// and subject from, so a control synthesises one from its own alt.
 function gitopsImageTargets(doc, pageSlug, seen) {
   const out = [];
   const visit = (v) => {
@@ -15349,7 +15363,14 @@ function gitopsImageTargets(doc, pageSlug, seen) {
       return;
     }
     if (Array.isArray(v)) { v.forEach(visit); return; }
-    if (v && typeof v === "object") { Object.values(v).forEach(visit); }
+    if (v && typeof v === "object") {
+      if (isMediaControl(v) && !seen.has(v.url)) {
+        seen.add(v.url);
+        const alt = typeof v.alt === "string" ? v.alt : "";
+        out.push({ src: v.url, tag: `<img alt="${alt.replace(/"/g, "")}">`, pageSlug, control: true });
+      }
+      Object.values(v).forEach(visit);
+    }
   };
   visit(doc);
   return out;
@@ -15373,6 +15394,10 @@ function gitopsRewriteImages(v, refs) {
   if (v && typeof v === "object") {
     const out = {};
     for (const [k, val] of Object.entries(v)) out[k] = gitopsRewriteImages(val, refs);
+    // The control keeps its old `url`. MediaResolver overwrites it with the real
+    // attachment URL once the ref resolves, and if resolution ever fails the page
+    // falls back to the image it was already serving rather than to nothing.
+    if (isMediaControl(v) && refs.has(v.url)) out.id = `media:${refs.get(v.url)}`;
     return out;
   }
   return v;
