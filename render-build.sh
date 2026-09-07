@@ -1,7 +1,31 @@
 #!/usr/bin/env bash
-# Render build step: fetch the GitHub CLI static binary into ./bin
-# (server.js prepends ./bin to PATH at startup; gh authenticates via GH_TOKEN).
+# Render build step.
 set -euo pipefail
+
+# Dependencies FIRST, and explicitly.
+#
+# Naming a buildCommand REPLACES Render's default `npm install` — it does not run
+# alongside it. This script never installed anything, so for as long as it has
+# existed the service has been running on whatever node_modules survived in
+# Render's build cache from before it. Everything already in the cache kept
+# working, which is why nobody noticed; but a dependency ADDED after that point
+# could never arrive, however many times the service was redeployed. `pg` was
+# added for the generation-history database and the deployed tool answered
+# "Cannot find module 'pg'" through deploy after deploy, on both hosts, because
+# no install step existed to fetch it.
+#
+# `npm ci` because a lockfile is committed: it installs exactly what the lock
+# pins and refuses to drift. It also wipes node_modules first, so a stale cached
+# tree cannot mask a missing dependency ever again.
+echo "--- installing node dependencies"
+npm ci --omit=dev --no-audit --no-fund
+# Prove the two lazily-required modules resolve. Both are required from INSIDE a
+# function (pg in lib/history/db.js, cheerio in lib/designgen/index.js), so
+# neither one missing stops the server from booting — pg turns history silently
+# off, and cheerio waits to throw until a build has already generated its pages.
+# A missing dependency has to fail here, in a build log, not there.
+node -e "for (const m of ['pg','cheerio','playwright']) { require.resolve(m); console.log('  ok', m); }"
+
 GH_VERSION="2.63.2"
 mkdir -p bin
 curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \

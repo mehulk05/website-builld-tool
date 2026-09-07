@@ -58,6 +58,18 @@
     // describing. Offset so it reads as an annotation rather than a border the
     // designer might mistake for part of the page.
     + ".g99r-outline{outline:2px dashed #7c5cff!important;outline-offset:-4px!important}"
+    // The panel is injected into a page whose CSS we have never read, and
+    // inheritable type is the part that leaks: family, size, case, tracking,
+    // colour. Reset it on everything the widget owns. Kept at id+universal,
+    // which is LOWER specificity than the id+class rules below, so it sets a
+    // floor without overwriting them.
+    + "#g99r-panel,#g99r-launch,#g99r-chip,#g99r-hint,#g99r-hovertag,"
+    + "#g99r-panel *,#g99r-launch *,#g99r-chip *,#g99r-hint *{"
+    + "font-family:system-ui,-apple-system,sans-serif;font-size:14px;font-weight:400;"
+    + "font-style:normal;line-height:1.45;letter-spacing:normal;text-transform:none;"
+    + "text-align:left;text-indent:0;text-shadow:none;box-sizing:border-box;"
+    + "white-space:normal;word-spacing:normal;text-decoration:none;"
+    + "max-width:none;min-width:0;float:none;position:static}"
     + "#g99r-panel .g99r-picklabel{font-size:11px;font-weight:700;text-transform:uppercase;"
     + "letter-spacing:.04em;color:#666;margin:10px 0 5px}"
     + "#g99r-panel .g99r-pick{display:flex;flex-direction:column;gap:2px;border:1px solid #e6e6e6;"
@@ -84,29 +96,29 @@
     + "font:13px/1.4 system-ui,sans-serif;resize:vertical}"
     + "#g99r-panel textarea[readonly]{background:#f5f5f5;color:#555}"
     + "#g99r-panel label{display:block;font-size:12px;font-weight:600;margin:10px 0 4px}"
-    + ".g99r-btn{border:0;border-radius:8px;padding:9px 14px;font:600 13px system-ui,sans-serif;cursor:pointer}"
-    + ".g99r-primary{background:#111;color:#fff}.g99r-primary[disabled]{opacity:.45;cursor:default}"
-    + ".g99r-ghost{background:#eee;color:#111}"
-    + ".g99r-row{display:flex;gap:8px;margin-top:12px}"
-    + ".g99r-item{border-top:1px solid #eee;padding:9px 0;font-size:12px}"
-    + ".g99r-item del{color:#9b1c1c;text-decoration:line-through}.g99r-item ins{color:#136c2e;text-decoration:none}"
-    + ".g99r-item button{float:right;border:0;background:none;color:#888;cursor:pointer;font-size:14px;line-height:1}"
-    + ".g99r-where{color:#888;font-size:11px;text-transform:uppercase;letter-spacing:.04em}"
-    + ".g99r-pagehead{margin:14px 0 2px;font-size:12px;font-weight:700;color:#111;border-bottom:1px solid #111;padding-bottom:3px}"
-    + ".g99r-pagehead:first-of-type{margin-top:6px}"
-    + ".g99r-warn{background:#fff6e5;color:#7a4b00;border-radius:8px;padding:8px;font-size:12px;margin-top:10px}"
-    + ".g99r-note{color:#666;font-size:12px;margin-top:10px}"
-    + ".g99r-modes{display:flex;gap:6px;margin-bottom:10px}"
-    + ".g99r-mode{flex:1;border:1px solid #ddd;background:#fff;border-radius:8px;padding:7px;cursor:pointer;"
+    + "#g99r-panel .g99r-btn{border:0;border-radius:8px;padding:9px 14px;font:600 13px system-ui,sans-serif;cursor:pointer}"
+    + "#g99r-panel .g99r-primary{background:#111;color:#fff}.g99r-primary[disabled]{opacity:.45;cursor:default}"
+    + "#g99r-panel .g99r-ghost{background:#eee;color:#111}"
+    + "#g99r-panel .g99r-row{display:flex;gap:8px;margin-top:12px;position:sticky;bottom:-16px;background:#fff;padding:10px 0 2px;box-shadow:0 -10px 14px -10px rgba(0,0,0,.2)}"
+    + "#g99r-panel .g99r-item{border-top:1px solid #eee;padding:9px 0;font-size:12px}"
+    + "#g99r-panel .g99r-item del{color:#9b1c1c;text-decoration:line-through}.g99r-item ins{color:#136c2e;text-decoration:none}"
+    + "#g99r-panel .g99r-item button{float:right;border:0;background:none;color:#888;cursor:pointer;font-size:14px;line-height:1}"
+    + "#g99r-panel .g99r-where{color:#888;font-size:11px;text-transform:uppercase;letter-spacing:.04em;line-height:1.4;max-height:2.8em;overflow:hidden;overflow-wrap:anywhere}"
+    + "#g99r-panel .g99r-pagehead{margin:14px 0 2px;font-size:12px;font-weight:700;color:#111;border-bottom:1px solid #111;padding-bottom:3px}"
+    + "#g99r-panel .g99r-pagehead:first-of-type{margin-top:6px}"
+    + "#g99r-panel .g99r-warn{background:#fff6e5;color:#7a4b00;border-radius:8px;padding:8px;font-size:12px;margin-top:10px}"
+    + "#g99r-panel .g99r-note{color:#666;font-size:12px;margin-top:10px}"
+    + "#g99r-panel .g99r-modes{display:flex;gap:6px;margin-bottom:10px}"
+    + "#g99r-panel .g99r-mode{flex:1;border:1px solid #ddd;background:#fff;border-radius:8px;padding:7px;cursor:pointer;"
     + "font:600 12px system-ui,sans-serif;color:#444}"
-    + ".g99r-mode.on{background:#111;color:#fff;border-color:#111}"
-    + ".g99r-ok{color:#136c2e}.g99r-bad{color:#9b1c1c}"
-    + ".g99r-scope{display:flex;flex-direction:column;gap:5px;margin-top:8px}"
-    + ".g99r-scope label{display:flex;align-items:center;gap:7px;font-size:12px;font-weight:500;margin:0;cursor:pointer}"
-    + ".g99r-scope input{margin:0}"
-    + ".g99r-drop{border:1px dashed #c8c8c8;border-radius:9px;padding:12px;text-align:center;font-size:12px;color:#666;cursor:pointer;margin-top:8px}"
-    + ".g99r-drop.on{border-color:#2f6df6;color:#2f6df6}"
-    + ".g99r-thumb{max-width:100%;max-height:120px;border-radius:7px;margin-top:8px;display:block}"
+    + "#g99r-panel .g99r-mode.on{background:#111;color:#fff;border-color:#111}"
+    + "#g99r-panel .g99r-ok{color:#136c2e}.g99r-bad{color:#9b1c1c}"
+    + "#g99r-panel .g99r-scope{display:flex;flex-direction:column;gap:5px;margin-top:8px}"
+    + "#g99r-panel .g99r-scope label{display:flex;align-items:center;gap:7px;font-size:12px;font-weight:500;margin:0;cursor:pointer}"
+    + "#g99r-panel .g99r-scope input{margin:0}"
+    + "#g99r-panel .g99r-drop{border:1px dashed #c8c8c8;border-radius:9px;padding:12px;text-align:center;font-size:12px;color:#666;cursor:pointer;margin-top:8px}"
+    + "#g99r-panel .g99r-drop.on{border-color:#2f6df6;color:#2f6df6}"
+    + "#g99r-panel .g99r-thumb{max-width:100%;max-height:120px;border-radius:7px;margin-top:8px;display:block}"
     // The picker's own highlight. outline rather than border so nothing reflows
     // under the cursor while the reviewer is aiming at it.
     + ".g99r-target{outline:2px solid #2f6df6!important;outline-offset:-2px!important;cursor:crosshair!important}"
@@ -527,7 +539,11 @@
     panel.appendChild(el("h4", null, "What should be different here?"));
     panel.appendChild(el("p", { class: "g99r-sub" }, esc(CFG.reviewer) + " · " + esc(CFG.path)));
 
-    var what = target.tag ? "<" + esc(target.tag) + ">" : "this element";
+    // Entity-escaped brackets, because el() sets innerHTML. With raw ones,
+    // "<h2>" became a REAL heading inside the panel and the site's own display
+    // type — 50px Cormorant on nuvo — filled the whole thing. The CSS reset
+    // would now paper over that, but a stray element is still a stray element.
+    var what = target.tag ? "&lt;" + esc(target.tag) + "&gt;" : "this element";
     panel.appendChild(el("div", { class: "g99r-where" },
       "Selected: " + what + (target.text ? " · " + esc(clip(target.text, 60)) : "")));
 

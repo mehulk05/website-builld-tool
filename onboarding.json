@@ -1,23 +1,39 @@
 {
-  "draftId": "nuvo-navfix-1",
-  "businessId": null,
+  "draftId": "nuvo-manual-1788500002",
+  "businessId": 88888,
   "template": "WEBSITE",
-  "receivedAt": "2026-09-01T09:07:56.890Z",
+  "receivedAt": "2026-09-03T09:09:19.315Z",
   "betaSiteUrl": "https://nuvoaestheticsclinic.gogroth.com",
   "betaSiteRepo": "G99agency/nuvoaestheticsclinic.gogroth.com",
-  "referenceWebsite": "https://ruma.com",
-  "existingWebsite": "",
+  "referenceWebsite": "",
+  "existingWebsite": "https://ruma.com",
   "confirmedBrand": null,
   "logoUrl": null,
   "answers": {
     "business_name": "NUVO Aesthetics Clinic",
-    "location": "Peoria, AZ",
+    "location": "Sycamore, IL",
+    "phone_for_website": "(815) 991-5150",
+    "business_description": "Medical aesthetics and wellness clinic offering injectables, dermal fillers, Sculptra, medical weight loss and bio-identical hormone therapy.",
     "services_offered": [
-      "Botox",
+      "Neurotoxins",
       "Dermal Fillers",
-      "Facials",
-      "Laser Treatments",
-      "Weight Loss"
-    ]
+      "Sculptra Aesthetic",
+      "Medical Weight Loss",
+      "Bio-Identical Hormone Therapy"
+    ],
+    "revenue_services": [
+      "Neurotoxins",
+      "Dermal Fillers",
+      "Sculptra Aesthetic"
+    ],
+    "featured_review": "\"Natural results and a team that truly listens.\" — Google, 5★",
+    "primary_cta": "Book a consultation",
+    "team_roster": [
+      {
+        "name": "Dr. Elena Marsh",
+        "title": "MD, Medical Director"
+      }
+    ],
+    "hero_headline": "Aesthetics and wellness, elevated"
   }
 }

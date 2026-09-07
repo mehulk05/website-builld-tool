@@ -1,4 +1,40 @@
-# Plan: Designer feedback loop — delivery and capability  (updated 2026-09-02)
+# Plan: Generation history preview  (started 2026-09-03)
+
+Goal: open any past generation of a client as a real website in a new tab — done =
+the history browser lists V1..Vn per client (failed ones greyed out), and clicking a
+version opens its stored home page with working CSS, JS and nav between all four pages.
+
+| # | Task | Files / area | Status | Notes |
+|---|------|--------------|--------|-------|
+| 1 | Record what already shipped | PLAN.md | ✅ done | schema, db module, migrate-at-boot, upsert, versioning, page storage and the /history JSON API are all live — verified: 8 versions for nuvo, V8 home renders 57kb |
+| 2 | `listClients()` — every client + version count | lib/history/db.js | ✅ done | returns 2 clients: nuvo (8 versions) and mcptest2 (3) |
+| 3 | Routes `/api/history/clients` + `/api/history/client/<key>` | server.js | ✅ done | both 200 with the admin key; 401 without it |
+| 4 | Preview route, website-shaped | server.js, lib/history/preview.js | ✅ done | all four pages 200; nav rewritten to /preview/<key>/v8/…; zero links left pointing at the live site; bad version/slug/client each render an explained page, not JSON |
+| 5 | History browser page | public/history.html | ✅ done | screenshot: V8 done + V7 failed both previewable, V6–V1 greyed with "no pages stored" and no button |
+| 6 | Reach it from the rest of the tool | public/nav.js | ✅ done | "Generation history" in the sidebar; /history?client=<key> deep-links |
+| 7 | Tests | test-history.js | ✅ done | 13 passed, 0 failed — including "only the hrefs move, nothing else about the bytes" |
+| 8 | Live proof | — | ✅ done | walked V8 home→services→about→contact in a browser: titles change, 8/8/8/5 images all loaded (0 broken), map iframe + 5 form fields present, 0 console errors; V7 links stay inside V7 |
+| 9 | Client row → that client's history | public/clients.js, public/clients.html | ✅ done | whole row clickable (plus a "History" action link); rows with no beta site stay inert — 27 rows checked, 23 linked, 4 inert |
+| 10 | Any spelling of the beta URL selects the right client | public/history.html | ✅ done | ?client=https%3A%2F%2Fnuvo… selects nuvo and the address bar normalizes to the bare key; a client with no history says so instead of silently showing someone else’s |
+| 11 | Generation row → its job detail page | server.js, public/history.html | ✅ done | jobUrl only when the job still exists; clicked V8 → /job?id=nuvo-manual-1788500002 loaded; a row’s own links still win over the row |
+| 12 | Clients page redesign + search | public/clients.html, public/clients.js | ✅ done | client column 114px→256px, row height 149px→60px, 6 stat tiles→4 figures, beta site + repo folded into one column; search matches name/draft id/beta site/repo/status, every word must hit (nuvo=8, failed=7, "nuvo failed"=3 of 27) and survives the 10s refresh with caret and focus intact |
+| 13 | Generation history redesign | public/history.html | ✅ done | house status pills, pages as size-labelled chips, client filter, per-card counts; fixed a real overlap — min-width 660px against 632px of fixed columns squeezed the pages column to 28px with 109px of content, so its chips drew over the job column. Widths now sum to 828px and 0 cells are squeezed at any width |
+
+Verified facts this plan rests on:
+- stored pages are self-contained: CSS in 4 inline <style> blocks, JS in 1 inline <script>,
+  images and fonts absolute https. The ONLY relative refs are href="/", "/services/",
+  "/about/", "/contact/" — so no asset serving is needed, only link rewriting.
+- /history/* is not behind the admin gate (that gate covers /api/* only), so a new tab
+  opens without a key. Responses carry X-Robots-Tag: noindex.
+
+Server runs on PORT=8793 for this work (nothing else was listening there).
+
+Infra ask (still open): make infratools RDS reachable from the deployed tool —
+publicly_accessible or a proxy. Until then history only works locally through the tunnel.
+
+## Archive
+
+### Plan: Designer feedback loop — delivery and capability  (updated 2026-09-02)
 
 Goal: a designer opens a signed link on a live beta site, leaves notes, presses Submit
 once, and the build tool applies what it safely can, refuses the rest out loud, and
@@ -109,7 +145,9 @@ incomplete. So F4 through F9 are one writer each, and as each lands its rule
 leaves scope.js and the refusal becomes routing. Nothing is meant to stay
 refused.
 
-## Archive
+_Archived 2026-09-03 — loop live on nuvo; remaining rows (F9/H6/H9 media, G5, A8, D-series) blocked on infra or tracked in INFRA-media-on-deploy.md._
+
+
 
 ### Plan: Output G99 GitOps `resources/` format instead of PHP theme  (started 2026-08-21 → done)
 
