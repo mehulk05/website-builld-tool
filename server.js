@@ -15374,8 +15374,22 @@ async function webpUnderBudget(buf, maxBytes) {
   }
   return last;
 }
-// Every <img src> in the document tree, first occurrence only, with the tag it
-// came from so the rename can read its alt text.
+// An Elementor media control — {url, id, size, alt, source} — as it appears on
+// settings.image, settings.background_image, background_image_mobile and
+// background_overlay_image. This shape is the ONE place g99-control's
+// MediaResolver already rewrites a ref: resolvePlaceholders() matches either a
+// whole string beginning "media:" or an object whose `id` does, and for the
+// object it also refreshes `url` to wp_get_attachment_url(). A ref inside markup
+// is never matched — str_starts_with() cannot see into the middle of a string —
+// which is why an image localised here needs no plugin change and one localised
+// in markup needs one.
+function isMediaControl(v) {
+  return !!v && typeof v === "object" && !Array.isArray(v)
+    && typeof v.url === "string" && /^https?:\/\//i.test(v.url) && "id" in v;
+}
+// Every image in the document tree, first occurrence only: <img src> inside raw
+// markup, and Elementor media controls. `tag` is what the rename reads alt text
+// and subject from, so a control synthesises one from its own alt.
 function gitopsImageTargets(doc, pageSlug, seen) {
   const out = [];
   const visit = (v) => {
@@ -15389,7 +15403,14 @@ function gitopsImageTargets(doc, pageSlug, seen) {
       return;
     }
     if (Array.isArray(v)) { v.forEach(visit); return; }
-    if (v && typeof v === "object") { Object.values(v).forEach(visit); }
+    if (v && typeof v === "object") {
+      if (isMediaControl(v) && !seen.has(v.url)) {
+        seen.add(v.url);
+        const alt = typeof v.alt === "string" ? v.alt : "";
+        out.push({ src: v.url, tag: `<img alt="${alt.replace(/"/g, "")}">`, pageSlug, control: true });
+      }
+      Object.values(v).forEach(visit);
+    }
   };
   visit(doc);
   return out;
@@ -15398,21 +15419,19 @@ function gitopsImageTargets(doc, pageSlug, seen) {
 // the old host, at higher priority than src, so leaving them in means the browser
 // keeps loading the foreign image and the fix changes nothing anyone can see.
 function gitopsRewriteImages(v, refs) {
-  if (typeof v === "string") {
-    if (!/<img\b/i.test(v)) return v;
-    return v.replace(/<img\b[^>]*>/gi, (tag) => {
-      const src = (tag.match(/\ssrc\s*=\s*"([^"]*)"/i) || [])[1] || "";
-      const ref = refs.get(src);
-      if (!ref) return tag;
-      return tag
-        .replace(/\s(?:srcset|data-srcset|sizes)\s*=\s*"[^"]*"/gi, "")
-        .replace(/(\ssrc\s*=\s*")[^"]*(")/i, `$1media:${ref}$2`);
-    });
-  }
+  // Markup is deliberately left untouched. A "media:<ref>" inside an <img src>
+  // is dead on arrival — the reconciler only matches a whole string or a
+  // control's `id` — so rewriting one replaces a photo that loads with one that
+  // does not. Only controls are repointed, below.
+  if (typeof v === "string") return v;
   if (Array.isArray(v)) return v.map((x) => gitopsRewriteImages(x, refs));
   if (v && typeof v === "object") {
     const out = {};
     for (const [k, val] of Object.entries(v)) out[k] = gitopsRewriteImages(val, refs);
+    // The control keeps its old `url`. MediaResolver overwrites it with the real
+    // attachment URL once the ref resolves, and if resolution ever fails the page
+    // falls back to the image it was already serving rather than to nothing.
+    if (isMediaControl(v) && refs.has(v.url)) out.id = `media:${refs.get(v.url)}`;
     return out;
   }
   return v;
@@ -15448,6 +15467,14 @@ async function gitopsFixImages(resAbs, pages, businessName, facts) {
   let bytesBefore = 0, bytesAfter = 0;
   for (const t of targets) {
     if (IMG_SKIP_HOSTS.test(t.src)) continue;
+    // An image still sitting in markup is left exactly as it is. A ref written
+    // into an <img src> is never resolved — resolvePlaceholders() matches a whole
+    // string or a control's `id`, never a substring — so localising one would
+    // trade a working hotlink for a broken image, which is worse than the hotlink
+    // we are trying to remove. Lifting the section's backdrop into a container
+    // background (GITOPS_IMAGE_CONTROLS in lib/gitops/compile.js) is what makes an
+    // image localisable; until then it is reported, not touched.
+    if (!t.control) { notLocalised.push("still in markup"); continue; }
     if (/\.svg(?:$|[?#])/i.test(t.src)) { notLocalised.push("SVG"); continue; }
     let buf = null, was = 0;
     // The body of a rejected response has to be cancelled explicitly: undici keeps

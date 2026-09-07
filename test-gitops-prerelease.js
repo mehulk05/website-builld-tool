@@ -304,12 +304,28 @@ async function imageChecks() {
     // a second document quoting the same photo adds nothing
     assert.strictEqual(S.gitopsImageTargets(readJ(root, "pages/botox/elementor.json"), "botox", seen).length, 0);
   });
-  ok("a rewritten tag points at the media ref and loses its srcset", () => {
+  // A ref in markup is dead on arrival: MediaResolver::resolvePlaceholders()
+  // matches a whole string beginning "media:" or a control's `id`, never a
+  // substring. Rewriting an <img src> to one therefore replaces a photo that
+  // loads with a photo that does not, which is why markup is left alone.
+  ok("markup is left exactly as it was, ref or no ref", () => {
     const before = { settings: { html: '<img src="https://cdn.example/a.jpg" srcset="https://cdn.example/a-2x.jpg 2x" sizes="100vw" alt="chair">' } };
     const after = S.gitopsRewriteImages(before, new Map([["https://cdn.example/a.jpg", "treatment-chair-brew"]]));
-    assert.ok(after.settings.html.includes('src="media:treatment-chair-brew"'), after.settings.html);
-    assert.ok(!/srcset|sizes=/.test(after.settings.html), "srcset and sizes would out-rank src and keep loading the old host");
-    assert.ok(after.settings.html.includes('alt="chair"'), "alt text survives");
+    assert.strictEqual(after.settings.html, before.settings.html, "a markup ref would never resolve, so the hotlink stays");
+  });
+  ok("an Elementor media control is repointed at the ref", () => {
+    const before = { settings: { background_image: { url: "https://cdn.example/a.jpg", id: "", size: "", alt: "chair", source: "library" } } };
+    const after = S.gitopsRewriteImages(before, new Map([["https://cdn.example/a.jpg", "treatment-chair-brew"]]));
+    assert.strictEqual(after.settings.background_image.id, "media:treatment-chair-brew");
+    assert.strictEqual(after.settings.background_image.alt, "chair", "alt text survives");
+    // url is deliberately left: the reconciler overwrites it with
+    // wp_get_attachment_url(), and if the ref ever fails to resolve the page
+    // falls back to the image it was already serving.
+    assert.strictEqual(after.settings.background_image.url, "https://cdn.example/a.jpg");
+  });
+  ok("a control the run did not localise is untouched", () => {
+    const before = { image: { url: "https://cdn.example/b.jpg", id: "", source: "library" } };
+    assert.deepStrictEqual(S.gitopsRewriteImages(before, new Map()), before);
   });
   ok("an unknown src is left exactly as it was", () => {
     const before = { html: '<img src="https://cdn.example/b.jpg" alt="x">' };
