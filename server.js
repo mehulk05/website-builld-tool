@@ -15379,17 +15379,11 @@ function gitopsImageTargets(doc, pageSlug, seen) {
 // the old host, at higher priority than src, so leaving them in means the browser
 // keeps loading the foreign image and the fix changes nothing anyone can see.
 function gitopsRewriteImages(v, refs) {
-  if (typeof v === "string") {
-    if (!/<img\b/i.test(v)) return v;
-    return v.replace(/<img\b[^>]*>/gi, (tag) => {
-      const src = (tag.match(/\ssrc\s*=\s*"([^"]*)"/i) || [])[1] || "";
-      const ref = refs.get(src);
-      if (!ref) return tag;
-      return tag
-        .replace(/\s(?:srcset|data-srcset|sizes)\s*=\s*"[^"]*"/gi, "")
-        .replace(/(\ssrc\s*=\s*")[^"]*(")/i, `$1media:${ref}$2`);
-    });
-  }
+  // Markup is deliberately left untouched. A "media:<ref>" inside an <img src>
+  // is dead on arrival — the reconciler only matches a whole string or a
+  // control's `id` — so rewriting one replaces a photo that loads with one that
+  // does not. Only controls are repointed, below.
+  if (typeof v === "string") return v;
   if (Array.isArray(v)) return v.map((x) => gitopsRewriteImages(x, refs));
   if (v && typeof v === "object") {
     const out = {};
@@ -15433,6 +15427,14 @@ async function gitopsFixImages(resAbs, pages, businessName, facts) {
   let bytesBefore = 0, bytesAfter = 0;
   for (const t of targets) {
     if (IMG_SKIP_HOSTS.test(t.src)) continue;
+    // An image still sitting in markup is left exactly as it is. A ref written
+    // into an <img src> is never resolved — resolvePlaceholders() matches a whole
+    // string or a control's `id`, never a substring — so localising one would
+    // trade a working hotlink for a broken image, which is worse than the hotlink
+    // we are trying to remove. Lifting the section's backdrop into a container
+    // background (GITOPS_IMAGE_CONTROLS in lib/gitops/compile.js) is what makes an
+    // image localisable; until then it is reported, not touched.
+    if (!t.control) { notLocalised.push("still in markup"); continue; }
     if (/\.svg(?:$|[?#])/i.test(t.src)) { notLocalised.push("SVG"); continue; }
     let buf = null, was = 0;
     // The body of a rejected response has to be cancelled explicitly: undici keeps
