@@ -10915,7 +10915,9 @@ function writeGenericJobReport(job) {
 // already-built theme) revenue-first individual service pages + a public brand
 // guide, mimicking the reference site's per-service structure. Reuses the edit
 // job's clone → write → PR → CI → merge rails. Fail-soft: never touches the beta.
-const MAX_SERVICE_PAGES = 10;
+// Raised from 10: a client with 15 onboarding services plus live-only treatments lost every page past
+// the 10th (dripdocx: The Perfect Derma Peel was 11th, GLP-1 was only on the live site).
+const MAX_SERVICE_PAGES = 30;
 const BASE_SLUGS = new Set(["home", "services", "about", "contact", "branding", "seo", "brand-guide", "team"]);
 function slugify(s) {
   return String(s || "").toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
@@ -10936,7 +10938,37 @@ function cleanServiceList(raw) {
 }
 // Revenue-first, then growth, then the rest of services_offered; dedupe; slugify;
 // cap at MAX_SERVICE_PAGES. Returns {services:[{name,slug}], total, truncated}.
-function selectServices(A, cap = MAX_SERVICE_PAGES) {
+// Words that say what kind of page it is, not which treatment; two names sharing only these are different services.
+const GENERIC_SERVICE_WORDS = new Set(["the", "and", "of", "for", "in", "a", "therapy", "therapies", "treatment", "treatments",
+  "service", "services", "injection", "injections", "medical", "weight", "loss", "shots", "shot", "page", "new"]);
+function serviceTokens(s) {
+  return String(s).toLowerCase().replace(/[^a-z0-9]+/g, " ").split(" ")
+    .map((t) => t.replace(/s$/, "")).filter((t) => t && !/^\d+$/.test(t) && !GENERIC_SERVICE_WORDS.has(t) && !GENERIC_SERVICE_WORDS.has(t + "s"));
+}
+// A live treatment page's name from its path: "/the-perfect-derma-peel" -> "The Perfect Derma Peel",
+// "/iv-therapy-1" -> "Iv Therapy" (Squarespace's "-1"/"2" copies dropped), "/botox/dysport" -> "Botox Dysport".
+function liveServiceName(path) {
+  const words = String(path).split("/").filter(Boolean).join(" ").replace(/-?\d+$/, "").split(/[-_\s]+/).filter(Boolean);
+  return words.map((w) => (/^glp$/i.test(w) ? "GLP" : w.charAt(0).toUpperCase() + w.slice(1))).join(" ").replace(/^GLP 1(?= |$)/, "GLP-1").trim();
+}
+// Treatment pages found on the live site that no onboarding service already covers. Hubs ("/skin-services")
+// are left out: the build makes its own services hub. A page is covered when it shares a real treatment
+// word with an onboarding service ("/iv-therapy-1" is covered by "IV Hydration Therapy").
+function liveOnlyServices(livePaths, onboardingNames) {
+  const taken = (onboardingNames || []).map((n) => new Set(serviceTokens(n)));
+  const out = []; const seen = new Set();
+  for (const p of livePaths || []) {
+    const last = String(p).split("/").filter(Boolean).pop() || "";
+    if (/services?$/i.test(last)) continue;
+    const name = liveServiceName(p); const toks = serviceTokens(name);
+    if (!name || !toks.length) continue;
+    const key = toks.join(" ");
+    if (seen.has(key) || taken.some((t) => toks.some((x) => t.has(x)))) continue;
+    seen.add(key); taken.push(new Set(toks)); out.push(name);
+  }
+  return out;
+}
+function selectServices(A, cap = MAX_SERVICE_PAGES, livePaths = []) {
   A = A || {};
   const norm = (s) => String(s).replace(/\s+/g, " ").trim();
   const ordered = []; const seen = new Set();
@@ -10946,14 +10978,18 @@ function selectServices(A, cap = MAX_SERVICE_PAGES) {
   cleanServiceList(A.revenue_services).forEach(push);
   cleanServiceList(A.growth_services).forEach(push);
   cleanServiceList(A.services_offered).forEach(push);
+  // Then treatments the live site has that the onboarding answers did not list (they go after, so the
+  // client's own list wins the cap).
+  const liveOnly = liveOnlyServices(livePaths, ordered);
+  liveOnly.forEach(push);
   const used = new Set(BASE_SLUGS); const services = [];
   for (const name of ordered) {
     if (services.length >= cap) break;
     const base = slugify(name); if (!base) continue;
     let s = base, n = 2; while (used.has(s)) s = base + "-" + (n++);
-    used.add(s); services.push({ name, slug: s });
+    used.add(s); services.push(liveOnly.includes(name) ? { name, slug: s, source: "live" } : { name, slug: s });
   }
-  return { services, total: ordered.length, truncated: ordered.length > cap };
+  return { services, total: ordered.length, truncated: ordered.length > cap, liveOnly };
 }
 function deriveCity(location) {
   const parts = String(location || "").split(",").map((x) => x.trim()).filter(Boolean);
@@ -12070,7 +12106,11 @@ async function runEnrichJob(job) {
 
     // 2 — plan services + reference structure
     jobStep(job, 1, "running", "Selecting services…");
-    const { services, total, truncated } = selectServices(A);
+    // The client's live site's treatment pages count too, not only the onboarding answers.
+    let live = { pages: [] };
+    try { live = await discoverServicePages(P.existingWebsite); } catch (e) { /* fail-soft */ }
+    const { services, total, truncated, liveOnly } = selectServices(A, MAX_SERVICE_PAGES, live.pages.map((p) => p.path));
+    if (liveOnly.length) log_srv(`services from the live site, not in the onboarding answers: ${liveOnly.join(", ")}`);
     let ref = { count: 0, localSeo: false };
     try { ref = await discoverServicePages(P.referenceWebsite); } catch (e) { /* fail-soft */ }
     job.servicePages = services;
@@ -20151,6 +20191,7 @@ module.exports = {
   // exercised against a real theme without cloning a repo or opening a PR.
   liveSiteCandidate, nameTokens, textNodesOutsideAnchors, extractSocials, themeBrandColor, themeLogoUrl, siteHostOf,
   findingsBusinessName, findingsContact, findingsClickable, findingsCta, findingsFavicon,
+  selectServices, liveOnlyServices, liveServiceName, discoverServicePages,
   fetchLiveSitemap, sitemapLocs, urlSlug, findingsMissingPages, resolveLiveSite,
   splitLocationSlug, findingsUrlStructure, pageSpeedRun, findingsPageSpeed, psiReportUrl, collapseFindings,
   fixSpelling, fixCta, extractCtaBlock, performPrFixImages, cdnWebpUrl, imageSubject, uniqueImageName,
